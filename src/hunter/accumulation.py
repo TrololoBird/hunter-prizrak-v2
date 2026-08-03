@@ -30,7 +30,14 @@ MIN_BOUNDARY_POINTS = 4
 """Стр. 22, 23, 24: «4 и более точек границ». Курс называет только это число."""
 
 CONFIRM_BODIES = 2
-"""Стр. 55 даёт диапазон «2-3 полных тела». Взята нижняя граница — Р-7 в разборе."""
+"""Стр. 55 даёт диапазон «2-3 полных тела». Двойка ЗАМЕРЕНА, а не выбрана.
+
+Замер 2026-08-03 на структуре, которую автор обвёл сам (BTC 15м, 17.07): при 2 телах
+ПОК = 62 800.0, до названного им вслух уровня 62 837.3 расхождение −0.059% — внутри
+шума разрешения прибора. При 3 телах выход не подтверждается, структура вбирает ещё
+сутки, ПОК = 64 000.0, расхождение +1.850% и ни одной линии автора рядом.
+Протокол: docs/audit/stage3-corpus-acceptance-2026-08-03.md, результат 5.
+"""
 
 
 class ExitDirection(StrEnum):
@@ -108,12 +115,24 @@ def _body_beyond(bar: Bar, level: float, direction: ExitDirection) -> bool:
     return max(bar.open, bar.close) < level
 
 
-def detect(bars: list[Bar], swings: SwingSet, timeframe: str) -> tuple[Accumulation, ...]:
+def detect(
+    bars: list[Bar],
+    swings: SwingSet,
+    timeframe: str,
+    *,
+    min_points: int = MIN_BOUNDARY_POINTS,
+    confirm_bodies: int = CONFIRM_BODIES,
+) -> tuple[Accumulation, ...]:
     """Накопления, из которых цена уже вышла, в порядке подтверждения выхода.
 
     Проход строго слева направо по закрытым барам. Фрактал участвует только с того
     бара, на котором он стал известен (`confirmed_at_index`) — иначе структура
     опиралась бы на будущее (I-5).
+
+    Пороги вынесены в аргументы НЕ для настройки: умолчания взяты из курса и меняться
+    не должны. Они вынесены, чтобы чувствительность результата к ним можно было
+    ЗАМЕРИТЬ — курс даёт «4+» и «2-3», то есть диапазоны, и без замера выбор внутри
+    диапазона остаётся магическим числом.
     """
     by_confirm: dict[int, list[tuple[SwingKind, int, float]]] = {}
     for s in swings.swings:
@@ -172,9 +191,9 @@ def detect(bars: list[Bar], swings: SwingSet, timeframe: str) -> tuple[Accumulat
         if direction is not run_dir:
             run_dir, run_from = direction, k
         bodies = k - run_from + 1
-        if bodies < CONFIRM_BODIES:
+        if bodies < confirm_bodies:
             continue
-        if len(hi_px) + len(lo_px) < MIN_BOUNDARY_POINTS:
+        if len(hi_px) + len(lo_px) < min_points:
             # Цена ушла раньше, чем структура набрала 4 точки — накопления не было.
             reset()
             continue
