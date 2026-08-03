@@ -26,7 +26,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accumulation import Accumulation
-from .breach import Direction
+from .breach import CONFIRM_BODIES, RETURN_BARS, Breach, BreachKind, Direction, first_breach
 from .models import Bar, NotReady, TradeHistogram
 from .volume_profile import VolumeProfile, build
 
@@ -136,6 +136,55 @@ def build_level(
         boundary_lo=Decimal(str(acc.lower.lo)),
         boundary_hi=Decimal(str(acc.upper.hi)),
     )
+
+
+class LevelState(StrEnum):
+    ACTIVE = "active"
+    """Уровень жив: цена за него ещё не заходила."""
+
+    WORKED_OFF = "worked_off"
+    """Отработан на первое касание — стр. 25: «мы этот уровень удаляем».
+
+    Стр. 31 уточняет, чем именно нельзя торговать: «уровень лимитными ордерами больше не
+    торгуем… Позицию от уровня смотрим только по факту слома структуры на более мелких
+    ТФ». То есть уровень не исчезает совсем, но лимитки по нему сняты.
+    """
+
+    FLIPPED = "flipped"
+    """Пробит — стр. 43: «уровень лонг/шорт меняется для нас на противоположный»."""
+
+
+class LevelStatus(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    state: LevelState
+    event: Breach | None
+    """Событие, приведшее к состоянию. None — уровень активен, событий не было."""
+
+    limit_orders_allowed: bool
+    """Стр. 25 и 31: после отработки лимитками уровень больше не торгуется."""
+
+
+def status(
+    level: Level,
+    bars: list[Bar],
+    *,
+    confirm_bodies: int = CONFIRM_BODIES,
+    return_bars: int = RETURN_BARS,
+) -> LevelStatus:
+    """Состояние уровня §2.10 — выводится из первого события на нём.
+
+    Своей логики у §2.10 нет: прокол уже объявлен отработкой (стр. 6), пробой — флипом
+    (стр. 43). Здесь только связывание одного с другим, без новых правил.
+    """
+    ev = first_breach(bars, float(level.price), level.breach_direction,
+                      from_index=level.created_at_index + 1,
+                      confirm_bodies=confirm_bodies, return_bars=return_bars)
+    if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
+        return LevelStatus(state=LevelState.ACTIVE, event=ev, limit_orders_allowed=True)
+    if ev.kind is BreachKind.BREAKOUT:
+        return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False)
+    return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False)
 
 
 def first_test_index(level: Level, bars: list[Bar]) -> int | None:
