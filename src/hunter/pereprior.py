@@ -100,40 +100,54 @@ def _detect_side(
     others = [s for s in ordered if s.kind is other_kind]
     if len(others) < 2:
         return None
-    last_other, prev_other = others[-1], others[-2]
 
-    # Стр. 50 против стр. 51: обновился ли последний хай (для шорта) / лой (для лонга).
-    updated = (last_other.price > prev_other.price if side is PPSide.SHORT
-               else last_other.price < prev_other.price)
-    kind = PPKind.TRUE if updated else PPKind.EARLY
+    found: Pereprior | None = None
+    for i in range(1, len(others)):
+        prev_other, last_other = others[i - 1], others[i]
 
-    # Ломаемый экстремум в ОБОИХ случаях один и тот же — ближайший перед последним хаем:
-    #   стр. 50 «лой, ИЗ КОТОРОГО был последний хай»;
-    #   стр. 51 «формирует хай, затем ЛОЙ — затем не обновляет хай и пробивает последний лой»,
-    #   то есть лой между двумя хаями, он же ближайший перед вторым.
-    # Различает эти два случая только `kind`: обновился последний хай или нет.
-    candidates = [s for s in ordered
-                  if s.kind is broken_kind and prev_other.index < s.index < last_other.index]
-    if not candidates:
-        return None
-    broken: Swing = candidates[-1]
+        # Стр. 50 против стр. 51: обновился ли хай (для шорта) / лой (для лонга).
+        # ⚠ Считается по состоянию НА ТОТ МОМЕНТ, а не по последним двум экстремумам
+        # ряда. Замер 2026-08-04 показал, к чему ведёт второе: после слома цена падает и
+        # рисует новые, более НИЗКИЕ хаи, последний хай перестаёт быть обновлённым, и
+        # каждый истинный ПП механически переклассифицируется в ранний. Истинных было
+        # 0 из 32 конфигураций — не свойство рынка, а свойство порядка вычислений.
+        updated = (last_other.price > prev_other.price if side is PPSide.SHORT
+                   else last_other.price < prev_other.price)
 
-    lo, hi = _shadow_zone(bars[broken.index], broken_kind)
-    edge = lo if side is PPSide.SHORT else hi
-    ev = first_breach(bars, edge, direction,
-                      from_index=broken.confirmed_at_index + 1,
-                      confirm_bodies=confirm_bodies)
-    if ev is None or ev.kind is not BreachKind.BREAKOUT or ev.resolved_index is None:
-        # Прокол подтверждением не является (стр. 55) — переприора нет.
-        return None
+        # Ломаемый экстремум — последний ПЕРЕД этим хаем: стр. 50 «лой, ИЗ КОТОРОГО был
+        # последний хай», то есть тот, откуда начался рост. Условия «между двумя хаями»
+        # курс не ставит, и оно отбрасывало 8 конфигураций из 32: фракталы Вильямса не
+        # чередуются строго, между соседними хаями лоя может не быть вовсе.
+        candidates = [s for s in ordered
+                      if s.kind is broken_kind and s.index < last_other.index]
+        if not candidates:
+            continue
+        broken: Swing = candidates[-1]
 
-    return Pereprior(
-        kind=kind, side=side,
-        broken_index=broken.index, broken_price=broken.price,
-        zone_lo=lo, zone_hi=hi,
-        confirmed_at_index=ev.resolved_index,
-        tested_at_index=_test_index(bars, lo, hi, ev.resolved_index + 1),
-    )
+        # Конфигурация «последний хай + его лой» действует, пока не появился следующий
+        # хай: после него «последним» становится уже он, и слом относился бы к другой
+        # паре. Поэтому окно поиска слома ограничено сверху.
+        end = others[i + 1].confirmed_at_index if i + 1 < len(others) else len(bars)
+        start = max(broken.confirmed_at_index + 1, last_other.confirmed_at_index)
+        if start >= end:
+            continue
+
+        lo, hi = _shadow_zone(bars[broken.index], broken_kind)
+        edge = lo if side is PPSide.SHORT else hi
+        ev = first_breach(bars[:end], edge, direction, from_index=start,
+                          confirm_bodies=confirm_bodies)
+        if ev is None or ev.kind is not BreachKind.BREAKOUT or ev.resolved_index is None:
+            # Прокол подтверждением не является (стр. 55) — переприора нет.
+            continue
+
+        found = Pereprior(
+            kind=PPKind.TRUE if updated else PPKind.EARLY, side=side,
+            broken_index=broken.index, broken_price=broken.price,
+            zone_lo=lo, zone_hi=hi,
+            confirmed_at_index=ev.resolved_index,
+            tested_at_index=_test_index(bars, lo, hi, ev.resolved_index + 1),
+        )
+    return found
 
 
 def detect(
