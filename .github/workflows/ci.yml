@@ -43,11 +43,18 @@ jobs:
       - name: 'гейт: индикаторы против независимого оракула (§10.3)'
         run: uv run python gates/indicator_oracle.py
 
+      - name: 'гейт: ATR по опубликованному определению Уайлдера (§0)'
+        run: uv run python gates/wilder_atr.py
+
+      - name: 'гейт: с какого бара величина определена (§4.3)'
+        run: uv run python gates/indicator_availability.py
+
       - name: 'гейт: смоук-импорт всех модулей'
         run: uv run python gates/smoke_import.py
 
       - name: 'гейт: вселенная читается (§5)'
-        run: uv run python -c "from hunter.config import load_universe as l; u=l(); print(f'вселенная: символов {len(u.symbols)}, ТФ {len(u.timeframes)}')"
+        run: |
+          uv run python -c "from hunter.config import load_universe as l; u=l(); print('вселенная: символов', len(u.symbols), 'ТФ', len(u.timeframes))"
 
       - name: 'гейт: схема леджера и read-only (§10.2, §10.6)'
         run: |
