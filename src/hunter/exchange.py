@@ -107,6 +107,20 @@ class Exchange:
             )
         return OhlcvFetch(bars=closed, rejected=rejected)
 
+    async def count_history(self, symbol: str, timeframe: str) -> int:
+        """Сколько закрытых баров биржа отдаёт по этому символу и ТФ — всего."""
+        total, since = 0, 0
+        while True:
+            r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
+                                           limit=CCXT_EFFECTIVE_LIMIT)
+            if not r:
+                break
+            total += len(r)
+            if len(r) < CCXT_EFFECTIVE_LIMIT:
+                break
+            since = int(r[-1][0]) + 1
+        return total
+
     async def watch_closed_ohlcv(self, symbol: str, timeframe: str) -> AsyncGenerator[Bar]:
         """WS-поток. Отдаёт бар только после его закрытия (§6).
 
