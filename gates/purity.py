@@ -18,7 +18,12 @@ from pathlib import Path
 
 # Модули, обязанные быть чистыми. Список растёт с этапами 2–5: примитивы, структура,
 # уровни, геометрия сделки — всё это расчёт.
-PURE_MODULES = ["src/hunter/bars.py", "src/hunter/models.py"]
+PURE_MODULES = [
+    "src/hunter/bars.py",
+    "src/hunter/models.py",
+    "src/hunter/admission.py",
+    "src/hunter/volume_profile.py",
+]
 
 # Чего чистый модуль не имеет права импортировать.
 FORBIDDEN_IMPORTS = {

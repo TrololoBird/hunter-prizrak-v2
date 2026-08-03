@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import sqlite3
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from . import clock, log, store
@@ -30,6 +31,49 @@ def _check(args: argparse.Namespace) -> int:
     if args.symbols:
         uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
     return 1 if run_check(uni, args.seconds, args.seed_limit) else 0
+
+
+def _profile(args: argparse.Namespace) -> int:
+    """Профиль объёма за сутки из архива: ПОК, VAH, VAL (§2.2, §5)."""
+    import datetime as dt
+
+    from .archive import fetch_agg_trades_day, histogram_from_day
+    from .exchange import Exchange
+    from .models import NotReady
+    from .volume_profile import Expansion, build
+
+    async def tick_of(market_id: str) -> Decimal | NotReady:
+        ex = Exchange()
+        await ex.open()
+        try:
+            for sym, mk in ex.markets_by_id().items():
+                if mk == market_id:
+                    inst = ex.instrument(sym)
+                    return inst if isinstance(inst, NotReady) else inst.tick_size
+            return NotReady(reason=f"{market_id}: нет такого рынка")
+        finally:
+            await ex.close()
+
+    tick = asyncio.run(tick_of(args.symbol))
+    if isinstance(tick, NotReady):
+        print(f"НЕ ГОТОВО: {tick.reason}")
+        return 1
+    day = dt.date.fromisoformat(args.day)
+    data = fetch_agg_trades_day(args.symbol, day)
+    if isinstance(data, NotReady):
+        print(f"НЕ ГОТОВО: {data.reason}")
+        return 1
+    h = histogram_from_day(data, args.symbol, tick)
+    print(f"{args.symbol} {day}: сделок {h.trades_seen:,}, бинов {len(h.qty_by_bin):,}, "
+          f"объём {h.qty_seen:,.3f}, tickSize {tick}")
+    for e in (Expansion.PAIRS, Expansion.SINGLE):
+        vp = build(h, expansion=e)
+        if isinstance(vp, NotReady):
+            print(f"  {e.value:8} НЕ ГОТОВО: {vp.reason}")
+            continue
+        print(f"  {e.value:8} ПОК {vp.poc_price}  VAL {vp.val_price}  VAH {vp.vah_price}  "
+              f"бинов {vp.bins_in_area}  покрыто {vp.covered_fraction:.4%}")
+    return 0
 
 
 def _admission(args: argparse.Namespace) -> int:
@@ -139,6 +183,10 @@ def main(argv: list[str] | None = None) -> int:
     chk.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     chk.add_argument("--symbols", type=int, default=0)
 
+    prof = sub.add_parser("profile", help="профиль объёма за сутки: ПОК, VAH, VAL")
+    prof.add_argument("--symbol", required=True, help="идентификатор биржи, напр. BTCUSDT")
+    prof.add_argument("--day", required=True, help="дата YYYY-MM-DD")
+
     adm = sub.add_parser("admission", help="хватает ли истории на величины §2.9")
     adm.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     adm.add_argument("--required", type=int, default=0,
@@ -152,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args)
     if args.cmd == "check":
         return _check(args)
+    if args.cmd == "profile":
+        return _profile(args)
     if args.cmd == "admission":
         return _admission(args)
     if args.cmd == "ledger":

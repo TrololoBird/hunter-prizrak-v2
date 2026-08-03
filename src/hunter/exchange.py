@@ -64,6 +64,10 @@ class Exchange:
         self._instruments[symbol] = inst
         return inst
 
+    def markets_by_id(self) -> dict[str, str]:
+        """ccxt-символ → идентификатор биржи (BTCUSDT). Нужен для архива."""
+        return {sym: str(mk.get("id")) for sym, mk in self._ex.markets.items()}
+
     # --- OHLCV -------------------------------------------------------------
 
     async def fetch_closed_ohlcv(
