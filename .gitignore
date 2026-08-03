@@ -8,3 +8,6 @@ data/
 # «проверка не состоялась» и падает (проверено — так и случилось в CI 2026-08-03).
 *.parquet
 !docs/audit/reference-slice/*.parquet
+
+# страницы курса — рендерятся локально одной командой (см. CLAUDE.md), в git не нужны
+docs/course/pages/

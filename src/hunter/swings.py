@@ -52,7 +52,7 @@ class SwingKind(StrEnum):
 
 
 class Swing(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: SwingKind
     index: int = Field(ge=0)
@@ -65,7 +65,7 @@ class Swing(BaseModel):
 
 
 class SwingSet(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     swings: tuple[Swing, ...]
     bars_scanned: int

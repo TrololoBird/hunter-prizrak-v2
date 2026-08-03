@@ -24,7 +24,15 @@ PURE_MODULES = [
     "src/hunter/admission.py",
     "src/hunter/volume_profile.py",
     "src/hunter/swings.py",
+    "src/hunter/accumulation.py",
 ]
+
+# Список выше ведётся руками, и 2026-08-03 он отстал: `accumulation.py` объявил себя
+# чистым в докстроке, в список не попал, и гейт напечатал «нарушений 0», ни разу его не
+# открыв. Охват проверки сам является утверждением — поэтому расхождение между «модуль
+# объявил себя чистым» и «модуль в списке» теперь провал, а не тишина.
+PURITY_MARKER = "ЧИСТЫЙ МОДУЛЬ"
+SOURCE_ROOT = Path("src/hunter")
 
 # Чего чистый модуль не имеет права импортировать.
 FORBIDDEN_IMPORTS = {
@@ -52,25 +60,37 @@ def scan(path: Path) -> list[tuple[int, str]]:
     return out
 
 
+def declares_purity(path: Path) -> bool:
+    doc = ast.get_docstring(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    return PURITY_MARKER in (doc or "")
+
+
 def main() -> int:
     files = [Path(p) for p in PURE_MODULES]
     absent = [p for p in files if not p.exists()]
     findings: list[str] = []
+
+    listed = {p.as_posix() for p in files}
+    declared = {p.as_posix() for p in sorted(SOURCE_ROOT.rglob("*.py")) if declares_purity(p)}
+    drift = sorted(declared - listed)
     for p in files:
         if not p.exists():
             continue
         for line, why in scan(p):
             findings.append(f"{p}:{line}: {why}")
-    print(f"гейт чистоты расчёта: объявлено чистыми {len(files)}, "
-          f"просмотрено {len(files) - len(absent)}, нарушений {len(findings)}")
+    print(f"гейт чистоты расчёта: в списке {len(files)}, просмотрено "
+          f"{len(files) - len(absent)}, помечено «{PURITY_MARKER}» {len(declared)}, "
+          f"нарушений {len(findings)}")
     for a in absent:
         print(f"  ПРОВАЛ: модуль объявлен чистым, но отсутствует: {a}")
+    for d in drift:
+        print(f"  ПРОВАЛ: модуль помечен «{PURITY_MARKER}», но не в списке гейта: {d}")
     for f in findings:
         print(f"  НАРУШЕНИЕ {f}")
     if not files:
         print("ПРОВАЛ: список чистых модулей пуст — проверка не состоялась")
         return 1
-    return 1 if (findings or absent) else 0
+    return 1 if (findings or absent or drift) else 0
 
 
 if __name__ == "__main__":

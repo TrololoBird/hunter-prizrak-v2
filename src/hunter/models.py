@@ -1,5 +1,7 @@
 """Контракты между слоями. FOUNDATION.md §10.1 — словари между слоями запрещены.
 
+ЧИСТЫЙ МОДУЛЬ (§10.3): часы, сеть и глобальное состояние не трогаются.
+
 Причина, названная в §10.1: 910 вхождений `dict[str, Any]` в прошлой реализации
 породили класс «поле без продюсера» — ключ читается, никто его не пишет, ошибка молчит
 годами. У модели такого не бывает: mypy падает на несуществующем атрибуте.
@@ -15,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class NotReady(BaseModel):
     """Данных нет. Причина обязательна — §4.3 запрещает молчаливый пропуск."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     reason: str = Field(min_length=1)
 
@@ -24,7 +26,7 @@ class NotReady(BaseModel):
 
 
 class Bar(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     open_ms: int = Field(ge=0)
     open: float
@@ -48,7 +50,7 @@ class Bar(BaseModel):
 
 
 class Instrument(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     symbol: str = Field(min_length=1)
     market_id: str = Field(min_length=1)
@@ -59,7 +61,7 @@ class Instrument(BaseModel):
 
 
 class ClockSync(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     offset_ms: int
     """Сдвиг: серверное время минус локальное. Положительный = локальные отстают."""
@@ -77,6 +79,8 @@ class TradeHistogram(BaseModel):
     Сторона сделки НЕ хранится умышленно: §3 запрещает CVD, а поле стороны —
     единственное, из чего он собирается.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     symbol: str
     tick_size: Decimal = Field(gt=0)
@@ -120,13 +124,15 @@ class TradeHistogram(BaseModel):
 class OhlcvFetch(BaseModel):
     """Результат REST-засева: что принято и что отклонено. §4.3."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     bars: list[Bar]
     rejected: list[str] = Field(default_factory=list)
 
 
 class SeriesState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str
     timeframe: str
     bars: list[Bar] = Field(default_factory=list)
@@ -143,6 +149,8 @@ class SeriesState(BaseModel):
 
 
 class RunReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     sync: ClockSync
     series: dict[tuple[str, str], SeriesState] = Field(default_factory=dict)
     histograms: dict[str, TradeHistogram] = Field(default_factory=dict)

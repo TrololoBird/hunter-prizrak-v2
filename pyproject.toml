@@ -26,6 +26,9 @@ dev = ["ruff>=0.14", "mypy>=1.18"]
 # ATR совпал побитово; с talib=False разошёлся на 1.5e-11). Оракул ОБЯЗАН звать
 # pandas-ta с talib=False, иначе он сверяет TA-Lib сам с собой и не проверяет ничего.
 gates = ["pandas-ta==0.4.71b0", "ta-lib==0.7.1", "pandas>=2.2"]
+tools = [
+    "pymupdf>=1.28.0",
+]
 
 [build-system]
 requires = ["hatchling"]

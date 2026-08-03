@@ -64,7 +64,7 @@ class Expansion(StrEnum):
 
 
 class VolumeProfile(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     poc_bin: int
     poc_price: Decimal
