@@ -3,76 +3,42 @@
 Приёмка §8: «живой прогон, кадры свежие, ни одного молчаливого пропуска».
 Сводка печатает числа, а не слово «ОК»: пустой список нарушений сопровождается
 числом проверенного, иначе он неотличим от непроведённой проверки.
+
+Кадры сохраняются в parquet (§10.3) — без них детерминированный повтор невозможен.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from itertools import pairwise
 
-from . import clock, log
-from .bars import Bar, expected_last_closed_open_ms, is_closed, on_grid, tf_ms
+from . import clock, log, store
+from .bars import expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
-from .profile import TradeHistogram
-from .quality import NotReady
-
-
-@dataclass(slots=True)
-class SeriesState:
-    symbol: str
-    timeframe: str
-    bars: list[Bar] = field(default_factory=list)
-    gaps: list[tuple[int, int]] = field(default_factory=list)
-    """Пары (open_ms предыдущего, open_ms следующего) там, где сетка разорвана."""
-
-    not_ready: NotReady | None = None
-    ws_bars: int = 0
-    ws_unclosed_violations: int = 0
-    ws_offgrid_violations: int = 0
-
-
-@dataclass(slots=True)
-class RunReport:
-    sync: clock.ClockSync
-    series: dict[tuple[str, str], SeriesState] = field(default_factory=dict)
-    histograms: dict[str, TradeHistogram] = field(default_factory=dict)
-    seeded_bars: int = 0
-    seed_checked: int = 0
-    clock_drift_ms: int | None = None
-    clock_recheck_after_s: int | None = None
-
-
-def find_gaps(bars: list[Bar], timeframe: str) -> list[tuple[int, int]]:
-    step = tf_ms(timeframe)
-    out: list[tuple[int, int]] = []
-    for prev, cur in pairwise(bars):
-        if cur.open_ms - prev.open_ms != step:
-            out.append((prev.open_ms, cur.open_ms))
-    return out
+from .models import NotReady, RunReport, SeriesState, TradeHistogram
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> None:
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
-            log.degraded(f"инструмент недоступен — {inst.reason}")
+            log.degraded("инструмент недоступен", причина=inst.reason)
         for tf in uni.timeframes:
-            st = SeriesState(sym, tf)
+            st = SeriesState(symbol=sym, timeframe=tf)
             report.series[(sym, tf)] = st
             got = await ex.fetch_closed_ohlcv(sym, tf, limit=limit)
             report.seed_checked += 1
             if isinstance(got, NotReady):
                 st.not_ready = got
-                log.degraded(f"засев пропущен — {got.reason}")
+                log.degraded("засев пропущен", причина=got.reason)
                 continue
-            st.bars = got
-            st.gaps = find_gaps(got, tf)
-            report.seeded_bars += len(got)
+            st.bars = got.bars
+            st.rejected_bars = got.rejected
+            st.gaps = find_gaps(got.bars, tf)
+            report.seeded_bars += len(got.bars)
             if st.gaps:
-                log.warn(f"{sym} {tf}: разрывов сетки {len(st.gaps)}, первый после "
-                         f"{st.gaps[0][0]}")
+                log.warn("разрыв сетки", символ=sym, тф=tf, разрывов=len(st.gaps),
+                         первый_после=st.gaps[0][0])
 
 
 async def _watch_bars(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> None:
@@ -83,10 +49,12 @@ async def _watch_bars(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> Non
             st.ws_bars += 1
             if not is_closed(bar.open_ms, st.timeframe, clock.now_ms()):
                 st.ws_unclosed_violations += 1
-                log.error(f"{st.symbol} {st.timeframe}: отдан НЕзакрытый бар {bar.open_ms}")
+                log.error("отдан НЕзакрытый бар", символ=st.symbol, тф=st.timeframe,
+                          open_ms=bar.open_ms)
             if not on_grid(bar.open_ms, st.timeframe):
                 st.ws_offgrid_violations += 1
-                log.error(f"{st.symbol} {st.timeframe}: бар вне сетки {bar.open_ms}")
+                log.error("бар вне сетки", символ=st.symbol, тф=st.timeframe,
+                          open_ms=bar.open_ms)
             st.bars.append(bar)
     except asyncio.CancelledError:
         raise
@@ -103,7 +71,7 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
             for t in batch:
                 price, amount, ts = t.get("price"), t.get("amount"), t.get("timestamp")
                 if price is None or amount is None or ts is None:
-                    log.degraded(f"{sym}: сделка без цены/объёма/метки, пропущена")
+                    log.degraded("сделка без цены/объёма/метки, пропущена", символ=sym)
                     continue
                 hist.add(float(price), float(amount), int(ts))
     except asyncio.CancelledError:
@@ -112,15 +80,28 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
         await agen.aclose()
 
 
-async def live_run(uni: Universe, seconds: int, seed_limit: int) -> RunReport:
+def persist(run_id: str, report: RunReport) -> None:
+    """Сохранить кадры для детерминированного повтора (§10.3)."""
+    for (sym, tf), st in report.series.items():
+        if st.not_ready is not None or not st.bars:
+            continue
+        store.write_bars(run_id, sym, tf, st.bars)
+        report.frames_written += 1
+    for h in report.histograms.values():
+        if h.trades_seen:
+            store.write_histogram(run_id, h)
+            report.frames_written += 1
+
+
+async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) -> RunReport:
     ex = Exchange()
     sync = await ex.open()
     report = RunReport(sync=sync)
     try:
-        log.info(f"засев: {len(uni.symbols)} символов × {len(uni.timeframes)} ТФ, "
-                 f"по {seed_limit} баров")
+        log.info("засев", символов=len(uni.symbols), тф=len(uni.timeframes),
+                 баров_на_ряд=seed_limit)
         await seed(ex, uni, report, seed_limit)
-        log.info(f"засеяно баров {report.seeded_bars}, запросов {report.seed_checked}")
+        log.info("засеяно", баров=report.seeded_bars, запросов=report.seed_checked)
 
         stop = asyncio.Event()
         tasks: list[asyncio.Task[None]] = []
@@ -134,7 +115,7 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int) -> RunReport:
             report.histograms[sym] = h
             tasks.append(asyncio.create_task(_watch_trades(ex, sym, h, stop)))
 
-        log.info(f"потоков поднято {len(tasks)}; наблюдение {seconds} с")
+        log.info("наблюдение", потоков=len(tasks), секунд=seconds)
         await asyncio.sleep(seconds)
 
         # Повторный замер часов — оценить, насколько сдвиг уползает (задача 1.3).
@@ -150,19 +131,22 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int) -> RunReport:
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await ex.close()
+
+    persist(run_id, report)
+    log.info("кадры сохранены", файлов=report.frames_written,
+             каталог=str(store.FRAMES_DIR / run_id))
     return report
 
 
-def print_report(uni: Universe, r: RunReport) -> int:
-    """Печатает приёмку. Возвращает число нарушений."""
-    now = clock.now_ms()
+def print_report(r: RunReport, now_ms: int) -> int:
+    """Печатает приёмку. Возвращает число нарушений. Время — аргумент (§10.3)."""
     print()
     print("=" * 78)
     print("ПРИЁМКА ЭТАПА 1 — FOUNDATION.md §8")
     print("=" * 78)
 
     print("\n1. ЧАСЫ (§6)")
-    print(f"   сдвиг биржа−локальные : {r.sync.offset_ms:+d} мс")
+    print(f"   сдвиг биржа−локальные    : {r.sync.offset_ms:+d} мс")
     print(f"   неопределённость (±rtt/2): ±{r.sync.rtt_ms // 2} мс")
     print(f"   замеров: {r.sync.samples}")
     if r.clock_drift_ms is not None:
@@ -176,15 +160,14 @@ def print_report(uni: Universe, r: RunReport) -> int:
     offgrid_seed: list[str] = []
     for st in sorted(ready, key=lambda s: (s.timeframe, s.symbol)):
         last = st.bars[-1]
-        age = now - (last.open_ms + tf_ms(st.timeframe))
-        expected = expected_last_closed_open_ms(st.timeframe, now)
+        expected = expected_last_closed_open_ms(st.timeframe, now_ms)
         behind = (expected - last.open_ms) // tf_ms(st.timeframe)
         if behind > 0:
             stale.append(f"{st.symbol} {st.timeframe}: отстаёт на {behind} баров")
         if not on_grid(last.open_ms, st.timeframe):
             offgrid_seed.append(f"{st.symbol} {st.timeframe}")
-        _ = age
-    print(f"   рядов со свежим последним закрытым баром: {len(ready) - len(stale)} из {len(ready)}")
+    print(f"   рядов со свежим последним закрытым баром: "
+          f"{len(ready) - len(stale)} из {len(ready)}")
     for s in stale:
         print(f"   ОТСТАЁТ: {s}")
     print(f"   баров вне сетки в засеве: {len(offgrid_seed)}")
@@ -194,8 +177,20 @@ def print_report(uni: Universe, r: RunReport) -> int:
     for st in missing:
         assert st.not_ready is not None
         print(f"   НЕТ ДАННЫХ: {st.symbol} {st.timeframe} — {st.not_ready.reason}")
+    rejected = [x for s in r.series.values() for x in s.rejected_bars]
+    print(f"   баров ОТКЛОНЕНО как битые: {len(rejected)} "
+          f"(из {r.seeded_bars + len(rejected)} полученных)")
+    for x in rejected:
+        print(f"   БИТЫЙ БАР: {x}")
+
     total_gaps = sum(len(s.gaps) for s in ready)
-    print(f"   разрывов сетки внутри рядов: {total_gaps} (проверено баров {r.seeded_bars})")
+    # Разрыв, объяснённый отклонённым баром, — не наш дефект, а видимое следствие
+    # дефекта данных биржи. Считаем отдельно, чтобы не путать с необъяснённым.
+    explained = sum(1 for s in ready if s.rejected_bars for _ in s.gaps)
+    unexplained = total_gaps - explained
+    print(f"   разрывов сетки внутри рядов: {total_gaps} "
+          f"(объяснено отклонёнными барами {explained}, необъяснённых {unexplained}; "
+          f"проверено баров {r.seeded_bars})")
     for st in ready:
         for a, b in st.gaps[:3]:
             print(f"   РАЗРЫВ: {st.symbol} {st.timeframe} между {a} и {b}")
@@ -219,10 +214,15 @@ def print_report(uni: Universe, r: RunReport) -> int:
               f"tick {h.tick_size}")
     silent = [s for s, h in r.histograms.items() if h.trades_seen == 0]
     if silent:
-        print(f"   БЕЗ ЕДИНОЙ СДЕЛКИ за прогон ({len(silent)}): {', '.join(sorted(silent))}")
+        print(f"   БЕЗ ЕДИНОЙ СДЕЛКИ за прогон ({len(silent)}): "
+              f"{', '.join(sorted(silent))}")
 
-    violations = len(stale) + len(missing) + total_gaps + unclosed + offgrid_ws + len(offgrid_seed)
-    print("\n6. ИТОГ")
+    print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
+    print(f"   файлов parquet записано: {r.frames_written}")
+
+    violations = (len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
+                  + len(offgrid_seed))
+    print("\n7. ИТОГ")
     print(f"   деградаций отмечено: {log.degraded_count()}")
     print(f"   нарушений приёмки: {violations}")
     print("=" * 78)

@@ -1,42 +1,54 @@
-"""Вывод. Без зависимостей и без stdlib logging.
+"""Логи через structlog. FOUNDATION.md §10.1.
 
-FOUNDATION.md §4.3 требует, чтобы пропуск был виден. Поэтому у вывода есть уровень
-`degraded` — им отмечается всякий путь, который продолжил работу в урезанном виде.
+§4.3 требует, чтобы пропуск был виден, поэтому здесь есть уровень `degraded`: им
+отмечается всякий путь, продолживший работу в урезанном виде. Счётчик деградаций
+печатается в приёмке — «деградаций 0» без счётчика неотличимо от «никто не считал».
 """
 
 from __future__ import annotations
 
 import sys
-from typing import TextIO
+from typing import Any
 
-from .clock import local_ms
+import structlog
 
-_stream: TextIO = sys.stderr
 _degraded_count = 0
 
 
-def _emit(level: str, msg: str) -> None:
-    ms = local_ms()
-    print(f"{ms // 1000 % 86400:05d}.{ms % 1000:03d} {level:8} {msg}", file=_stream, flush=True)
+def configure(json_output: bool = False) -> None:
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+            (structlog.processors.JSONRenderer() if json_output
+             else structlog.dev.ConsoleRenderer(colors=False)),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=True,
+    )
 
 
-def info(msg: str) -> None:
-    _emit("info", msg)
+_log = structlog.get_logger()
 
 
-def warn(msg: str) -> None:
-    _emit("warn", msg)
+def info(event: str, **kw: Any) -> None:
+    _log.info(event, **kw)
 
 
-def error(msg: str) -> None:
-    _emit("ERROR", msg)
+def warn(event: str, **kw: Any) -> None:
+    _log.warning(event, **kw)
 
 
-def degraded(msg: str) -> None:
+def error(event: str, **kw: Any) -> None:
+    _log.error(event, **kw)
+
+
+def degraded(event: str, **kw: Any) -> None:
     """Работа продолжена в урезанном виде. Молчать об этом запрещено — §4.3."""
     global _degraded_count
     _degraded_count += 1
-    _emit("DEGRADED", msg)
+    _log.warning(event, degraded=True, **kw)
 
 
 def degraded_count() -> int:

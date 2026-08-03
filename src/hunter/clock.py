@@ -9,23 +9,12 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+
+from .models import ClockSync
 
 
 class ClockNotSynced(RuntimeError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class ClockSync:
-    offset_ms: int
-    """Сдвиг: серверное время минус локальное. Положительный = локальные отстают."""
-
-    rtt_ms: int
-    """Круговая задержка замера. Неопределённость сдвига — ±rtt/2."""
-
-    measured_at_local_ms: int
-    samples: int
 
 
 _sync: ClockSync | None = None

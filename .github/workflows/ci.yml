@@ -16,7 +16,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --frozen
+      # группа gates — независимый оракул индикаторов (§10.3)
+      - run: uv sync --frozen --group gates
 
       - name: ruff
         run: uv run ruff check .
@@ -30,11 +31,28 @@ jobs:
       - name: 'гейт: только публичные данные (§1, §5)'
         run: uv run python gates/public_data_only.py
 
+      - name: 'гейт: словари между слоями запрещены (§10.1)'
+        run: uv run python gates/no_loose_dicts.py
+
+      - name: 'гейт: чистота расчёта (§10.3)'
+        run: uv run python gates/purity.py
+
+      - name: 'гейт: единственный писатель в боевую базу (§10.2)'
+        run: uv run python gates/production_writer.py
+
+      - name: 'гейт: индикаторы против независимого оракула (§10.3)'
+        run: uv run python gates/indicator_oracle.py
+
       - name: 'гейт: смоук-импорт всех модулей'
         run: uv run python gates/smoke_import.py
 
       - name: 'гейт: вселенная читается (§5)'
         run: uv run python -c "from hunter.config import load_universe as l; u=l(); print(f'вселенная: символов {len(u.symbols)}, ТФ {len(u.timeframes)}')"
+
+      - name: 'гейт: схема леджера и read-only (§10.2, §10.6)'
+        run: |
+          uv run python -m hunter ledger --init
+          uv run python -m hunter ledger
 
   live:
     # Живой прогон против биржи. Отдельной работой: сеть может быть недоступна

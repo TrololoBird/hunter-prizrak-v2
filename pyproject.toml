@@ -2,16 +2,30 @@
 name = "hunter"
 version = "0.1.0"
 description = "Сигнально-аналитическая система по методологии PrizrakTrade"
-requires-python = ">=3.14"
+# FOUNDATION.md §10.2: 3.12, а не свежайшая — максимум готовых колёс.
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    # FOUNDATION.md §5: "Источник — Binance USD-M через ccxt/ccxt.pro, публичные потоки."
-    "ccxt>=4.5.9",
-    # FOUNDATION.md §6: факт о поведении null в ewm_mean начиная с polars 1.0.
-    "polars>=1.0",
+    # §10.1: транспорт. Документация ccxt — внешний референт, самописный WS-клиент — нет.
+    "ccxt==4.5.70",
+    # §10.1: «Пинить жёстко: polars быстро меняет API, и агент, помнящий старую
+    # версию, изобретёт несуществующий метод».
+    "polars==1.43.2",
+    # §10.2: «Индикаторы: не писать свои».
+    "polars-talib==0.1.4",
+    # §10.1: контракты между слоями. Словари между слоями запрещены.
+    "pydantic==2.13.4",
+    # §10.1
+    "structlog==26.1.0",
+    "aiogram==3.30.0",
 ]
 
 [dependency-groups]
 dev = ["ruff>=0.14", "mypy>=1.18"]
+# §10.3: «Отдельная зависимость только для гейтов, не для продакшена».
+# ⚠ pandas-ta по умолчанию делегирует в TA-Lib, если тот установлен (замер 2026-08-03:
+# ATR совпал побитово; с talib=False разошёлся на 1.5e-11). Оракул ОБЯЗАН звать
+# pandas-ta с talib=False, иначе он сверяет TA-Lib сам с собой и не проверяет ничего.
+gates = ["pandas-ta==0.4.71b0", "ta-lib==0.7.1", "pandas>=2.2"]
 
 [build-system]
 requires = ["hatchling"]
@@ -22,7 +36,7 @@ packages = ["src/hunter"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py312"
 src = ["src", "gates"]
 # docs/audit/probes/ — исходники зондов, сохранённые как есть ради воспроизводимости
 # (§7.4: зонд отвечает на один вопрос и удаляется; здесь удалён из рабочего дерева, но
@@ -38,22 +52,27 @@ select = ["E", "F", "W", "I", "UP", "B", "TID", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-# FOUNDATION.md §6: "любое сравнение «сейчас против биржевой метки» использует
-# скорректированное время". Локальные часы недоступны в обход hunter.clock.
+# FOUNDATION.md §6: «любое сравнение «сейчас против биржевой метки» использует
+# скорректированное время». §10.3: «Время входит как аргумент, а не берётся внутри».
 # Исключение — построчный noqa с причиной; пофайловых исключений нет умышленно.
-"time.time".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
-"time.time_ns".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
-"datetime.datetime.now".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
-"datetime.datetime.utcnow".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
+# Проверено пробником из 5 форм записи: поймано 5 из 5.
+"time.time".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6, §10.3."
+"time.time_ns".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6, §10.3."
+"datetime.datetime.now".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6, §10.3."
+"datetime.datetime.utcnow".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6, §10.3."
+# §10.4: «LLM в конвейере расчёта… Никакой случайности».
+"random".msg = "Случайность запрещена — FOUNDATION.md §10.3 (детерминированный повтор)."
+# §10.4: ORM не добавляется; §10.2: SQLite напрямую, чтобы владелец мог читать SQL.
+"pandas".msg = "pandas только в гейтах-оракулах — FOUNDATION.md §10.3."
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 strict = true
 packages = ["hunter"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-# У ccxt нет типовых стабов. Точечно, не глобально: глобальный
-# ignore_missing_imports скрывает удаление собственного модуля.
-module = ["ccxt.*"]
+# Стабов нет. Точечно, не глобально: глобальный ignore_missing_imports скрывает
+# удаление собственного модуля.
+module = ["ccxt.*", "polars_talib.*", "pandas_ta.*", "talib.*"]
 ignore_missing_imports = true

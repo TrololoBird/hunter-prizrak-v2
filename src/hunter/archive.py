@@ -21,8 +21,7 @@ from decimal import Decimal
 
 import polars as pl
 
-from .profile import TradeHistogram
-from .quality import NotReady
+from .models import NotReady, TradeHistogram
 
 BASE = "https://data.binance.vision/data/futures/um/daily"
 
@@ -52,9 +51,9 @@ def _fetch(url: str, timeout: int) -> bytes | NotReady:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return bytes(r.read())
     except urllib.error.HTTPError as e:
-        return NotReady(f"{url}: HTTP {e.code}")
+        return NotReady(reason=f"{url}: HTTP {e.code}")
     except OSError as e:
-        return NotReady(f"{url}: {type(e).__name__} {e}")
+        return NotReady(reason=f"{url}: {type(e).__name__} {e}")
 
 
 def fetch_agg_trades_day(
@@ -68,11 +67,11 @@ def fetch_agg_trades_day(
 
     checksum = _fetch(url + ".CHECKSUM", timeout)
     if isinstance(checksum, NotReady):
-        return NotReady(f"{market_id} {day}: нет .CHECKSUM — целостность не проверяема")
+        return NotReady(reason=f"{market_id} {day}: нет .CHECKSUM — целостность не проверяема")
     expected = checksum.decode().split()[0]
     actual = hashlib.sha256(blob).hexdigest()
     if actual != expected:
-        return NotReady(f"{market_id} {day}: sha256 не сошёлся ({actual} против {expected})")
+        return NotReady(reason=f"{market_id} {day}: sha256 не сошёлся ({actual} против {expected})")
 
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
         name = z.namelist()[0]
@@ -102,13 +101,3 @@ def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> Trad
     h.first_ms = int(day_data.frame["transact_time"].min())  # type: ignore[arg-type]
     h.last_ms = int(day_data.frame["transact_time"].max())  # type: ignore[arg-type]
     return h
-
-
-def histogram_to_frame(h: TradeHistogram) -> pl.DataFrame:
-    bins = sorted(h.qty_by_bin)
-    return pl.DataFrame({
-        "bin": bins,
-        "price": [float(h.bin_price(b)) for b in bins],
-        "qty": [h.qty_by_bin[b] for b in bins],
-        "n": [h.count_by_bin[b] for b in bins],
-    })

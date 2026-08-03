@@ -6,28 +6,21 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 import ccxt.pro as ccxtpro
+from pydantic import ValidationError
 
 from . import clock, log
-from .bars import Bar, closed_only, on_grid, tf_ms
-from .quality import NotReady
+from .bars import closed_only, on_grid, tf_ms
+from .models import Bar, ClockSync, Instrument, NotReady, OhlcvFetch
 
 # Замер 2026-08-03: /fapi/v1/klines принимает limit=1500, на 1501 отвечает
 # HTTP 400 code -1130. ccxt при этом сам режет выдачу до 1000.
 # Протокол: docs/audit/exchange-limits-2026-08-03.md
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
-
-
-@dataclass(frozen=True, slots=True)
-class Instrument:
-    symbol: str
-    tick_size: Decimal
-    """Шаг цены из фильтра PRICE_FILTER. §5: бины профиля привязаны к нему."""
 
 
 class Exchange:
@@ -40,13 +33,11 @@ class Exchange:
         })
         self._instruments: dict[str, Instrument] = {}
 
-    async def open(self) -> clock.ClockSync:
+    async def open(self) -> ClockSync:
         await self._ex.load_markets()
         sync = await clock.measure(self.fetch_server_ms)
-        log.info(
-            f"часы сведены: сдвиг {sync.offset_ms:+d} мс, rtt {sync.rtt_ms} мс, "
-            f"замеров {sync.samples}"
-        )
+        log.info("часы сведены", сдвиг_мс=sync.offset_ms, rtt_мс=sync.rtt_ms,
+                 замеров=sync.samples)
         return sync
 
     async def close(self) -> None:
@@ -62,11 +53,14 @@ class Exchange:
             return self._instruments[symbol]
         market = self._ex.markets.get(symbol)
         if market is None:
-            return NotReady(f"{symbol}: нет на бирже")
+            return NotReady(reason=f"{symbol}: нет на бирже")
         tick = _price_filter_tick(market)
         if tick is None:
-            return NotReady(f"{symbol}: в PRICE_FILTER нет tickSize")
-        inst = Instrument(symbol=symbol, tick_size=tick)
+            return NotReady(reason=f"{symbol}: в PRICE_FILTER нет tickSize")
+        market_id = market.get("id")
+        if not market_id:
+            return NotReady(reason=f"{symbol}: у рынка нет id для архива")
+        inst = Instrument(symbol=symbol, market_id=str(market_id), tick_size=tick)
         self._instruments[symbol] = inst
         return inst
 
@@ -74,22 +68,44 @@ class Exchange:
 
     async def fetch_closed_ohlcv(
         self, symbol: str, timeframe: str, limit: int = CCXT_EFFECTIVE_LIMIT
-    ) -> list[Bar] | NotReady:
-        """REST-засев. Незакрытая свеча отбрасывается здесь же (§6)."""
+    ) -> OhlcvFetch | NotReady:
+        """REST-засев. Незакрытая свеча отбрасывается здесь же (§6).
+
+        Битый бар (экстремумы не накрывают open/close) не роняет прогон и не
+        проходит молча: он отклоняется, причина с числами уходит наверх и в лог.
+        Замер 2026-08-03: 1 такой бар на 73 828 — BCH/USDT:USDT 1w 2020-01-13,
+        подтверждён сырым ответом биржи, см. docs/audit/broken-bar-bch-2026-08-03.md
+        """
         raw = await self._ex.fetch_ohlcv(symbol, timeframe, limit=limit)
         if not raw:
-            return NotReady(f"{symbol} {timeframe}: биржа вернула пустой список")
-        bars = [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
-                for r in raw]
+            return NotReady(reason=f"{symbol} {timeframe}: биржа вернула пустой список")
+        bars: list[Bar] = []
+        rejected: list[str] = []
+        for r in raw:
+            try:
+                bars.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
+                                low=float(r[3]), close=float(r[4]), volume=float(r[5])))
+            except ValidationError as e:
+                why = (f"{symbol} {timeframe} бар {int(r[0])}: o={r[1]} h={r[2]} "
+                       f"l={r[3]} c={r[4]} — {e.errors()[0]['msg']}")
+                rejected.append(why)
+                log.error("бар отклонён как битый", причина=why)
+        if not bars:
+            return NotReady(
+                reason=f"{symbol} {timeframe}: все {len(raw)} баров отклонены как битые"
+            )
         off_grid = [b.open_ms for b in bars if not on_grid(b.open_ms, timeframe)]
         if off_grid:
             return NotReady(
-                f"{symbol} {timeframe}: {len(off_grid)} баров вне сетки, первый {off_grid[0]}"
+                reason=f"{symbol} {timeframe}: {len(off_grid)} баров вне сетки, "
+                       f"первый {off_grid[0]}"
             )
         closed = closed_only(bars, timeframe, clock.now_ms())
         if not closed:
-            return NotReady(f"{symbol} {timeframe}: все {len(bars)} баров ещё не закрыты")
-        return closed
+            return NotReady(
+                reason=f"{symbol} {timeframe}: все {len(bars)} баров ещё не закрыты"
+            )
+        return OhlcvFetch(bars=closed, rejected=rejected)
 
     async def watch_closed_ohlcv(self, symbol: str, timeframe: str) -> AsyncGenerator[Bar]:
         """WS-поток. Отдаёт бар только после его закрытия (§6).
@@ -109,8 +125,8 @@ class Exchange:
                 if now < open_ms + tf_ms(timeframe):
                     continue
                 emitted = open_ms
-                yield Bar(open_ms, float(r[1]), float(r[2]), float(r[3]),
-                          float(r[4]), float(r[5]))
+                yield Bar(open_ms=open_ms, open=float(r[1]), high=float(r[2]),
+                          low=float(r[3]), close=float(r[4]), volume=float(r[5]))
 
     # --- сделки ------------------------------------------------------------
 
