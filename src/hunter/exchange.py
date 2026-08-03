@@ -71,7 +71,11 @@ class Exchange:
     # --- OHLCV -------------------------------------------------------------
 
     async def fetch_closed_ohlcv(
-        self, symbol: str, timeframe: str, limit: int = CCXT_EFFECTIVE_LIMIT
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = CCXT_EFFECTIVE_LIMIT,
+        since_ms: int | None = None,
     ) -> OhlcvFetch | NotReady:
         """REST-засев. Незакрытая свеча отбрасывается здесь же (§6).
 
@@ -79,8 +83,12 @@ class Exchange:
         проходит молча: он отклоняется, причина с числами уходит наверх и в лог.
         Замер 2026-08-03: 1 такой бар на 73 828 — BCH/USDT:USDT 1w 2020-01-13,
         подтверждён сырым ответом биржи, см. docs/audit/broken-bar-bch-2026-08-03.md
+
+        `since_ms` отматывает окно назад. Нужен для приёмки этапа 3: разборы корпуса
+        датированы июлем, а без него доступны только последние `limit` баров — для 15м
+        это 10.4 суток, то есть до дат разборов окно не достаёт.
         """
-        raw = await self._ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        raw = await self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
         if not raw:
             return NotReady(reason=f"{symbol} {timeframe}: биржа вернула пустой список")
         bars: list[Bar] = []
