@@ -36,6 +36,7 @@ TOLERANCE = 1e-9
 SLICE = Path("docs/audit/reference-slice/BTCUSDT-1h-500.parquet")
 
 sys.path.insert(0, "src")
+from hunter import indicators  # noqa: E402
 from hunter.admission import CANONICAL_FROM_BARS  # noqa: E402
 
 
@@ -99,20 +100,15 @@ def rsi(close: list[float], n: int = 14) -> list[float | None]:
     return out
 
 
-def macd_line(close: list[float], fast: int = 12, slow: int = 26,
-              signal: int = 9) -> list[float | None]:
+def macd_line(close: list[float], fast: int = 12, slow: int = 26) -> list[float | None]:
+    """MACD = EMA(fast) − EMA(slow). Выравнивания по сигнальной линии НЕТ:
+    оно было особенностью plta.macd(), а не частью определения."""
     ef, es = ema(close, fast), ema(close, slow)
     raw: list[float | None] = [
         (a - b) if (a is not None and b is not None) else None
         for a, b in zip(ef, es, strict=True)
     ]
-    # TA-Lib выравнивает выходы по сигнальной линии: MACD печатается только там,
-    # где определён и сигнал.
-    defined = [i for i, v in enumerate(raw) if v is not None]
-    if len(defined) < signal:
-        return [None] * len(close)
-    first_sig = defined[signal - 1]
-    return [v if i >= first_sig else None for i, v in enumerate(raw)]
+    return raw
 
 
 def bbands_upper(close: list[float], n: int = 20, k: float = 2.0) -> list[float | None]:
@@ -194,9 +190,10 @@ def main() -> int:
          plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14)),
         ("rsi14", rsi(c, 14), plta.rsi(pl.col("close"), timeperiod=14)),
         ("ema200", ema(c, 200), plta.ema(pl.col("close"), timeperiod=200)),
-        ("macd", macd_line(c),
-         plta.macd(pl.col("close"), fastperiod=12, slowperiod=26,
-                   signalperiod=9).struct.field("macd")),
+        # MACD сверяется с ПРОЕКТНЫМ определением (ema12 - ema26), а не с
+        # plta.macd(): тот противоречит своим же EMA, см.
+        # docs/audit/macd-talib-inconsistency-2026-08-03.md
+        ("macd", macd_line(c), indicators.macd_line()),
         ("bb_upper", bbands_upper(c, 20, 2.0),
          plta.bbands(pl.col("close"), timeperiod=20, nbdevup=2.0,
                      nbdevdn=2.0).struct.field("upperband")),

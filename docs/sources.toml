@@ -287,3 +287,30 @@ quote = "разница вариантов «по одному» и «парам
 # (eminimind.com), по §0.1 относится к уровню 5 и источником не является.
 # Поэтому реализация по умолчанию переведена на вариант «по одному»: у него два
 # независимых источника уровня 3, у «парами» — ноль.
+
+# ---------------------------------------------------------------- свинги
+
+[[element]]
+name = "swing_fractal"
+what = "Детекция свингов — фрактал Билла Вильямса: 5 баров, экстремум посередине"
+
+[[element.source]]
+url = "https://www.metatrader5.com/en/terminal/help/indicators/bw_indicators/fractals"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "a series of at least five successive bars, with the highest HIGH in the middle, and two lower HIGHs on both sides"
+
+[[element.source]]
+url = "https://toslc.thinkorswim.com/center/reference/Patterns/candlestick-patterns-library/bearish-and-bullish/WilliamsFractal"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "A sequence of at least five bars where the highest price is reached in the middle, preceded and followed by lower highs"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000591663-williams-fractal/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "five candlesticks or bars on the price chart with the third candlestick always presenting as the highest high or lowest low"
