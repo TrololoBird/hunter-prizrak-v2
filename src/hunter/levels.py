@@ -26,8 +26,11 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accumulation import Accumulation
+from .accumulation import detect as detect_accumulations
+from .bars import TIMEFRAME_MS
 from .breach import CONFIRM_BODIES, RETURN_BARS, Breach, BreachKind, Direction, first_breach
-from .models import Bar, NotReady, TradeHistogram
+from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
+from .swings import detect as detect_swings
 from .volume_profile import VolumeProfile, build
 
 
@@ -136,6 +139,63 @@ def build_level(
         boundary_lo=Decimal(str(acc.lower.lo)),
         boundary_hi=Decimal(str(acc.upper.hi)),
     )
+
+
+class Unbuilt(BaseModel):
+    """Почему уровень не построен. §4.3: пропуск обязан дойти до оператора с причиной."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    index: int | None
+    """Индекс первого бара структуры. None — не дошли даже до структур."""
+
+    reason: str = Field(min_length=1)
+
+
+def build_all(
+    symbol: str,
+    series: dict[str, list[Bar]],
+    trades: BarBinnedTrades | None,
+    timeframes: tuple[str, ...],
+) -> tuple[tuple[Level, ...], tuple[Unbuilt, ...]]:
+    """Все уровни по всем ТФ плюс НАЗВАННЫЕ причины, где уровень не построен.
+
+    Живёт здесь, а не в карточке: уровни нужны и печати, и эмиссии, и доставке, а
+    вторая копия этого цикла разошлась бы с первой на первой же правке.
+
+    Причины возвращаются РАЗОБРАННЫМИ (ТФ отдельно от текста), а не готовой строкой:
+    подпись ТФ — дело печати, и склеивать её здесь значит навязывать формат всем
+    вызывающим.
+    """
+    built: list[Level] = []
+    unbuilt: list[Unbuilt] = []
+    for tf in timeframes:
+        bars = series.get(tf)
+        if not bars:
+            continue
+        sw = detect_swings(bars)
+        if isinstance(sw, NotReady):
+            unbuilt.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
+            continue
+        for acc in detect_accumulations(bars, sw, tf).closed:
+            if trades is None:
+                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                                       reason="сделок не собрано"))
+                continue
+            lo, hi = structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
+            hist = trades.window(lo, hi)
+            if isinstance(hist, NotReady):
+                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                                       reason=hist.reason))
+                continue
+            lvl = build_level(acc, hist, symbol)
+            if isinstance(lvl, NotReady):
+                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                                       reason=lvl.reason))
+                continue
+            built.append(lvl)
+    return tuple(built), tuple(unbuilt)
 
 
 class LevelState(StrEnum):

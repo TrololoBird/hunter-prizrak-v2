@@ -25,6 +25,9 @@ WRITER = "open_production_ledger"
 ALLOWED = {
     "src/hunter/store.py",     # объявление и init_ledger
     "src/hunter/__main__.py",  # боевая точка входа
+    # §8 этап 7: единственный путь, записывающий сигналы и исходы. Добавлен 2026-08-04
+    # вместе с `run.record`; гейт поймал появление нового вызывающего сразу, как и должен.
+    "src/hunter/run.py",
 }
 
 

@@ -225,3 +225,5 @@ class RunReport(BaseModel):
     clock_recheck_after_s: int | None = None
     frames_written: int = 0
     cards_written: int = 0
+    signals_recorded: int = 0
+    outcomes_recorded: int = 0

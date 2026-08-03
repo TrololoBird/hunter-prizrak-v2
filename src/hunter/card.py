@@ -71,7 +71,6 @@ def render(
     scans: dict[str, accumulation.AccumulationScan] = {}
     trends: dict[str, swings.Trend] = {}
     sw_by_tf: dict[str, swings.SwingSet] = {}
-    pool: list[levels.Level] = []
     unbuilt: list[str] = []
 
     for tf in timeframes:
@@ -103,29 +102,13 @@ def render(
 
     out.append("")
     out.append("УРОВНИ (ПОК накоплений)")
-    for tf in timeframes:
-        if tf not in scans:
-            continue
-        bars = series[tf]
-        for acc in scans[tf].closed:
-            if trades is None:
-                unbuilt.append(f"{TF_LABEL.get(tf, tf)} структура {acc.first_index}: "
-                               f"сделок не собрано")
-                continue
-            lo, hi = levels.structure_window_ms(acc, bars, _tf_ms(tf))
-            hist = trades.window(lo, hi)
-            if isinstance(hist, NotReady):
-                unbuilt.append(f"{TF_LABEL.get(tf, tf)} структура {acc.first_index}: "
-                               f"{hist.reason}")
-                continue
-            lvl = levels.build_level(acc, hist, symbol)
-            if isinstance(lvl, NotReady):
-                unbuilt.append(f"{TF_LABEL.get(tf, tf)} структура {acc.first_index}: "
-                               f"{lvl.reason}")
-                continue
-            pool.append(lvl)
-
-    frozen = tuple(pool)
+    frozen, reasons = levels.build_all(symbol, series, trades, timeframes)
+    unbuilt.extend(
+        f"{TF_LABEL.get(u.timeframe, u.timeframe)}"
+        + (f" структура {u.index}" if u.index is not None else "")
+        + f": {u.reason}"
+        for u in reasons
+    )
     if not frozen:
         out.append("  уровней нет")
     for lvl in frozen:

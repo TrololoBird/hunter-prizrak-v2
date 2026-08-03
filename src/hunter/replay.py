@@ -64,7 +64,9 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
         return NotReady(reason=f"{symbol}: кадров баров в прогоне нет")
     series = {tf: store.read_bars(run_id, dir_name, tf) for tf in tfs}
 
-    trades = store.read_binned_trades(run_id, dir_name, tick, bucket)
+    # Имя символа берётся из meta, а не из имени каталога: иначе искажённое
+    # `BTC_USDT_USDT` попадает в тексты причин и уезжает в карточку владельца.
+    trades = store.read_binned_trades(run_id, dir_name, tick, bucket, symbol)
     binned = None if isinstance(trades, NotReady) else trades
 
     rebuilt = card.render(symbol, series, binned, tfs)

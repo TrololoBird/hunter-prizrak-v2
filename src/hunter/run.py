@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 
-from . import card, clock, log, store
+from . import card, clock, emit, levels, log, store, swings
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
@@ -113,6 +113,49 @@ def persist(run_id: str, report: RunReport, uni: Universe) -> None:
         report.cards_written += 1
 
 
+def record(run_id: str, report: RunReport, uni: Universe) -> None:
+    """Записать эмиссии и их исходы в боевой леджер (§8 этап 7).
+
+    Единственное место в проекте, которое пишет сигналы. Открытые и несостоявшиеся
+    сделки в исходы НЕ пишутся: исход у них ещё не наступил (§4.3).
+    """
+    conn = store.open_production_ledger()
+    try:
+        for sym in uni.symbols:
+            series = {tf: st.bars for (s, tf), st in report.series.items()
+                      if s == sym and st.not_ready is None and st.bars}
+            if not series:
+                continue
+            trades = report.binned.get(sym)
+            lv, _ = levels.build_all(sym, series, trades, tuple(uni.timeframes))
+            trends = {tf: swings.trend(sw) for tf, bars in series.items()
+                      if not isinstance(sw := swings.detect(bars), NotReady)}
+            for em in emit.select(lv, series, trends):
+                bars = series[em.level.timeframe]
+                opened_at = bars[em.level.created_at_index].open_ms
+                sid = store.record_signal(
+                    conn, sym, em.level.timeframe, em.direction, opened_at,
+                    em.setup.entry, em.ledger_stop, run_id,
+                )
+                if isinstance(sid, NotReady):
+                    log.degraded("сигнал не записан", причина=sid.reason)
+                    continue
+                report.signals_recorded += 1
+                res = emit.outcome_of(em, bars)
+                if res.kind.value in ("stop", "target", "ambiguous"):
+                    assert res.closed_at_index is not None
+                    err = store.record_outcome(
+                        conn, sid, res.kind.value,
+                        bars[res.closed_at_index].open_ms, res.exit_price, res.r,
+                    )
+                    if isinstance(err, NotReady):
+                        log.degraded("исход не записан", причина=err.reason)
+                    else:
+                        report.outcomes_recorded += 1
+    finally:
+        conn.close()
+
+
 async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) -> RunReport:
     ex = Exchange()
     sync = await ex.open()
@@ -158,6 +201,7 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) ->
         await ex.close()
 
     persist(run_id, report, uni)
+    record(run_id, report, uni)
     log.info("кадры сохранены", файлов=report.frames_written,
              каталог=str(store.FRAMES_DIR / run_id))
     return report
@@ -246,9 +290,14 @@ def print_report(r: RunReport, now_ms: int) -> int:
     print(f"   файлов parquet записано: {r.frames_written}")
     print(f"   карточек сохранено: {r.cards_written}")
 
+    print("\n7. ЛЕДЖЕР (§8 этап 7)")
+    print(f"   сигналов записано: {r.signals_recorded}")
+    print(f"   исходов записано: {r.outcomes_recorded} "
+          f"(открытые и несостоявшиеся не пишутся — §4.3)")
+
     violations = (len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
                   + len(offgrid_seed))
-    print("\n7. ИТОГ")
+    print("\n8. ИТОГ")
     print(f"   деградаций отмечено: {log.degraded_count()}")
     print(f"   нарушений приёмки: {violations}")
     print("=" * 78)

@@ -43,11 +43,25 @@ CREATE TABLE IF NOT EXISTS signals (
     UNIQUE (symbol, opened_at)
 );
 
+CREATE TABLE IF NOT EXISTS outcomes (
+    signal_id  INTEGER PRIMARY KEY REFERENCES signals(id),
+    kind       TEXT    NOT NULL CHECK (kind IN ('stop', 'target', 'ambiguous')),
+    closed_at  INTEGER NOT NULL,
+    exit_price REAL,
+    r          REAL,
+    CHECK ((kind = 'ambiguous') = (r IS NULL)),
+    CHECK ((kind = 'ambiguous') = (exit_price IS NULL))
+);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 """
+# Исход «неоднозначно» (бар накрыл и стоп, и цель) хранится БЕЗ r и без цены выхода, и
+# ограничение это требует: подставить туда ноль значило бы записать безубыток там, где
+# результат неизвестен (§4.3). Открытые и несостоявшиеся сделки в таблицу не попадают
+# вовсе — исход у них ещё не наступил, а строка означала бы, что наступил.
 
 
 # --- кадры для повтора (§10.3) ------------------------------------------------
@@ -132,14 +146,21 @@ def write_binned_trades(run_id: str, t: BarBinnedTrades) -> Path:
 
 
 def read_binned_trades(
-    run_id: str, symbol: str, tick_size: Decimal, bucket_ms: int
+    run_id: str, dir_name: str, tick_size: Decimal, bucket_ms: int,
+    symbol: str | None = None,
 ) -> BarBinnedTrades | NotReady:
-    """Восстановить раскладку сделок. Отсутствие файла — названная причина, не пустота."""
-    path = _binned_path(run_id, symbol)
+    """Восстановить раскладку сделок. Отсутствие файла — названная причина, не пустота.
+
+    `dir_name` адресует каталог, `symbol` — НАСТОЯЩЕЕ имя. Их надо различать: имя каталога
+    искажено (`BTC_USDT_USDT`), и попав в текст причины, оно уезжает в карточку владельца.
+    Замер 2026-08-04: именно так и уехало, поймал повтор.
+    """
+    path = _binned_path(run_id, dir_name)
+    name = symbol or dir_name
     if not path.exists():
-        return NotReady(reason=f"{symbol}: файла сделок нет — {path}")
+        return NotReady(reason=f"{name}: файла сделок нет — {path}")
     df = pl.read_parquet(path)
-    t = BarBinnedTrades(symbol=symbol, tick_size=tick_size, bucket_ms=bucket_ms)
+    t = BarBinnedTrades(symbol=name, tick_size=tick_size, bucket_ms=bucket_ms)
     for row in df.iter_rows(named=True):
         b, i = int(row["bucket_ms"]), int(row["bin"])
         t.qty.setdefault(b, {})[i] = float(row["qty"])
@@ -244,8 +265,59 @@ def init_ledger(path: Path = LEDGER_PATH) -> Path:
 
 # §10.6 условие 1: «Владелец может проверить состояние леджера тремя заготовленными
 # SQL-запросами, не читая код». Вот эти три.
+def record_signal(
+    conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
+    opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str,
+) -> int | NotReady:
+    """Записать сигнал. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
+
+    Соединение обязано быть боевым: у read-only СУБД сама отклонит запись. Повтор по
+    ключу (символ, время) — не ошибка выполнения, а названный отказ: гейт §10.2 требует,
+    чтобы бессмысленную строку записать было НЕЛЬЗЯ, а не чтобы процесс падал.
+    """
+    try:
+        cur = conn.execute(
+            "INSERT INTO signals (symbol, timeframe, direction, opened_at, entry, stop,"
+            " frames_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (symbol, timeframe, direction, opened_at, float(entry), float(stop), frames_ref),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        return NotReady(reason=f"{symbol} {opened_at}: строка отклонена схемой — {e}")
+    if cur.lastrowid is None:
+        return NotReady(reason=f"{symbol} {opened_at}: СУБД не вернула идентификатор строки")
+    return cur.lastrowid
+
+
+def record_outcome(
+    conn: sqlite3.Connection, signal_id: int, kind: str, closed_at: int,
+    exit_price: Decimal | None, r: float | None,
+) -> NotReady | None:
+    """Записать исход. Открытые и несостоявшиеся сделки сюда НЕ пишутся (§4.3)."""
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO outcomes (signal_id, kind, closed_at, exit_price, r)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (signal_id, kind, closed_at,
+             None if exit_price is None else float(exit_price), r),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        return NotReady(reason=f"исход {signal_id}: строка отклонена схемой — {e}")
+    return None
+
+
 OWNER_QUERIES: dict[str, str] = {
     "сколько сделок": "SELECT COUNT(*) AS всего FROM signals;",
+    "результат в R (стр. 9 курса)": (
+        "SELECT COUNT(*) AS закрыто, "
+        "SUM(CASE WHEN kind='target' THEN 1 ELSE 0 END) AS по_цели, "
+        "SUM(CASE WHEN kind='stop' THEN 1 ELSE 0 END) AS по_стопу, "
+        "SUM(CASE WHEN kind='ambiguous' THEN 1 ELSE 0 END) AS неоднозначно, "
+        "ROUND(SUM(COALESCE(r,0)), 3) AS сумма_R, "
+        "ROUND(AVG(r), 3) AS средний_R "
+        "FROM outcomes;"
+    ),
     "какие символы": (
         "SELECT symbol AS символ, COUNT(*) AS сделок, "
         "MIN(opened_at) AS первая, MAX(opened_at) AS последняя "
