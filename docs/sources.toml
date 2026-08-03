@@ -1,0 +1,289 @@
+# РЕЕСТР ИСТОЧНИКОВ. FOUNDATION.md §0.1 (указание владельца 2026-08-03).
+#
+# Правило: основа метода — мини-курс PrizrakTrade; всё остальное — из авторитетных
+# внешних источников, МИНИМУМ ТРИ на элемент, курс в эти три не входит.
+#
+# Уровни: 1 замер · 2 первоисточник/офиц. документация · 3 отраслевой эталон
+#         (вендор данных) · 4 энциклопедия и учебные материалы · 5 блог — НЕ источник.
+#
+# fetched = "пересказ"  — страница получена инструментом, который возвращает ответ
+#                         другой модели, а не текст. Цитата слабее.
+# fetched = "замер"     — не страница, а прогон с командой.
+#
+# Комплектность проверяет gates/sources.py
+
+# ---------------------------------------------------------------- ATR (Уайлдер)
+
+[[element]]
+name = "atr14"
+what = "Average True Range, период 14: определение TR, затравка, сглаживание"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Average_true_range"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "TR = max[(high − low), abs(high − close_prev), abs(low − close_prev)]; ATR_t = (ATR_{t-1} × (n-1) + TR_t) / n"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/average-true-range-atr"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "The first 14-day ATR is the average of the daily TR values for the last 14 days. Current ATR = [(Prior ATR x 13) + Current TR] / 14"
+
+[[element.source]]
+url = "https://help.tc2000.com/m/69445/l/755843-average-true-range-atr"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "the largest of the: most recent period's high minus low; abs(high − previous close); abs(low − previous close). Wilder's smoothing via exponential average requires period = ((period * 2) - 1)"
+
+[[element.source]]
+url = "gates/formula_reference.py"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "скалярная реализация формулы против polars_talib: расхождение 0.000e+00 на 485 точках, включая затравку"
+
+# ---------------------------------------------------------------- RSI (Уайлдер)
+
+[[element]]
+name = "rsi14"
+what = "Relative Strength Index, период 14: RS, затравка, сглаживание Уайлдера"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Relative_strength_index"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "RS = SMMA(U,n) / SMMA(D,n); RSI = 100 - 100/(1+RS); newval = (prevval * (n - 1) + newdata) / n"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/relative-strength-index-rsi"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "First Average Gain = Sum of Gains over the past 14 periods / 14. Average Gain = [(previous Average Gain) x 13 + current Gain] / 14"
+
+[[element.source]]
+url = "https://help.tc2000.com/m/69404/l/747071-rsi-wilder-s-rsi"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "RSI = 100 - (100 / (1+RS)); Wilder's smoothing = Previous MA value + (1/n periods * (Close - Previous MA))"
+
+[[element.source]]
+url = "gates/formula_reference.py"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "скалярная реализация против polars_talib: расхождение 4.324e-16 на 485 точках"
+
+# ---------------------------------------------------------------- EMA
+
+[[element]]
+name = "ema200"
+what = "Экспоненциальная скользящая: множитель, рекурсия, затравка"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Exponential_smoothing"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "s_t = alpha*x_t + (1-alpha)*s_{t-1}; alpha = 2/(k+1) where k is the number of past data points of the moving average"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/moving-averages-simple-and-exponential"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "Multiplier: (2 / (Time periods + 1)); EMA: {Close - EMA(previous day)} x multiplier + EMA(previous day); a simple moving average is used as the previous period's EMA in the first calculation"
+
+[[element.source]]
+url = "gates/formula_reference.py"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "скалярная реализация против polars_talib: расхождение 4.315e-15 на 300 точках"
+
+# ---------------------------------------------------------------- MACD
+
+[[element]]
+name = "macd"
+what = "MACD 12/26/9: линия, сигнал, гистограмма"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/MACD"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "MACD line = EMA12 − EMA26; Signal line = EMA9(MACD line)"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/macd-moving-average-convergence-divergence-oscillator"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "MACD Line: (12-day EMA - 26-day EMA); Signal Line: 9-day EMA of MACD Line; MACD Histogram: MACD Line - Signal Line; Closing prices are used"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000502344-macd-moving-average-convergence-divergence/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "MACD = Fast MA − Slow MA; Signal = Moving average of MACD; Histogram = MACD − Signal"
+
+[[element.source]]
+url = "docs/audit/macd-talib-inconsistency-2026-08-03.md"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "MACD библиотеки НЕ равен разности её же ema12 и ema26: расхождение 5.874e-02 на баре 33, ноль с бара 300"
+
+# ---------------------------------------------------------------- Боллинджер
+
+[[element]]
+name = "bb_upper"
+what = "Полосы Боллинджера 20/2: середина, границы, тип стандартного отклонения"
+
+[[element.source]]
+url = "https://www.bollingerbands.com/bollinger-bands"
+tier = 2
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "20 periods for the moving average with the bands set at plus and minus two standard deviations; the population calculation for standard deviation"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Bollinger_Bands"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "Since Bollinger Bands use the population method of calculating standard deviation, the proper divisor for the sigma calculation is n, not n − 1"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/bollinger-bands"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "Middle Band: 20-day simple moving average; Upper Band: 20-day SMA + (20-day standard deviation of price x 2)"
+
+[[element.source]]
+url = "gates/formula_reference.py"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "скалярная реализация с популяционным отклонением против polars_talib: расхождение 1.177e-12 на 480 точках"
+
+# ---------------------------------------------------------------- ADX
+
+[[element]]
+name = "adx14"
+what = "ADX 14: +DM/-DM, +DI/-DI, DX, сглаживание. §2.9 его НЕ называет — не используется"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Average_directional_movement_index"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "UpMove = today's high − yesterday's high; if UpMove > DownMove and UpMove > 0, then +DM = UpMove, else +DM = 0; ADX = 100 times the smoothed moving average of the absolute value of (+DI − -DI) divided by (+DI + -DI)"
+
+[[element.source]]
+url = "https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/average-directional-index-adx"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "The first ADX value is simply a 14-day average of DX; ((Prior ADX14 x 13) + Current DX Value)/14; smoothing: Prior TR14 - (Prior TR14/14) + Current TR1"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000502250-average-directional-index-adx/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "Current High - Previous High = UpMove; ADX = 100 times the Exponential Moving Average of the Absolute Value of (+DI - -DI) / (+DI + -DI); default 14"
+
+# ---------------------------------------------------------------- ПОК
+
+[[element]]
+name = "point_of_control"
+what = "ПОК — ценовой уровень с максимальным объёмом"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Market_profile"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "the price of the peak cleared volume is identified as the Point of Control (POC)"
+
+[[element.source]]
+url = "https://help.cqg.com/cqgic/25/Documents/marketprofilevalueareasmpva.htm"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "the price level with maximum TPOs during the specified period"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000713306-time-price-opportunity-tpo-indicator/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "the row with the highest number of blocks; The POC is the first row added to the VA"
+
+# ---------------------------------------------------------------- Value Area
+
+[[element]]
+name = "value_area_fraction"
+what = "Доля объёма в области стоимости — 0.70"
+
+[[element.source]]
+url = "https://en.wikipedia.org/wiki/Market_profile"
+tier = 4
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "the central seventy percent of trading activity about POC (+/- one standard deviation) is termed the Value Area"
+
+[[element.source]]
+url = "https://help.cqg.com/cqgic/25/Documents/marketprofilevalueareasmpva.htm"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "until the value area represents 70% of the TPOs"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000713306-time-price-opportunity-tpo-indicator/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "The default value area percentage is 70% of total TPO blocks"
+
+# ------------------------------------------------- Value Area: процедура расширения
+
+[[element]]
+name = "value_area_expansion"
+what = "Процедура расширения области стоимости от ПОК"
+
+[[element.source]]
+url = "https://help.cqg.com/cqgic/25/Documents/marketprofilevalueareasmpva.htm"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "expands the value area one price at a time in either direction... expanded in the direction of the price having more TPOs"
+
+[[element.source]]
+url = "https://www.tradingview.com/support/solutions/43000713306-time-price-opportunity-tpo-indicator/"
+tier = 3
+date = "2026-08-03"
+fetched = "пересказ"
+quote = "Counts the blocks in the row above the highest VA row; Counts the blocks in the row below the lowest VA row; Determines the row with the highest block count from steps four and five"
+
+[[element.source]]
+url = "docs/audit/value-area-2026-08-03.md"
+tier = 1
+date = "2026-08-03"
+fetched = "замер"
+quote = "разница вариантов «по одному» и «парами» на сутках BTCUSDT: 1.40 на границе = 0.0022% от цены ПОК, ширина совпадает до бина"
+
+# ⚠ ВАРИАНТ «ПАРАМИ» ИСТОЧНИКОВ НЕ ИМЕЕТ. Единственная страница, где он найден
+# (eminimind.com), по §0.1 относится к уровню 5 и источником не является.
+# Поэтому реализация по умолчанию переведена на вариант «по одному»: у него два
+# независимых источника уровня 3, у «парами» — ноль.

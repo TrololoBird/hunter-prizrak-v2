@@ -29,8 +29,11 @@ Wikipedia даёт ДОЛЮ, но не процедуру расширения.
 «Market Profile» — его товарный знак). Его страница НЕДОСТУПНА отсюда: два запроса
 завершились ECONNRESET. Источником не является и в ссылках не значится.
 
-Реализованы ОБА варианта, по умолчанию PAIRS. Расхождение ЗАМЕРЕНО и мало
-(0.0022% от цены ПОК на сутках BTC): docs/audit/value-area-2026-08-03.md
+⚠ ПО УМОЛЧАНИЮ — SINGLE, и это следствие правила §0.1 (минимум три источника,
+блог источником не является). У варианта «по одному» два независимых источника
+уровня 3 (CQG, TradingView); у «парами» после отсева блога — НОЛЬ. Реализованы оба,
+расхождение замерено и мало (0.0022% от цены ПОК на сутках BTC):
+docs/audit/value-area-2026-08-03.md, реестр — docs/sources.toml
 
 Бины привязаны к `tickSize` инструмента (§5, §10.2): фиксированное число бинов не
 используется — при разном числе бинов один и тот же ПОК получается разным.
@@ -99,7 +102,7 @@ def point_of_control(hist: TradeHistogram) -> int | NotReady:
 def build(
     hist: TradeHistogram,
     fraction: float = VALUE_AREA_FRACTION,
-    expansion: Expansion = Expansion.PAIRS,
+    expansion: Expansion = Expansion.SINGLE,
 ) -> VolumeProfile | NotReady:
     """ПОК + область стоимости. Пустая зона или неоднозначность → NotReady (§4.3)."""
     if not 0.0 < fraction <= 1.0:
