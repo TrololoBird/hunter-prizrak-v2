@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from . import card, clock, emit, levels, log, store, swings
+from .archive import fetch_agg_trades_day
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
@@ -79,6 +81,53 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
         raise
     finally:
         await agen.aclose()
+
+
+def backfill_trades(ex: Exchange, uni: Universe, report: RunReport, days: int) -> None:
+    """Долить сделки из суточных архивов биржи под ИСТОРИЧЕСКИЕ окна структур.
+
+    ⚠ Без этого шага уровней не бывает вовсе, и это не свойство рынка. Профиль по стр. 26
+    натягивается на бары структуры, а структуры лежат в истории; живой поток покрывает
+    только длительность прогона. Замер 2026-08-04 (3 символа, 120 с): найдено 200 структур
+    и построено 0 уровней — 100% отказов «окно выходит за собранное».
+
+    Архив ограничен `days` умышленно: суточный файл BTC — 15.5 МБ и 1.26 млн сделок,
+    а структура на 1Н тянется на годы. Непокрытые окна остаются `NotReady` с названной
+    причиной (§4.3), а не заполняются приблизительным профилем.
+    """
+    if days <= 0:
+        return
+    last_ms = max((st.bars[-1].open_ms for st in report.series.values() if st.bars),
+                  default=0)
+    if not last_ms:
+        log.degraded("бэкфилл сделок пропущен: нет ни одного бара")
+        return
+    last_day = datetime.fromtimestamp(last_ms / 1000, UTC).date()
+    wanted = [last_day - timedelta(days=k) for k in range(days)]
+
+    for sym in uni.symbols:
+        inst = ex.instrument(sym)
+        if isinstance(inst, NotReady):
+            log.degraded("бэкфилл пропущен: нет инструмента", символ=sym)
+            continue
+        target = report.binned.get(sym)
+        if target is None:
+            bucket = min(TIMEFRAME_MS[tf] for tf in uni.timeframes)
+            target = BarBinnedTrades(symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
+            report.binned[sym] = target
+        for day in wanted:
+            got = fetch_agg_trades_day(inst.market_id, day)
+            if isinstance(got, NotReady):
+                log.degraded("сутки архива не получены", символ=sym, дата=str(day),
+                             причина=got.reason)
+                report.backfill_days_missing += 1
+                continue
+            for r in got.frame.iter_rows(named=True):
+                target.add(float(r["price"]), float(r["quantity"]), int(r["transact_time"]))
+            report.backfill_days_loaded += 1
+            report.backfill_trades += got.rows
+        log.info("сделки долиты", символ=sym, корзин=len(target.qty),
+                 сделок=target.trades_seen)
 
 
 def persist(run_id: str, report: RunReport, uni: Universe) -> None:
@@ -156,7 +205,8 @@ def record(run_id: str, report: RunReport, uni: Universe) -> None:
         conn.close()
 
 
-async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) -> RunReport:
+async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
+                   trade_days: int = 3) -> RunReport:
     ex = Exchange()
     sync = await ex.open()
     report = RunReport(sync=sync)
@@ -197,6 +247,10 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) ->
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
+        # исторических структур не покрыты и уровней не бывает вовсе.
+        backfill_trades(ex, uni, report, trade_days)
     finally:
         await ex.close()
 

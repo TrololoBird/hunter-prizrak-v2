@@ -20,7 +20,9 @@ def _run(args: argparse.Namespace) -> int:
         uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
     from .run import live_run, print_report
 
-    report = asyncio.run(live_run(uni, args.seconds, args.seed_limit, args.run_id))
+    report = asyncio.run(
+        live_run(uni, args.seconds, args.seed_limit, args.run_id, args.trade_days)
+    )
     return 1 if print_report(report, clock.now_ms()) else 0
 
 
@@ -191,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--seed-limit", type=int, default=500)
     run.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     run.add_argument("--run-id", default="last")
+    run.add_argument("--trade-days", type=int, default=3,
+                     help="суток сделок долить из архива под окна структур; 0 = не доливать")
     run.add_argument("--symbols", type=int, default=0,
                      help="взять только первые N символов вселенной")
 

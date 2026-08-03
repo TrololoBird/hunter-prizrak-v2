@@ -227,3 +227,6 @@ class RunReport(BaseModel):
     cards_written: int = 0
     signals_recorded: int = 0
     outcomes_recorded: int = 0
+    backfill_days_loaded: int = 0
+    backfill_days_missing: int = 0
+    backfill_trades: int = 0
