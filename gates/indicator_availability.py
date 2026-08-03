@@ -1,6 +1,8 @@
 """ГЕЙТ: с какого бара величина ВООБЩЕ определена. FOUNDATION.md §4.3.
 
-Держит числа в hunter/admission.py::REQUIRED_BARS честными. Если библиотека сменит
+Держит числа в hunter/admission.py::DEFINED_FROM_BARS честными — это «с какого бара
+библиотека вообще выдаёт значение». Отдельный вопрос — с какого бара значение
+КАНОНИЧНО (не зависит от затравки); его держит gates/formula_reference.py. Если библиотека сменит
 конвенцию затравки, требование к истории поедет — и гейт это покажет, а не система
 начнёт молча считать направление по несуществующим числам.
 
@@ -16,7 +18,7 @@ import polars as pl
 import polars_talib as plta
 
 sys.path.insert(0, "src")
-from hunter.admission import REQUIRED_BARS
+from hunter.admission import DEFINED_FROM_BARS
 
 SLICE = Path("docs/audit/reference-slice/BTCUSDT-1h-500.parquet")
 
@@ -34,6 +36,7 @@ def main() -> int:
         return 1
     df = pl.read_parquet(SLICE)
     computed = {
+        "adx14": plta.adx(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
         "atr14": plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
         "rsi14": plta.rsi(pl.col("close"), timeperiod=14),
         "macd": plta.macd(pl.col("close"), fastperiod=12, slowperiod=26,
@@ -47,7 +50,7 @@ def main() -> int:
     failed = 0
     for name in sorted(computed):
         idx = first_defined(out[name].to_list())
-        declared = REQUIRED_BARS.get(name)
+        declared = DEFINED_FROM_BARS.get(name)
         if idx is None:
             print(f"  ПРОВАЛ {name}: ни одного значения на срезе")
             failed += 1

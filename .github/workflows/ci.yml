@@ -43,8 +43,8 @@ jobs:
       - name: 'гейт: индикаторы против независимого оракула (§10.3)'
         run: uv run python gates/indicator_oracle.py
 
-      - name: 'гейт: ATR по опубликованному определению Уайлдера (§0)'
-        run: uv run python gates/wilder_atr.py
+      - name: 'гейт: все величины против опубликованных формул (§0)'
+        run: uv run python gates/formula_reference.py
 
       - name: 'гейт: с какого бара величина определена (§4.3)'
         run: uv run python gates/indicator_availability.py

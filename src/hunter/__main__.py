@@ -22,6 +22,16 @@ def _run(args: argparse.Namespace) -> int:
     return 1 if print_report(report, clock.now_ms()) else 0
 
 
+def _check(args: argparse.Namespace) -> int:
+    """Единая команда владельца (§7.5, поправка 2026-08-03)."""
+    from .check import run_check
+
+    uni = load_universe(args.universe)
+    if args.symbols:
+        uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
+    return 1 if run_check(uni, args.seconds, args.seed_limit) else 0
+
+
 def _admission(args: argparse.Namespace) -> int:
     """Хватает ли истории, чтобы величины §2.9 вообще существовали."""
     from .admission import REQUIRED_BARS, admits, unavailable_quantities
@@ -123,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--symbols", type=int, default=0,
                      help="взять только первые N символов вселенной")
 
+    chk = sub.add_parser("check", help="ПРОВЕРКА: один вход, вердикт по-русски (§7.5)")
+    chk.add_argument("--seconds", type=int, default=400)
+    chk.add_argument("--seed-limit", type=int, default=500)
+    chk.add_argument("--universe", type=Path, default=DEFAULT_PATH)
+    chk.add_argument("--symbols", type=int, default=0)
+
     adm = sub.add_parser("admission", help="хватает ли истории на величины §2.9")
     adm.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     adm.add_argument("--required", type=int, default=0,
@@ -134,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "check":
+        return _check(args)
     if args.cmd == "admission":
         return _admission(args)
     if args.cmd == "ledger":
