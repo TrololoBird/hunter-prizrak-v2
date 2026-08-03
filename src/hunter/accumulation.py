@@ -46,13 +46,28 @@ class ExitDirection(StrEnum):
 
 
 class BoundaryZone(BaseModel):
-    """Граница базы. Не линия, а зона: её задают первые две точки (стр. 18)."""
+    """Граница базы: зона, заданная ПЕРВЫМИ ДВУМЯ точками и дальше НЕИЗМЕННАЯ (стр. 18).
+
+    Заморозка — не оптимизация, а требование стр. 13: «локальные хаи/лои повторяются и
+    НЕ МЕНЯЮТСЯ». Первая редакция расширяла зону каждым новым экстремумом, и замер
+    2026-08-04 показал, к чему это ведёт: на тренде BTC 15м накопилось 39 верхних точек
+    против 6 нижних, «граница» расползлась на 1.82%, структура не закрывалась 316 баров
+    подряд, а `detect` об этом молчал. Протокол: docs/audit/stuck-structure-2026-08-04.md
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     lo: float
     hi: float
     point_indices: tuple[int, ...] = Field(min_length=2)
+
+    puncture: float | None = None
+    """Самый дальний заход ЗА зону без подтверждения выхода.
+
+    Стр. 18: «если на 3++ точках были проколы за границы — стоп всегда ставится за этот
+    прокол». `None` означает «проколов не было», а не «неизвестно»: продюсер здесь один
+    и он всегда отрабатывает.
+    """
 
     @property
     def width_pct(self) -> float:
@@ -108,6 +123,35 @@ class Accumulation(BaseModel):
         return self.exit.direction is ExitDirection.UP
 
 
+class OpenStructure(BaseModel):
+    """Структура, из которой цена ещё не вышла. Уровня по стр. 23 у неё нет.
+
+    Существует, чтобы её было ВИДНО (§4.3). Незакрытая структура — это не «ничего не
+    нашли»: она может стоять сутками, и молчать о ней значит выдавать пустоту за покой.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    first_index: int
+    bars_open: int
+    upper: BoundaryZone
+    lower: BoundaryZone
+
+    @property
+    def points(self) -> int:
+        return len(self.upper.point_indices) + len(self.lower.point_indices)
+
+
+class AccumulationScan(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    closed: tuple[Accumulation, ...]
+    open_tail: OpenStructure | None
+    bars_scanned: int
+    resets: int
+    """Сколько раз структура распалась, не дав уровня (зоны сошлись либо точек не хватило)."""
+
+
 def _body_beyond(bar: Bar, level: float, direction: ExitDirection) -> bool:
     """Тело свечи ЦЕЛИКОМ за уровнем (стр. 55 «полных тел», не «закрытий»). Р-8."""
     if direction is ExitDirection.UP:
@@ -122,12 +166,16 @@ def detect(
     *,
     min_points: int = MIN_BOUNDARY_POINTS,
     confirm_bodies: int = CONFIRM_BODIES,
-) -> tuple[Accumulation, ...]:
-    """Накопления, из которых цена уже вышла, в порядке подтверждения выхода.
+) -> AccumulationScan:
+    """Накопления, из которых цена уже вышла, плюс незакрытый хвост.
 
     Проход строго слева направо по закрытым барам. Фрактал участвует только с того
     бара, на котором он стал известен (`confirmed_at_index`) — иначе структура
     опиралась бы на будущее (I-5).
+
+    Границы каждой стороны задаются ПЕРВЫМИ ДВУМЯ её точками и дальше не двигаются
+    (стр. 18). Экстремум за зоной — прокол: он считается точкой границы и запоминается
+    для стопа, но зону НЕ расширяет. Выход проверяется против замороженной границы.
 
     Пороги вынесены в аргументы НЕ для настройки: умолчания взяты из курса и меняться
     не должны. Они вынесены, чтобы чувствительность результата к ним можно было
@@ -143,35 +191,62 @@ def detect(
     hi_idx: list[int] = []
     lo_px: list[float] = []
     lo_idx: list[int] = []
+    hi_punct: float | None = None
+    lo_punct: float | None = None
     run_dir: ExitDirection | None = None
     run_from = 0
+    resets = 0
 
     def reset() -> None:
-        nonlocal run_dir, run_from
+        nonlocal run_dir, run_from, hi_punct, lo_punct, resets
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
         lo_idx.clear()
+        hi_punct = lo_punct = None
         run_dir, run_from = None, 0
+        resets += 1
+
+    def upper_zone() -> tuple[float, float]:
+        return min(hi_px[:2]), max(hi_px[:2])
+
+    def lower_zone() -> tuple[float, float]:
+        return min(lo_px[:2]), max(lo_px[:2])
 
     for k in range(len(bars)):
         for kind, index, price in by_confirm.get(k, []):
             if kind is SwingKind.HIGH:
-                # Первые две точки задают зону (стр. 18). С третьей — фрактал попадает
-                # в границу, если дотягивается до её низа; выше низа он может уйти
-                # сколь угодно далеко: это прокол, то есть расширение базы (стр. 18).
-                if len(hi_px) < 2 or price >= min(hi_px):
+                if len(hi_px) < 2:
                     hi_px.append(price)
                     hi_idx.append(index)
-            elif len(lo_px) < 2 or price <= max(lo_px):
+                    continue
+                zlo, zhi = upper_zone()
+                if price < zlo:
+                    continue  # локальный хай внутри базы — не точка границы
+                hi_px.append(price)
+                hi_idx.append(index)
+                if price > zhi:
+                    # Прокол за границу (стр. 18): точка засчитана, зона НЕ расширена,
+                    # глубина прокола запомнена — за неё ставится стоп.
+                    hi_punct = price if hi_punct is None else max(hi_punct, price)
+            else:
+                if len(lo_px) < 2:
+                    lo_px.append(price)
+                    lo_idx.append(index)
+                    continue
+                zlo, zhi = lower_zone()
+                if price > zhi:
+                    continue
                 lo_px.append(price)
                 lo_idx.append(index)
+                if price < zlo:
+                    lo_punct = price if lo_punct is None else min(lo_punct, price)
 
         if len(hi_px) < 2 or len(lo_px) < 2:
             continue
 
-        upper_lo, upper_hi = min(hi_px), max(hi_px)
-        lower_lo, lower_hi = min(lo_px), max(lo_px)
+        upper_lo, upper_hi = upper_zone()
+        lower_lo, lower_hi = lower_zone()
         if upper_lo <= lower_hi:
             # Зоны границ пересеклись — горизонтального диапазона нет (стр. 13).
             reset()
@@ -203,8 +278,10 @@ def detect(
                 timeframe=timeframe,
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
-                upper=BoundaryZone(lo=upper_lo, hi=upper_hi, point_indices=tuple(hi_idx)),
-                lower=BoundaryZone(lo=lower_lo, hi=lower_hi, point_indices=tuple(lo_idx)),
+                upper=BoundaryZone(lo=upper_lo, hi=upper_hi,
+                                   point_indices=tuple(hi_idx), puncture=hi_punct),
+                lower=BoundaryZone(lo=lower_lo, hi=lower_hi,
+                                   point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction,
                     first_body_index=run_from,
@@ -213,5 +290,20 @@ def detect(
             )
         )
         reset()
+        resets -= 1  # эмиссия — не распад
 
-    return tuple(found)
+    tail: OpenStructure | None = None
+    if len(hi_px) >= 2 and len(lo_px) >= 2:
+        ulo, uhi = upper_zone()
+        llo, lhi = lower_zone()
+        first = min(hi_idx + lo_idx)
+        tail = OpenStructure(
+            first_index=first,
+            bars_open=len(bars) - first,
+            upper=BoundaryZone(lo=ulo, hi=uhi, point_indices=tuple(hi_idx), puncture=hi_punct),
+            lower=BoundaryZone(lo=llo, hi=lhi, point_indices=tuple(lo_idx), puncture=lo_punct),
+        )
+
+    return AccumulationScan(
+        closed=tuple(found), open_tail=tail, bars_scanned=len(bars), resets=resets
+    )
