@@ -36,7 +36,8 @@ def _admission(args: argparse.Namespace) -> int:
         try:
             out: list[tuple[str, dict[str, int]]] = []
             for sym in uni.symbols:
-                counts = {tf: await ex.count_history(sym, tf) for tf in uni.timeframes}
+                counts = {tf: await ex.count_history(sym, tf, cap=required)
+                          for tf in uni.timeframes}
                 out.append((sym, counts))
             return out
         finally:
@@ -46,6 +47,8 @@ def _admission(args: argparse.Namespace) -> int:
     tfs = list(uni.timeframes)
     print(f"ДОПУСК: порог {required} баров на каждом ТФ")
     print(f"Требования замерены: {REQUIRED_BARS} (docs/audit/wilder-reference-2026-08-03.md)")
+    print()
+    print(f"(счёт с отсечкой на {required}: большее значение означает «не меньше»)")
     print()
     head = f"{'символ':22}" + "".join(f"{tf:>8}" for tf in tfs) + "  допуск  недостаёт"
     print(head)

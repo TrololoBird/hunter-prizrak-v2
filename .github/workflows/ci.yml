@@ -61,16 +61,10 @@ jobs:
           uv run python -m hunter ledger --init
           uv run python -m hunter ledger
 
-  live:
-    # Живой прогон против биржи. Отдельной работой: сеть может быть недоступна
-    # из раннера, и это не должно валить проверки самого дерева.
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - name: 'живой прогон, 3 символа'
-        run: uv run python -m hunter run --symbols 3 --seconds 400 --seed-limit 200
+# ЖИВОЙ ПРОГОН В CI НЕВОЗМОЖЕН, и это замер, а не предположение.
+# Прогон 2026-08-03 на раннере GitHub: Binance ответил HTTP 451
+#   "Service unavailable from a restricted location according to 'b. Eligibility'"
+# То есть §7.5 «верификация — гейты в CI и живые прогоны» здесь расщепляется:
+# гейты живут в CI, живые прогоны — только на машине владельца.
+#   uv run python -m hunter run --seconds 400 --seed-limit 500
+# Держать в CI постоянно красную работу нельзя: она обучает не смотреть на CI.

@@ -107,8 +107,13 @@ class Exchange:
             )
         return OhlcvFetch(bars=closed, rejected=rejected)
 
-    async def count_history(self, symbol: str, timeframe: str) -> int:
-        """Сколько закрытых баров биржа отдаёт по этому символу и ТФ — всего."""
+    async def count_history(self, symbol: str, timeframe: str, cap: int = 0) -> int:
+        """Сколько баров биржа отдаёт по символу и ТФ.
+
+        `cap > 0` — считать до отсечки и остановиться: для допуска важно «хватает
+        ли», а не точное число. Без отсечки счёт по 5м занимает 15 страниц на символ.
+        Возвращённое значение при достижении отсечки означает «не меньше cap».
+        """
         total, since = 0, 0
         while True:
             r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
@@ -116,6 +121,8 @@ class Exchange:
             if not r:
                 break
             total += len(r)
+            if cap and total >= cap:
+                return total
             if len(r) < CCXT_EFFECTIVE_LIMIT:
                 break
             since = int(r[-1][0]) + 1
