@@ -84,9 +84,39 @@ def fetch_agg_trades_day(
     )
 
 
+def histogram_from_window(
+    day_data: ArchiveDay, symbol: str, tick: Decimal, from_ms: int, to_ms: int
+) -> TradeHistogram | NotReady:
+    """Гистограмма по ОКНУ внутри суток: `from_ms <= transact_time < to_ms`.
+
+    Нужна для §2.2: профиль натягивается ровно на структуру (стр. 26 — «важно захватить
+    все свечи структуры»), а не на сутки. Окно, не покрытое сутками, — отказ, а не
+    молчаливо усечённый профиль (§4.3).
+    """
+    lo, hi = int(day_data.frame["transact_time"].min()), int(  # type: ignore[arg-type]
+        day_data.frame["transact_time"].max()  # type: ignore[arg-type]
+    )
+    if from_ms < lo or to_ms > hi + 1:
+        return NotReady(
+            reason=f"{symbol}: окно [{from_ms},{to_ms}) выходит за сутки архива [{lo},{hi}]"
+        )
+    window = day_data.frame.filter(
+        (pl.col("transact_time") >= from_ms) & (pl.col("transact_time") < to_ms)
+    )
+    if window.height == 0:
+        return NotReady(reason=f"{symbol}: в окне [{from_ms},{to_ms}) нет ни одной сделки")
+    return _histogram(window, symbol, tick, window.height)
+
+
 def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> TradeHistogram:
     """Свернуть сутки сделок в гистограмму цена→объём с шагом tickSize (§5)."""
-    binned = day_data.frame.with_columns(
+    return _histogram(day_data.frame, symbol, tick, day_data.rows)
+
+
+def _histogram(
+    frame: pl.DataFrame, symbol: str, tick: Decimal, rows: int
+) -> TradeHistogram:
+    binned = frame.with_columns(
         (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin")
     ).group_by("bin").agg(
         pl.col("quantity").sum().alias("qty"),
@@ -96,8 +126,8 @@ def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> Trad
     for row in binned.iter_rows(named=True):
         h.qty_by_bin[int(row["bin"])] = float(row["qty"])
         h.count_by_bin[int(row["bin"])] = int(row["n"])
-    h.trades_seen = day_data.rows
-    h.qty_seen = float(day_data.frame["quantity"].sum())
-    h.first_ms = int(day_data.frame["transact_time"].min())  # type: ignore[arg-type]
-    h.last_ms = int(day_data.frame["transact_time"].max())  # type: ignore[arg-type]
+    h.trades_seen = rows
+    h.qty_seen = float(frame["quantity"].sum())
+    h.first_ms = int(frame["transact_time"].min())  # type: ignore[arg-type]
+    h.last_ms = int(frame["transact_time"].max())  # type: ignore[arg-type]
     return h
