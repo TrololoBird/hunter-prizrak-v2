@@ -8,18 +8,29 @@
 https://en.wikipedia.org/wiki/Market_profile
 
 Value Area — «the central seventy percent of trading activity about POC» (там же).
-Метод расширения (Steidlmayer, CBOT, 1980-е) — «add the TPOs of the two prices above
-and below the POC; beginning with the larger number of combined two rows, add this
-number to the POC number, continuing this process until the number reaches 70% of the
-total».
+Wikipedia даёт ДОЛЮ, но не процедуру расширения.
 
-⚠ ИСТОЧНИКИ РАСХОДЯТСЯ, и это заявляется как РЕШЕНИЕ, а не выводится.
-Документация CQG (help.cqg.com, Market Profile Value Areas) описывает расширение
-**по одному уровню**: «expands the value area one price at a time in either direction…
-expanded in the direction of the price having more TPOs». Классическое изложение
-Steidlmayer — **парами**. Здесь реализован ПАРНЫЙ вариант как более цитируемый;
-одиночный доступен как `Expansion.SINGLE`, и расхождение между ними ЗАМЕРЕНО:
-docs/audit/value-area-2026-08-03.md
+⚠ ПРОЦЕДУРА РАСШИРЕНИЯ У ИСТОЧНИКОВ РАЗНАЯ. Это заявляется как РЕШЕНИЕ, а не
+выводится, и ссылки ниже — на страницы, которые реально прочитаны:
+
+  ПО ОДНОМУ УРОВНЮ (два независимых вендора):
+    CQG, Market Profile Value Areas, help.cqg.com — «expands the value area one price
+    at a time in either direction… expanded in the direction of the price having more
+    TPOs»;
+    TradingView, TPO indicator, tradingview.com/support/solutions/43000713306 —
+    сравнивает строку над верхней границей со строкой под нижней, добавляет большую.
+
+  ПАРАМИ (один образовательный сайт):
+    eminimind.com/the-ultimate-guide-to-market-profile — «Add the TPOs of the two
+    prices above and below the POC. Beginning with the larger number of combined two
+    rows of TPOs, add this number to the POC number…».
+
+⚠ CME Group — институциональный первоисточник (ему принадлежит CBOT, где метод создан;
+«Market Profile» — его товарный знак). Его страница НЕДОСТУПНА отсюда: два запроса
+завершились ECONNRESET. Источником не является и в ссылках не значится.
+
+Реализованы ОБА варианта, по умолчанию PAIRS. Расхождение ЗАМЕРЕНО и мало
+(0.0022% от цены ПОК на сутках BTC): docs/audit/value-area-2026-08-03.md
 
 Бины привязаны к `tickSize` инструмента (§5, §10.2): фиксированное число бинов не
 используется — при разном числе бинов один и тот же ПОК получается разным.
