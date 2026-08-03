@@ -1,0 +1,114 @@
+"""Исторические сделки и бары из публичного архива Binance. FOUNDATION.md §8 этап 3.
+
+Зачем архив, а не REST: /fapi/v1/aggTrades отдаёт «futures trade histories that are not
+older than 24 hours» (документация Binance, раздел Compressed/Aggregate Trades List).
+Сверка с разборами автора требует прошлого — значит REST для этого непригоден.
+
+Целостность проверяется приложенным биржей .CHECKSUM: замер 2026-08-03 на
+BTCUSDT-aggTrades-2026-08-01.zip — sha256 совпал.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import urllib.error
+import urllib.request
+import zipfile
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+
+import polars as pl
+
+from .profile import TradeHistogram
+from .quality import NotReady
+
+BASE = "https://data.binance.vision/data/futures/um/daily"
+
+# Колонки CSV архива, замер 2026-08-03 по заголовку файла.
+AGG_COLUMNS = [
+    "agg_trade_id", "price", "quantity",
+    "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveDay:
+    market_id: str
+    day: date
+    zip_bytes: int
+    csv_bytes: int
+    rows: int
+    frame: pl.DataFrame
+
+
+def agg_trades_url(market_id: str, day: date) -> str:
+    return f"{BASE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
+
+
+def _fetch(url: str, timeout: int) -> bytes | NotReady:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return bytes(r.read())
+    except urllib.error.HTTPError as e:
+        return NotReady(f"{url}: HTTP {e.code}")
+    except OSError as e:
+        return NotReady(f"{url}: {type(e).__name__} {e}")
+
+
+def fetch_agg_trades_day(
+    market_id: str, day: date, timeout: int = 180
+) -> ArchiveDay | NotReady:
+    """Скачать сутки сделок и проверить контрольную сумму биржи."""
+    url = agg_trades_url(market_id, day)
+    blob = _fetch(url, timeout)
+    if isinstance(blob, NotReady):
+        return blob
+
+    checksum = _fetch(url + ".CHECKSUM", timeout)
+    if isinstance(checksum, NotReady):
+        return NotReady(f"{market_id} {day}: нет .CHECKSUM — целостность не проверяема")
+    expected = checksum.decode().split()[0]
+    actual = hashlib.sha256(blob).hexdigest()
+    if actual != expected:
+        return NotReady(f"{market_id} {day}: sha256 не сошёлся ({actual} против {expected})")
+
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        name = z.namelist()[0]
+        csv = z.read(name)
+
+    frame = pl.read_csv(io.BytesIO(csv), columns=["price", "quantity", "transact_time"])
+    return ArchiveDay(
+        market_id=market_id, day=day, zip_bytes=len(blob), csv_bytes=len(csv),
+        rows=frame.height, frame=frame,
+    )
+
+
+def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> TradeHistogram:
+    """Свернуть сутки сделок в гистограмму цена→объём с шагом tickSize (§5)."""
+    binned = day_data.frame.with_columns(
+        (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin")
+    ).group_by("bin").agg(
+        pl.col("quantity").sum().alias("qty"),
+        pl.len().alias("n"),
+    )
+    h = TradeHistogram(symbol=symbol, tick_size=tick)
+    for row in binned.iter_rows(named=True):
+        h.qty_by_bin[int(row["bin"])] = float(row["qty"])
+        h.count_by_bin[int(row["bin"])] = int(row["n"])
+    h.trades_seen = day_data.rows
+    h.qty_seen = float(day_data.frame["quantity"].sum())
+    h.first_ms = int(day_data.frame["transact_time"].min())  # type: ignore[arg-type]
+    h.last_ms = int(day_data.frame["transact_time"].max())  # type: ignore[arg-type]
+    return h
+
+
+def histogram_to_frame(h: TradeHistogram) -> pl.DataFrame:
+    bins = sorted(h.qty_by_bin)
+    return pl.DataFrame({
+        "bin": bins,
+        "price": [float(h.bin_price(b)) for b in bins],
+        "qty": [h.qty_by_bin[b] for b in bins],
+        "n": [h.count_by_bin[b] for b in bins],
+    })

@@ -1,0 +1,49 @@
+# Вселенная. FOUNDATION.md §5: «закреплённый набор символов, задаваемый оператором».
+# Замер (биржевое время): 2026-08-03T16:41:30Z. Не пересчитывается автоматически.
+# Протокол и команда воспроизведения: docs/audit/universe-2026-08-03.md
+#
+# Правило отбора: символы корпуса ∪ топ-12 по обороту, только крипто-бессрочные.
+# «Не-крипто» — по механическому признаку биржи (underlyingType/contractType),
+# а не подбором тикеров; PAXG назван явно, потому что признаком не отсекается.
+#
+# ⚠ ЖДЁТ ПОДТВЕРЖДЕНИЯ ВЛАДЕЛЬЦА (план этапа 1, задача 1.2).
+
+[universe]
+timeframes = ["5m", "15m", "1h", "4h", "1d", "1w"]  # §2.8
+
+symbols = [
+  # --- из корпуса разборов (17) ---
+  "BTC/USDT:USDT",
+  "ETH/USDT:USDT",
+  "BCH/USDT:USDT",
+  "POL/USDT:USDT",
+  "ASTR/USDT:USDT",
+  "AEVO/USDT:USDT",
+  "ONDO/USDT:USDT",
+  "ANKR/USDT:USDT",
+  "ARPA/USDT:USDT",
+  "UNI/USDT:USDT",
+  "SAND/USDT:USDT",
+  "CFX/USDT:USDT",
+  "STX/USDT:USDT",
+  "CHZ/USDT:USDT",
+  "THETA/USDT:USDT",
+  "SUPER/USDT:USDT",
+  "NEO/USDT:USDT",
+  # --- топ-12 по обороту, не вошедшие в корпус (10) ---
+  "SOL/USDT:USDT",
+  "BLESS/USDT:USDT",
+  "ZEC/USDT:USDT",
+  "HYPE/USDT:USDT",
+  "XRP/USDT:USDT",
+  "1000RATS/USDT:USDT",
+  "DOGE/USDT:USDT",
+  "ADA/USDT:USDT",
+  "BICO/USDT:USDT",
+  "BNB/USDT:USDT",
+]
+
+# Символ RES из корпуса (research/prizrak_corpus/prizrak_res.*) НЕ включён:
+# опознать нечем. Манифест хранит только имя файла 37627648-CwU1oJ1HmYUI3-_N.mp4,
+# расшифровка слышит «RSI», цен для сверки в транскрипте нет. На бирже есть RESOLV —
+# но это догадка, а не референт (§0). Ждёт опознания владельцем.

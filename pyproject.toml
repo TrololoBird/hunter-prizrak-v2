@@ -1,0 +1,54 @@
+[project]
+name = "hunter"
+version = "0.1.0"
+description = "Сигнально-аналитическая система по методологии PrizrakTrade"
+requires-python = ">=3.14"
+dependencies = [
+    # FOUNDATION.md §5: "Источник — Binance USD-M через ccxt/ccxt.pro, публичные потоки."
+    "ccxt>=4.5.9",
+    # FOUNDATION.md §6: факт о поведении null в ewm_mean начиная с polars 1.0.
+    "polars>=1.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.14", "mypy>=1.18"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hunter"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "gates"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "TID", "RUF"]
+# RUF001-003 ловят кириллицу как «неоднозначный символ» — правило против подмены
+# латиницы гомоглифами. Язык документации проекта русский, поэтому на нём оно даёт
+# только шум: замер 2026-08-03 — 67 срабатываний из 77, все на русском тексте.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# FOUNDATION.md §6: "любое сравнение «сейчас против биржевой метки» использует
+# скорректированное время". Локальные часы недоступны в обход hunter.clock.
+# Исключение — построчный noqa с причиной; пофайловых исключений нет умышленно.
+"time.time".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
+"time.time_ns".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
+"datetime.datetime.now".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
+"datetime.datetime.utcnow".msg = "Часы только через hunter.clock.now_ms() — FOUNDATION.md §6."
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+packages = ["hunter"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+# У ccxt нет типовых стабов. Точечно, не глобально: глобальный
+# ignore_missing_imports скрывает удаление собственного модуля.
+module = ["ccxt.*"]
+ignore_missing_imports = true

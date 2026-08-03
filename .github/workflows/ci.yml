@@ -1,0 +1,51 @@
+name: CI
+
+# FOUNDATION.md §7.4: гейт работает в CI постоянно. §7.5: тестов нет,
+# верификация — гейты и живые прогоны.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: mypy
+        run: uv run mypy
+
+      - name: 'гейт: никакого молчания (§4.3)'
+        run: uv run python gates/no_silent_failure.py
+
+      - name: 'гейт: только публичные данные (§1, §5)'
+        run: uv run python gates/public_data_only.py
+
+      - name: 'гейт: смоук-импорт всех модулей'
+        run: uv run python gates/smoke_import.py
+
+      - name: 'гейт: вселенная читается (§5)'
+        run: uv run python -c "from hunter.config import load_universe as l; u=l(); print(f'вселенная: символов {len(u.symbols)}, ТФ {len(u.timeframes)}')"
+
+  live:
+    # Живой прогон против биржи. Отдельной работой: сеть может быть недоступна
+    # из раннера, и это не должно валить проверки самого дерева.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: 'живой прогон, 3 символа'
+        run: uv run python -m hunter run --symbols 3 --seconds 400 --seed-limit 200
