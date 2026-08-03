@@ -11,12 +11,14 @@ SQLite — состояние и исходы, со схемой и ограни
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
 
-from .models import Bar, TradeHistogram
+from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
 DATA_DIR = Path("data")
 FRAMES_DIR = DATA_DIR / "frames"
@@ -106,6 +108,104 @@ def write_histogram(run_id: str, h: TradeHistogram) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     histogram_to_frame(h).write_parquet(path, compression="zstd")
     return path
+
+
+def _binned_path(run_id: str, symbol: str) -> Path:
+    return FRAMES_DIR / run_id / _safe(symbol) / "trades_by_bar.parquet"
+
+
+def write_binned_trades(run_id: str, t: BarBinnedTrades) -> Path:
+    """Сделки по корзинам баров. Без них уровень §2.2 из кадров не восстановить."""
+    rows = sorted((b, i, q) for b, bins in t.qty.items() for i, q in bins.items())
+    path = _binned_path(run_id, t.symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "bucket_ms": [r[0] for r in rows],
+            "bin": [r[1] for r in rows],
+            "qty": [r[2] for r in rows],
+            "n": [t.cnt.get(r[0], {}).get(r[1], 0) for r in rows],
+        },
+        schema={"bucket_ms": pl.Int64, "bin": pl.Int64, "qty": pl.Float64, "n": pl.Int64},
+    ).write_parquet(path, compression="zstd")
+    return path
+
+
+def read_binned_trades(
+    run_id: str, symbol: str, tick_size: Decimal, bucket_ms: int
+) -> BarBinnedTrades | NotReady:
+    """Восстановить раскладку сделок. Отсутствие файла — названная причина, не пустота."""
+    path = _binned_path(run_id, symbol)
+    if not path.exists():
+        return NotReady(reason=f"{symbol}: файла сделок нет — {path}")
+    df = pl.read_parquet(path)
+    t = BarBinnedTrades(symbol=symbol, tick_size=tick_size, bucket_ms=bucket_ms)
+    for row in df.iter_rows(named=True):
+        b, i = int(row["bucket_ms"]), int(row["bin"])
+        t.qty.setdefault(b, {})[i] = float(row["qty"])
+        t.cnt.setdefault(b, {})[i] = int(row["n"])
+        t.trades_seen += int(row["n"])
+        t.qty_seen += float(row["qty"])
+    return t
+
+
+# --- карточка: единица повтора (§10.3, §10.6 условие 2) -----------------------
+
+def card_path(run_id: str, symbol: str) -> Path:
+    return FRAMES_DIR / run_id / _safe(symbol) / "card.txt"
+
+
+def write_card(run_id: str, symbol: str, text: str) -> Path:
+    path = card_path(run_id, symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    return path
+
+
+def read_card(run_id: str, symbol: str) -> str | NotReady:
+    path = card_path(run_id, symbol)
+    if not path.exists():
+        return NotReady(reason=f"{symbol}: карточки прогона нет — {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_meta(run_id: str, symbol: str, tick_size: Decimal, bucket_ms: int) -> Path:
+    """Шаг цены и сетка корзин. Без них раскладку сделок из parquet не собрать обратно."""
+    path = FRAMES_DIR / run_id / _safe(symbol) / "meta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"symbol": symbol, "tick_size": str(tick_size),
+                                "bucket_ms": bucket_ms}, ensure_ascii=False),
+                    encoding="utf-8", newline="\n")
+    return path
+
+
+def read_meta(run_id: str, symbol: str) -> tuple[str, Decimal, int] | NotReady:
+    """Возвращает НАСТОЯЩЕЕ имя символа, шаг цены и сетку корзин.
+
+    Имя каталога — это `_safe(symbol)`, из него исходное имя не восстановить (в нём
+    подчёркивания вместо `/` и `:`), поэтому оно хранится явно.
+    """
+    path = FRAMES_DIR / run_id / _safe(symbol) / "meta.json"
+    if not path.exists():
+        return NotReady(reason=f"{symbol}: meta.json прогона нет — {path}")
+    d = json.loads(path.read_text(encoding="utf-8"))
+    return str(d["symbol"]), Decimal(d["tick_size"]), int(d["bucket_ms"])
+
+
+def saved_symbols(run_id: str) -> tuple[str, ...]:
+    """Символы, у которых в прогоне есть кадры. Порядок — алфавитный, для дет-повтора."""
+    root = FRAMES_DIR / run_id
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(p.name for p in root.iterdir() if p.is_dir()))
+
+
+def saved_timeframes(run_id: str, symbol: str) -> tuple[str, ...]:
+    d = FRAMES_DIR / run_id / _safe(symbol)
+    if not d.is_dir():
+        return ()
+    skip = {"profile", "trades_by_bar"}
+    return tuple(sorted(p.stem for p in d.glob("*.parquet") if p.stem not in skip))
 
 
 # --- леджер (§10.2) -----------------------------------------------------------

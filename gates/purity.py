@@ -32,6 +32,8 @@ PURE_MODULES = [
     "src/hunter/geometry.py",
     "src/hunter/priority.py",
     "src/hunter/factors.py",
+    "src/hunter/card.py",
+    "src/hunter/replay.py",
 ]
 
 # Список выше ведётся руками, и 2026-08-03 он отстал: `accumulation.py` объявил себя

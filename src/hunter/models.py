@@ -121,6 +121,70 @@ class TradeHistogram(BaseModel):
         return abs(self.binned_qty_total() - self.qty_seen) / self.qty_seen
 
 
+class BarBinnedTrades(BaseModel):
+    """Сделки, разложенные по БАРАМ и бинам цены. §5 + §10.3.
+
+    Зачем отдельно от `TradeHistogram`: та агрегатная и времени не хранит, поэтому вырезать
+    из неё окно структуры нельзя. А профиль по стр. 26 натягивается ровно на бары структуры.
+    Без этой раскладки уровень §2.2 на живом прогоне не построить вовсе — только из
+    суточного архива.
+
+    Сетка `bucket_ms` — самый младший используемый ТФ: бары старших ТФ кратны ему, значит
+    окно любой структуры складывается из целых корзин без остатка.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    tick_size: Decimal = Field(gt=0)
+    bucket_ms: int = Field(gt=0)
+    qty: dict[int, dict[int, float]] = Field(default_factory=dict)
+    """корзина (open_ms) → бин цены → объём."""
+
+    cnt: dict[int, dict[int, int]] = Field(default_factory=dict)
+    """То же по числу сделок. Хранится отдельно, потому что число сделок в окне нельзя
+    восстановить из объёмов: попытка выдать за него число бинов была бы именем-ложью."""
+
+    trades_seen: int = 0
+    qty_seen: float = 0.0
+
+    def add(self, price: float, qty: float, ts_ms: int) -> None:
+        bucket = ts_ms - ts_ms % self.bucket_ms
+        idx = int(Decimal(str(price)) // self.tick_size)
+        self.qty.setdefault(bucket, {})
+        self.cnt.setdefault(bucket, {})
+        self.qty[bucket][idx] = self.qty[bucket].get(idx, 0.0) + qty
+        self.cnt[bucket][idx] = self.cnt[bucket].get(idx, 0) + 1
+        self.trades_seen += 1
+        self.qty_seen += qty
+
+    def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
+        """Профиль по окну `[from_ms, to_ms)`. Пустое окно — отказ, а не пустой профиль."""
+        if not self.qty:
+            return NotReady(reason=f"{self.symbol}: сделок не собрано вовсе")
+        first, last = min(self.qty), max(self.qty)
+        if from_ms < first or to_ms > last + self.bucket_ms:
+            return NotReady(
+                reason=f"{self.symbol}: окно [{from_ms},{to_ms}) выходит за собранное "
+                       f"[{first},{last + self.bucket_ms})"
+            )
+        h = TradeHistogram(symbol=self.symbol, tick_size=self.tick_size)
+        for bucket, bins in self.qty.items():
+            if not from_ms <= bucket < to_ms:
+                continue
+            counts = self.cnt.get(bucket, {})
+            for idx, q in bins.items():
+                n = counts.get(idx, 0)
+                h.qty_by_bin[idx] = h.qty_by_bin.get(idx, 0.0) + q
+                h.count_by_bin[idx] = h.count_by_bin.get(idx, 0) + n
+                h.qty_seen += q
+                h.trades_seen += n
+        if not h.qty_by_bin:
+            return NotReady(reason=f"{self.symbol}: в окне [{from_ms},{to_ms}) сделок нет")
+        h.first_ms, h.last_ms = from_ms, to_ms
+        return h
+
+
 class OhlcvFetch(BaseModel):
     """Результат REST-засева: что принято и что отклонено. §4.3."""
 
@@ -154,8 +218,10 @@ class RunReport(BaseModel):
     sync: ClockSync
     series: dict[tuple[str, str], SeriesState] = Field(default_factory=dict)
     histograms: dict[str, TradeHistogram] = Field(default_factory=dict)
+    binned: dict[str, BarBinnedTrades] = Field(default_factory=dict)
     seeded_bars: int = 0
     seed_checked: int = 0
     clock_drift_ms: int | None = None
     clock_recheck_after_s: int | None = None
     frames_written: int = 0
+    cards_written: int = 0

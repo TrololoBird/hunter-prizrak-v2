@@ -9,8 +9,9 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
-from . import clock, log, store
+from . import clock, log, replay, store
 from .config import DEFAULT_PATH, Universe, load_universe
+from .models import NotReady
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -164,6 +165,22 @@ def _ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+def _replay(args: argparse.Namespace) -> int:
+    """Повтор карточки из сохранённых кадров (§10.6 условие 2)."""
+    if args.card:
+        text = store.read_card(args.run_id, args.card)
+        if isinstance(text, NotReady):
+            print(f"ПЛОХО: {text.reason}")
+            return 1
+        print(text, end="")
+        return 0
+    res = replay.replay_run(args.run_id)
+    if isinstance(res, NotReady):
+        print(f"ПЛОХО: {res.reason}")
+        return 1
+    return replay.print_result(res, show_diff=args.diff)
+
+
 def main(argv: list[str] | None = None) -> int:
     log.configure()
     p = argparse.ArgumentParser(prog="hunter")
@@ -195,6 +212,12 @@ def main(argv: list[str] | None = None) -> int:
     led = sub.add_parser("ledger", help="три проверочных запроса к леджеру (§10.6)")
     led.add_argument("--init", action="store_true", help="создать базу со схемой")
 
+    rep = sub.add_parser("replay",
+                         help="ПОВТОР: пересобрать карточку из кадров и показать разницу")
+    rep.add_argument("--run-id", default="last")
+    rep.add_argument("--diff", action="store_true", help="печатать саму разницу построчно")
+    rep.add_argument("--card", default="", help="просто показать карточку символа")
+
     args = p.parse_args(argv)
     if args.cmd == "run":
         return _run(args)
@@ -206,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         return _admission(args)
     if args.cmd == "ledger":
         return _ledger(args)
+    if args.cmd == "replay":
+        return _replay(args)
     return 2
 
 

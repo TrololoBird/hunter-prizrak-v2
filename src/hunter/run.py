@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import asyncio
 
-from . import clock, log, store
-from .bars import expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
+from . import card, clock, log, store
+from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
-from .models import NotReady, RunReport, SeriesState, TradeHistogram
+from .models import BarBinnedTrades, NotReady, RunReport, SeriesState, TradeHistogram
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> None:
@@ -63,7 +63,7 @@ async def _watch_bars(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> Non
 
 
 async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
-                        stop: asyncio.Event) -> None:
+                        binned: BarBinnedTrades, stop: asyncio.Event) -> None:
     agen = ex.watch_agg_trades(sym)
     try:
         while not stop.is_set():
@@ -74,14 +74,19 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
                     log.degraded("сделка без цены/объёма/метки, пропущена", символ=sym)
                     continue
                 hist.add(float(price), float(amount), int(ts))
+                binned.add(float(price), float(amount), int(ts))
     except asyncio.CancelledError:
         raise
     finally:
         await agen.aclose()
 
 
-def persist(run_id: str, report: RunReport) -> None:
-    """Сохранить кадры для детерминированного повтора (§10.3)."""
+def persist(run_id: str, report: RunReport, uni: Universe) -> None:
+    """Сохранить кадры И карточку для детерминированного повтора (§10.3).
+
+    Карточка сохраняется рядом с кадрами, потому что §10.6 требует сравнивать именно её:
+    «на этих сохранённых данных карточка была такой, стала такой».
+    """
     for (sym, tf), st in report.series.items():
         if st.not_ready is not None or not st.bars:
             continue
@@ -91,6 +96,21 @@ def persist(run_id: str, report: RunReport) -> None:
         if h.trades_seen:
             store.write_histogram(run_id, h)
             report.frames_written += 1
+    for sym, t in report.binned.items():
+        store.write_meta(run_id, sym, t.tick_size, t.bucket_ms)
+        if t.trades_seen:
+            store.write_binned_trades(run_id, t)
+            report.frames_written += 1
+
+    tfs = tuple(uni.timeframes)
+    for sym in uni.symbols:
+        series = {tf: st.bars for (s, tf), st in report.series.items()
+                  if s == sym and st.not_ready is None and st.bars}
+        if not series:
+            continue
+        text = card.render(sym, series, report.binned.get(sym), tfs)
+        store.write_card(run_id, sym, text)
+        report.cards_written += 1
 
 
 async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) -> RunReport:
@@ -113,7 +133,12 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) ->
                 continue
             h = TradeHistogram(symbol=sym, tick_size=inst.tick_size)
             report.histograms[sym] = h
-            tasks.append(asyncio.create_task(_watch_trades(ex, sym, h, stop)))
+            # Корзина — самый младший ТФ вселенной: бары старших кратны ему, значит
+            # окно любой структуры складывается из целых корзин (см. BarBinnedTrades).
+            bucket = min(TIMEFRAME_MS[tf] for tf in uni.timeframes)
+            b = BarBinnedTrades(symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
+            report.binned[sym] = b
+            tasks.append(asyncio.create_task(_watch_trades(ex, sym, h, b, stop)))
 
         log.info("наблюдение", потоков=len(tasks), секунд=seconds)
         await asyncio.sleep(seconds)
@@ -132,7 +157,7 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str) ->
     finally:
         await ex.close()
 
-    persist(run_id, report)
+    persist(run_id, report, uni)
     log.info("кадры сохранены", файлов=report.frames_written,
              каталог=str(store.FRAMES_DIR / run_id))
     return report
@@ -219,6 +244,7 @@ def print_report(r: RunReport, now_ms: int) -> int:
 
     print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
     print(f"   файлов parquet записано: {r.frames_written}")
+    print(f"   карточек сохранено: {r.cards_written}")
 
     violations = (len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
                   + len(offgrid_seed))
