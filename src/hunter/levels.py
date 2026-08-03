@@ -26,6 +26,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accumulation import Accumulation
+from .breach import Direction
 from .models import Bar, NotReady, TradeHistogram
 from .volume_profile import VolumeProfile, build
 
@@ -73,6 +74,24 @@ class Level(BaseModel):
     boundary_lo: Decimal
     boundary_hi: Decimal
     """Границы структуры — за них ставится стоп (стр. 33)."""
+
+    @property
+    def breach_direction(self) -> Direction:
+        """С какой стороны цена уходит ЗА уровень.
+
+        Лонговый уровень — поддержка: цена подходит сверху, значит уйти за него значит
+        уйти ВНИЗ. Шортовый — сопротивление, зеркально (стр. 22, 28).
+        """
+        return Direction.BELOW if self.side is LevelSide.LONG else Direction.ABOVE
+
+    def flipped(self) -> Level:
+        """Уровень после ПРОБОЯ. Стр. 43: «уровень лонг/шорт меняется на противоположный».
+
+        Меняется только сторона: цена, геометрия и происхождение остаются те же — это
+        тот же уровень, прочитанный наоборот, а не новый.
+        """
+        other = LevelSide.SHORT if self.side is LevelSide.LONG else LevelSide.LONG
+        return self.model_copy(update={"side": other})
 
 
 def structure_window_ms(

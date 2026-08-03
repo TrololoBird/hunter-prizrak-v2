@@ -19,30 +19,14 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
-
 from pydantic import BaseModel, ConfigDict, Field
 
+from .breach import CONFIRM_BODIES, Direction, body_beyond
 from .models import Bar
 from .swings import SwingKind, SwingSet
 
 MIN_BOUNDARY_POINTS = 4
 """Стр. 22, 23, 24: «4 и более точек границ». Курс называет только это число."""
-
-CONFIRM_BODIES = 2
-"""Стр. 55 даёт диапазон «2-3 полных тела». Двойка ЗАМЕРЕНА, а не выбрана.
-
-Замер 2026-08-03 на структуре, которую автор обвёл сам (BTC 15м, 17.07): при 2 телах
-ПОК = 62 800.0, до названного им вслух уровня 62 837.3 расхождение −0.059% — внутри
-шума разрешения прибора. При 3 телах выход не подтверждается, структура вбирает ещё
-сутки, ПОК = 64 000.0, расхождение +1.850% и ни одной линии автора рядом.
-Протокол: docs/audit/stage3-corpus-acceptance-2026-08-03.md, результат 5.
-"""
-
-
-class ExitDirection(StrEnum):
-    UP = "up"
-    DOWN = "down"
 
 
 class BoundaryZone(BaseModel):
@@ -86,7 +70,7 @@ class StructureExit(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    direction: ExitDirection
+    direction: Direction
     first_body_index: int
     confirmed_at_index: int
     """Бар, на котором набралось CONFIRM_BODIES тел подряд.
@@ -120,7 +104,7 @@ class Accumulation(BaseModel):
     @property
     def is_long(self) -> bool:
         """Лонговое накопление — из которого цена вышла вверх (стр. 22)."""
-        return self.exit.direction is ExitDirection.UP
+        return self.exit.direction is Direction.ABOVE
 
 
 class OpenStructure(BaseModel):
@@ -150,13 +134,6 @@ class AccumulationScan(BaseModel):
     bars_scanned: int
     resets: int
     """Сколько раз структура распалась, не дав уровня (зоны сошлись либо точек не хватило)."""
-
-
-def _body_beyond(bar: Bar, level: float, direction: ExitDirection) -> bool:
-    """Тело свечи ЦЕЛИКОМ за уровнем (стр. 55 «полных тел», не «закрытий»). Р-8."""
-    if direction is ExitDirection.UP:
-        return min(bar.open, bar.close) > level
-    return max(bar.open, bar.close) < level
 
 
 def detect(
@@ -193,7 +170,7 @@ def detect(
     lo_idx: list[int] = []
     hi_punct: float | None = None
     lo_punct: float | None = None
-    run_dir: ExitDirection | None = None
+    run_dir: Direction | None = None
     run_from = 0
     resets = 0
 
@@ -253,10 +230,10 @@ def detect(
             continue
 
         bar = bars[k]
-        if _body_beyond(bar, upper_hi, ExitDirection.UP):
-            direction = ExitDirection.UP
-        elif _body_beyond(bar, lower_lo, ExitDirection.DOWN):
-            direction = ExitDirection.DOWN
+        if body_beyond(bar, upper_hi, Direction.ABOVE):
+            direction = Direction.ABOVE
+        elif body_beyond(bar, lower_lo, Direction.BELOW):
+            direction = Direction.BELOW
         else:
             # Возврат внутрь структуры обрывает серию тел: стр. 55 — «возвращается той
             # же или следующей свечой» это прокол БЕЗ подтверждения.

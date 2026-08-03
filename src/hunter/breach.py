@@ -1,0 +1,165 @@
+"""Прокол против пробоя §2.4. Источник — мини-курс, стр. 6, 7, 42, 43, 55.
+
+ЧИСТЫЙ МОДУЛЬ (§10.3): часы, сеть и глобальное состояние не трогаются.
+
+Разбор источника с цитатами: docs/audit/course-reading-2026-08-03.md
+
+Здесь живёт ЕДИНСТВЕННОЕ определение «цена за уровнем» на весь проект. Так требует
+стр. 55: «Уровень ПП, **как и уровни границ накопления или объёмные уровни**, могут
+Прокалываться или Пробиваться, и требуют подтверждения». Один механизм — одно место;
+накопление (§2.1) импортирует отсюда, а не держит свою копию.
+
+Два исхода, оба из курса:
+  стр. 6   ПРОКОЛ — «цена прошла за уровень и вернула обратно той же или следующей
+           1-2 свечами… является одним из вариантов ОТРАБОТКИ уровня»
+  стр. 7   ПРОБОЙ — «цена прошла за какой-то уровень и в данный момент остаётся за ним»;
+           стр. 42: пробой есть вариант ЛОВУШКИ, то есть НЕ отработки
+  стр. 55  различает их: подтверждение = «закрытия под/над уровнем 2-3 полных тел свечей
+           ЭТОГО ТФ»; возврат той же или следующей свечой — «просто прокол БЕЗ
+           подтверждения, не берём позицию»
+  стр. 43  после пробоя «уровень лонг/шорт меняется для нас на противоположный»
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .models import Bar
+
+CONFIRM_BODIES = 2
+"""Стр. 55: подтверждение — «2-3 полных тел свечей ЭТОГО ТФ».
+
+Курс даёт ДИАПАЗОН и внутри него не выбирает. Взята нижняя граница: уровень,
+подтверждённый тремя телами, подтверждён и двумя, то есть двойка — более раннее и более
+слабое условие, а не более сильное. Фактическое число тел едет вместе с событием полем
+`bodies`, поэтому ничего не прячется.
+
+⚠ Выбор внутри диапазона курсом НЕ решён и остаётся открытым до фазы сверки с корпусом.
+"""
+
+RETURN_BARS = 2
+"""Сколько баров есть у цены, чтобы вернуться и сделать заход проколом.
+
+Стр. 55: «возвращается той же или следующей свечой» — это два бара, и формулировка там
+точнее, чем в словаре на стр. 6 («той же или следующей 1-2 свечами»). Взято 2; как и с
+CONFIRM_BODIES, значение вынесено в аргумент, чтобы чувствительность к нему замерялась,
+а не предполагалась.
+"""
+
+
+class Direction(StrEnum):
+    """С какой стороны цена ушла за уровень."""
+
+    ABOVE = "above"
+    BELOW = "below"
+
+
+class BreachKind(StrEnum):
+    PUNCTURE = "puncture"
+    """Прокол (стр. 6). Уровень ОТРАБОТАН, реакция валидна."""
+
+    BREAKOUT = "breakout"
+    """Пробой (стр. 7, 42). Ловушка: уровень не отработал и флипается (стр. 43)."""
+
+    UNRESOLVED = "unresolved"
+    """Ушла за уровень, вернулась позже прокола и не закрепилась телами.
+
+    ⚠ Это НЕ третий вид события из курса. Курс такого случая не разбирает, и имя означает
+    ровно «источник вердикта не даёт». Назвать его проколом или пробоем значило бы
+    выдумать правило и спрятать выдумку под знакомым словом (§4.3).
+    """
+
+    OPEN = "open"
+    """Заход не закончился к последнему бару ряда. Вердикта ещё нет и быть не может."""
+
+
+class Breach(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: BreachKind
+    direction: Direction
+    level: float
+    start_index: int
+    """Бар, на котором цена впервые оказалась за уровнем."""
+
+    resolved_index: int | None
+    """Бар, на котором заход разрешился. None у OPEN."""
+
+    extreme: float
+    """Самая дальняя цена за уровнем. Стр. 18/43: за неё ставится стоп."""
+
+    bodies: int = Field(ge=0)
+    """Максимум подряд идущих ПОЛНЫХ тел за уровнем внутри захода."""
+
+    @property
+    def worked_off(self) -> bool:
+        """Отработал ли уровень. Стр. 6: прокол — это отработка, пробой — нет."""
+        return self.kind is BreachKind.PUNCTURE
+
+
+def body_beyond(bar: Bar, level: float, direction: Direction) -> bool:
+    """Тело свечи ЦЕЛИКОМ за уровнем. Стр. 55 говорит «полных тел», не «закрытий»."""
+    if direction is Direction.ABOVE:
+        return min(bar.open, bar.close) > level
+    return max(bar.open, bar.close) < level
+
+
+def _beyond(bar: Bar, level: float, direction: Direction) -> bool:
+    """Цена хоть чем-то зашла за уровень — тенью считается тоже (стр. 46: «прокол тенью»)."""
+    return bar.high > level if direction is Direction.ABOVE else bar.low < level
+
+
+def first_breach(
+    bars: list[Bar],
+    level: float,
+    direction: Direction,
+    *,
+    from_index: int = 0,
+    confirm_bodies: int = CONFIRM_BODIES,
+    return_bars: int = RETURN_BARS,
+) -> Breach | None:
+    """ПЕРВОЕ разрешившееся событие на уровне. `None` — цена за уровень не заходила.
+
+    Первое, а не все: у уровня по курсу ОДНА судьба, и обе терминальны. Прокол —
+    «уровень отработан на 1 касание… этот уровень становится больше не актуальным, т.е.
+    мы этот уровень удаляем» (стр. 25). Пробой — «уровень лонг/шорт меняется для нас на
+    противоположный» (стр. 43), то есть дальше это уже другой уровень.
+
+    ⚠ Первая редакция возвращала ВСЕ заходы до конца ряда, и живой прогон дал 435 пробоев
+    на 4 уровня: после разрешения цена оставалась за уровнем, тут же начинала новый заход,
+    набирала два тела — и так подряд. Контракт «все события» противоречит курсу и потому
+    порождал бессмыслицу.
+
+    Проход слева направо, каждый бар смотрится один раз — заглядывания вперёд нет (I-5).
+    """
+    start: int | None = None
+    extreme = 0.0
+    run = 0
+    best_run = 0
+
+    def made(kind: BreachKind, at: int | None) -> Breach:
+        assert start is not None
+        return Breach(kind=kind, direction=direction, level=level, start_index=start,
+                      resolved_index=at, extreme=extreme, bodies=best_run)
+
+    for i in range(from_index, len(bars)):
+        bar = bars[i]
+        if _beyond(bar, level, direction):
+            edge = bar.high if direction is Direction.ABOVE else bar.low
+            if start is None:
+                start, extreme, run, best_run = i, edge, 0, 0
+            extreme = (max(extreme, edge) if direction is Direction.ABOVE
+                       else min(extreme, edge))
+            run = run + 1 if body_beyond(bar, level, direction) else 0
+            best_run = max(best_run, run)
+            if run >= confirm_bodies:
+                return made(BreachKind.BREAKOUT, i)
+            continue
+        if start is None:
+            continue
+        # Цена вернулась. Прокол — только если уложилась в отведённые бары (стр. 55).
+        return made(BreachKind.PUNCTURE if i - start <= return_bars else BreachKind.UNRESOLVED, i)
+
+    return made(BreachKind.OPEN, None) if start is not None else None
