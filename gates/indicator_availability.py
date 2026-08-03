@@ -18,6 +18,7 @@ import polars as pl
 import polars_talib as plta
 
 sys.path.insert(0, "src")
+from hunter import indicators
 from hunter.admission import DEFINED_FROM_BARS
 
 SLICE = Path("docs/audit/reference-slice/BTCUSDT-1h-500.parquet")
@@ -39,8 +40,9 @@ def main() -> int:
         "adx14": plta.adx(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
         "atr14": plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
         "rsi14": plta.rsi(pl.col("close"), timeperiod=14),
-        "macd": plta.macd(pl.col("close"), fastperiod=12, slowperiod=26,
-                          signalperiod=9).struct.field("macd"),
+        # MACD — проектное определение (ema12 - ema26), а не plta.macd():
+        # тот противоречит своим же EMA, см. docs/audit/macd-talib-inconsistency-*.md
+        "macd": indicators.macd_line(),
         "ema200": plta.ema(pl.col("close"), timeperiod=200),
     }
     out = df.select(**{k: v.alias(k) for k, v in computed.items()})
