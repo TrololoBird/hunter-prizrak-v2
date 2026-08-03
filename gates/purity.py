@@ -28,6 +28,7 @@ PURE_MODULES = [
     "src/hunter/levels.py",
     "src/hunter/stop_volume.py",
     "src/hunter/breach.py",
+    "src/hunter/pereprior.py",
 ]
 
 # Список выше ведётся руками, и 2026-08-03 он отстал: `accumulation.py` объявил себя

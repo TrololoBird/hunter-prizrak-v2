@@ -72,6 +72,67 @@ class SwingSet(BaseModel):
     confirmed_until_index: int
     """Дальше этого индекса фракталы ещё не могут быть подтверждены."""
 
+    def of(self, kind: SwingKind) -> tuple[Swing, ...]:
+        return tuple(s for s in self.swings if s.kind is kind)
+
+
+class TrendDirection(StrEnum):
+    UP = "up"
+    DOWN = "down"
+    NONE = "none"
+    """Ни того, ни другого. Курс такого случая не называет — и здесь он не выдумывается."""
+
+
+class Trend(BaseModel):
+    """Тренд по стр. 12 — определение курса, а не индикатор.
+
+    Дословно: «Восходящий тренд — движение цены на выбранном ТФ, при котором **каждый
+    следующий ЛОЙ выше предыдущего**. Нисходящий — при котором **каждый следующий ХАЙ
+    ниже предыдущего**.»
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    direction: TrendDirection
+    holds_for: int = Field(ge=0)
+    """На скольких подряд идущих экстремумах свойство выполняется, считая от последнего.
+
+    Окна здесь нет умышленно: курс говорит «каждый следующий», но не говорит, сколько
+    их брать. Вместо выдуманного окна сообщается ЗАМЕРЕННАЯ глубина, на которой свойство
+    держится, — читающий видит, тренд это из двух точек или из десяти (§I-7).
+    """
+
+
+def trend(swings: SwingSet) -> Trend:
+    """Направление по стр. 12 и глубина, на которой оно держится.
+
+    Минимальная проверка — два последних экстремума нужной стороны: «следующий выше
+    предыдущего» меньше чем на двух не определено. Если выполняются оба условия сразу
+    (лои растут И хаи падают) — это не тренд, а сходящаяся структура, и направление
+    не назначается.
+    """
+    lows = [s.price for s in swings.of(SwingKind.LOW)]
+    highs = [s.price for s in swings.of(SwingKind.HIGH)]
+
+    def depth(seq: list[float], rising: bool) -> int:
+        n = 0
+        for i in range(len(seq) - 1, 0, -1):
+            if (seq[i] > seq[i - 1]) if rising else (seq[i] < seq[i - 1]):
+                n += 1
+            else:
+                break
+        return n + 1 if n else 0
+
+    up = depth(lows, rising=True)
+    down = depth(highs, rising=False)
+    if up and down:
+        return Trend(direction=TrendDirection.NONE, holds_for=0)
+    if up:
+        return Trend(direction=TrendDirection.UP, holds_for=up)
+    if down:
+        return Trend(direction=TrendDirection.DOWN, holds_for=down)
+    return Trend(direction=TrendDirection.NONE, holds_for=0)
+
 
 def detect(bars: list[Bar]) -> SwingSet | NotReady:
     """Фракталы Вильямса на закрытых барах.
