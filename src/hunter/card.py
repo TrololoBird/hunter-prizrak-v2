@@ -132,6 +132,14 @@ def render(
             f"рисковый {_num(s.stop_risky)}  "
             f"{'закуп дробим' if s.split_orders else 'один ордер'}"
         )
+        if len(s.ladder) > 1:
+            # Стр. 32: «лучше закуп делать на все уровни, что бы ваша средняя твх была
+            # максимально безопасная». Средняя названа при равных долях — долей курс не
+            # задаёт, и подпись об этом говорит прямо.
+            out.append(
+                f"        лестница {' · '.join(_num(x) for x in s.ladder)}  "
+                f"средняя при равных долях {_num(s.average_entry_equal_shares)}"
+            )
         if s.targets:
             for t in s.targets:
                 role = "цель" if t.role is geometry.TargetRole.PRIMARY else "промежуточная"

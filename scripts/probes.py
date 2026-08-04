@@ -189,6 +189,89 @@ def _resolution_noise(hist: TradeHistogram, poc: float) -> float:
     return (max(pocs) - min(pocs)) / poc * 100
 
 
+def _levels_over(
+    symbol: str,
+    tick: Decimal,
+    todo: list[tuple[str, accumulation.Accumulation, int, int]],
+    frames: dict[date, pl.DataFrame],
+    series: dict[str, list[Bar]],
+) -> tuple[list[tuple[levels.Level, float, int, bool]], Counter[str], Counter[str]]:
+    """Уровни по списку структур: сам `Level`, допуск, число сделок, активен ли.
+
+    Возвращает НЕ отфильтрованный список, а признак `active` рядом: отбор — дело зонда,
+    и разные зонды отбирают по-разному (сверка с автором берёт активные, замер лестницы —
+    все, потому что стр. 32 про состав структуры, а не про торгуемость).
+    """
+    out: list[tuple[levels.Level, float, int, bool]] = []
+    states: Counter[str] = Counter()
+    skipped: Counter[str] = Counter()
+    for tf, a, lo, hi in todo:
+        d0 = datetime.fromtimestamp(lo / 1000, UTC).date()
+        d1 = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
+        want = [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
+        if any(d not in frames for d in want):
+            skipped[f"{tf}: суток нет в кэше"] += 1
+            continue
+        hist = _histogram_over([frames[d] for d in want], symbol, tick, lo, hi)
+        if isinstance(hist, NotReady):
+            skipped[f"{tf}: {hist.reason.split(':')[-1].strip()}"] += 1
+            continue
+        lvl = levels.build_level(a, hist, symbol, (lo, hi))
+        if isinstance(lvl, NotReady):
+            skipped[f"{tf}: ПОК не построен"] += 1
+            continue
+        st = levels.status(lvl, series[tf])
+        active = st.state is levels.LevelState.ACTIVE
+        if not active:
+            states[st.state.value] += 1
+        out.append((lvl, _resolution_noise(hist, float(lvl.price)), hist.trades_seen,
+                    active))
+    return out, states, skipped
+
+
+async def _archive_levels(
+    ex: Exchange, symbol: str, horizon_days: int = 90
+) -> tuple[list[tuple[levels.Level, float, int, bool]], Counter[str], Counter[str], int]:
+    """Все уровни символа в горизонте: бары → структуры → архив → ПОК. Общая часть зондов."""
+    inst = ex.instrument(symbol)
+    if isinstance(inst, NotReady):
+        raise RuntimeError(inst.reason)
+    series: dict[str, list[Bar]] = {}
+    for tf in TFS:
+        f = await ex.fetch_closed_ohlcv(symbol, tf, limit=1000)
+        if not isinstance(f, NotReady):
+            series[tf] = f.bars
+
+    now = max(b[-1].open_ms for b in series.values())
+    cut = now - horizon_days * 86400000
+    todo: list[tuple[str, accumulation.Accumulation, int, int]] = []
+    days: set[date] = set()
+    for tf, bars in series.items():
+        sw = swings.detect(bars)
+        if isinstance(sw, NotReady):
+            continue
+        for a in accumulation.detect(bars, sw, tf).closed:
+            lo, hi = levels.structure_window_ms(a, bars, TIMEFRAME_MS[tf])
+            if hi < cut:
+                continue
+            todo.append((tf, a, lo, hi))
+            d = datetime.fromtimestamp(lo / 1000, UTC).date()
+            end = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
+            while d <= end:
+                days.add(d)
+                d += timedelta(days=1)
+
+    def pull(d: date, mid: str = inst.market_id, tk: Decimal = inst.tick_size
+             ) -> tuple[date, pl.DataFrame | None]:
+        return d, _cached_day(mid, d, tk)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        pulled = list(pool.map(pull, sorted(days)))
+    frames = {d: f for d, f in pulled if f is not None}
+    built, states, skipped = _levels_over(symbol, inst.tick_size, todo, frames, series)
+    return built, states, skipped, len(todo)
+
+
 # --- зонды -------------------------------------------------------------------
 
 async def structures() -> None:
@@ -365,33 +448,11 @@ async def author_poc() -> None:
             if missing:
                 print(f"  ⚠ суток не получено: {len(missing)} — {missing[:5]}")
 
-            pocs: list[tuple[str, float, float, int]] = []
-            all_pocs: list[tuple[str, float, float, int]] = []
-            states: Counter[str] = Counter()
-            skipped: Counter[str] = Counter()
-            for tf, a, lo, hi in todo:
-                d0 = datetime.fromtimestamp(lo / 1000, UTC).date()
-                d1 = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
-                want = [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
-                if any(d not in frames for d in want):
-                    skipped[f"{tf}: суток нет в кэше"] += 1
-                    continue
-                span = [frames[d] for d in want]
-                hist = _histogram_over(span, s, inst.tick_size, lo, hi)
-                if isinstance(hist, NotReady):
-                    skipped[f"{tf}: {hist.reason.split(':')[-1].strip()}"] += 1
-                    continue
-                lvl = levels.build_level(a, hist, s)
-                if isinstance(lvl, NotReady):
-                    skipped[f"{tf}: ПОК не построен"] += 1
-                    continue
-                p = float(lvl.price)
-                st = levels.status(lvl, series[tf])
-                all_pocs.append((tf, p, _resolution_noise(hist, p), hist.trades_seen))
-                if st.state is levels.LevelState.ACTIVE:
-                    pocs.append((tf, p, _resolution_noise(hist, p), hist.trades_seen))
-                else:
-                    states[st.state.value] += 1
+            built, states, skipped = _levels_over(
+                s, inst.tick_size, todo, frames, series)
+            pocs = [(x.timeframe, float(x.price), n, t)
+                    for x, n, t, active in built if active]
+            all_pocs = [(x.timeframe, float(x.price), n, t) for x, n, t, _ in built]
             # ⚠ Отработанные и флипнутые уровни в карту не идут: стр. 25 — «уровень был
             # отработан на 1 касание… мы этот уровень удаляем». Без этого фильтра ПОК
             # получается вчетверо больше, чем публикует автор, и сверка вырождается:
@@ -447,6 +508,46 @@ async def author_poc() -> None:
             best = min((med([dist(x * (1 + k / 100)) for x in lines]), k) for k in shifts)
             print(f"  контроль-сдвиг: исходное положение лучше {worse} из {len(shifts)} "
                   f"сдвигов на ±0.3…3.0%; лучший сдвиг {best[1]:+.1f}% даёт {best[0]:.3f}%")
+    finally:
+        await ex.close()
+
+
+async def ladder() -> None:
+    """§2.2 стр. 32: срабатывает ли лестница вложенных уровней и какого она размера.
+
+    Поле, у которого всегда одно значение, инертно — это проверка на то, что `nested`
+    вообще что-то находит, а не украшает модель. Сравнение — с составом зон автора:
+    он публикует «63680-63950-64360» и «1935-1945-1960», то есть по 2-3 линии.
+    """
+    ex = Exchange()
+    await ex.open()
+    try:
+        for s in SYMS:
+            built, _states, _skipped, n_struct = await _archive_levels(ex, s)
+            pool = tuple(x for x, _n, _t, _a in built)
+            print(f"\n=== {s}: структур {n_struct}, уровней {len(pool)}")
+            for steps, label in ((1, "ТФ-1 (по стр. 32/24)"), (4, "ВСЕ младшие ТФ")):
+                sizes: Counter[int] = Counter()
+                by_tf: Counter[str] = Counter()
+                examples: list[str] = []
+                for lvl in pool:
+                    inner = levels.nested(lvl, pool, max_steps=steps)
+                    sizes[1 + len(inner)] += 1
+                    if inner:
+                        by_tf[lvl.timeframe] += 1
+                        if steps == 1 and len(examples) < 3 and len(inner) >= 2:
+                            rung = " · ".join(
+                                f"{x:.6g}" for x in
+                                sorted({lvl.price, *(i.price for i in inner)}))
+                            examples.append(f"{lvl.timeframe:>3} {rung}")
+                total = sum(sizes.values())
+                multi = total - sizes[1]
+                big = sum(n for k, n in sizes.items() if k > 4)
+                print(f"  {label:22}: с вложенными {multi} ({multi / total * 100:.0f}%), "
+                      f"длиннее 4 ступеней — {big}, размеры {dict(sorted(sizes.items()))}")
+                print(f"  {'':22}  родители по ТФ: {dict(by_tf)}")
+                for e in examples:
+                    print(f"  {'':22}  пример: {e}")
     finally:
         await ex.close()
 
@@ -557,6 +658,7 @@ PROBES = {
     "convergence": convergence,
     "author-coverage": author_coverage,
     "author-poc": author_poc,
+    "ladder": ladder,
     "archive-need": archive_need,
     "rest-history": rest_history,
     "bar-vs-tick": bar_vs_tick,

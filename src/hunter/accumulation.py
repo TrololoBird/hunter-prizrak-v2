@@ -26,7 +26,8 @@ from .models import Bar
 from .swings import SwingKind, SwingSet
 
 MIN_BOUNDARY_POINTS = 4
-"""Стр. 22, 23, 24: «4 и более точек границ». Курс называет только это число."""
+"""Стр. 22: «4 и более точек»; стр. 23: «(4+6+ точки границ)»; стр. 24: «(4+
+точки границ)». Курс называет только это число."""
 
 
 class BoundaryZone(BaseModel):

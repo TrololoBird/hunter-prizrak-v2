@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .accumulation import Accumulation
 from .accumulation import detect as detect_accumulations
-from .bars import TIMEFRAME_MS
+from .bars import TIMEFRAME_MS, tf_ms
 from .breach import CONFIRM_BODIES, RETURN_BARS, Breach, BreachKind, Direction, first_breach
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 from .swings import detect as detect_swings
@@ -66,6 +66,15 @@ class Level(BaseModel):
     structure_first_index: int
     structure_last_index: int
 
+    structure_from_ms: int
+    structure_to_ms: int
+    """Окно структуры в биржевом времени — ТО ЖЕ, по которому натянут профиль (стр. 26).
+
+    Индексы выше живут в СВОЁМ ряду баров и между ТФ несравнимы: индекс 40 на 15м и
+    индекс 40 на 4ч — разные моменты. Вложенность уровней (стр. 32) без общей шкалы
+    времени не выражается вовсе, поэтому окно хранится, а не пересчитывается.
+    """
+
     structure_volume: float = Field(gt=0)
     """Объём структуры. Стр. 22: сила = ТФ И объём, РАЗДЕЛЬНО.
 
@@ -88,7 +97,7 @@ class Level(BaseModel):
         return Direction.BELOW if self.side is LevelSide.LONG else Direction.ABOVE
 
     def flipped(self) -> Level:
-        """Уровень после ПРОБОЯ. Стр. 43: «уровень лонг/шорт меняется на противоположный».
+        """Уровень после ПРОБОЯ. Стр. 43: «Уровень лонг/шорт менятся для нас на противоположный».
 
         Меняется только сторона: цена, геометрия и происхождение остаются те же — это
         тот же уровень, прочитанный наоборот, а не новый.
@@ -114,12 +123,18 @@ def build_level(
     acc: Accumulation,
     hist: TradeHistogram,
     symbol: str,
+    window_ms: tuple[int, int],
 ) -> Level | NotReady:
     """Уровень из закрытого накопления.
 
     Гистограмма обязана покрывать ВСЕ бары структуры (стр. 26). Проверить это здесь
     нельзя — у гистограммы нет разбивки по барам, — поэтому ответственность на
     вызывающем, и он обязан строить её ровно по окну структуры.
+
+    `window_ms` — то же окно, что подано гистограмме (`structure_window_ms`). Передаётся
+    аргументом, а не берётся из `hist.first_ms`: у гистограммы это МОМЕНТЫ КРАЙНИХ
+    СДЕЛОК, а нужны границы окна. Разница мала и потому опасна — она молча сместила бы
+    проверку вложенности (стр. 32) там, где структура кончается тихим участком.
     """
     profile: VolumeProfile | NotReady = build(hist)
     if isinstance(profile, NotReady):
@@ -135,6 +150,8 @@ def build_level(
         created_at_index=acc.exit.confirmed_at_index,
         structure_first_index=acc.first_index,
         structure_last_index=acc.last_index,
+        structure_from_ms=window_ms[0],
+        structure_to_ms=window_ms[1],
         structure_volume=profile.total_volume,
         boundary_lo=Decimal(str(acc.lower.lo)),
         boundary_hi=Decimal(str(acc.upper.hi)),
@@ -189,13 +206,78 @@ def build_all(
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=hist.reason))
                 continue
-            lvl = build_level(acc, hist, symbol)
+            lvl = build_level(acc, hist, symbol, (lo, hi))
             if isinstance(lvl, NotReady):
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=lvl.reason))
                 continue
             built.append(lvl)
     return tuple(built), tuple(unbuilt)
+
+
+NESTED_MAX_STEPS = 1
+"""На сколько ступеней ТФ вниз ищутся вложенные уровни. Число из курса, не подобранное.
+
+Стр. 32 говорит «если мы перейдем на МТФ» — на МЛАДШИЙ ТФ, в единственном числе, то есть
+одна ступень. Стр. 24 то же самое запрещает распространять дальше прямо: «Уровни ТФ-2
+(15м и ниже) обычно не берутся в расчет, т.к. на старшем ТФ их вообще "нет"».
+
+⚠ Замер 2026-08-04 показал, ЧТО именно это ограничивает. Без него (все младшие ТФ сразу)
+лестницы доходили до 15, 17 и 22 ступеней: суточная структура вмещает десятки пятиминутных.
+«лучше закуп делать на все уровни» из стр. 32 при двадцати двух ордерах перестаёт быть
+исполнимым планом, и это признак того, что читается стр. 32 неверно, а не что рынок такой.
+"""
+
+
+def nested(
+    parent: Level, pool: tuple[Level, ...], *, max_steps: int = NESTED_MAX_STEPS
+) -> tuple[Level, ...]:
+    """Дополнительные уровни ВНУТРИ большой структуры. Источник — стр. 32.
+
+    Дословно: «если у нас есть большая структура на СТФ - и у нее есть основной уровень
+    ПОК. Но если мы перейдем на МТФ, то в одной большой структуре могут быть
+    дополнительные уровни и цена может забрать как и основной уровень, так и пройтись по
+    всем локальным уровням которые находятся в одной большой структуре».
+
+    ⚠ Это НЕ вторые пики того же профиля объёма. Читать стр. 32 так — распространённая
+    ошибка (я сам так её понял, пока не прочёл дословно); курс говорит про ПЕРЕХОД НА
+    МЛАДШИЙ ТФ, где внутри одной большой структуры видны свои накопления со своими ПОК.
+    Механизм уже есть целиком — структуры считаются на всех ТФ; недоставало только
+    отношения вложенности, и оно здесь.
+
+    Вложенным считается уровень, у которого:
+      * ТФ младше родительского (иначе это не «переход на МТФ»);
+      * окно структуры целиком внутри окна родителя — по биржевому времени;
+      * сам ПОК внутри границ родительской структуры.
+
+    Проверяется положение ПОК, а не всей младшей структуры: курс говорит про «локальные
+    уровни, которые находятся в одной большой структуре», то есть про уровни. Младшая
+    структура может выходить за границу проколом (стр. 18), уровень при этом внутри.
+
+    Сторона НЕ фильтруется: стр. 32 велит «закуп делать на все уровни», не различая их
+    происхождение. Отбор по стороне — работа вызывающего, здесь его нет.
+    """
+    rank = _tf_rank(parent.timeframe)
+    out = [
+        lvl for lvl in pool
+        if lvl.symbol == parent.symbol
+        and lvl is not parent
+        and 1 <= rank - _tf_rank(lvl.timeframe) <= max_steps
+        and lvl.structure_from_ms >= parent.structure_from_ms
+        and lvl.structure_to_ms <= parent.structure_to_ms
+        and parent.boundary_lo <= lvl.price <= parent.boundary_hi
+    ]
+    return tuple(sorted(out, key=lambda x: x.price))
+
+
+def _tf_rank(tf: str) -> int:
+    """Старшинство ТФ по порядку `TIMEFRAME_MS` — он и есть список курса со стр. 17.
+
+    Своей копии порядка здесь нет умышленно: вторая копия разошлась бы с первой на первой
+    же правке. Неизвестный ТФ падает через `tf_ms`, а не становится молча самым младшим.
+    """
+    tf_ms(tf)
+    return list(TIMEFRAME_MS).index(tf)
 
 
 class LevelState(StrEnum):

@@ -28,6 +28,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .levels import Level, LevelSide
+from .levels import nested as nested_levels
 
 TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
 """Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2."""
@@ -81,6 +82,24 @@ class Setup(BaseModel):
     entry_zone_hi: Decimal
     split_orders: bool
     """Стр. 30: крупная база — делить закуп на зону и уровень; мелкая — один ордер."""
+
+    ladder: tuple[Decimal, ...]
+    """Все уровни внутри большой структуры, снизу вверх (стр. 32).
+
+    Первым элементом всегда идёт `entry` — основной ПОК; дальше ПОК вложенных структур
+    младшего ТФ. Пустой лестницы не бывает: одиночный уровень — это лестница из одного.
+    Стр. 32: «лучше закуп делать на все уровни».
+    """
+
+    @property
+    def average_entry_equal_shares(self) -> Decimal:
+        """Средняя ТВХ при РАВНЫХ долях на каждый уровень лестницы.
+
+        Стр. 32 называет цель — «что бы ваша средняя твх была максимально безопасная», —
+        но долей НЕ задаёт. Поэтому равные доли названы прямо в имени: это допущение
+        читателя, а не правило курса, и молча зашивать его в поле `entry` нельзя.
+        """
+        return sum(self.ladder, Decimal(0)) / Decimal(len(self.ladder))
 
     stop_safe_near: Decimal
     stop_safe_far: Decimal
@@ -165,12 +184,14 @@ def build_setup(
     def with_margin(pct: float) -> Decimal:
         return edge + sign * edge * Decimal(str(pct)) / Decimal(100)
 
+    inner = nested_levels(level, pool)
     return Setup(
         level=level,
         entry=level.price,
         entry_zone_lo=level.zone_lo,
         entry_zone_hi=level.zone_hi,
         split_orders=level.timeframe in BIG_STRUCTURE_TFS,
+        ladder=tuple(sorted({level.price, *(x.price for x in inner)})),
         stop_safe_near=with_margin(margin_min_pct),
         stop_safe_far=with_margin(margin_max_pct),
         stop_risky=edge,
