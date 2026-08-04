@@ -25,7 +25,7 @@ dev = ["ruff>=0.14", "mypy>=1.18"]
 # ⚠ pandas-ta по умолчанию делегирует в TA-Lib, если тот установлен (замер 2026-08-03:
 # ATR совпал побитово; с talib=False разошёлся на 1.5e-11). Оракул ОБЯЗАН звать
 # pandas-ta с talib=False, иначе он сверяет TA-Lib сам с собой и не проверяет ничего.
-gates = ["pandas-ta==0.4.71b0", "ta-lib==0.7.1", "pandas>=2.2"]
+gates = ["pandas-ta==0.4.71b0", "ta-lib==0.7.1", "pandas>=2.2", "pymupdf>=1.28.0"]
 tools = [
     "pymupdf>=1.28.0",
 ]
@@ -71,11 +71,24 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["hunter"]
+# ⚠ `scripts/` и `gates/` добавлены 2026-08-04. До этого проверялся ТОЛЬКО `hunter`, а
+# числа всех протоколов производит `scripts/probes.py` — то есть инструмент измерения
+# стоял вне гейта, который ловит «поля не существует». Именно mypy поймал молчаливое
+# проглатывание `bodies=bodies` в src (docs/audit/falsifiability-2026-08-04.md); в
+# scripts такое не поймал бы никто. Первый же прогон с расширенным охватом нашёл в
+# `gates/no_loose_dicts.py` ветку, которая упала бы с AttributeError.
+files = ["src/hunter", "scripts", "gates"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
 # Стабов нет. Точечно, не глобально: глобальный ignore_missing_imports скрывает
 # удаление собственного модуля.
 module = ["ccxt.*", "polars_talib.*", "pandas_ta.*", "talib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pandas — только в гейте-оракуле (§10.3 разрешает его там и запрещает в hunter/).
+# Стабы pandas-stubs не ставятся умышленно: они тянут зависимость ради одного файла,
+# который сравнивает наши индикаторы с чужой библиотекой и типами не пользуется.
+module = ["pandas.*", "fitz.*"]
 ignore_missing_imports = true

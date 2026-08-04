@@ -55,6 +55,26 @@ jobs:
       - name: 'гейт: смоук-импорт всех модулей'
         run: uv run python gates/smoke_import.py
 
+      # ⚠ Четыре шага ниже добавлены 2026-08-04. Три первых гейта существовали с
+      # 2026-08-03, но в CI ВПИСАНЫ НЕ БЫЛИ и потому ни разу не отработали на чужой
+      # машине: гейт вне CI — это скрипт, который помнят, пока помнят. Нашлось при
+      # сверке списка `gates/*.py` со списком шагов, а не гейтом: за самим CI
+      # автоматической проверки полноты нет, и это остаётся дырой.
+      - name: 'гейт: модели запрещают лишние поля (§10.1)'
+        run: uv run python gates/models_forbid_extra.py
+
+      - name: 'гейт: ссылки в документах ведут на существующее (§0)'
+        run: uv run python gates/doc_refs.py
+
+      - name: 'гейт: у каждого числа есть команда воспроизведения (§7.3)'
+        run: uv run python gates/repro_commands.py
+
+      - name: 'гейт: цитаты курса дословны (§0)'
+        run: uv run python gates/course_citations.py
+
+      - name: 'гейт: каждый гейт вызывается в CI'
+        run: uv run python gates/ci_covers_gates.py
+
       - name: 'гейт: вселенная читается (§5)'
         run: |
           uv run python -c "from hunter.config import load_universe as l; u=l(); print('вселенная: символов', len(u.symbols), 'ТФ', len(u.timeframes))"

@@ -362,6 +362,7 @@ dev = [
 gates = [
     { name = "pandas" },
     { name = "pandas-ta" },
+    { name = "pymupdf" },
     { name = "ta-lib" },
 ]
 tools = [
@@ -386,6 +387,7 @@ dev = [
 gates = [
     { name = "pandas", specifier = ">=2.2" },
     { name = "pandas-ta", specifier = "==0.4.71b0" },
+    { name = "pymupdf", specifier = ">=1.28.0" },
     { name = "ta-lib", specifier = "==0.7.1" },
 ]
 tools = [{ name = "pymupdf", specifier = ">=1.28.0" }]

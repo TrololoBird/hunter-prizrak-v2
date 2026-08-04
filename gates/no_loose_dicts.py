@@ -50,7 +50,11 @@ def scan(path: Path) -> list[tuple[int, str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.AnnAssign) and _is_loose_dict(node.annotation):
             out.append((node.lineno, "поле объявлено как dict[str, Any]"))
-        elif isinstance(node, ast.FunctionType | ast.AsyncFunctionDef | ast.FunctionDef):
+        # ⚠ `ast.FunctionType` тут стоял ошибочно: это узел ТИПОВОГО КОММЕНТАРИЯ
+        # (`# type: (int) -> str`), у него нет ни `.name`, ни `.args`. Появись он —
+        # гейт упал бы с AttributeError. Не появлялся: `ast.parse` даёт его только в
+        # режиме `func_type`. Ошибку нашёл mypy, когда охват расширили на gates/.
+        elif isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
             if node.returns is not None and _is_loose_dict(node.returns):
                 out.append((node.lineno, f"{node.name}: возвращает dict[str, Any]"))
             for a in [*node.args.args, *node.args.kwonlyargs, *node.args.posonlyargs]:
