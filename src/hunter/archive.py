@@ -30,6 +30,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import polars as pl
 
@@ -94,6 +95,60 @@ def fetch_agg_trades_day(
         market_id=market_id, day=day, zip_bytes=len(blob), csv_bytes=len(csv),
         rows=frame.height, frame=frame,
     )
+
+
+CACHE_DIR = Path("data/aggcache")
+CACHE_BUCKET_MS = 300_000
+"""Корзина кэша — 5 минут, самый младший ТФ проекта (§2.8: 5м/15м/1ч/4ч/1Д/1Н).
+
+Окно любой структуры кратно своему ТФ, а все ТФ кратны пяти минутам, значит срез по
+кэшу ТОЧЕН, а не приблизителен. Мельче — раздувает кэш без выигрыша; крупнее — сделало
+бы окна 5м-структур приблизительными, а приблизительное окно профиля это ровно тот
+дефект, что дал чужой ПОК 63 950 (docs/audit/stage3-corpus-acceptance-2026-08-03.md).
+
+⚠ Гранулярность стоит в ИМЕНИ файла. Сменить её — значит обесценить весь накопленный
+кэш: свернуть 15м обратно в 5м нельзя. Первая редакция кэша (в scripts/probes.py) была
+на 900_000, и переход сюда потребовал перекачки 3.6 ГБ.
+"""
+
+
+def binned_day(
+    market_id: str, day: date, tick: Decimal, timeout: int = 900
+) -> pl.DataFrame | NotReady:
+    """Сутки сделок, свёрнутые в (корзина, бин) → объём и число, С КЭШЕМ на диске.
+
+    Кэш обязателен, а не удобен: боевой бэкфилл без него качал 15 МБ на символ-сутки
+    ЗАНОВО каждый прогон, и потому был вынужден ограничиваться тремя сутками — а трёх
+    суток хватает на 15% структур и на НОЛЬ структур 4ч и 1Д (замер 2026-08-04,
+    docs/audit/backfill-window-2026-08-04.md).
+
+    sha256 сверяется ДО свёртки и только при скачивании: в кэш кладётся уже проверенное.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / f"{market_id}-{day.isoformat()}-{CACHE_BUCKET_MS}.parquet"
+    if path.exists():
+        return pl.read_parquet(path)
+
+    got = fetch_agg_trades_day(market_id, day, timeout)
+    if isinstance(got, NotReady):
+        return got
+    binned = got.frame.with_columns(
+        (pl.col("transact_time") // CACHE_BUCKET_MS * CACHE_BUCKET_MS).alias("bucket"),
+        (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin"),
+    ).group_by("bucket", "bin").agg(
+        pl.col("quantity").sum().alias("qty"), pl.len().alias("n")
+    )
+    binned.write_parquet(path)
+    return binned
+
+
+def cached_days(market_id: str) -> set[date]:
+    """Какие сутки уже лежат в кэше — чтобы отчёт мог назвать цену прогона заранее."""
+    out: set[date] = set()
+    for p in CACHE_DIR.glob(f"{market_id}-*-{CACHE_BUCKET_MS}.parquet"):
+        stem = p.stem[len(market_id) + 1: -len(str(CACHE_BUCKET_MS)) - 1]
+        out.add(date.fromisoformat(stem))
+    return out
 
 
 def histogram_from_window(

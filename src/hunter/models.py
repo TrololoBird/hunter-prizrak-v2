@@ -159,6 +159,28 @@ class BarBinnedTrades(BaseModel):
         self.trades_seen += 1
         self.qty_seen += qty
 
+    def merge_binned(self, buckets: list[tuple[int, int, float, int]]) -> None:
+        """Влить уже свёрнутые сутки: (корзина, бин, объём, число сделок).
+
+        Отдельно от `add`, потому что поштучный `add` на 1.26 млн сделок в сутках — это
+        миллион вызовов Python на файл. Корзина архива (5 мин) обязана быть НЕ КРУПНЕЕ
+        собственной; иначе окно 5м-структуры пришлось бы округлять, и профиль перестал
+        бы соответствовать стр. 26. Несовпадение — исключение, а не тихое округление.
+        """
+        for bucket, idx, qty, cnt in buckets:
+            if bucket % self.bucket_ms:
+                raise ValueError(
+                    f"{self.symbol}: корзина архива {bucket} не ложится на сетку "
+                    f"{self.bucket_ms} — окно структуры пришлось бы округлять"
+                )
+            own = bucket - bucket % self.bucket_ms
+            self.qty.setdefault(own, {})
+            self.cnt.setdefault(own, {})
+            self.qty[own][idx] = self.qty[own].get(idx, 0.0) + qty
+            self.cnt[own][idx] = self.cnt[own].get(idx, 0) + cnt
+            self.trades_seen += cnt
+            self.qty_seen += qty
+
     def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
         """Профиль по окну `[from_ms, to_ms)`. Пустое окно — отказ, а не пустой профиль."""
         if not self.qty:
@@ -231,6 +253,10 @@ class RunReport(BaseModel):
     backfill_days_loaded: int = 0
     backfill_days_missing: int = 0
     backfill_trades: int = 0
+    backfill_structures: int = 0
+    backfill_structures_old: int = 0
+    backfill_days_capped: int = 0
+    """Сутки, отброшенные предохранителем. §4.3: усечение обязано быть ЧИСЛОМ в отчёте."""
 
     map_added: int = 0
     map_updated: int = 0

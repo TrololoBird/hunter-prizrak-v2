@@ -21,7 +21,7 @@ def _run(args: argparse.Namespace) -> int:
     from .run import live_run, print_report
 
     report = asyncio.run(
-        live_run(uni, args.seconds, args.seed_limit, args.run_id, args.trade_days)
+        live_run(uni, args.seconds, args.seed_limit, args.run_id, args.horizon_days)
     )
     return 1 if print_report(report, clock.now_ms()) else 0
 
@@ -193,8 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--seed-limit", type=int, default=500)
     run.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     run.add_argument("--run-id", default="last")
-    run.add_argument("--trade-days", type=int, default=3,
-                     help="суток сделок долить из архива под окна структур; 0 = не доливать")
+    # ⚠ Раньше здесь было `--trade-days` = «сколько ПОСЛЕДНИХ суток скачать», умолчание 3.
+    # Ручка задавала не глубину архива, а то, БУДЕТ ЛИ уровень вообще: при 3 сутках его
+    # мог получить 15% структур, а на 4ч и 1Д — ноль из 28 и 21. Теперь набор суток
+    # выводится из окон структур (`run.needed_days`), а этот параметр задаёт только
+    # ГОРИЗОНТ: насколько старые структуры ещё считаются картой (стр. 25).
+    run.add_argument("--horizon-days", type=int, default=90,
+                     help="структуры, вышедшие раньше чем N суток назад, в карту не идут; "
+                          "0 = не доливать сделки вовсе")
     run.add_argument("--symbols", type=int, default=0,
                      help="взять только первые N символов вселенной")
 

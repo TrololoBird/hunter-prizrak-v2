@@ -24,11 +24,19 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import polars as pl
 
-from hunter import accumulation, breach, factors, indicators, levels, pereprior, swings
+from hunter import (
+    accumulation,
+    archive,
+    breach,
+    factors,
+    indicators,
+    levels,
+    pereprior,
+    swings,
+)
 from hunter.bars import TIMEFRAME_MS
 from hunter.exchange import Exchange
 from hunter.models import Bar, NotReady, TradeHistogram
@@ -38,14 +46,9 @@ ARCHIVE = "https://data.binance.vision/data/futures/um/daily"
 SYMS = ("BTC/USDT:USDT", "ETH/USDT:USDT")
 TFS = ("5m", "15m", "1h", "4h", "1d")
 
-CACHE = Path("data/aggcache")
-BUCKET_MS = 900_000
-"""Корзина кэша 15 минут: окна структур 15м…1Д кратны ей, то есть срез ТОЧЕН.
-
-Меньшая корзина раздула бы кэш без выигрыша, большая сделала бы срез приблизительным —
-а приблизительное окно профиля это ровно тот дефект, который дал ПОК 63 950 у старого
-проекта (docs/audit/stage3-corpus-acceptance-2026-08-03.md).
-"""
+# Кэш архива живёт в `hunter.archive` — ОДИН на боевой путь и на зонды. Своей копии
+# констант здесь нет умышленно: вторая копия сетки разъехалась бы с первой, и зонд стал
+# бы проверять собственный двойник вместо рабочего кода.
 
 # Уровни, снятые с кадров автора 03.08.2026 — research/author_markup/2026-08-03_overcarder.md
 AUTHOR: dict[str, list[float]] = {
@@ -104,45 +107,19 @@ def _fetch_day(market_id: str, day: date, tick: Decimal, bucket_ms: int) -> pl.D
 
 
 def _cached_day(market_id: str, day: date, tick: Decimal) -> pl.DataFrame | None:
-    """Сутки сделок, свёрнутые в (корзина, бин) → объём и число сделок, с кэшем на диске.
+    """Сутки сделок из ОБЩЕГО кэша — того же, которым пользуется боевой бэкфилл.
 
-    Кэш нужен не для скорости ради скорости: без него сверка ПОК по 220 суткам архива
-    (3.4 ГБ) не переигрывается, а значит §7.3 «воспроизводится одной командой» становится
-    обещанием на двадцать минут трафика при каждом чтении протокола.
-
-    Сумма sha256 проверяется ДО свёртки и только при скачивании: в кэш кладётся уже
-    проверенное. Несошедшаяся сумма — отказ (`None`), а не тихо усечённые сутки.
+    ⚠ Здесь была вторая, СОБСТВЕННАЯ реализация кэша с гранулярностью 900 000 мс. Пока
+    боевой путь качал архив заново каждый прогон, зонды и продакшн жили на разных
+    хранилищах и разной сетке — то есть проверялось не то, что работает. После переноса
+    кэша в `archive.binned_day` (сетка 300 000 мс, самый младший ТФ проекта) реализация
+    ровно одна, и зонд подтверждает боевой код, а не свой двойник.
     """
-    CACHE.mkdir(parents=True, exist_ok=True)
-    path = CACHE / f"{market_id}-{day.isoformat()}-{BUCKET_MS}.parquet"
-    if path.exists():
-        return pl.read_parquet(path)
-
-    url = f"{ARCHIVE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
-    try:
-        with urllib.request.urlopen(url, timeout=900) as r:
-            blob = bytes(r.read())
-        with urllib.request.urlopen(url + ".CHECKSUM", timeout=300) as r:
-            expected = r.read().decode().split()[0]
-    except OSError as e:
-        print(f"    {market_id} {day}: не получено — {type(e).__name__} {e}")
+    got = archive.binned_day(market_id, day, tick)
+    if isinstance(got, NotReady):
+        print(f"    {market_id} {day}: не получено — {got.reason}")
         return None
-    if hashlib.sha256(blob).hexdigest() != expected:
-        print(f"    {market_id} {day}: sha256 НЕ СОШЁЛСЯ — отброшено")
-        return None
-
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        csv = z.read(z.namelist()[0])
-    binned = pl.read_csv(io.BytesIO(csv), columns=["price", "quantity", "transact_time"]) \
-        .with_columns(
-            (pl.col("transact_time") // BUCKET_MS * BUCKET_MS).alias("bucket"),
-            (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin"),
-        ).group_by("bucket", "bin").agg(
-            pl.col("quantity").sum().alias("qty"), pl.len().alias("n")
-        )
-    binned.write_parquet(path)
-    print(f"    {market_id} {day}: {len(blob)/1e6:5.2f} МБ → строк {binned.height}")
-    return binned
+    return got
 
 
 def _histogram_over(
@@ -587,6 +564,50 @@ async def states() -> None:
         await ex.close()
 
 
+async def backfill_window() -> None:
+    """Сколько структур МОГУТ получить уровень при глубине архива «последние N суток».
+
+    Замер, которым владелец вскрыл дефект: набор суток задавался ручкой `--trade-days`
+    (умолчание 3), а по стр. 26 его задают сами структуры. Таблица показывает перекос
+    по ТФ — именно он и был не виден, пока отказы считались поштучно.
+    """
+    ex = Exchange()
+    await ex.open()
+    try:
+        for s in SYMS:
+            print(f"\n=== {s}")
+            spans: dict[str, list[int]] = {}
+            for tf in TFS:
+                f = await ex.fetch_closed_ohlcv(s, tf, limit=1000)
+                if isinstance(f, NotReady):
+                    continue
+                sw = swings.detect(f.bars)
+                if isinstance(sw, NotReady):
+                    continue
+                now = f.bars[-1].open_ms
+                rows: list[int] = []
+                for a in accumulation.detect(f.bars, sw, tf).closed:
+                    lo, _hi = levels.structure_window_ms(a, f.bars, TIMEFRAME_MS[tf])
+                    d0 = datetime.fromtimestamp(lo / 1000, UTC).date()
+                    dn = datetime.fromtimestamp(now / 1000, UTC).date()
+                    rows.append((dn - d0).days + 1)
+                spans[tf] = rows
+            print(f"  {'ТФ':>4} {'структур':>9} | {'N=3':>6} {'N=7':>6} {'N=30':>6} "
+                  f"{'N=90':>6} {'всё':>6}")
+            for tf, rows in spans.items():
+                if not rows:
+                    continue
+                cov = " ".join(f"{sum(1 for r in rows if r <= n):>6}"
+                               for n in (3, 7, 30, 90))
+                print(f"  {tf:>4} {len(rows):>9} | {cov} {len(rows):>6}")
+            tot = sum(len(v) for v in spans.values())
+            got3 = sum(sum(1 for r in v if r <= 3) for v in spans.values())
+            print(f"  ИТОГО структур {tot}, при прежнем умолчании 3 суток покрыто {got3}"
+                  + (f" ({got3 / tot * 100:.0f}%)" if tot else ""))
+    finally:
+        await ex.close()
+
+
 async def map_drift() -> None:
     """Сколько уровней исчезает из карты по НЕВЕРНОЙ причине — уход окна баров.
 
@@ -636,11 +657,14 @@ async def map_drift() -> None:
                         while d <= end:
                             days.add(d)
                             d += timedelta(days=1)
+                    # Только то, что УЖЕ в кэше: этот зонд меряет дрейф карты, а не
+                    # качает архив. Непокрытые структуры честно уходят в «нет в кэше».
+                    have = archive.cached_days(inst.market_id)
                     frames = {}
-                    for d in sorted(days):
-                        path = CACHE / f"{inst.market_id}-{d.isoformat()}-{BUCKET_MS}.parquet"
-                        if path.exists():
-                            frames[d] = pl.read_parquet(path)
+                    for d in sorted(days & have):
+                        got = archive.binned_day(inst.market_id, d, inst.tick_size)
+                        if not isinstance(got, NotReady):
+                            frames[d] = got
                     built, _st, sk = _levels_over(
                         s, inst.tick_size, todo, frames, {tf: bars})
                     if not built:
@@ -812,6 +836,7 @@ PROBES = {
     "ladder": ladder,
     "states": states,
     "map-drift": map_drift,
+    "backfill-window": backfill_window,
     "archive-need": archive_need,
     "rest-history": rest_history,
     "bar-vs-tick": bar_vs_tick,

@@ -10,14 +10,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
-from . import card, clock, emit, levels, log, store, swings
-from .archive import fetch_agg_trades_day
+from . import archive, card, clock, emit, levels, log, store, swings
+from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
-from .models import BarBinnedTrades, NotReady, RunReport, SeriesState, TradeHistogram
+from .models import Bar, BarBinnedTrades, NotReady, RunReport, SeriesState, TradeHistogram
+from .swings import detect as detect_swings
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> None:
@@ -83,49 +84,108 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
         await agen.aclose()
 
 
-def backfill_trades(ex: Exchange, uni: Universe, report: RunReport, days: int) -> None:
-    """Долить сделки из суточных архивов биржи под ИСТОРИЧЕСКИЕ окна структур.
+def needed_days(
+    series: dict[str, list[Bar]], horizon_days: int
+) -> tuple[set[date], int, int]:
+    """Какие сутки архива нужны — ВЫВОДИТСЯ ИЗ СТРУКТУР, а не задаётся ручкой.
+
+    Стр. 26: «важно захватить все свечи структуры». Значит набор суток определяют сами
+    структуры, и спрашивать «сколько последних суток скачать» неправильно по существу.
+
+    ⚠ Так и было до 2026-08-04, и цена этого замерена: при умолчании «последние 3 суток»
+    уровень мог получить 15% структур, а на 4ч и 1Д — НОЛЬ из 28 и 21. Курс на стр. 48
+    говорит «Чем старше ТФ - тем выше винрейт, но дольше отработка», то есть карта
+    состояла ровно из тех ТФ, что слабее. Каждый пропуск честно логировался как
+    `NotReady` — но по одному, и перекос по ТФ не суммировал никто. Разбор:
+    docs/audit/backfill-window-2026-08-04.md
+
+    `horizon_days` отсекает старое — и это НЕ порог качества, а граница набора: структура,
+    из которой цена ушла год назад, уровнем по стр. 25 уже не является. Возвращается
+    вместе с числом отсечённых структур, чтобы отсечение было видно, а не молчало.
+    """
+    days: set[date] = set()
+    used = dropped = 0
+    now = max((b[-1].open_ms for b in series.values() if b), default=0)
+    cut = now - horizon_days * 86_400_000
+    for tf, bars in series.items():
+        if not bars:
+            continue
+        sw = detect_swings(bars)
+        if isinstance(sw, NotReady):
+            continue
+        for acc in detect_accumulations(bars, sw, tf).closed:
+            lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
+            if hi < cut:
+                dropped += 1
+                continue
+            used += 1
+            d = datetime.fromtimestamp(lo / 1000, UTC).date()
+            end = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
+            while d <= end:
+                days.add(d)
+                d += timedelta(days=1)
+    return days, used, dropped
+
+
+def backfill_trades(
+    ex: Exchange, uni: Universe, report: RunReport, horizon_days: int,
+    max_days_per_symbol: int = 400,
+) -> None:
+    """Долить сделки под ИСТОРИЧЕСКИЕ окна структур. Набор суток — из `needed_days`.
 
     ⚠ Без этого шага уровней не бывает вовсе, и это не свойство рынка. Профиль по стр. 26
     натягивается на бары структуры, а структуры лежат в истории; живой поток покрывает
     только длительность прогона. Замер 2026-08-04 (3 символа, 120 с): найдено 200 структур
     и построено 0 уровней — 100% отказов «окно выходит за собранное».
 
-    Архив ограничен `days` умышленно: суточный файл BTC — 15.5 МБ и 1.26 млн сделок,
-    а структура на 1Н тянется на годы. Непокрытые окна остаются `NotReady` с названной
-    причиной (§4.3), а не заполняются приблизительным профилем.
+    `max_days_per_symbol` — предохранитель от многолетних структур 1Н, и он ГРОМКИЙ:
+    отброшенное печатается числом, а не проглатывается. Непокрытые окна остаются
+    `NotReady` с названной причиной (§4.3), а не заполняются приблизительным профилем.
     """
-    if days <= 0:
+    if horizon_days <= 0:
         return
-    last_ms = max((st.bars[-1].open_ms for st in report.series.values() if st.bars),
-                  default=0)
-    if not last_ms:
-        log.degraded("бэкфилл сделок пропущен: нет ни одного бара")
-        return
-    last_day = datetime.fromtimestamp(last_ms / 1000, UTC).date()
-    wanted = [last_day - timedelta(days=k) for k in range(days)]
-
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
             log.degraded("бэкфилл пропущен: нет инструмента", символ=sym)
             continue
+        series = {tf: st.bars for (s, tf), st in report.series.items()
+                  if s == sym and st.not_ready is None and st.bars}
+        if not series:
+            log.degraded("бэкфилл пропущен: нет баров", символ=sym)
+            continue
+        want, used, dropped = needed_days(series, horizon_days)
+        if len(want) > max_days_per_symbol:
+            keep = sorted(want)[-max_days_per_symbol:]
+            log.warn("предохранитель бэкфилла", символ=sym, нужно_суток=len(want),
+                     берём=len(keep), отброшено=len(want) - len(keep))
+            report.backfill_days_capped += len(want) - len(keep)
+            want = set(keep)
+        report.backfill_structures += used
+        report.backfill_structures_old += dropped
+
         target = report.binned.get(sym)
         if target is None:
             bucket = min(TIMEFRAME_MS[tf] for tf in uni.timeframes)
             target = BarBinnedTrades(symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
             report.binned[sym] = target
-        for day in wanted:
-            got = fetch_agg_trades_day(inst.market_id, day)
+        cached = archive.cached_days(inst.market_id)
+        log.info("бэкфилл: набор суток из структур", символ=sym, структур=used,
+                 суток=len(want), из_кэша=len(want & cached),
+                 качать=len(want - cached), старых_структур=dropped)
+        for day in sorted(want):
+            got = archive.binned_day(inst.market_id, day, inst.tick_size)
             if isinstance(got, NotReady):
                 log.degraded("сутки архива не получены", символ=sym, дата=str(day),
                              причина=got.reason)
                 report.backfill_days_missing += 1
                 continue
-            for r in got.frame.iter_rows(named=True):
-                target.add(float(r["price"]), float(r["quantity"]), int(r["transact_time"]))
+            target.merge_binned([
+                (int(r["bucket"]), int(r["bin"]), float(r["qty"]), int(r["n"]))
+                for r in got.iter_rows(named=True)
+            ])
             report.backfill_days_loaded += 1
-            report.backfill_trades += got.rows
+            report.backfill_trades += int(got["n"].sum())
         log.info("сделки долиты", символ=sym, корзин=len(target.qty),
                  сделок=target.trades_seen)
 
@@ -225,7 +285,7 @@ def record(run_id: str, report: RunReport, uni: Universe) -> None:
 
 
 async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
-                   trade_days: int = 3) -> RunReport:
+                   horizon_days: int = 90) -> RunReport:
     ex = Exchange()
     sync = await ex.open()
     report = RunReport(sync=sync)
@@ -269,7 +329,7 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
 
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
-        backfill_trades(ex, uni, report, trade_days)
+        backfill_trades(ex, uni, report, horizon_days)
     finally:
         await ex.close()
 
@@ -362,6 +422,13 @@ def print_report(r: RunReport, now_ms: int) -> int:
     print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
     print(f"   файлов parquet записано: {r.frames_written}")
     print(f"   карточек сохранено: {r.cards_written}")
+
+    print("\n5б. АРХИВ СДЕЛОК ПОД ОКНА СТРУКТУР (стр. 26)")
+    print(f"   структур в горизонте: {r.backfill_structures}, "
+          f"старше горизонта отброшено: {r.backfill_structures_old}")
+    print(f"   суток загружено: {r.backfill_days_loaded}, не получено: "
+          f"{r.backfill_days_missing}, отброшено предохранителем: {r.backfill_days_capped}")
+    print(f"   сделок влито: {r.backfill_trades}")
 
     print("\n7. ЛЕДЖЕР (§8 этап 7)")
     print(f"   сигналов записано: {r.signals_recorded}")
