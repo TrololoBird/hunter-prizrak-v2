@@ -34,7 +34,7 @@ from . import (
     swings,
 )
 from .bars import TIMEFRAME_MS
-from .models import Bar, BarBinnedTrades, NotReady
+from .models import Bar, NotReady, TradeWindows
 
 TF_LABEL = {"5m": "5м", "15m": "15м", "1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
 SIDE_LABEL = {"long": "ЛОНГ", "short": "ШОРТ"}
@@ -66,7 +66,7 @@ def _num(x: float | Decimal, digits: int = 8) -> str:
 def render(
     symbol: str,
     series: dict[str, list[Bar]],
-    trades: BarBinnedTrades | None,
+    trades: TradeWindows | None,
     timeframes: tuple[str, ...],
 ) -> str:
     """Карточка символа по всем поданным ТФ. Чистая функция от кадров.

@@ -23,18 +23,20 @@ BTCUSDT-aggTrades-2026-08-01.zip — sha256 совпал.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import urllib.error
 import urllib.request
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
 
-from .models import NotReady, TradeHistogram
+from .models import BarBinnedTrades, NotReady, TradeHistogram
 
 BASE = "https://data.binance.vision/data/futures/um/daily"
 
@@ -59,14 +61,39 @@ def agg_trades_url(market_id: str, day: date) -> str:
     return f"{BASE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
 
 
-def _fetch(url: str, timeout: int) -> bytes | NotReady:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return bytes(r.read())
-    except urllib.error.HTTPError as e:
-        return NotReady(reason=f"{url}: HTTP {e.code}")
-    except OSError as e:
-        return NotReady(reason=f"{url}: {type(e).__name__} {e}")
+FETCH_TRIES = 3
+"""Попыток на файл. Обрыв закачки — не отказ сервера, а транзиентная помеха.
+
+⚠ Число подобрано, а не замерено: обрывов на выборке было слишком мало, чтобы считать
+частоту. Здесь оно названо тем, чем является, и не выдаётся за измеренное.
+"""
+
+
+def _fetch(url: str, timeout: int, tries: int = FETCH_TRIES) -> bytes | NotReady:
+    """Скачать файл. Любой сетевой сбой — НАЗВАННЫЙ отказ, а не исключение наружу.
+
+    ⚠ Прежняя редакция ловила только `HTTPError` и `OSError`. `http.client.IncompleteRead`
+    (оборванная закачка) не относится ни к тому, ни к другому — это `HTTPException`, —
+    и потому пролетала наружу и роняла ВЕСЬ прогон из-за одних суток. Замер 2026-08-04:
+    прогон упал на `IncompleteRead(5711811 bytes read, 7057424 more expected)`, успев
+    уложить в кэш большую часть горизонта.
+
+    Класс дефекта тот же, что и всё остальное здесь, только вывернутый: не молчаливое
+    проглатывание, а падение там, где деградация допустима и должна быть названа (§4.3).
+    """
+    last = ""
+    for attempt in range(1, tries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return bytes(r.read())
+        except urllib.error.HTTPError as e:
+            # HTTP-код сервера повтором не лечится: 404 останется 404.
+            return NotReady(reason=f"{url}: HTTP {e.code}")
+        except (OSError, http.client.HTTPException) as e:
+            last = f"{type(e).__name__} {e}"
+            if attempt < tries:
+                continue
+    return NotReady(reason=f"{url}: {last} (попыток {tries})")
 
 
 def fetch_agg_trades_day(
@@ -149,6 +176,105 @@ def cached_days(market_id: str) -> set[date]:
         stem = p.stem[len(market_id) + 1: -len(str(CACHE_BUCKET_MS)) - 1]
         out.add(date.fromisoformat(stem))
     return out
+
+
+class WindowSource:
+    """Профиль по окну ПО ТРЕБОВАНИЮ: суточный кэш на диске плюс живой поток прогона.
+
+    Заменяет накопление всего горизонта в одном `BarBinnedTrades`. Замер, из-за которого
+    это переделано (docs/audit/backfill-window-2026-08-04.md): 102 суток BTC — это
+    двадцать миллионов пар (корзина, бин), слияние идёт ~10.5 с на миллион и кончается
+    `MemoryError`. При этом КАЖДОЙ структуре нужно только её собственное окно, а окна
+    вместе покрывают горизонт лишь потому, что их много, — держать всё сразу незачем.
+
+    Источников два, и порядок важен:
+      * архив — история, неизменяемая и сверенная по sha256 при укладке в кэш;
+      * живой поток — последние сутки, которых в архиве ещё нет (замер: файл суток
+        публикуется с задержкой, 03.08 и 04.08 отдавали HTTP 404).
+
+    Окно, не покрытое ни тем ни другим, — `NotReady` с перечислением недостающих суток,
+    а не молча усечённый профиль (§4.3).
+
+    Кэш прочитанных суток ограничен `max_open`: без него 40 структур × до 19 суток дают
+    сотни повторных чтений parquet, с ним — по одному на сутки.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        market_id: str,
+        tick: Decimal,
+        live: BarBinnedTrades | None = None,
+        max_open: int = 48,
+    ) -> None:
+        self.symbol = symbol
+        self.market_id = market_id
+        self.tick = tick
+        self.live = live
+        self.max_open = max_open
+        self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
+
+    def _day(self, day: date) -> pl.DataFrame | None:
+        """Сутки из кэша. Скачивания здесь НЕТ: это работа бэкфилла, а не расчёта."""
+        if day in self._open:
+            self._open.move_to_end(day)
+            return self._open[day]
+        path = CACHE_DIR / f"{self.market_id}-{day.isoformat()}-{CACHE_BUCKET_MS}.parquet"
+        if not path.exists():
+            return None
+        frame = pl.read_parquet(path)
+        self._open[day] = frame
+        while len(self._open) > self.max_open:
+            self._open.popitem(last=False)
+        return frame
+
+    def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
+        d0 = datetime.fromtimestamp(from_ms / 1000, UTC).date()
+        d1 = datetime.fromtimestamp((to_ms - 1) / 1000, UTC).date()
+        span = [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
+
+        qty: dict[int, float] = {}
+        cnt: dict[int, int] = {}
+        missing: list[date] = []
+        for day in span:
+            frame = self._day(day)
+            if frame is None:
+                missing.append(day)
+                continue
+            part = frame.filter(
+                (pl.col("bucket") >= from_ms) & (pl.col("bucket") < to_ms)
+            ).group_by("bin").agg(pl.col("qty").sum(), pl.col("n").sum())
+            for row in part.iter_rows(named=True):
+                idx = int(row["bin"])
+                qty[idx] = qty.get(idx, 0.0) + float(row["qty"])
+                cnt[idx] = cnt.get(idx, 0) + int(row["n"])
+
+        if missing and self.live is not None:
+            # Сутки без архива добираются из живого потока — но только те, что он
+            # реально покрывает; иначе окно остаётся неполным и об этом говорится.
+            got = self.live.window(from_ms, to_ms)
+            if not isinstance(got, NotReady):
+                for idx, q in got.qty_by_bin.items():
+                    qty[idx] = qty.get(idx, 0.0) + q
+                    cnt[idx] = cnt.get(idx, 0) + got.count_by_bin.get(idx, 0)
+                missing = []
+
+        if missing:
+            return NotReady(
+                reason=f"{self.symbol}: окно [{from_ms},{to_ms}) не покрыто — нет суток "
+                       f"{', '.join(d.isoformat() for d in missing[:5])}"
+                       + (f" и ещё {len(missing) - 5}" if len(missing) > 5 else "")
+            )
+        if not qty:
+            return NotReady(reason=f"{self.symbol}: в окне [{from_ms},{to_ms}) сделок нет")
+
+        h = TradeHistogram(symbol=self.symbol, tick_size=self.tick)
+        h.qty_by_bin = qty
+        h.count_by_bin = cnt
+        h.qty_seen = sum(qty.values())
+        h.trades_seen = sum(cnt.values())
+        h.first_ms, h.last_ms = from_ms, to_ms
+        return h
 
 
 def histogram_from_window(

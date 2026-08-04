@@ -17,7 +17,15 @@ from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, is_closed, on_grid, tf_ms
 from .config import Universe
 from .exchange import Exchange
-from .models import Bar, BarBinnedTrades, NotReady, RunReport, SeriesState, TradeHistogram
+from .models import (
+    Bar,
+    BarBinnedTrades,
+    NotReady,
+    RunReport,
+    SeriesState,
+    TradeHistogram,
+    TradeWindows,
+)
 from .swings import detect as detect_swings
 
 
@@ -164,15 +172,15 @@ def backfill_trades(
         report.backfill_structures += used
         report.backfill_structures_old += dropped
 
-        target = report.binned.get(sym)
-        if target is None:
-            bucket = min(TIMEFRAME_MS[tf] for tf in uni.timeframes)
-            target = BarBinnedTrades(symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
-            report.binned[sym] = target
         cached = archive.cached_days(inst.market_id)
         log.info("бэкфилл: набор суток из структур", символ=sym, структур=used,
                  суток=len(want), из_кэша=len(want & cached),
                  качать=len(want - cached), старых_структур=dropped)
+        # ⚠ Сутки только УКЛАДЫВАЮТСЯ В КЭШ, в память ничего не сливается. Прежняя
+        # редакция копила весь горизонт в одном `BarBinnedTrades` и кончалась
+        # `MemoryError` на 102 сутках: двадцать миллионов пар (корзина, бин) при том,
+        # что каждой структуре нужно только её окно. Профиль теперь строит
+        # `archive.WindowSource` по требованию.
         for day in sorted(want):
             got = archive.binned_day(inst.market_id, day, inst.tick_size)
             if isinstance(got, NotReady):
@@ -180,17 +188,26 @@ def backfill_trades(
                              причина=got.reason)
                 report.backfill_days_missing += 1
                 continue
-            target.merge_binned([
-                (int(r["bucket"]), int(r["bin"]), float(r["qty"]), int(r["n"]))
-                for r in got.iter_rows(named=True)
-            ])
             report.backfill_days_loaded += 1
             report.backfill_trades += int(got["n"].sum())
-        log.info("сделки долиты", символ=sym, корзин=len(target.qty),
-                 сделок=target.trades_seen)
+        log.info("сутки уложены в кэш", символ=sym, суток=report.backfill_days_loaded)
 
 
-def persist(run_id: str, report: RunReport, uni: Universe) -> None:
+def trade_source(ex: Exchange, sym: str, report: RunReport) -> TradeWindows | None:
+    """Источник профиля для символа: кэш архива плюс живой поток прогона.
+
+    Один на оба пути — печать карточки и запись в леджер. Раньше туда передавался
+    материализованный `BarBinnedTrades`, и он же был причиной `MemoryError`.
+    """
+    inst = ex.instrument(sym)
+    if isinstance(inst, NotReady):
+        return report.binned.get(sym)
+    return archive.WindowSource(sym, inst.market_id, inst.tick_size,
+                                live=report.binned.get(sym))
+
+
+def persist(run_id: str, report: RunReport, uni: Universe,
+            sources: dict[str, TradeWindows]) -> None:
     """Сохранить кадры И карточку для детерминированного повтора (§10.3).
 
     Карточка сохраняется рядом с кадрами, потому что §10.6 требует сравнивать именно её:
@@ -217,12 +234,13 @@ def persist(run_id: str, report: RunReport, uni: Universe) -> None:
                   if s == sym and st.not_ready is None and st.bars}
         if not series:
             continue
-        text = card.render(sym, series, report.binned.get(sym), tfs)
+        text = card.render(sym, series, sources.get(sym), tfs)
         store.write_card(run_id, sym, text)
         report.cards_written += 1
 
 
-def record(run_id: str, report: RunReport, uni: Universe) -> None:
+def record(run_id: str, report: RunReport, uni: Universe,
+           sources: dict[str, TradeWindows]) -> None:
     """Записать эмиссии и их исходы в боевой леджер (§8 этап 7).
 
     Единственное место в проекте, которое пишет сигналы. Открытые и несостоявшиеся
@@ -236,8 +254,8 @@ def record(run_id: str, report: RunReport, uni: Universe) -> None:
                       if s == sym and st.not_ready is None and st.bars}
             if not series:
                 continue
-            trades = report.binned.get(sym)
-            lv, _ = levels.build_all(sym, series, trades, tuple(uni.timeframes))
+            lv, _ = levels.build_all(sym, series, sources.get(sym),
+                                     tuple(uni.timeframes))
             trends = {tf: swings.trend(sw) for tf, bars in series.items()
                       if not isinstance(sw := swings.detect(bars), NotReady)}
 
@@ -330,11 +348,15 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
         backfill_trades(ex, uni, report, horizon_days)
+        # Источники строятся ДО закрытия соединения: им нужен `market_id` инструмента.
+        # Сеть после этого не трогается — читается только кэш на диске.
+        sources = {sym: src for sym in uni.symbols
+                   if (src := trade_source(ex, sym, report)) is not None}
     finally:
         await ex.close()
 
-    persist(run_id, report, uni)
-    record(run_id, report, uni)
+    persist(run_id, report, uni, sources)
+    record(run_id, report, uni, sources)
     log.info("кадры сохранены", файлов=report.frames_written,
              каталог=str(store.FRAMES_DIR / run_id))
     return report

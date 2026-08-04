@@ -19,7 +19,7 @@ import difflib
 
 from pydantic import BaseModel, ConfigDict
 
-from . import card, store
+from . import archive, card, store
 from .models import NotReady
 
 
@@ -69,7 +69,15 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
     trades = store.read_binned_trades(run_id, dir_name, tick, bucket, symbol)
     binned = None if isinstance(trades, NotReady) else trades
 
-    rebuilt = card.render(symbol, series, binned, tfs)
+    # Источник тот же, что в прогоне: кэш суточных архивов плюс сохранённый живой поток.
+    # Архив для повтора ПРИГОДЕН именно потому, что неизменяем и сверен по sha256 при
+    # укладке в кэш, — это более сильная гарантия, чем пересохранённый parquet.
+    # `market_id` восстанавливается из имени символа: сети здесь нет и быть не должно
+    # (§10.3 — повтор чистый), а правило Binance «BTC/USDT:USDT → BTCUSDT» механическое.
+    market_id = symbol.split(":")[0].replace("/", "")
+    source = archive.WindowSource(symbol, market_id, tick, live=binned)
+
+    rebuilt = card.render(symbol, series, source, tfs)
     diff = "".join(difflib.unified_diff(
         saved.splitlines(keepends=True), rebuilt.splitlines(keepends=True),
         fromfile=f"{symbol} сохранено", tofile=f"{symbol} пересчитано", n=2,

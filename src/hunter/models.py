@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -222,6 +222,22 @@ class BarBinnedTrades(BaseModel):
             return NotReady(reason=f"{self.symbol}: в окне [{from_ms},{to_ms}) сделок нет")
         h.first_ms, h.last_ms = from_ms, to_ms
         return h
+
+
+class TradeWindows(Protocol):
+    """Что угодно, способное отдать профиль по окну. Контракт §2.2 сводится к одному методу.
+
+    Введён 2026-08-04, когда правильный горизонт вскрыл, что накапливать все сделки в
+    памяти нельзя (`MemoryError` на 102 сутках, docs/audit/backfill-window-2026-08-04.md).
+    Раньше `build_all` требовал именно `BarBinnedTrades` — то есть материализованный
+    контейнер, — и другого источника подставить было некуда.
+
+    Реализации: `BarBinnedTrades` (живой поток прогона) и `archive.WindowSource`
+    (кэш суточных архивов + живой поток), обе отдают `NotReady` с названной причиной,
+    когда окно не покрыто (§4.3).
+    """
+
+    def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady: ...
 
 
 class OhlcvFetch(BaseModel):

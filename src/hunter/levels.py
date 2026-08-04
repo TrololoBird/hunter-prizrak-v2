@@ -29,7 +29,7 @@ from .accumulation import Accumulation
 from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS, tf_ms
 from .breach import CONFIRM_BODIES, RETURN_BARS, Breach, BreachKind, Direction, first_breach
-from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
+from .models import Bar, NotReady, TradeHistogram, TradeWindows
 from .swings import detect as detect_swings
 from .volume_profile import VolumeProfile, build
 
@@ -173,7 +173,7 @@ class Unbuilt(BaseModel):
 def build_all(
     symbol: str,
     series: dict[str, list[Bar]],
-    trades: BarBinnedTrades | None,
+    trades: TradeWindows | None,
     timeframes: tuple[str, ...],
 ) -> tuple[tuple[Level, ...], tuple[Unbuilt, ...]]:
     """Все уровни по всем ТФ плюс НАЗВАННЫЕ причины, где уровень не построен.
