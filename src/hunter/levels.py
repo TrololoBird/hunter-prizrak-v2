@@ -296,6 +296,40 @@ class LevelState(StrEnum):
     """Пробит — стр. 43: «Уровень лонг/шорт менятся для нас на противоположный»."""
 
 
+class EntryRule(StrEnum):
+    """ЧЕМ уровень торгуется в этом состоянии. У каждого значения своя страница.
+
+    Введено 2026-08-04 после разметки автора: у него в легенде 🟢 «лимитки стоят» и
+    🟡 «можем проколоть без реакции, работать по факту» — ДВА РАЗНЫХ разрешения, а не
+    «активен/неактивен». Мой `limit_orders_allowed` их различал наполовину: он говорил,
+    чего делать НЕЛЬЗЯ, и молчал о том, что можно. Молчание о доступном действии — та же
+    потеря, что молчание о деградации (§4.3).
+
+    ⚠ Красного 🔴 «шорт-зона в перезакуп» здесь НЕТ и не будет. «Шорт-зона» — это
+    `side`, он уже есть; «перезакуп» — рыночная оценка автора, которой курс не даёт ни
+    определения, ни порога. Завести под неё состояние значило бы придумать метрику (§3).
+    """
+
+    LIMIT = "limit"
+    """Лимитки на ПОК и зону — стр. 30: «надежнее всего брать от уровня ПОК»."""
+
+    CONFIRMATION = "confirmation"
+    """Только по слому структуры на младшем ТФ — стр. 31.
+
+    Дословно: «уровень лимитными ордерами больше не торгуем… Позицию от уровня смотрим
+    только по факту слома структуры на более мелких ТФ». Стр. 25 говорит то же про
+    повторные касания: «можно рассматривать вход от 2 или 3 касания только по факту
+    слома структуры на младшем ТФ».
+    """
+
+    RETEST_FLIPPED = "retest_flipped"
+    """По ретесту с обратной стороны, в ПРОТИВОПОЛОЖНУЮ сторону — стр. 43.
+
+    Дословно: «По возврату цены на ретест уровня -  открываем позицию и ставим СТОП за
+    накопление». Сам уровень при этом уже другой стороны — `Level.flipped()`.
+    """
+
+
 class LevelStatus(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -305,6 +339,13 @@ class LevelStatus(BaseModel):
 
     limit_orders_allowed: bool
     """Стр. 25 и 31: после отработки лимитками уровень больше не торгуется."""
+
+    entry_rule: EntryRule
+    """Чем уровень торгуется СЕЙЧАС. Не выводится из `state` вызывающим — выводится здесь.
+
+    Вывод «отработан, значит ничего нельзя» неверен и был бы сделан: стр. 25 и 31 прямо
+    оставляют вход по слому младшего ТФ, а стр. 43 — вход по ретесту после пробоя.
+    """
 
 
 def status(
@@ -323,10 +364,13 @@ def status(
                       from_index=level.created_at_index + 1,
                       confirm_bodies=confirm_bodies, return_bars=return_bars)
     if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
-        return LevelStatus(state=LevelState.ACTIVE, event=ev, limit_orders_allowed=True)
+        return LevelStatus(state=LevelState.ACTIVE, event=ev, limit_orders_allowed=True,
+                           entry_rule=EntryRule.LIMIT)
     if ev.kind is BreachKind.BREAKOUT:
-        return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False)
-    return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False)
+        return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False,
+                           entry_rule=EntryRule.RETEST_FLIPPED)
+    return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
+                       entry_rule=EntryRule.CONFIRMATION)
 
 
 def first_test_index(level: Level, bars: list[Bar]) -> int | None:

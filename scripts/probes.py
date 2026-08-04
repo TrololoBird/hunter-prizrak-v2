@@ -552,6 +552,41 @@ async def ladder() -> None:
         await ex.close()
 
 
+async def states() -> None:
+    """§2.10: встречается ли КАЖДОЕ состояние и КАЖДОЕ правило входа.
+
+    Значение перечисления, которого код не выдаёт ни разу, — свойство кода, а не рынка.
+    До этого замера `EntryRule.RETEST_FLIPPED` мог бы никогда не возникнуть, и заметить
+    это было бы нечем: карточка печатала бы оставшиеся два и выглядела исправной.
+    """
+    ex = Exchange()
+    await ex.open()
+    try:
+        for s in SYMS:
+            built, _st, _sk, n_struct = await _archive_levels(ex, s)
+            by_state: Counter[str] = Counter()
+            by_rule: Counter[str] = Counter()
+            pairs: Counter[str] = Counter()
+            series: dict[str, list[Bar]] = {}
+            for tf in TFS:
+                f = await ex.fetch_closed_ohlcv(s, tf, limit=1000)
+                if not isinstance(f, NotReady):
+                    series[tf] = f.bars
+            for lvl, _n, _t, _a in built:
+                st = levels.status(lvl, series[lvl.timeframe])
+                by_state[st.state.value] += 1
+                by_rule[st.entry_rule.value] += 1
+                pairs[f"{st.state.value}/{st.entry_rule.value}"] += 1
+            print(f"\n=== {s}: структур {n_struct}, уровней {len(built)}")
+            print(f"  состояния:      {dict(by_state)}")
+            print(f"  правила входа:  {dict(by_rule)}")
+            missing = [r.value for r in levels.EntryRule if r.value not in by_rule]
+            print(f"  НЕ ВСТРЕТИЛОСЬ: {missing or 'нет — все значения выданы'}")
+            print(f"  пары:           {dict(pairs)}")
+    finally:
+        await ex.close()
+
+
 async def archive_need() -> None:
     """map-depth, data-channels: сколько суток архива нужно при разных горизонтах."""
     mb = {"BTC/USDT:USDT": 15.5, "ETH/USDT:USDT": 6.0}
@@ -659,6 +694,7 @@ PROBES = {
     "author-coverage": author_coverage,
     "author-poc": author_poc,
     "ladder": ladder,
+    "states": states,
     "archive-need": archive_need,
     "rest-history": rest_history,
     "bar-vs-tick": bar_vs_tick,
