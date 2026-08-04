@@ -191,9 +191,25 @@ class BarBinnedTrades(BaseModel):
                 reason=f"{self.symbol}: окно [{from_ms},{to_ms}) выходит за собранное "
                        f"[{first},{last + self.bucket_ms})"
             )
+        if from_ms % self.bucket_ms or to_ms % self.bucket_ms:
+            # Перечисление окна корзинами верно только на выровненных границах. Сетка
+            # ТФ кратна 5 минутам, поэтому в норме это выполняется всегда; несовпадение
+            # означает ошибку вызывающего и обязано быть видно, а не тихо терять корзины.
+            return NotReady(
+                reason=f"{self.symbol}: границы окна [{from_ms},{to_ms}) не легли на "
+                       f"сетку корзин {self.bucket_ms}"
+            )
         h = TradeHistogram(symbol=self.symbol, tick_size=self.tick_size)
-        for bucket, bins in self.qty.items():
-            if not from_ms <= bucket < to_ms:
+        # ⚠ Перебираются корзины ОКНА, а не все собранные. Прежняя редакция шла по
+        # `self.qty.items()` и отсеивала лишние внутри цикла — на трёх сутках это было
+        # незаметно, а на полных окнах структур стало стеной: замер 2026-08-04 — 15 млн
+        # пар (корзина, бин) у BTC за 102 суток, и `window` зовётся по разу на структуру
+        # на каждом ТФ (~240 раз), то есть 3.6 млрд обходов. Прогон не дошёл до карточки
+        # за 50 минут. Корзины лежат на фиксированной сетке, поэтому окно перечисляется
+        # напрямую: 19-суточная структура 1Д это 5472 корзины вместо 15 млн пар.
+        for bucket in range(from_ms, to_ms, self.bucket_ms):
+            bins = self.qty.get(bucket)
+            if not bins:
                 continue
             counts = self.cnt.get(bucket, {})
             for idx, q in bins.items():
