@@ -17,7 +17,9 @@ from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
+from pydantic import BaseModel, ConfigDict
 
+from .levels import Level, LevelState
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
 DATA_DIR = Path("data")
@@ -53,11 +55,47 @@ CREATE TABLE IF NOT EXISTS outcomes (
     CHECK ((kind = 'ambiguous') = (exit_price IS NULL))
 );
 
+CREATE TABLE IF NOT EXISTS levels (
+    symbol       TEXT    NOT NULL,
+    timeframe    TEXT    NOT NULL,
+    side         TEXT    NOT NULL CHECK (side IN ('long', 'short')),
+    price        REAL    NOT NULL CHECK (price > 0),
+    zone_lo      REAL    NOT NULL CHECK (zone_lo > 0),
+    zone_hi      REAL    NOT NULL CHECK (zone_hi > 0),
+    boundary_lo  REAL    NOT NULL CHECK (boundary_lo > 0),
+    boundary_hi  REAL    NOT NULL CHECK (boundary_hi > 0),
+    volume       REAL    NOT NULL CHECK (volume > 0),
+    from_ms      INTEGER NOT NULL,
+    to_ms        INTEGER NOT NULL,
+    first_seen   INTEGER NOT NULL,
+    last_seen    INTEGER NOT NULL,
+    state        TEXT    NOT NULL CHECK (state IN ('active', 'worked_off', 'flipped')),
+    retired_at   INTEGER,
+    CHECK (zone_lo <= price AND price <= zone_hi),
+    CHECK (boundary_lo < boundary_hi),
+    CHECK (to_ms > from_ms),
+    CHECK (last_seen >= first_seen),
+    CHECK ((retired_at IS NULL) = (state = 'active')),
+    PRIMARY KEY (symbol, timeframe, from_ms, to_ms)
+);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 """
+# Таблица `levels` — КАРТА, живущая между прогонами (стр. 25, 31: уровень существует, пока
+# не отработан, а не пока он виден в окне баров). Ключ — ОКНО СТРУКТУРЫ, а не цена ПОК:
+# структура это то, чем уровень порождён, и она не меняется, тогда как ПОК может
+# сдвинуться на бин при доливке сделок. Ключ по цене плодил бы дубликаты на каждый прогон.
+#
+# `retired_at` заполнен ровно тогда, когда состояние не `active`, и ограничение это
+# требует: «уровень снят» без даты и «дата без снятия» — обе формы молчания (§4.3).
+#
+# Полей «лимитки выставлены» и «позиция взята» здесь НЕТ. У автора они в легенде есть
+# (🟢, ✅), но продюсера у них в этой системе нет: ордера она не ставит (§1 — оператор
+# торгует руками) и о них не узнаёт. Поле без продюсера запрещено §0 и есть фирменный
+# дефект прошлого проекта.
 # Исход «неоднозначно» (бар накрыл и стоп, и цель) хранится БЕЗ r и без цены выхода, и
 # ограничение это требует: подставить туда ноль значило бы записать безубыток там, где
 # результат неизвестен (§4.3). Открытые и несостоявшиеся сделки в таблицу не попадают
@@ -305,6 +343,110 @@ def record_outcome(
     except sqlite3.IntegrityError as e:
         return NotReady(reason=f"исход {signal_id}: строка отклонена схемой — {e}")
     return None
+
+
+def sync_levels(
+    conn: sqlite3.Connection,
+    symbol: str,
+    seen: list[tuple[Level, LevelState]],
+    now_ms: int,
+) -> tuple[int, int, int]:
+    """Слить свежепосчитанную карту с накопленной. Возвращает (новых, обновлено, снято).
+
+    Зачем накопление, а не пересборка каждый прогон — ЗАМЕР, а не удобство.
+    `scripts/probes.py map-drift`: при сдвиге окна на 200 баров 2% карты BTC и 3% ETH
+    исчезали не потому, что уровень отработан (стр. 25 — единственная причина, которую
+    знает курс), а потому что структура уехала за край окна в 1000 баров. Уровень при
+    этом оставался активным. Автор говорит ровно обратное: «зона остаётся актуальна».
+
+    Что делает функция:
+      * НОВЫЙ уровень (окна структуры ещё нет в таблице) — вставляется;
+      * ВИДИМЫЙ снова — обновляется `last_seen` и состояние;
+      * ПРОПАВШИЙ из расчёта — НЕ трогается: он остаётся в карте с прежним состоянием.
+        Именно это и есть накопление; отсутствие в текущем окне не является событием.
+
+    Снятие происходит ТОЛЬКО по состоянию из курса — `worked_off` или `flipped`, — и
+    тогда проставляется `retired_at`. Ни одна строка не удаляется: история карты нужна,
+    чтобы можно было спросить, когда уровень появился и когда перестал торговаться.
+    """
+    added = updated = retired = 0
+    for lvl, state in seen:
+        key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
+        row = conn.execute(
+            "SELECT state FROM levels WHERE symbol=? AND timeframe=? AND from_ms=?"
+            " AND to_ms=?", key,
+        ).fetchone()
+        retired_at = None if state is LevelState.ACTIVE else now_ms
+        if row is None:
+            conn.execute(
+                "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
+                " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen, last_seen,"
+                " state, retired_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
+                 float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
+                 float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
+                 lvl.structure_to_ms, now_ms, now_ms, state.value, retired_at),
+            )
+            added += 1
+            retired += state is not LevelState.ACTIVE
+            continue
+        was_active = row[0] == LevelState.ACTIVE.value
+        conn.execute(
+            "UPDATE levels SET last_seen=?, price=?, zone_lo=?, zone_hi=?, state=?,"
+            " retired_at=COALESCE(retired_at, ?) WHERE symbol=? AND timeframe=?"
+            " AND from_ms=? AND to_ms=?",
+            (now_ms, float(lvl.price), float(lvl.zone_lo), float(lvl.zone_hi),
+             state.value, retired_at, *key),
+        )
+        updated += 1
+        retired += was_active and state is not LevelState.ACTIVE
+    conn.commit()
+    return added, updated, retired
+
+
+class CarriedLevel(BaseModel):
+    """Уровень, перенесённый из прошлого прогона: посчитать заново его не удалось.
+
+    Отдельный тип, а не `Level`: у `Level` есть поля, которых здесь взять неоткуда
+    (индексы баров в ряду, которого в этом прогоне нет). Отдать `Level` с выдуманными
+    индексами значило бы сфабриковать данные (§4.3).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    side: str
+    price: Decimal
+    zone_lo: Decimal
+    zone_hi: Decimal
+    from_ms: int
+    to_ms: int
+    first_seen: int
+    last_seen: int
+
+
+def carried_levels(
+    conn: sqlite3.Connection, symbol: str, now_ms: int
+) -> tuple[CarriedLevel, ...]:
+    """Активные уровни карты, которых в ЭТОМ прогоне посчитать не удалось.
+
+    «Не удалось» определяется вызывающим по `last_seen`: строки, чей `last_seen` старше
+    текущего прогона, — это и есть перенесённые. Возвращаются как есть, без пересчёта:
+    ПОК у них старый, и выдавать его за свежий нельзя.
+    """
+    rows = conn.execute(
+        "SELECT timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms, first_seen,"
+        " last_seen FROM levels WHERE symbol=? AND state='active' AND last_seen < ?"
+        " ORDER BY price", (symbol, now_ms),
+    ).fetchall()
+    return tuple(
+        CarriedLevel(
+            timeframe=r[0], side=r[1], price=Decimal(str(r[2])),
+            zone_lo=Decimal(str(r[3])), zone_hi=Decimal(str(r[4])),
+            from_ms=r[5], to_ms=r[6], first_seen=r[7], last_seen=r[8],
+        )
+        for r in rows
+    )
 
 
 OWNER_QUERIES: dict[str, str] = {

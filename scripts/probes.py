@@ -587,6 +587,91 @@ async def states() -> None:
         await ex.close()
 
 
+async def map_drift() -> None:
+    """Сколько уровней исчезает из карты по НЕВЕРНОЙ причине — уход окна баров.
+
+    Курс знает ровно одну причину убрать уровень: стр. 25 — «уровень был отработан на 1
+    касание… мы этот уровень удаляем». Моя карта строится заново каждый прогон из
+    последних 1000 баров, поэтому есть и вторая, которой в курсе нет: структура просто
+    уехала за край окна. Различить их можно только замером — снаружи обе выглядят как
+    «уровня больше нет».
+
+    Замер: два окна по 800 баров, сдвинутые на 200. Уровень из раннего окна ищется в
+    позднем по (ТФ, сторона, цена в пределах шага цены).
+    """
+    shift, min_bars = 200, 400
+    # ⚠ Ширина окна считается ОТ ФАКТИЧЕСКОЙ длины ряда, а не берётся константой.
+    # Первая редакция ставила `width = 800` и проверяла `len(bars) < shift + width`:
+    # `fetch_closed_ohlcv(limit=1000)` отдаёт 999 баров (незакрытый отброшен по §6), и
+    # условие `999 < 1000` пропускало ВСЕ ТФ. Зонд напечатал «уровней 0» и выглядел
+    # исправным — ровно тот ноль с правдоподобным видом, про который CLAUDE.md.
+    ex = Exchange()
+    await ex.open()
+    try:
+        for s in SYMS:
+            inst = ex.instrument(s)
+            if isinstance(inst, NotReady):
+                continue
+            gone: Counter[str] = Counter()
+            kept = 0
+            for tf in TFS:
+                f = await ex.fetch_closed_ohlcv(s, tf, limit=1000)
+                if isinstance(f, NotReady) or len(f.bars) < shift + min_bars:
+                    continue
+                width = len(f.bars) - shift
+                early, late = f.bars[:width], f.bars[shift:shift + width]
+                maps: list[list[tuple[levels.Level, list[Bar]]]] = []
+                for bars in (early, late):
+                    sw = swings.detect(bars)
+                    if isinstance(sw, NotReady):
+                        maps.append([])
+                        continue
+                    todo = []
+                    days: set[date] = set()
+                    for a in accumulation.detect(bars, sw, tf).closed:
+                        lo, hi = levels.structure_window_ms(a, bars, TIMEFRAME_MS[tf])
+                        todo.append((tf, a, lo, hi))
+                        d = datetime.fromtimestamp(lo / 1000, UTC).date()
+                        end = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
+                        while d <= end:
+                            days.add(d)
+                            d += timedelta(days=1)
+                    frames = {}
+                    for d in sorted(days):
+                        path = CACHE / f"{inst.market_id}-{d.isoformat()}-{BUCKET_MS}.parquet"
+                        if path.exists():
+                            frames[d] = pl.read_parquet(path)
+                    built, _st, sk = _levels_over(
+                        s, inst.tick_size, todo, frames, {tf: bars})
+                    if not built:
+                        print(f"  ⚠ {tf}: структур {len(todo)}, суток нужно {len(days)}, "
+                              f"в кэше {len(frames)}, уровней 0 — {dict(sk)}")
+                    maps.append([(x, bars) for x, _n, _t, _a in built])
+                early_map, late_map = maps
+                late_prices = {(x.timeframe, x.side, round(float(x.price), 8))
+                               for x, _b in late_map}
+                cutoff = late[0].open_ms
+                for lvl, _b in early_map:
+                    if (lvl.timeframe, lvl.side, round(float(lvl.price), 8)) in late_prices:
+                        kept += 1
+                        continue
+                    st = levels.status(lvl, early)
+                    if st.state is not levels.LevelState.ACTIVE:
+                        gone[f"по курсу: {st.state.value}"] += 1
+                    elif lvl.structure_from_ms < cutoff:
+                        gone[f"ОКНО УЕХАЛО ({tf})"] += 1
+                    else:
+                        gone[f"необъяснённо ({tf})"] += 1
+            total = kept + sum(gone.values())
+            wrong = sum(v for k, v in gone.items() if k.startswith("ОКНО"))
+            print(f"\n=== {s}: уровней в раннем окне {total}, дожило {kept}")
+            print(f"  исчезло: {dict(gone)}")
+            print(f"  ПО НЕВЕРНОЙ ПРИЧИНЕ (окно уехало): {wrong}"
+                  + (f" — {wrong / total * 100:.0f}% карты" if total else ""))
+    finally:
+        await ex.close()
+
+
 async def archive_need() -> None:
     """map-depth, data-channels: сколько суток архива нужно при разных горизонтах."""
     mb = {"BTC/USDT:USDT": 15.5, "ETH/USDT:USDT": 6.0}
@@ -626,11 +711,25 @@ async def archive_need() -> None:
 
 
 async def rest_history() -> None:
-    """data-channels: отдаёт ли REST исторические сделки и с какой скоростью."""
+    """data-channels: что REST покрывает сам, а где нужен архив.
+
+    Отвечает на вопрос владельца 2026-08-04: «нужны ли нам вообще запросы к data, если
+    rest покрывает необходимый набор свечей даже на дневном таймфрейме?» Ответ разный
+    для БАРОВ и для СДЕЛОК, и здесь он меряется, а не выводится.
+    """
     import ccxt.pro as ccxtpro
     ex = ccxtpro.binanceusdm({"enableRateLimit": True})
     await ex.load_markets()
     try:
+        print("БАРЫ — REST, архив не нужен:")
+        for tf in ("1d", "4h"):
+            t0 = time.perf_counter()
+            b = await ex.fetch_ohlcv("BTC/USDT:USDT", tf, limit=1000)
+            el = time.perf_counter() - t0
+            print(f"  {tf:>3}: {len(b)} баров за {el:.2f} с, "
+                  f"охват {(b[-1][0] - b[0][0]) / 86400000:.0f} суток")
+
+        print("\nСДЕЛКИ — REST историю ОТДАЁТ, но окно структуры им не закрыть:")
         for name, dt in (("18 суток назад", datetime(2026, 7, 17, 6, 15, tzinfo=UTC)),
                          ("трое суток назад", datetime(2026, 8, 1, tzinfo=UTC))):
             since = int(dt.timestamp() * 1000)
@@ -638,7 +737,24 @@ async def rest_history() -> None:
             tr = await ex.fetch_trades("BTC/USDT:USDT", since=since, limit=1000)
             el = time.perf_counter() - t0
             span = (tr[-1]["timestamp"] - tr[0]["timestamp"]) / 1000 if tr else 0
-            print(f"{name:20} сделок {len(tr)} за {el:.2f} с, охват рынка {span:.1f} с")
+            print(f"  {name:20} сделок {len(tr)} за {el:.2f} с, охват рынка {span:.1f} с")
+
+        # Цена ОДНОГО окна структуры: 8 страниц замеряются, остальное экстраполируется.
+        lo = int(datetime(2026, 7, 17, 6, 15, tzinfo=UTC).timestamp() * 1000)
+        hi = int(datetime(2026, 7, 17, 17, 0, tzinfo=UTC).timestamp() * 1000)
+        cur, pages, got, t0 = lo, 0, 0, time.perf_counter()
+        while pages < 8:
+            tr = await ex.fetch_trades("BTC/USDT:USDT", since=cur, limit=1000)
+            if not tr or tr[-1]["timestamp"] + 1 <= cur:
+                break
+            pages, got, cur = pages + 1, got + len(tr), tr[-1]["timestamp"] + 1
+        el = time.perf_counter() - t0
+        est = (hi - lo) / (cur - lo) * pages
+        print(f"\n  окно структуры BTC 15м 17.07 ({(hi - lo) / 3600000:.1f} ч):")
+        print(f"    замерено {pages} страниц, {got} сделок за {el:.2f} с "
+              f"(покрыто {(cur - lo) / 1000:.0f} с рынка)")
+        print(f"    на ВСЁ окно ≈ {est:.0f} запросов ≈ {est * el / pages / 60:.0f} мин")
+        print("    те же сутки одним ZIP: 15.5 МБ за 5.3 с")
     finally:
         await ex.close()
 
@@ -695,6 +811,7 @@ PROBES = {
     "author-poc": author_poc,
     "ladder": ladder,
     "states": states,
+    "map-drift": map_drift,
     "archive-need": archive_need,
     "rest-history": rest_history,
     "bar-vs-tick": bar_vs_tick,

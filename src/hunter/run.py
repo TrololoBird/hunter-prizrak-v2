@@ -169,6 +169,7 @@ def record(run_id: str, report: RunReport, uni: Universe) -> None:
     сделки в исходы НЕ пишутся: исход у них ещё не наступил (§4.3).
     """
     conn = store.open_production_ledger()
+    stamp_ms = clock.now_ms()
     try:
         for sym in uni.symbols:
             series = {tf: st.bars for (s, tf), st in report.series.items()
@@ -179,6 +180,24 @@ def record(run_id: str, report: RunReport, uni: Universe) -> None:
             lv, _ = levels.build_all(sym, series, trades, tuple(uni.timeframes))
             trends = {tf: swings.trend(sw) for tf, bars in series.items()
                       if not isinstance(sw := swings.detect(bars), NotReady)}
+
+            # Карта живёт МЕЖДУ прогонами (стр. 25, 31). Замер `probes.py map-drift`:
+            # при сдвиге окна на 200 баров 2-3% активных уровней исчезали не потому, что
+            # отработаны, а потому что структура уехала за край окна в 1000 баров.
+            # ⚠ Отметка времени берётся ОДНА на прогон, а не по вызову. Первая редакция
+            # звала `clock.now_ms()` дважды, и второй ответ был на миллисекунды позже
+            # первого: строки, только что записанные этим же прогоном, попадали под
+            # условие `last_seen < now` и объявлялись «перенесёнными из прошлых
+            # прогонов». Живой прогон на ПУСТОЙ карте напечатал «перенесено 4» — число
+            # правдоподобное и целиком выдуманное.
+            seen = [(x, levels.status(x, series[x.timeframe]).state) for x in lv]
+            added, upd, retired = store.sync_levels(conn, sym, seen, stamp_ms)
+            carried = store.carried_levels(conn, sym, stamp_ms)
+            report.map_added += added
+            report.map_updated += upd
+            report.map_retired += retired
+            report.map_carried[sym] = carried
+
             for em in emit.select(lv, series, trends):
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
@@ -348,6 +367,17 @@ def print_report(r: RunReport, now_ms: int) -> int:
     print(f"   сигналов записано: {r.signals_recorded}")
     print(f"   исходов записано: {r.outcomes_recorded} "
           f"(открытые и несостоявшиеся не пишутся — §4.3)")
+
+    carried = sum(len(v) for v in r.map_carried.values())
+    print("\n7б. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
+    print(f"   новых уровней: {r.map_added}, подтверждено прежних: {r.map_updated}")
+    print(f"   снято по курсу (отработан/пробит): {r.map_retired}")
+    print(f"   ПЕРЕНЕСЕНО из прошлых прогонов: {carried} "
+          f"(активны, но в этом окне баров не пересчитаны)")
+    for sym, rows in sorted(r.map_carried.items()):
+        for c in rows[:3]:
+            print(f"     {sym:16} {c.timeframe:>3} {c.side:5} ПОК {c.price} "
+                  f"(окно {c.from_ms}…{c.to_ms})")
 
     violations = (len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
                   + len(offgrid_seed))

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -230,3 +231,15 @@ class RunReport(BaseModel):
     backfill_days_loaded: int = 0
     backfill_days_missing: int = 0
     backfill_trades: int = 0
+
+    map_added: int = 0
+    map_updated: int = 0
+    map_retired: int = 0
+    map_carried: dict[str, tuple[Any, ...]] = Field(default_factory=dict)
+    """Уровни, ПЕРЕНЕСЁННЫЕ из прошлых прогонов: посчитать заново их не удалось.
+
+    Тип элемента — `store.CarriedLevel`; здесь `Any`, потому что `store` импортирует
+    модели, а не наоборот, и обратная ссылка замкнула бы цикл. Это ЕДИНСТВЕННОЕ место
+    с `Any` в моделях, и оно отмечено умышленно: гейт `no_loose_dicts` запрещает
+    `dict[str, Any]` как контракт между слоями, а здесь контейнер отчёта, не контракт.
+    """
