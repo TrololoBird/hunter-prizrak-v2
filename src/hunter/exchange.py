@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import Counter
 from collections.abc import AsyncGenerator
 from decimal import Decimal
 from typing import Any
 
+import ccxt
 import ccxt.pro as ccxtpro
 from pydantic import ValidationError
 
@@ -22,6 +25,18 @@ from .models import Bar, ClockSync, Instrument, NotReady, OhlcvFetch
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
 
+WS_SILENCE_S = 60.0
+"""Молчание потока дольше этого — поломка. ЗАМЕР 2026-08-04, BTC/USDT:USDT.
+
+`watch_ohlcv` отвечает med 0.40 с, p90 0.72 с, max 1.13 с на 1Н и med 0.38 / max 0.83 на
+5м: Binance обновляет свечу ПО ТАЙМЕРУ, а не по сделке, поэтому тишина на барах означает
+именно обрыв. `watch_trades` — med 0.08 с, max 0.79 с. Порог взят с запасом ×53 к
+наибольшему наблюдённому промежутку.
+"""
+
+WS_RETRY_S = 1.0
+"""Пауза перед повторной подпиской. Число ПОДОБРАНО, а не замерено, и здесь названо так."""
+
 
 class Exchange:
     def __init__(self) -> None:
@@ -32,6 +47,13 @@ class Exchange:
             "options": {"watchTrades": {"name": "aggTrade"}},
         })
         self._instruments: dict[str, Instrument] = {}
+        self.ws_reconnects: Counter[str] = Counter()
+        self.ws_errors: Counter[str] = Counter()
+        """Переподключения и ошибки биржи по потокам. Читает отчёт прогона.
+
+        Живут на объекте, а не внутри генератора: генератор о структуре отчёта не знает,
+        а без счётчика переподключение неотличимо от бесперебойной работы.
+        """
 
     async def open(self) -> ClockSync:
         await self._ex.load_markets()
@@ -119,13 +141,19 @@ class Exchange:
             )
         return OhlcvFetch(bars=closed, rejected=rejected)
 
-    async def count_history(self, symbol: str, timeframe: str, cap: int = 0) -> int:
+    async def count_history(self, symbol: str, timeframe: str, *, cap: int) -> int:
         """Сколько баров биржа отдаёт по символу и ТФ.
 
-        `cap > 0` — считать до отсечки и остановиться: для допуска важно «хватает
-        ли», а не точное число. Без отсечки счёт по 5м занимает 15 страниц на символ.
-        Возвращённое значение при достижении отсечки означает «не меньше cap».
+        `cap` — считать до отсечки и остановиться: для допуска важно «хватает ли», а не
+        точное число. Возвращённое значение при достижении отсечки означает «не меньше cap».
+
+        ⚠ Параметр ОБЯЗАТЕЛЕН и только именованный. Раньше стояло `cap: int = 0`, то есть
+        «без предела» по умолчанию: пагинация шла до исчерпания истории — по 5м это 15
+        страниц на символ, на 27 символах × 6 ТФ сотни запросов подряд. Оба нынешних
+        вызывающих отсечку передают, так что мина была скрытой; умолчание её и прятало.
         """
+        if cap <= 0:
+            raise ValueError(f"count_history({symbol} {timeframe}): cap обязан быть > 0")
         total, since = 0, 0
         while True:
             r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
@@ -140,16 +168,57 @@ class Exchange:
             since = int(r[-1][0]) + 1
         return total
 
+    async def _watch_step(self, what: str, key: str, factory: Any) -> Any | None:
+        """Одно ожидание WS с таймаутом и переподключением. `None` — попытка не удалась.
+
+        ⚠ Раньше переподключения не было ВООБЩЕ: генератор делал `while True: yield await
+        …`, и первое же сетевое исключение завершало его навсегда. Процесс, задуманный
+        работать сутками, деградировал до нуля потоков без единого сообщения.
+
+        Молчание тоже ловится, и порог тут ЗАМЕРЕН, а не выбран. Замер 2026-08-04 по
+        BTC/USDT:USDT: `watch_ohlcv` отвечает med 0.40 с / p90 0.72 с / max 1.13 с на 1Н
+        и med 0.38 / max 0.83 на 5м — то есть Binance шлёт обновление по таймеру, а не по
+        сделке, и молчание потока означает поломку, а не тихий рынок. `watch_trades`:
+        med 0.08 с, max 0.79 с.
+
+        ⚠ Для сделок на НЕЛИКВИДНОМ символе долгая тишина законна, и там этот порог даст
+        ложное срабатывание. Оно выбрано сознательно: ложная тревога с названной причиной
+        лучше, чем молчаливая смерть потока (§4.3). Замера по неликвидным символам нет.
+        """
+        try:
+            return await asyncio.wait_for(factory(), timeout=WS_SILENCE_S)
+        except TimeoutError:
+            self.ws_reconnects[key] += 1
+            log.degraded(f"{what}: поток молчит дольше порога, переподключение",
+                         символ=key, порог_с=WS_SILENCE_S)
+        except ccxt.NetworkError as e:
+            self.ws_reconnects[key] += 1
+            log.degraded(f"{what}: сетевой сбой, переподключение",
+                         символ=key, причина=f"{type(e).__name__} {e}")
+        except ccxt.ExchangeError as e:
+            self.ws_errors[key] += 1
+            log.error(f"{what}: ошибка биржи", символ=key,
+                      причина=f"{type(e).__name__} {e}")
+        await asyncio.sleep(WS_RETRY_S)
+        return None
+
     async def watch_closed_ohlcv(self, symbol: str, timeframe: str) -> AsyncGenerator[Bar]:
         """WS-поток. Отдаёт бар только после его закрытия (§6).
 
         Признак закрытия — биржевое время дошло до правой границы, а не «отбросить
         последний элемент кэша»: последний элемент бывает и закрытым, и тогда
         отбрасывание подало бы позапрошлый бар.
+
+        Курсор `emitted` живёт ВНЕ попытки и потому переживает переподключение. Иначе
+        после обрыва уже отданные бары ушли бы повторно, а потребитель их не различает.
         """
         emitted: int | None = None
+        key = f"{symbol} {timeframe}"
         while True:
-            raw = await self._ex.watch_ohlcv(symbol, timeframe)
+            raw = await self._watch_step("бары", key,
+                                         lambda: self._ex.watch_ohlcv(symbol, timeframe))
+            if raw is None:
+                continue
             now = clock.now_ms()
             for r in raw:
                 open_ms = int(r[0])
@@ -165,7 +234,10 @@ class Exchange:
 
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[dict[str, Any]]]:
         while True:
-            yield await self._ex.watch_trades(symbol)
+            batch = await self._watch_step("сделки", symbol,
+                                           lambda: self._ex.watch_trades(symbol))
+            if batch is not None:
+                yield batch
 
 
 def _price_filter_tick(market: dict[str, Any]) -> Decimal | None:

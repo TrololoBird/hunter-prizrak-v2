@@ -290,6 +290,16 @@ class RunReport(BaseModel):
     backfill_days_capped: int = 0
     """Сутки, отброшенные предохранителем. §4.3: усечение обязано быть ЧИСЛОМ в отчёте."""
 
+    watch_failures: list[str] = Field(default_factory=list)
+    """Задачи наблюдения, умершие не по остановке. Пустой список — И ЭТО ЧИСЛО В СВОДКЕ.
+
+    До 2026-08-04 такие задачи исчезали в `gather(..., return_exceptions=True)`: символ
+    переставал получать данные, а сводка печатала «0 нарушений».
+    """
+
+    ws_reconnects: int = 0
+    ws_stream_errors: int = 0
+
     map_added: int = 0
     map_updated: int = 0
     map_retired: int = 0

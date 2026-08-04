@@ -33,7 +33,7 @@ from . import (
     priority,
     swings,
 )
-from .bars import TIMEFRAME_MS
+from .bars import TIMEFRAME_MS, continuous_tail
 from .models import Bar, NotReady, TradeWindows
 
 TF_LABEL = {"5m": "5м", "15m": "15м", "1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
@@ -204,8 +204,23 @@ def render(
     for tf in timeframes:
         if tf not in scans:
             continue
-        bars, sw = series[tf], sw_by_tf[tf]
+        full, sw = series[tf], sw_by_tf[tf]
+        # ⚠ Рекурсивные величины считаются ТОЛЬКО на непрерывном хвосте. Ряд с дырой
+        # ATR/RSI/EMA считают как смежный, и сглаживание тащит искажение на десятки
+        # баров вперёд — а от ATR зависит стоп. До 2026-08-04 `find_gaps` звалась лишь
+        # для отчёта, и дыра доходила до расчёта беспрепятственно.
+        bars = continuous_tail(full, tf)
         parts: list[str] = []
+        if len(bars) < len(full):
+            parts.append(f"⚠ разрыв в ряду: считаем по хвосту {len(bars)} из {len(full)}")
+        # Свинги пересчитываются на хвосте: их индексы принадлежат СВОЕМУ ряду, и
+        # подставить сюда свинги полного ряда значило бы адресовать чужие бары.
+        sw_tail = sw if len(bars) == len(full) else swings.detect(bars)
+        if isinstance(sw_tail, NotReady):
+            out.append(f"  {TF_LABEL.get(tf, tf):>3}  хвост без разрывов слишком короток: "
+                       f"{sw_tail.reason}")
+            continue
+        sw = sw_tail
         for name, expr in (("RSI", indicators.rsi()), ("MACD", indicators.macd_line())):
             for d in factors.divergences(bars, sw, _series(bars, expr), name):
                 what = ("дивергенция" if d.kind is factors.DivergenceKind.DIVERGENCE

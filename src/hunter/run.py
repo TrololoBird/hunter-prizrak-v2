@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from datetime import UTC, date, datetime, timedelta
 
 from . import archive, card, clock, emit, levels, log, store, swings
@@ -52,7 +53,7 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> No
                          первый_после=st.gaps[0][0])
 
 
-async def _watch_bars(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> None:
+async def _watch_bars_impl(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> None:
     agen = ex.watch_closed_ohlcv(st.symbol, st.timeframe)
     try:
         while not stop.is_set():
@@ -73,7 +74,7 @@ async def _watch_bars(ex: Exchange, st: SeriesState, stop: asyncio.Event) -> Non
         await agen.aclose()
 
 
-async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
+async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
                         binned: BarBinnedTrades, stop: asyncio.Event) -> None:
     agen = ex.watch_agg_trades(sym)
     try:
@@ -90,6 +91,33 @@ async def _watch_trades(ex: Exchange, sym: str, hist: TradeHistogram,
         raise
     finally:
         await agen.aclose()
+
+
+async def _guarded(name: str, coro: Awaitable[None], report: RunReport) -> None:
+    """Обёртка задачи наблюдения: смерть задачи ОБЯЗАНА попасть в отчёт.
+
+    ⚠ Без неё задачи ловили только `CancelledError`, а `gather(..., return_exceptions=
+    True)` поглощал всё прочее без лога и без счётчика. Символ переставал получать данные
+    в середине прогона, а сводка показывала его наблюдавшимся и печатала «0 нарушений».
+    Это ровно тот тихий отказ, который запрещает §4.3, — и ни один из пятнадцати гейтов
+    его не видел, включая `no_silent_failure.py`.
+
+    Обёртка только ЛОГИРУЕТ и пробрасывает: считает отказы разбор `gather` — иначе один
+    отказ попадает в счётчик дважды. Проверено пробником: подсаженный сбой одного потока
+    дал «умерло 2» до этой правки.
+
+    Немедленный лог всё равно нужен: `gather` разбирается только после остановки, а
+    оператору важно видеть отказ в тот момент, когда он случился.
+    """
+    del report  # счётчик ведёт разбор gather; здесь только лог
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("задача наблюдения умерла", задача=name,
+                  причина=f"{type(e).__name__} {e}")
+        raise
 
 
 def needed_days(
@@ -316,7 +344,9 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
         stop = asyncio.Event()
         tasks: list[asyncio.Task[None]] = []
         for st in report.series.values():
-            tasks.append(asyncio.create_task(_watch_bars(ex, st, stop)))
+            name = f"бары {st.symbol} {st.timeframe}"
+            tasks.append(asyncio.create_task(
+                _guarded(name, _watch_bars_impl(ex, st, stop), report), name=name))
         for sym in uni.symbols:
             inst = ex.instrument(sym)
             if isinstance(inst, NotReady):
@@ -328,7 +358,10 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
             bucket = min(TIMEFRAME_MS[tf] for tf in uni.timeframes)
             b = BarBinnedTrades(symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
             report.binned[sym] = b
-            tasks.append(asyncio.create_task(_watch_trades(ex, sym, h, b, stop)))
+            tname = f"сделки {sym}"
+            tasks.append(asyncio.create_task(
+                _guarded(tname, _watch_trades_impl(ex, sym, h, b, stop), report),
+                name=tname))
 
         log.info("наблюдение", потоков=len(tasks), секунд=seconds)
         await asyncio.sleep(seconds)
@@ -343,7 +376,17 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
         stop.set()
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # ⚠ Результаты РАЗБИРАЮТСЯ, а не выбрасываются. `return_exceptions=True` нужен,
+        # чтобы дождаться всех, но проглатывать его молча нельзя: до 2026-08-04 именно
+        # здесь исчезали умершие задачи. `CancelledError` — штатная остановка, всё
+        # остальное — отказ, о котором обязана знать сводка (§4.3).
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, res in zip(tasks, results, strict=True):
+            if isinstance(res, asyncio.CancelledError) or not isinstance(res, BaseException):
+                continue
+            report.watch_failures.append(f"{task.get_name()}: {type(res).__name__} {res}")
+        report.ws_reconnects = sum(ex.ws_reconnects.values())
+        report.ws_stream_errors = sum(ex.ws_errors.values())
 
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
@@ -468,7 +511,14 @@ def print_report(r: RunReport, now_ms: int) -> int:
             print(f"     {sym:16} {c.timeframe:>3} {c.side:5} ПОК {c.price} "
                   f"(окно {c.from_ms}…{c.to_ms})")
 
-    violations = (len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
+    print("\n4б. ПОТОКИ WS — живы ли (§4.3)")
+    print(f"   задач наблюдения умерло: {len(r.watch_failures)}")
+    for why in r.watch_failures[:10]:
+        print(f"     {why}")
+    print(f"   переподключений: {r.ws_reconnects}, ошибок биржи: {r.ws_stream_errors}")
+
+    violations = (len(r.watch_failures)
+                  + len(stale) + len(missing) + unexplained + unclosed + offgrid_ws
                   + len(offgrid_seed))
     print("\n8. ИТОГ")
     print(f"   деградаций отмечено: {log.degraded_count()}")
