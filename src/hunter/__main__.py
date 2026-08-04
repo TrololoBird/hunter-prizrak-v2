@@ -18,11 +18,20 @@ def _run(args: argparse.Namespace) -> int:
     uni = load_universe(args.universe)
     if args.symbols:
         uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
-    from .run import live_run, print_report
+    from . import log
+    from .run import collect, persist_frames, print_report, produce_cards, record
 
-    report = asyncio.run(
-        live_run(uni, args.seconds, args.seed_limit, args.run_id, args.horizon_days)
+    # ЧЕТЫРЕ ШАГА, и они видны здесь, а не спрятаны друг в друге. Раньше `live_run`
+    # делал всё, причём карточку строил ВНУТРИ `persist` — сбор данных и производство
+    # сигнала в одном вызове. Именно из такой слипшейся точки в прошлом проекте вырос
+    # `orchestrator.py` на 2894 строки; разделено до реализации §2.4-2.7, пока дёшево.
+    report, sources = asyncio.run(
+        collect(uni, args.seconds, args.seed_limit, args.horizon_days)
     )
+    persist_frames(args.run_id, report)
+    produce_cards(args.run_id, report, uni, sources)
+    record(args.run_id, report, uni, sources)
+    log.info("кадры сохранены", файлов=report.frames_written, карточек=report.cards_written)
     return 1 if print_report(report, clock.now_ms()) else 0
 
 

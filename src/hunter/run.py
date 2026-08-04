@@ -234,12 +234,19 @@ def trade_source(ex: Exchange, sym: str, report: RunReport) -> TradeWindows | No
                                 live=report.binned.get(sym))
 
 
-def persist(run_id: str, report: RunReport, uni: Universe,
-            sources: dict[str, TradeWindows]) -> None:
-    """Сохранить кадры И карточку для детерминированного повтора (§10.3).
+def bars_of(report: RunReport, sym: str) -> dict[str, list[Bar]]:
+    """Готовые ряды символа. Один фильтр на все три шага — иначе они разойдутся."""
+    return {tf: st.bars for (s, tf), st in report.series.items()
+            if s == sym and st.not_ready is None and st.bars}
 
-    Карточка сохраняется рядом с кадрами, потому что §10.6 требует сравнивать именно её:
-    «на этих сохранённых данных карточка была такой, стала такой».
+
+def persist_frames(run_id: str, report: RunReport) -> None:
+    """ШАГ 2 из трёх: сохранить СЫРЫЕ КАДРЫ. Карточку здесь не строим.
+
+    ⚠ Раньше эта функция ещё и производила карточку. То есть сбор данных и производство
+    сигнала жили в одном вызове — та самая слипшаяся точка, из которой в прошлом проекте
+    вырос `orchestrator.py` на 2894 строки. Разделено 2026-08-04 по внешнему разбору,
+    ДО реализации §2.4-2.7: позже это перестало бы быть десятиминутной правкой.
     """
     for (sym, tf), st in report.series.items():
         if st.not_ready is not None or not st.bars:
@@ -256,10 +263,17 @@ def persist(run_id: str, report: RunReport, uni: Universe,
             store.write_binned_trades(run_id, t)
             report.frames_written += 1
 
+
+def produce_cards(run_id: str, report: RunReport, uni: Universe,
+                  sources: dict[str, TradeWindows]) -> None:
+    """ШАГ 3 из трёх: построить карточки и сохранить рядом с кадрами.
+
+    Рядом с кадрами — потому что §10.6 требует сравнивать именно карточку: «на этих
+    сохранённых данных карточка была такой, стала такой».
+    """
     tfs = tuple(uni.timeframes)
     for sym in uni.symbols:
-        series = {tf: st.bars for (s, tf), st in report.series.items()
-                  if s == sym and st.not_ready is None and st.bars}
+        series = bars_of(report, sym)
         if not series:
             continue
         text = card.render(sym, series, sources.get(sym), tfs)
@@ -269,7 +283,7 @@ def persist(run_id: str, report: RunReport, uni: Universe,
 
 def record(run_id: str, report: RunReport, uni: Universe,
            sources: dict[str, TradeWindows]) -> None:
-    """Записать эмиссии и их исходы в боевой леджер (§8 этап 7).
+    """ШАГ 4 из четырёх: записать эмиссии и их исходы в боевой леджер (§8 этап 7).
 
     Единственное место в проекте, которое пишет сигналы. Открытые и несостоявшиеся
     сделки в исходы НЕ пишутся: исход у них ещё не наступил (§4.3).
@@ -278,8 +292,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
     stamp_ms = clock.now_ms()
     try:
         for sym in uni.symbols:
-            series = {tf: st.bars for (s, tf), st in report.series.items()
-                      if s == sym and st.not_ready is None and st.bars}
+            series = bars_of(report, sym)
             if not series:
                 continue
             lv, _ = levels.build_all(sym, series, sources.get(sym),
@@ -330,8 +343,13 @@ def record(run_id: str, report: RunReport, uni: Universe,
         conn.close()
 
 
-async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
-                   horizon_days: int = 90) -> RunReport:
+async def collect(uni: Universe, seconds: int, seed_limit: int,
+                  horizon_days: int = 90) -> tuple[RunReport, dict[str, TradeWindows]]:
+    """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
+
+    Возвращает отчёт и источники профиля. Сеть трогается только здесь — дальше три шага
+    работают на кадрах и кэше, и потому проверяемы отдельно от биржи.
+    """
     ex = Exchange()
     sync = await ex.open()
     report = RunReport(sync=sync)
@@ -397,12 +415,7 @@ async def live_run(uni: Universe, seconds: int, seed_limit: int, run_id: str,
                    if (src := trade_source(ex, sym, report)) is not None}
     finally:
         await ex.close()
-
-    persist(run_id, report, uni, sources)
-    record(run_id, report, uni, sources)
-    log.info("кадры сохранены", файлов=report.frames_written,
-             каталог=str(store.FRAMES_DIR / run_id))
-    return report
+    return report, sources
 
 
 def print_report(r: RunReport, now_ms: int) -> int:

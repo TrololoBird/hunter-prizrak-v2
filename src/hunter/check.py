@@ -20,7 +20,7 @@ from .bars import expected_last_closed_open_ms, tf_ms
 from .config import Universe
 from .exchange import Exchange
 from .models import RunReport
-from .run import live_run
+from .run import collect
 
 
 def _verdict(lines: list[tuple[str, bool, str]]) -> int:
@@ -133,7 +133,10 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     print(f"Наблюдение: {seconds} с. Это займёт примерно {seconds // 60 + 2} минут.")
 
     print("\n1. ЖИВОЙ ПРОГОН")
-    report = asyncio.run(live_run(uni, seconds, seed_limit, "check"))
+    # Здесь нужен ТОЛЬКО сбор: `check` отвечает на вопрос «живы ли данные», карточки и
+    # леджер к нему отношения не имеют. До разделения конвейера отделить одно от другого
+    # было нельзя, и проверка состояния попутно писала в боевую базу.
+    report, _sources = asyncio.run(collect(uni, seconds, seed_limit, horizon_days=0))
     lines = _report_live(report, clock.now_ms())
 
     required = max(REQUIRED_BARS[q] for q in USED_BY_2_9)

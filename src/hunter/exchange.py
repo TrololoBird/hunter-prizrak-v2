@@ -26,12 +26,29 @@ KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
 
 WS_SILENCE_S = 60.0
-"""Молчание потока дольше этого — поломка. ЗАМЕР 2026-08-04, BTC/USDT:USDT.
+"""Молчание потока БАРОВ дольше этого — поломка. ЗАМЕР 2026-08-04, BTC/USDT:USDT.
 
 `watch_ohlcv` отвечает med 0.40 с, p90 0.72 с, max 1.13 с на 1Н и med 0.38 / max 0.83 на
-5м: Binance обновляет свечу ПО ТАЙМЕРУ, а не по сделке, поэтому тишина на барах означает
-именно обрыв. `watch_trades` — med 0.08 с, max 0.79 с. Порог взят с запасом ×53 к
-наибольшему наблюдённому промежутку.
+5м. Binance обновляет свечу ПО ТАЙМЕРУ, а не по сделке, поэтому тишина на барах означает
+именно обрыв, а не тихий рынок. Запас ×53 к наибольшему наблюдённому промежутку.
+"""
+
+WS_TRADES_SILENCE_S = 300.0
+"""Для СДЕЛОК порог отдельный, и это следствие замера, а не симметрии.
+
+Сделки — поток СОБЫТИЙНЫЙ: тишина в нём означает «сделок не было», то есть данные, а не
+протухание. Первая редакция брала общий порог 60 с, и он назывался сознательным разменом
+«лучше ложная тревога, чем молчаливая смерть». Замер 2026-08-04 показал, что размен был
+куда ближе к краю, чем казалось.
+
+Самый тонкий символ вселенной — ASTR/USDT:USDT, оборот за сутки 0.46 млн USDT против
+9263 млн у BTC (в 20 000 раз тоньше). Его `watch_trades` за 240 с: пакетов 24,
+med 7.91 с, p90 21.63 с, p99 43.37 с, **max 43.37 с**. Промежутков ≥ 60 с — НОЛЬ, то
+есть тревога не сработала бы; но запас составлял ×1.38, а не ×53 как на барах.
+
+⚠ Выборка 240 секунд днём. Ночью и в выходные тонкий символ молчит дольше, и этого я не
+мерил. 300 с — это ×6.9 к наблюдённому максимуму; число выбрано как запас к ЗАМЕРУ, но
+сам замер короткий, и это его главное ограничение.
 """
 
 WS_RETRY_S = 1.0
@@ -168,29 +185,25 @@ class Exchange:
             since = int(r[-1][0]) + 1
         return total
 
-    async def _watch_step(self, what: str, key: str, factory: Any) -> Any | None:
+    async def _watch_step(
+        self, what: str, key: str, factory: Any, silence_s: float
+    ) -> Any | None:
         """Одно ожидание WS с таймаутом и переподключением. `None` — попытка не удалась.
 
         ⚠ Раньше переподключения не было ВООБЩЕ: генератор делал `while True: yield await
         …`, и первое же сетевое исключение завершало его навсегда. Процесс, задуманный
         работать сутками, деградировал до нуля потоков без единого сообщения.
 
-        Молчание тоже ловится, и порог тут ЗАМЕРЕН, а не выбран. Замер 2026-08-04 по
-        BTC/USDT:USDT: `watch_ohlcv` отвечает med 0.40 с / p90 0.72 с / max 1.13 с на 1Н
-        и med 0.38 / max 0.83 на 5м — то есть Binance шлёт обновление по таймеру, а не по
-        сделке, и молчание потока означает поломку, а не тихий рынок. `watch_trades`:
-        med 0.08 с, max 0.79 с.
-
-        ⚠ Для сделок на НЕЛИКВИДНОМ символе долгая тишина законна, и там этот порог даст
-        ложное срабатывание. Оно выбрано сознательно: ложная тревога с названной причиной
-        лучше, чем молчаливая смерть потока (§4.3). Замера по неликвидным символам нет.
+        Порог молчания подаётся аргументом, потому что у баров и сделок он РАЗНОЙ ПРИРОДЫ:
+        бары идут по таймеру биржи (тишина = обрыв), сделки — по событию (тишина = данные).
+        Числа и их замеры — в `WS_SILENCE_S` и `WS_TRADES_SILENCE_S`.
         """
         try:
-            return await asyncio.wait_for(factory(), timeout=WS_SILENCE_S)
+            return await asyncio.wait_for(factory(), timeout=silence_s)
         except TimeoutError:
             self.ws_reconnects[key] += 1
             log.degraded(f"{what}: поток молчит дольше порога, переподключение",
-                         символ=key, порог_с=WS_SILENCE_S)
+                         символ=key, порог_с=silence_s)
         except ccxt.NetworkError as e:
             self.ws_reconnects[key] += 1
             log.degraded(f"{what}: сетевой сбой, переподключение",
@@ -215,8 +228,9 @@ class Exchange:
         emitted: int | None = None
         key = f"{symbol} {timeframe}"
         while True:
-            raw = await self._watch_step("бары", key,
-                                         lambda: self._ex.watch_ohlcv(symbol, timeframe))
+            raw = await self._watch_step(
+                "бары", key, lambda: self._ex.watch_ohlcv(symbol, timeframe),
+                WS_SILENCE_S)
             if raw is None:
                 continue
             now = clock.now_ms()
@@ -234,8 +248,9 @@ class Exchange:
 
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[dict[str, Any]]]:
         while True:
-            batch = await self._watch_step("сделки", symbol,
-                                           lambda: self._ex.watch_trades(symbol))
+            batch = await self._watch_step(
+                "сделки", symbol, lambda: self._ex.watch_trades(symbol),
+                WS_TRADES_SILENCE_S)
             if batch is not None:
                 yield batch
 
