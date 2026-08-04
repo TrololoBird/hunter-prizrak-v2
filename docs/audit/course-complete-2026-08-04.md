@@ -95,3 +95,13 @@
   ни по глубине истории не мерилось.
 - Ни одна величина §2 **не сверялась с разметкой автора**: это фаза корпуса, и она не
   начиналась.
+
+## Как воспроизвести (§7.3)
+
+```bash
+uv run python scripts/probes.py structures
+uv run python scripts/probes.py pereprior
+uv run python scripts/probes.py factors
+```
+
+Сквозной прогон целиком — `uv run python -m hunter run --symbols 2 --trade-days 3`, затем `uv run python -m hunter replay --run-id last --diff`.

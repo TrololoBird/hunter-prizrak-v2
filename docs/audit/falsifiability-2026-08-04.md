@@ -61,3 +61,14 @@ BTC · ETH · SOL · ONDO · BNB · XRP · DOGE · LINK, ТФ 5м/15м/1ч/4ч/1
 - Доля сходящихся структур: 1 из 671 здесь против 1 из 204 в `figures-2026-08-04.md` —
   разные выборки, и обе слишком малы, чтобы говорить о доле.
 - Корпус не привлекался.
+
+## Как воспроизвести (§7.3)
+
+```bash
+uv run python scripts/probes.py breach
+uv run python scripts/probes.py factors
+uv run python scripts/probes.py pereprior
+uv run python scripts/probes.py structures
+```
+
+Контроль §2.8 (согласие с приоритетом) отдельным зондом НЕ сохранён — он и был тем самым скриптом, в котором нашлась ошибка порядка вычислений.
