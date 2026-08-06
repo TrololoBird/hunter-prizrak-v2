@@ -3,6 +3,10 @@
     "context7": {
       "type": "http",
       "url": "https://mcp.context7.com/mcp"
+    },
+    "github-actions": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/x/actions/readonly"
     }
   }
 }
