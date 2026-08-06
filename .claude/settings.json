@@ -15,13 +15,6 @@
       "Bash(ls *)",
       "Bash(du *)",
       "Bash(wc *)"
-    ],
-    "deny": [
-      "Bash(git push --force *)",
-      "Bash(git push -f *)",
-      "Bash(git reset --hard *)",
-      "Bash(curl * | *)",
-      "Read(./.credentials.json)"
     ]
   },
   "hooks": {
@@ -37,7 +30,7 @@
           },
           {
             "type": "command",
-            "command": "uv run python ${CLAUDE_PROJECT_DIR}/.claude/hooks/protect_data.py",
+            "command": "uv run python ${CLAUDE_PROJECT_DIR}/.claude/hooks/guard_destructive.py",
             "timeout": 30
           }
         ]
