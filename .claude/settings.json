@@ -24,6 +24,16 @@
       "Read(./.credentials.json)"
     ]
   },
+  "env": {
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "disableClaudeAiConnectors": true,
+  "worktree": {
+    "symlinkDirectories": [
+      "data",
+      ".venv"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
