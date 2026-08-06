@@ -27,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .levels import Level, LevelSide
+from .levels import Level, LevelSide, MappedLevel
 from .levels import nested as nested_levels
 
 TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
@@ -50,6 +50,31 @@ GOLDEN_RR = 3.0
 
 BIG_STRUCTURE_TFS = frozenset({"1d", "1w"})
 """Стр. 30: крупное накопление — закуп делить на зону И уровень. Мелкое — одним ордером."""
+
+
+class StopBasis(StrEnum):
+    """Чем обоснован выставляемый стоп. Оба варианта — из курса, третьего нет."""
+
+    ANCHOR = "anchor"
+    """За стоповым объёмом или за проколом границы (стр. 18).
+
+    Стр. 18 называет это предпочтительным: «идеально стоп прятать за них». Прокол при
+    3+ точках границы — вообще обязателен: «стоп ВСЕГДА ставится за этот прокол».
+    """
+
+    MARGIN = "margin"
+    """Запас за структуру, когда прятать не за что (стр. 33: «с запасом 1-3%»)."""
+
+
+DEFAULT_MARGIN_PCT = STOP_MARGIN_MAX_PCT
+"""Какой край диапазона 1-3% берётся, когда якоря нет.
+
+⚠ Это ВЫБОР ВНУТРИ ДИАПАЗОНА, названного курсом, а не замер. Курс даёт «1-3%» и внутри
+не выбирает; выставить же можно одно число. Взят ДАЛЬНИЙ край, потому что назначение
+запаса курс формулирует как защиту: «обезопасит от сквизов на рынке, и на случай пробоя
+уровня и закрепа у вас будет больше шансов выйти в бу» (стр. 33). Ближний край той же
+цели служит хуже, а РР при отсутствии якоря и так худший из возможных.
+"""
 
 
 class TargetRole(StrEnum):
@@ -108,18 +133,36 @@ class Setup(BaseModel):
     stop_risky: Decimal
     """Прямо за границу структуры, без запаса (стр. 33)."""
 
-    structural_anchor: Decimal | None
-    """Стоповый объём или лой ТФ-1 в 2-5% от границы — «идеально стоп прятать за них» (стр. 18).
+    stop: Decimal
+    """ОДИН стоп, который выставляется. Всё выше — как он получен, а не выбор оператору.
 
-    None означает «такого якоря не подано», а не «его нет»: искать его — работа
-    вызывающего, у которого есть структуры младшего ТФ.
+    ⚠ До 2026-08-05 этого поля не было, и карточка печатала три цены: безопасный ближний,
+    безопасный дальний и рисковый. Выставить можно только ОДИН стоп, значит карточка
+    выдавала не сигнал, а меню, и РР был не определён — все замеры РР и R считались по
+    невыбранному стопу. Выбор делается здесь, по стр. 18 и 33, и называется в `stop_basis`.
+    """
+
+    stop_basis: StopBasis
+    """Чем стоп обоснован. Печатается рядом с ценой: оператор обязан видеть НЕ ТОЛЬКО
+    число, но и правило, по которому оно получено."""
+
+    structural_anchor: Decimal | None
+    """Стоповый объём или прокол в 2-5% от границы — «идеально стоп прятать за них» (стр. 18).
+
+    None — якоря нет: ни прокола на 3+ точках, ни стопового объёма в полосе. Тогда стоп
+    ставится запасом за структуру (стр. 33).
     """
 
     targets: tuple[Target, ...]
     partial_take_pct: float = PARTIAL_TAKE_PCT
 
-    def rr(self, stop: Decimal) -> float | None:
-        """РР до ПЕРВОЙ цели (стр. 9). None — целей нет, а не «ноль»."""
+    def rr(self, stop: Decimal | None = None) -> float | None:
+        """РР до ПЕРВОЙ цели (стр. 9). None — целей нет, а не «ноль».
+
+        Без аргумента считается по ВЫСТАВЛЯЕМОМУ стопу — единственное значение, имеющее
+        смысл. Аргумент оставлен для замеров, сравнивающих варианты между собой.
+        """
+        stop = self.stop if stop is None else stop
         primary = [t for t in self.targets if t.role is TargetRole.PRIMARY]
         if not primary:
             return None
@@ -136,20 +179,38 @@ def _tf_step(a: str, b: str) -> int | None:
     return TF_ORDER.index(a) - TF_ORDER.index(b)
 
 
-def build_targets(level: Level, pool: tuple[Level, ...]) -> tuple[Target, ...]:
+def build_targets(level: Level, pool: tuple[MappedLevel, ...]) -> tuple[Target, ...]:
     """Цели по стр. 24: свой ТФ и старшие — основные, ТФ-1 — промежуточные, ТФ-2 — нет.
 
     Целью служит уровень ПРОТИВОПОЛОЖНОЙ стороны по ходу сделки: от лонгового уровня
     идём вверх к шортовому (стр. 24, пример «цена забирает 4ч Лонг уровень; ваша цель —
     шорт уровень 4ч тф»).
+
+    ⚠ Пул подаётся РАЗМЕЧЕННЫМ (`MappedLevel`), и это не удобство типов. Прежняя редакция
+    брала `tuple[Level, ...]` и не проверяла ни момент появления цели, ни её состояние.
+    Замер на 374 уровнях (docs/audit/critical-review-verified-2026-08-04.md):
+
+      * 196 основных целей из 366 (54%) появились ПОЗЖЕ уровня, от которого строилась
+        сделка, — тейк-профит выбирался задним числом, и `outcome.resolve` затем искал
+        достижение именно этой цены;
+      * 283 цели из 366 (83%) были в состоянии `worked_off` или `flipped`, то есть по
+        стр. 25 «мы этот уровень удаляем», а по стр. 43 он уже противоположный.
+
+    Оба отсева делает `MappedLevel.alive_at` НА МОМЕНТ ПОЯВЛЕНИЯ уровня, а не на конец
+    ряда: фильтровать по нынешнему состоянию значило бы заменить одно заглядывание вперёд
+    другим — цель, снятая через месяц после сигнала, в момент сигнала была законной.
     """
     entry = level.price
     up = level.side is LevelSide.LONG
     want = LevelSide.SHORT if up else LevelSide.LONG
+    as_of = level.created_at_ms
 
     out: list[Target] = []
-    for other in pool:
+    for mapped in pool:
+        other = mapped.level
         if other.symbol != level.symbol or other.side is not want:
+            continue
+        if not mapped.alive_at(as_of):
             continue
         if (other.price > entry) is not up or other.price == entry:
             continue
@@ -165,7 +226,7 @@ def build_targets(level: Level, pool: tuple[Level, ...]) -> tuple[Target, ...]:
 
 def build_setup(
     level: Level,
-    pool: tuple[Level, ...] = (),
+    pool: tuple[MappedLevel, ...] = (),
     *,
     structural_anchor: Decimal | None = None,
     margin_min_pct: float = STOP_MARGIN_MIN_PCT,
@@ -176,6 +237,11 @@ def build_setup(
     Курс даёт два стопа (безопасный и рисковый) и диапазон запаса — здесь всё это
     сообщается как есть. Свернуть в одно число значило бы принять решение, которого
     источник не принимает.
+
+    Лестница закупа (стр. 32) собирается по тому же правилу, что и цели: в неё идут
+    только уровни, живые НА МОМЕНТ появления родителя. Ордер на отработанный уровень
+    запрещает стр. 31 («уровень лимитными ордерами больше не торгуем») ровно так же,
+    как стр. 25 запрещает целиться в него.
     """
     up = level.side is LevelSide.LONG
     edge = level.boundary_lo if up else level.boundary_hi
@@ -184,7 +250,15 @@ def build_setup(
     def with_margin(pct: float) -> Decimal:
         return edge + sign * edge * Decimal(str(pct)) / Decimal(100)
 
-    inner = nested_levels(level, pool)
+    alive = tuple(m.level for m in pool if m.alive_at(level.created_at_ms))
+    inner = nested_levels(level, alive)
+    # Якорь считается в `levels.build_all` — там есть ряды баров младшего ТФ. Сюда он
+    # приходит на уровне; параметр оставлен для зондов, подающих якорь вручную.
+    anchor = structural_anchor if structural_anchor is not None else level.stop_anchor
+    if anchor is not None:
+        stop, basis = anchor, StopBasis.ANCHOR
+    else:
+        stop, basis = with_margin(DEFAULT_MARGIN_PCT), StopBasis.MARGIN
     return Setup(
         level=level,
         entry=level.price,
@@ -195,7 +269,9 @@ def build_setup(
         stop_safe_near=with_margin(margin_min_pct),
         stop_safe_far=with_margin(margin_max_pct),
         stop_risky=edge,
-        structural_anchor=structural_anchor,
+        stop=stop,
+        stop_basis=basis,
+        structural_anchor=anchor,
         targets=build_targets(level, pool),
     )
 

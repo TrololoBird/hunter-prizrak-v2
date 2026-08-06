@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .bars import steps_between
 from .breach import CONFIRM_BODIES, Direction, body_beyond
 from .models import Bar
 from .swings import SwingKind, SwingSet
@@ -241,13 +242,30 @@ def detect(
             run_dir = None
             continue
 
-        if direction is not run_dir:
+        # Серия тел рвётся не только сменой стороны, но и ДЫРОЙ В РЯДУ: стр. 55 говорит
+        # «2-3 полных тел свечей ЭТОГО ТФ», то есть про подряд идущие свечи, а не про
+        # подряд идущие элементы списка. При дыре в ряду это разные вещи (Р-2 разбора).
+        broken = k > 0 and steps_between(bars[k - 1], bars[k], timeframe) != 1
+        if direction is not run_dir or broken:
             run_dir, run_from = direction, k
         bodies = k - run_from + 1
         if bodies < confirm_bodies:
             continue
         if len(hi_px) + len(lo_px) < min_points:
-            # Цена ушла раньше, чем структура набрала 4 точки — накопления не было.
+            # Цена ушла раньше, чем структура набрала нужные точки — накопления не было.
+            #
+            # ⚠ При умолчании `min_points = 4` эта ветка НЕДОСТИЖИМА, и это не дефект, а
+            # следствие предпосылки выше: пока у обеих сторон меньше двух точек, цикл до
+            # проверки выхода не доходит вовсе, значит на этой строке сумма гарантированно
+            # ≥ 4. Требование стр. 22 («4 и более точек») выполняется СТРУКТУРОЙ кода, а
+            # не этой проверкой.
+            #
+            # Ветка тем не менее нужна: стр. 23 называет и другое число — «(4+6+ точки
+            # границ)», — и при `min_points = 6` она срабатывает. Проверено случаем
+            # «структура из 4 точек при пороге 6» в gates/course_rules.py: без него
+            # строка была бы утверждением, которого никто не проверял. Именно в таком
+            # виде её и нашёл внешний разбор (Р-1): комментарий описывал поведение,
+            # которого не бывает.
             reset()
             continue
 

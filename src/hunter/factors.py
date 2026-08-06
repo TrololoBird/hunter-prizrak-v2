@@ -23,12 +23,33 @@
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
 from .models import Bar
 from .swings import SwingKind, SwingSet
+
+
+def _absent(x: float | None) -> bool:
+    """Величина не определена. ⚠ NaN — ТОЖЕ отсутствие, и это не педантизм.
+
+    Замер 2026-08-06: `polars_talib.ema(200)` на ряду из 150 баров отдаёт **150 NaN и ноль
+    None**. Все три функции ниже проверяли только `is None`, поэтому NaN проезжал насквозь,
+    и это давало разный вред в каждой:
+
+      * `ma_touch` — считал `abs(nan - entry) / entry * 100` и отдавал фактор с
+        `distance_pct = nan`. Карточка владельца печатала «EMA200 в nan% от цены»,
+        то есть ЧИСЛО БЕЗ РЕФЕРЕНТА в тексте, который читает человек (§0, §4.3);
+      * `squeeze` — клал NaN в список ширин, а дальше `w <= last` с NaN всегда ложно,
+        и перцентиль считался по испорченной выборке МОЛЧА;
+      * `divergences` — сравнения с NaN всегда ложны, то есть отсутствие индикатора
+        выглядело как «дивергенции нет». Отсутствие, поданное как ответ (§4.3).
+
+    Ни один из трёх случаев ничего не ронял и ни во что не логировался.
+    """
+    return x is None or math.isnan(x)
 
 
 class DivergenceKind(StrEnum):
@@ -85,8 +106,9 @@ def divergences(
 
     Сравниваются два последних свинга одной стороны: курс говорит «хаи повышаются, а на
     индикаторе затухают», то есть речь о соседних экстремумах, а не о произвольной паре
-    из истории. Значение индикатора берётся на баре экстремума; если оно `None`
-    (величина ещё не определена), фактор НЕ выдаётся — подставлять число нельзя (§4.3).
+    из истории. Значение индикатора берётся на баре экстремума; если его нет (`None`
+    ЛИБО `NaN` — см. `_absent`), фактор НЕ выдаётся: подставлять число нельзя (§4.3), а
+    сравнивать с NaN — значит молча получить «дивергенции нет».
     """
     out: list[Divergence] = []
     for kind in (DivergenceKind.DIVERGENCE, DivergenceKind.CONVERGENCE):
@@ -98,8 +120,9 @@ def divergences(
         if last.index >= len(indicator) or prev.index >= len(indicator):
             continue
         i_prev, i_last = indicator[prev.index], indicator[last.index]
-        if i_prev is None or i_last is None:
+        if _absent(i_prev) or _absent(i_last):
             continue
+        assert i_prev is not None and i_last is not None
         if kind is DivergenceKind.DIVERGENCE:
             hit = last.price > prev.price and i_last < i_prev
         else:
@@ -123,8 +146,9 @@ def squeeze(upper: list[float | None], lower: list[float | None],
     """
     widths: list[float] = []
     for u, low, m in zip(upper, lower, middle, strict=True):
-        if u is None or low is None or m is None or m == 0:
+        if _absent(u) or _absent(low) or _absent(m) or m == 0:
             continue
+        assert u is not None and low is not None and m is not None
         widths.append((u - low) / m * 100)
     if not widths:
         return None
@@ -136,9 +160,14 @@ def squeeze(upper: list[float | None], lower: list[float | None],
 
 
 def ma_touch(ma: list[float | None], entry: float) -> MaTouchFactor | None:
-    """MA200 против точки входа (стр. 69). `None` — MA ещё не определена."""
+    """MA200 против точки входа (стр. 69). `None` — MA ещё не определена.
+
+    Не определена — это и `None`, и `NaN`: см. `_absent`. Раньше проверялся только
+    `None`, и карточка печатала «EMA200 в nan% от цены».
+    """
     last = ma[-1] if ma else None
-    if last is None or entry == 0:
+    if _absent(last) or entry == 0:
         return None
+    assert last is not None
     return MaTouchFactor(ma_value=last, entry=entry,
                          distance_pct=abs(last - entry) / entry * 100)

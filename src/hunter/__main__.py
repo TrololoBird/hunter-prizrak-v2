@@ -9,7 +9,7 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
-from . import clock, log, replay, store
+from . import log, replay, service, store
 from .config import DEFAULT_PATH, Universe, load_universe
 from .models import NotReady
 
@@ -19,7 +19,15 @@ def _run(args: argparse.Namespace) -> int:
     if args.symbols:
         uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
     from . import log
-    from .run import collect, persist_frames, print_report, produce_cards, record
+    from .run import (
+        collect,
+        decide_once,
+        persist_archive,
+        persist_frames,
+        print_report,
+        produce_cards,
+        record,
+    )
 
     # ЧЕТЫРЕ ШАГА, и они видны здесь, а не спрятаны друг в друге. Раньше `live_run`
     # делал всё, причём карточку строил ВНУТРИ `persist` — сбор данных и производство
@@ -29,10 +37,33 @@ def _run(args: argparse.Namespace) -> int:
         collect(uni, args.seconds, args.seed_limit, args.horizon_days)
     )
     persist_frames(args.run_id, report)
-    produce_cards(args.run_id, report, uni, sources)
-    record(args.run_id, report, uni, sources)
+    # СИГНАЛ СЧИТАЕТСЯ ОДИН РАЗ и отдаётся обоим потребителям — карточке и леджеру.
+    # До 2026-08-06 каждый считал его сам, и они расходились: карточка печатала
+    # геометрию для 94 уровней, леджер эмитировал 33 (замер на кадрах прогона `a1`).
+    decided = decide_once(report, uni, sources)
+    produce_cards(args.run_id, report, uni, decided)
+    # Срез архива кладётся ПОСЛЕ карточек: до них неизвестно, какие сутки понадобились.
+    # Без него повтор читает общий кэш и объявляет «расчёт изменился» на доливке (Н-6).
+    persist_archive(args.run_id, report, sources)
+    record(args.run_id, report, uni, decided)
     log.info("кадры сохранены", файлов=report.frames_written, карточек=report.cards_written)
-    return 1 if print_report(report, clock.now_ms()) else 0
+    return 1 if print_report(report) else 0
+
+
+def _serve(args: argparse.Namespace) -> int:
+    """Боевое исполнение: служба 24/7 (§8, находка А-1).
+
+    Отличие от `run` не в длительности, а в устройстве: `run` собирает окно и считает
+    один раз, служба собирает непрерывно и считает циклами, не останавливая сбор.
+    """
+    from .service import serve
+
+    uni = load_universe(args.universe)
+    if args.symbols:
+        uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
+    bad = asyncio.run(serve(uni, args.seed_limit, args.horizon_days, args.run_id,
+                            cycle_seconds=args.cycle_seconds, max_cycles=args.cycles))
+    return 1 if bad else 0
 
 
 def _check(args: argparse.Namespace) -> int:
@@ -213,6 +244,19 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--symbols", type=int, default=0,
                      help="взять только первые N символов вселенной")
 
+    srv = sub.add_parser("serve", help="СЛУЖБА 24/7: сбор без остановки, расчёт циклами")
+    srv.add_argument("--cycle-seconds", type=int, default=service.CYCLE_SECONDS,
+                     help="такт расчёта; умолчание — младший ТФ проекта (§2.8)")
+    srv.add_argument("--cycles", type=int, default=0,
+                     help="остановиться после N циклов; 0 = работать до сигнала")
+    srv.add_argument("--seed-limit", type=int, default=500)
+    srv.add_argument("--universe", type=Path, default=DEFAULT_PATH)
+    srv.add_argument("--run-id", default="serve",
+                     help="куда класть кадры и карточки; каждый цикл ПЕРЕЗАПИСЫВАЕТ их")
+    srv.add_argument("--horizon-days", type=int, default=90)
+    srv.add_argument("--symbols", type=int, default=0,
+                     help="взять только первые N символов вселенной")
+
     chk = sub.add_parser("check", help="ПРОВЕРКА: один вход, вердикт по-русски (§7.5)")
     chk.add_argument("--seconds", type=int, default=400)
     chk.add_argument("--seed-limit", type=int, default=500)
@@ -240,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "serve":
+        return _serve(args)
     if args.cmd == "check":
         return _check(args)
     if args.cmd == "profile":

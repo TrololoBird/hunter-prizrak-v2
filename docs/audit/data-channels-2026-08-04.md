@@ -5,11 +5,17 @@
 
 ## Три канала, по коду
 
-| канал | что берёт | где |
-|---|---|---|
-| **WebSocket** (ccxt.pro) | живые бары `watch_ohlcv`, живые сделки `watch_trades` | `exchange.py::watch_closed_ohlcv`, `watch_agg_trades` |
-| **REST** (ccxt) | исторические БАРЫ `fetch_ohlcv` (до 1000 за запрос, с `since`), время сервера | `exchange.py::fetch_closed_ohlcv`, `count_history` |
-| **Прямой HTTPS** | суточные ZIP сделок с `data.binance.vision` + `.CHECKSUM` | `archive.py` |
+⚠ **Таблица описывает состояние на 2026-08-04.** 2026-08-05 бары сняты с вебсокета: в
+строке WebSocket остались только сделки, бары целиком перешли в строку REST. Решение и
+числа — [`transport-decision-2026-08-05.md`](transport-decision-2026-08-05.md). Ниже
+показаны оба состояния, потому что документ датирован и переписывать его задним числом
+значило бы потерять, из чего решение выросло.
+
+| канал | что берёт (04.08) | стало 05.08 | где |
+|---|---|---|---|
+| **WebSocket** (ccxt.pro) | живые бары `watch_ohlcv`, живые сделки `watch_trades` | **только сделки**; `watch_closed_ohlcv` удалён | `exchange.py::watch_agg_trades` |
+| **REST** (ccxt) | исторические БАРЫ `fetch_ohlcv` (до 1000 за запрос, с `since`), время сервера | **+ добор баров по границам ТФ** | `exchange.py::fetch_closed_ohlcv`, `count_history`, `run.py::_poll_bars_impl` |
+| **Прямой HTTPS** | суточные ZIP сделок с `data.binance.vision` + `.CHECKSUM` | без изменений | `archive.py` |
 
 **Сделки по REST не запрашивались вообще** — ни одного вызова `fetch_trades` в дереве.
 

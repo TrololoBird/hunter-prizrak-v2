@@ -23,23 +23,27 @@ from decimal import Decimal
 import polars as pl
 
 from . import (
-    accumulation,
+    admission,
     breach,
+    engine,
     factors,
     geometry,
     indicators,
-    levels,
     pereprior,
-    priority,
     swings,
 )
 from .bars import TIMEFRAME_MS, continuous_tail
-from .models import Bar, NotReady, TradeWindows
+from .models import Bar, NotReady
 
 TF_LABEL = {"5m": "5м", "15m": "15м", "1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
 SIDE_LABEL = {"long": "ЛОНГ", "short": "ШОРТ"}
 TREND_LABEL = {"up": "восходящий", "down": "нисходящий", "none": "не определён"}
 STATE_LABEL = {"active": "активен", "worked_off": "отработан", "flipped": "флипнут"}
+
+STOP_BASIS_LABEL = {
+    "anchor": "за стоповым объёмом либо проколом (стр. 18)",
+    "margin": "запас за структуру (стр. 33)",
+}
 ENTRY_LABEL = {
     "limit": "лимитки на ПОК и зону (стр. 30)",
     "confirmation": "только по слому структуры на младшем ТФ (стр. 31)",
@@ -57,54 +61,49 @@ AGREE_LABEL = {"by_trend": "по тренду", "against_trend": "ПРОТИВ �
 PP_LABEL = {"true": "истинный", "early": "ранний"}
 
 
+def _pct(base: Decimal, other: Decimal) -> str:
+    """Расстояние в процентах от цены входа — то, чем курс задаёт запас (стр. 18, 33)."""
+    if not base:
+        return "—"
+    return f"{abs(other - base) / base * 100:.2f}%"
+
+
 def _num(x: float | Decimal, digits: int = 8) -> str:
     """Число без экспоненты и без хвостовых нулей — иначе дифф шумит на форматировании."""
     s = f"{float(x):.{digits}f}".rstrip("0").rstrip(".")
     return s or "0"
 
 
-def render(
-    symbol: str,
-    series: dict[str, list[Bar]],
-    trades: TradeWindows | None,
-    timeframes: tuple[str, ...],
-) -> str:
-    """Карточка символа по всем поданным ТФ. Чистая функция от кадров.
+def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
+    """Карточка символа: ПЕЧАТЬ готового решения. Ничего не считает.
 
-    Порядок ТФ задаётся ЗДЕСЬ — по длительности, от младшего к старшему, — а не берётся
-    от вызывающего. Иначе карточка зависит от того, как её позвали: живой прогон идёт по
-    порядку вселенной, а повтор — по именам файлов, и тексты расходятся при неизменном
-    расчёте. Замер 2026-08-04: первый же повтор дал «изменилось» у 2 символов из 2 ровно
-    по этой причине.
+    ⚠ Так стало 2026-08-06. Раньше карточка сама звала `swings.detect`,
+    `accumulation.detect`, `levels.build_all`, `map_levels`, `priority.resolve`,
+    `priority.agreement` и `geometry.build_setup` — то есть считала сигнал заново, вторым
+    экземпляром рядом с тем, что уходил в леджер. Замер на кадрах прогона `a1`: карточка
+    печатала геометрию для 94 уровней, леджер эмитировал 33, и из 31 флипнутого уровня
+    геометрия строилась для ИСХОДНОЙ стороны вопреки стр. 43.
+
+    Теперь конвейер один (`engine.decide`), а карточка — один из двух его потребителей.
+    Геометрия печатается ТОЛЬКО там, где есть эмиссия; где её нет — печатается причина.
+
+    Чистота сохранена: `SymbolDecision` — чистая функция от кадров, значит и карточка
+    остаётся такой. Повтор (`replay`) строит решение из кадров заново, а не получает
+    готовым, иначе проверка §10.6 перестала бы быть независимой.
     """
-    timeframes = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
-    out: list[str] = [f"СИМВОЛ {symbol}"]
+    timeframes = d.timeframes
+    out: list[str] = [f"СИМВОЛ {d.symbol}"]
 
-    scans: dict[str, accumulation.AccumulationScan] = {}
-    trends: dict[str, swings.Trend] = {}
-    sw_by_tf: dict[str, swings.SwingSet] = {}
-    unbuilt: list[str] = []
-
-    for tf in timeframes:
-        bars = series.get(tf)
-        if not bars:
-            out.append(f"  {TF_LABEL.get(tf, tf)}: НЕТ КАДРОВ")
-            continue
-        sw = swings.detect(bars)
-        if isinstance(sw, NotReady):
-            # §4.3: короткий ряд — это названная причина, а не молчаливый пропуск ТФ.
-            out.append(f"  {TF_LABEL.get(tf, tf)}: {sw.reason}")
-            continue
-        sw_by_tf[tf] = sw
-        trends[tf] = swings.trend(sw)
-        scans[tf] = accumulation.detect(bars, sw, tf)
+    for u in d.unreadable:
+        out.append(f"  {TF_LABEL.get(u.timeframe, u.timeframe)}: {u.reason}")
 
     out.append("")
     out.append("ТРЕНД И СТРУКТУРА")
     for tf in timeframes:
-        if tf not in scans:
+        r = d.reads.get(tf)
+        if r is None:
             continue
-        sc, tr, bars = scans[tf], trends[tf], series[tf]
+        sc, tr = r.scan, r.trend
         tail = ("нет" if sc.open_tail is None
                 else f"открыта {sc.open_tail.bars_open} баров, точек {sc.open_tail.points}")
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  баров {sc.bars_scanned}  "
@@ -114,20 +113,10 @@ def render(
 
     out.append("")
     out.append("УРОВНИ (ПОК накоплений)")
-    frozen, reasons = levels.build_all(symbol, series, trades, timeframes)
-    unbuilt.extend(
-        f"{TF_LABEL.get(u.timeframe, u.timeframe)}"
-        + (f" структура {u.index}" if u.index is not None else "")
-        + f": {u.reason}"
-        for u in reasons
-    )
-    if not frozen:
+    if not d.mapped:
         out.append("  уровней нет")
-    for lvl in frozen:
-        st = levels.status(lvl, series[lvl.timeframe])
-        pr = priority.resolve(trends, lvl.timeframe)
-        ag = priority.agreement(lvl.side, pr)
-        s = geometry.build_setup(lvl, frozen)
+    for dec in d.decisions:
+        lvl, st, pr, ag = dec.level, dec.status, dec.priority, dec.agreement
         out.append(
             f"  {SIDE_LABEL[lvl.side.value]} {TF_LABEL.get(lvl.timeframe, lvl.timeframe):>3}  "
             f"ПОК {_num(lvl.price)}  зона {_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}  "
@@ -139,9 +128,21 @@ def render(
             f"{AGREE_LABEL[ag.value]}"
             + (f" ({TF_LABEL.get(pr.timeframe, pr.timeframe)})" if pr.timeframe else "")
         )
+        s = dec.setup
+        if s is None:
+            # ⚠ Геометрии НЕТ, и это не пропуск. Стоп, лестница и цели существуют только
+            # у сделки, которая будет взята; печатать их для уровня, который система не
+            # торгует, значит печатать сигнал, которого нет. Причина названа (§4.3).
+            out.append(f"        СДЕЛКИ НЕТ: {dec.hold}")
+            if st.event is not None:
+                out.append(f"        событие: {_event(st.event)}")
+            continue
+        # ОДИН стоп и его основание. Прежде печатались три цены — безопасный ближний,
+        # безопасный дальний и рисковый, — и выбор оставался оператору. Выставить можно
+        # один; меню вместо сигнала делало РР неопределённым (стр. 18, 33).
         out.append(
-            f"        стоп безопасный {_num(s.stop_safe_near)}…{_num(s.stop_safe_far)}  "
-            f"рисковый {_num(s.stop_risky)}  "
+            f"        стоп {_num(s.stop)} — {STOP_BASIS_LABEL[s.stop_basis.value]}  "
+            f"({_pct(s.entry, s.stop)} от входа)  "
             f"{'закуп дробим' if s.split_orders else 'один ордер'}"
         )
         if len(s.ladder) > 1:
@@ -160,26 +161,34 @@ def render(
                            f"{t.distance_pct:.2f}%)")
         else:
             out.append("        целей нет")
-        rr_far, rr_risk = s.rr(s.stop_safe_far), s.rr(s.stop_risky)
-        out.append(f"        РР: безопасный {_rr(rr_far)}  рисковый {_rr(rr_risk)}  "
-                   f"(стандарт курса 1к{_num(geometry.GOLDEN_RR, 0)})")
+        # РР по ВЫСТАВЛЯЕМОМУ стопу — единственное число, которое можно проверить.
+        # Прежде печаталось два РР под два непоставленных стопа.
+        rr = s.rr()
+        golden = "" if rr is None or rr >= geometry.GOLDEN_RR else "  НИЖЕ стандарта"
+        out.append(f"        РР {_rr(rr)} до первой цели "
+                   f"(стандарт курса 1к{_num(geometry.GOLDEN_RR, 0)}){golden}")
         if st.event is not None:
             out.append(f"        событие: {_event(st.event)}")
 
-    if unbuilt:
+    if d.unbuilt:
         out.append("")
         out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины (§4.3)")
-        for u in unbuilt:
-            out.append(f"  {u}")
+        for u in d.unbuilt:
+            out.append(
+                f"  {TF_LABEL.get(u.timeframe, u.timeframe)}"
+                + (f" структура {u.index}" if u.index is not None else "")
+                + f": {u.reason}"
+            )
 
     out.append("")
     out.append("ПЕРЕПРИОР")
     any_pp = False
     for tf in timeframes:
-        if tf not in scans:
+        r = d.reads.get(tf)
+        if r is None:
             continue
-        bars, sw = series[tf], sw_by_tf[tf]
-        for pp in pereprior.detect(bars, sw):
+        bars, sw = series[tf], r.swings
+        for pp in pereprior.detect(bars, sw, tf):
             any_pp = True
             width = (pp.zone_hi - pp.zone_lo) / pp.zone_lo * 100 if pp.zone_lo else 0.0
             test = ("теста не было" if pp.tested_at_index is None
@@ -199,12 +208,13 @@ def render(
 
     out.append("")
     out.append("ДОП-ФАКТОРЫ (сопровождают, не порождают сигнал — стр. 64)")
-    if not scans:
+    if not d.reads:
         out.append("  не считались: кадров нет")
     for tf in timeframes:
-        if tf not in scans:
+        r = d.reads.get(tf)
+        if r is None:
             continue
-        full, sw = series[tf], sw_by_tf[tf]
+        full, sw = series[tf], r.swings
         # ⚠ Рекурсивные величины считаются ТОЛЬКО на непрерывном хвосте. Ряд с дырой
         # ATR/RSI/EMA считают как смежный, и сглаживание тащит искажение на десятки
         # баров вперёд — а от ATR зависит стоп. До 2026-08-04 `find_gaps` звалась лишь
@@ -222,20 +232,38 @@ def render(
             continue
         sw = sw_tail
         for name, expr in (("RSI", indicators.rsi()), ("MACD", indicators.macd_line())):
-            for d in factors.divergences(bars, sw, _series(bars, expr), name):
-                what = ("дивергенция" if d.kind is factors.DivergenceKind.DIVERGENCE
+            for div in factors.divergences(bars, sw, _series(bars, expr), name):
+                what = ("дивергенция" if div.kind is factors.DivergenceKind.DIVERGENCE
                         else "конвергенция")
                 parts.append(f"{what} {name}")
+        # ⚠ Отсутствие фактора называется ЧИСЛАМИ, а не словами «истории мало». Требования
+        # к истории замерены (`admission.REQUIRED_BARS`), и `admission.check` умеет
+        # сказать «нужно N, есть M» — до 2026-08-06 эта функция не звалась ниоткуда, а
+        # карточка сочиняла причину на месте. §4.3 требует названной причины, и причина с
+        # числом проверяема, а без числа — нет.
         sq = factors.squeeze(_series(bars, indicators.bbands_upper()),
                              _series(bars, indicators.bbands_lower()),
                              _series(bars, indicators.ema(20)))
         parts.append(f"полосы {sq.width_pct:.2f}% (уже {sq.percentile:.0f}% истории)"
-                     if sq else "полосы не посчитаны")
+                     if sq else _short("bb_upper", len(bars), d.symbol, tf, "полосы"))
         ma = factors.ma_touch(_series(bars, indicators.ema(200)), bars[-1].close)
         parts.append(f"EMA200 в {ma.distance_pct:.2f}% от цены" if ma
-                     else "EMA200 не определена (истории мало)")
+                     else _short("ema200", len(bars), d.symbol, tf, "EMA200"))
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  " + " · ".join(parts))
     return "\n".join(out) + "\n"
+
+
+def _short(quantity: str, bars: int, symbol: str, timeframe: str, label: str) -> str:
+    """Почему фактора нет — ЧИСЛОМ. Причину даёт `admission.check`, а не эта функция.
+
+    Величина может отсутствовать и не из-за длины ряда; тогда `check` молчит, и здесь
+    говорится ровно то, что известно, — «не посчитан», без выдуманного объяснения (§4.3).
+    """
+    why = admission.check(quantity, bars, symbol, timeframe)
+    if why is not None:
+        return f"{label}: {why.reason}"
+    # Длины ряда хватает, а значения нет — причина другая, и придумывать её нельзя.
+    return f"{label}: значения нет, хотя длины ряда достаточно"
 
 
 def _series(bars: list[Bar], expr: pl.Expr) -> list[float | None]:

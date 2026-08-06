@@ -16,8 +16,16 @@ import ccxt.pro as ccxtpro
 from pydantic import ValidationError
 
 from . import clock, log
-from .bars import closed_only, on_grid, tf_ms
-from .models import Bar, ClockSync, Instrument, NotReady, OhlcvFetch
+from .bars import closed_only, on_grid
+from .models import (
+    Bar,
+    ClockSync,
+    Instrument,
+    MarketsReload,
+    NotReady,
+    OhlcvFetch,
+    TickChange,
+)
 
 # Замер 2026-08-03: /fapi/v1/klines принимает limit=1500, на 1501 отвечает
 # HTTP 400 code -1130. ccxt при этом сам режет выдачу до 1000.
@@ -25,12 +33,73 @@ from .models import Bar, ClockSync, Instrument, NotReady, OhlcvFetch
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
 
-WS_SILENCE_S = 60.0
-"""Молчание потока БАРОВ дольше этого — поломка. ЗАМЕР 2026-08-04, BTC/USDT:USDT.
+# ⚠ `WS_SILENCE_S` (порог молчания потока БАРОВ) удалён 2026-08-05 вместе с самим
+# потоком: бары больше не приходят вебсокетом, и порог его молчания нечему сторожить.
+# Замер, которым он был обоснован (`watch_ohlcv` med 0.40 с, max 1.13 с на BTC), не
+# опровергнут — он просто перестал к чему-либо относиться.
+# Решение и числа: docs/audit/transport-decision-2026-08-05.md
 
-`watch_ohlcv` отвечает med 0.40 с, p90 0.72 с, max 1.13 с на 1Н и med 0.38 / max 0.83 на
-5м. Binance обновляет свечу ПО ТАЙМЕРУ, а не по сделке, поэтому тишина на барах означает
-именно обрыв, а не тихий рынок. Запас ×53 к наибольшему наблюдённому промежутку.
+POLL_OFFSET_S = 3.0
+"""Отступ от границы ТФ до опроса баров. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — это задание Ж-1.
+
+Опрашивать ровно в границу нельзя: биржа закрывает свечу не мгновенно. Величина
+задержки на живом соединении не измерена ни разу (`fapi.binance.com` отдаёт `HTTP 451`
+из окружений, где шёл разбор), поэтому 3 секунды здесь — ВЕРХНЯЯ оценка, взятая по
+косвенному свидетельству: задержка флага `x=true` в потоке kline, по сообщению
+сотрудника Binance, доходит до 3 с. Прямого замера REST это не заменяет.
+
+Цена ошибки в обе стороны названа, потому что она НЕ симметрична:
+  * отступ мал  — биржа ещё не отдала ожидаемую свечу, `poll_late` растёт, бар
+    доедет следующим опросом. Данные не теряются, теряется свежесть;
+  * отступ велик — свежесть теряется всегда и молча.
+
+Поэтому число выбрано с запасом в сторону «мал», а счётчик `poll_late` печатается в
+приёмке: он и есть замер Ж-1, снимаемый на боевом прогоне.
+"""
+
+POLL_LIMIT = 3
+"""Сколько баров просить при обычном опросе. Три, а не один: опрос может опоздать на бар
+(пауза планировщика, повтор после сбоя), и тогда пропущенный бар обязан приехать в том
+же ответе. Больше трёх — плата за то же самое; `seed` берёт историю отдельно."""
+
+CATCHUP_MAX_BARS = 100
+"""Предел запроса при ДОГОНЕ. Число из ЗАМЕРА ступени веса, а не из таблицы.
+
+Замер 2026-08-06 по заголовку `x-mbx-used-weight-1m` (разница до и после запроса,
+BTC/USDT:USDT 5м):
+
+    limit     3   50  100 | 101  200  499  500 | 1000
+    вес       1    1    1 |   2    2    2    2 |    5
+
+То есть первая ступень кончается ровно на сотне: догон до ста баров стоит столько же,
+сколько обычный опрос, и отставание в сутки на 15м (96 баров) закрывается одним запросом.
+
+⚠ Мерить пришлось, а не брать из документации. Разбор прямо фиксирует, что официальная
+таблица весов Binance для `klines` не подтверждена, и здесь же видно, почему: при
+`limit=500` биржа берёт 2, тогда как таблица ccxt считает 5. Первая редакция этой строки
+ссылалась на «ступенчатую сетку» без замера — то есть заводила референт, которого нет.
+
+Отставание глубже сотни закрывается несколькими кругами: каждый круг продвигает ряд.
+"""
+
+CATCHUP_RETRY_S = 30.0
+"""Пауза перед ПОВТОРНЫМ догоном, когда предыдущий ничего не добавил.
+
+⚠ Число выведено из ЛИМИТА БИРЖИ, прочитанного У НЕЁ ЖЕ (замер: 2400 веса в минуту,
+`weight_limit`), а не из удобства и не из общеизвестного. Без паузы цикл догона крутился
+бы вплотную: ряд отстаёт, биржа бара ещё не отдала, запрос уходит снова — и так на каждом
+из 162 рядов вселенной. Арифметика худшего случая (все ряды отстают одновременно):
+
+    162 запроса за круг × вес 1 = 162 веса
+    при паузе 30 с это 324 веса в минуту против 2400 — около 13%
+    при паузе 3 с было бы 3240 в минуту, то есть ПРЕВЫШЕНИЕ
+
+Превышение карается баном по IP до трёх суток, поэтому запас берётся в сторону «реже».
+Обычная нагрузка опроса для сравнения — 1.8-2.8% лимита (замер живых прогонов).
+
+Первая попытка догона паузы НЕ ждёт: типичный случай (ряд отстал на бар, пока шёл засев)
+закрывается немедленно, а пауза включается только если биржа бара действительно ещё не
+отдала.
 """
 
 WS_TRADES_SILENCE_S = 300.0
@@ -54,6 +123,46 @@ med 7.91 с, p90 21.63 с, p99 43.37 с, **max 43.37 с**. Промежутко�
 WS_RETRY_S = 1.0
 """Пауза перед повторной подпиской. Число ПОДОБРАНО, а не замерено, и здесь названо так."""
 
+RATE_LIMIT_BACKOFF_S = 60.0
+"""Пауза после ответа «лимит превышен». ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — выбрано по документации.
+
+Лимит веса у Binance считается в окне ОДНОЙ МИНУТЫ (`X-MBX-USED-WEIGHT-1M`,
+`REQUEST_WEIGHT/MINUTE/1` в `exchangeInfo`), поэтому минута — наименьшая пауза, после
+которой окно заведомо новое. Меньшая пауза означала бы повтор внутри того же окна, а
+продолжение после `HTTP 429` карается баном по IP (`418`) на срок от 2 минут до 3 суток:
+цена ошибки в сторону «мало» несопоставимо выше цены ошибки в сторону «много».
+
+Заголовок `Retry-After` биржа присылает при `418` и `429`; здесь он НЕ читается, и это
+известное упрощение — пауза фиксированная.
+"""
+
+
+REQUIRED_CAPABILITIES: dict[str, str] = {
+    "fetchOHLCV": "бары всех ТФ — без них нет ни структур, ни уровней (§2.4, §2.8)",
+    "fetchTime": "сведение часов с биржей — §6 запрещает судить о закрытости по локальным",
+    "watchTrades": "поток сделок для профиля объёма (§2.2, §5: aggTrade)",
+}
+"""Возможности ccxt, без которых система не работает. Ключ — имя из `exchange.has`.
+
+⚠ Зачем проверять то, что «и так есть». Замер практики 2026-08-05: `exchange.has[...]`
+проверяют 6 из 13 зрелых проектов на ccxt, включая всех троих потребителей вебсокета;
+у freqtrade это отдельный метод с 57 употреблениями. Мы не проверяли нигде.
+
+Цена отсутствия проверки — не отказ биржи, а ФОРМА отказа. Снятый или переименованный в
+ccxt метод даёт `AttributeError` в середине прогона, из середины стека, без указания на
+причину. Это уже случилось в этой же сессии: `fapi_public_get_exchangeinfo`, которого в
+ccxt нет, уронил `open()` именно так. Проверка переносит тот же отказ в начало прогона и
+называет его словами.
+
+`has` принимает значения `True`, `False`, `None` и **`'emulated'`**. Последнее означает,
+что ccxt собирает метод из других — он работает, но может стоить иначе и вести себя
+иначе. Отсутствием это НЕ считается; о нём сообщается отдельно.
+"""
+
+
+class CapabilityMissing(RuntimeError):
+    """Биржа или версия ccxt не умеет того, без чего прогон бессмысленен."""
+
 
 class Exchange:
     def __init__(self) -> None:
@@ -64,6 +173,35 @@ class Exchange:
             "options": {"watchTrades": {"name": "aggTrade"}},
         })
         self._instruments: dict[str, Instrument] = {}
+        self.weight_limit: int | None = None
+        """Лимит веса за минуту, ПРОЧИТАННЫЙ У БИРЖИ, а не зашитый. `None` — не прочитан.
+
+        Числа 2400/мин во всех расчётах бюджета до 2026-08-05 брались как «общеизвестное»
+        и ни разу не подтверждались (задание Ж-7). Биржа публикует их сама в
+        `exchangeInfo.rateLimits`, и зашивать константу, которую можно спросить, значит
+        завести величину без референта вопреки §0.
+        """
+
+        self.weight_peak = 0
+        """Наибольший `X-MBX-USED-WEIGHT-1M` за прогон. 0 — заголовок ни разу не пришёл."""
+
+        self.weight_reads = 0
+        """Сколько ответов принесли заголовок веса. Знаменатель к `weight_peak`: без него
+        ноль «не подходили к лимиту» неотличим от «ни разу не смотрели»."""
+
+        self.rest_errors: Counter[str] = Counter()
+        """Отказы REST по КЛАССУ исключения ccxt. Пустой счётчик при ненулевом числе
+        запросов — свидетельство исправности, а не отсутствия проверки."""
+
+        self.rest_rate_limited = 0
+        """Сколько раз биржа ответила превышением лимита. После перехода на REST это
+        главный отказ системы, и он обязан быть виден отдельной строкой, а не тонуть
+        среди сетевых сбоев: `RateLimitExceeded` наследует `NetworkError`."""
+
+        self.ws_unsubscribes: Counter[str] = Counter()
+        """Пробуждения `watch_*` через `UnsubscribeError`. Это ШТАТНОЕ событие ccxt, а не
+        сбой, и считается отдельно, чтобы не разбавлять счётчик отказов."""
+
         self.ws_reconnects: Counter[str] = Counter()
         self.ws_errors: Counter[str] = Counter()
         """Переподключения и ошибки биржи по потокам. Читает отчёт прогона.
@@ -72,27 +210,132 @@ class Exchange:
         а без счётчика переподключение неотличимо от бесперебойной работы.
         """
 
+    def check_capabilities(self) -> tuple[str, ...]:
+        """Что из необходимого биржа не умеет. Пустой кортеж — умеет всё.
+
+        Печатает ЧИСЛО проверенного: «нарушений 0» без знаменателя неотличимо от
+        непроведённой проверки. Возвращает список, а не булево, чтобы вызывающий назвал
+        отсутствующее поимённо.
+        """
+        missing, emulated = [], []
+        for name, why in REQUIRED_CAPABILITIES.items():
+            value = self._ex.has.get(name)
+            if value == "emulated":
+                emulated.append(name)
+            elif not value:
+                missing.append(f"{name} ({why})")
+        log.info("возможности ccxt проверены", проверено=len(REQUIRED_CAPABILITIES),
+                 отсутствует=len(missing), эмулируется=len(emulated))
+        if emulated:
+            log.degraded("возможность ЭМУЛИРУЕТСЯ ccxt, а не даётся биржей напрямую",
+                         методы=", ".join(sorted(emulated)))
+        return tuple(missing)
+
     async def open(self) -> ClockSync:
         await self._ex.load_markets()
+        # Проверка ПОСЛЕ load_markets: у ccxt часть `has` уточняется по ответу биржи.
+        # И ДО всего остального: отказ обязан случиться в начале прогона, а не из
+        # середины стека спустя минуты сбора.
+        if missing := self.check_capabilities():
+            raise CapabilityMissing(
+                f"{self._ex.id}: нет необходимых возможностей ccxt — " + "; ".join(missing)
+            )
+        await self._read_weight_limit()
         sync = await clock.measure(self.fetch_server_ms)
         log.info("часы сведены", сдвиг_мс=sync.offset_ms, rtt_мс=sync.rtt_ms,
                  замеров=sync.samples)
         return sync
 
+    async def _read_weight_limit(self) -> None:
+        """Спросить у биржи её собственный лимит веса (задание Ж-11).
+
+        После перехода на REST 2026-08-05 лимит запросов стал ГЛАВНЫМ отказом системы:
+        по документации Binance превышение даёт `HTTP 429`, а продолжение после него —
+        бан по IP (`418`) на срок от 2 минут до 3 суток. Прибора на это в проекте не было
+        вовсе: заголовки веса не читались нигде.
+
+        Отказ здесь НЕ роняет прогон: без лимита система работает, просто перестаёт
+        сравнивать с ним потребление, и это сказано числом (`weight_limit is None`).
+        """
+        try:
+            # ⚠ Имя метода — `fapiPublicGetExchangeInfo`, а НЕ snake_case: ccxt порождает
+            # оба варианта, но `fapi_public_get_exchangeinfo` среди них нет, и первая
+            # редакция падала на нём `AttributeError` уже в `open()`.
+            info = await self._ex.fapiPublicGetExchangeInfo()
+        except ccxt.BaseError as e:
+            log.degraded("лимит веса у биржи не прочитан",
+                         причина=f"{type(e).__name__} {e}")
+            return
+        self._note_weight()
+        for row in info.get("rateLimits", []):
+            if (row.get("rateLimitType") == "REQUEST_WEIGHT"
+                    and row.get("interval") == "MINUTE"
+                    and int(row.get("intervalNum", 0)) == 1):
+                self.weight_limit = int(row["limit"])
+                log.info("лимит веса прочитан у биржи", вес_в_минуту=self.weight_limit)
+                return
+        log.degraded("в exchangeInfo нет строки REQUEST_WEIGHT/MINUTE/1",
+                     строк=len(info.get("rateLimits", [])))
+
+    def _note_weight(self) -> None:
+        """Запомнить потребление веса из заголовка последнего ответа.
+
+        Зовётся после КАЖДОГО REST-вызова этого класса. Заголовок приходит не всегда
+        (например, у ответов из кэша ccxt), поэтому число прочтений считается отдельно.
+
+        ⚠ Регистр ключа ищется ЯВНО. У синхронного клиента ccxt заголовки приходят в
+        `CaseInsensitiveDict`, и `get("X-MBX-USED-WEIGHT-1M")` работает; у асинхронного —
+        в ОБЫЧНОМ `dict` со строчными ключами, и тот же вызов молча даёт `None`. Механизм
+        был проверен на синхронном клиенте, а применён к асинхронному: прогон напечатал
+        «пик 0 — 0.0% лимита» при живом заголовке `x-mbx-used-weight-1m = 2`.
+        Поймал это `weight_reads`: ноль замеров отличим от нуля потребления.
+        """
+        headers = self._ex.last_response_headers or {}
+        raw = next((v for k, v in headers.items()
+                    if k.lower() == "x-mbx-used-weight-1m"), None)
+        if raw is None:
+            return
+        self.weight_reads += 1
+        self.weight_peak = max(self.weight_peak, int(raw))
+
     async def close(self) -> None:
         await self._ex.close()
 
     async def fetch_server_ms(self) -> int:
-        return int(await self._ex.fetch_time())
+        got = int(await self._ex.fetch_time())
+        self._note_weight()
+        return got
 
     # --- инструменты -------------------------------------------------------
 
     def instrument(self, symbol: str) -> Instrument | NotReady:
+        """Инструмент вселенной. `NotReady` — если торговать им нельзя.
+
+        ⚠ Проверка `active` добавлена 2026-08-05 после замера, и она закрывает ТИХИЙ
+        отказ, а не громкий. Снятый с торгов символ биржа не перестаёт обслуживать:
+        `fetch_ohlcv` по нему отдаёт бары С ТЕКУЩИМИ МЕТКАМИ ВРЕМЕНИ. Замер на четырёх
+        делистнутых рынках (OMG, WAVES, MKR, DEFI), 50 баров 5м:
+
+            символ            active  баров  разных close  сумма объёма
+            BTC/USDT:USDT       True     50            48      15964.12
+            OMG/USDT:USDT      False     50             1          0.00
+
+        То есть ряд ЗАМОРОЖЕН — одна цена и нулевой объём, — но выглядит здоровым:
+        свежесть сходится (метки текущие), разрывов нет, бары не битые (o=h=l=c проходит
+        определение свечи). ВСЕ проверки приёмки напечатали бы зелёное, а система строила
+        бы уровни по инструменту, которым нельзя торговать.
+
+        На бирже таких рынков 124 из 852. Во вселенной проекта на 2026-08-05 — ни одного,
+        поэтому дефект ЛАТЕНТНЫЙ: он ждёт первого делистинга среди 27 символов. Вселенная
+        закреплена и автоматически не пересчитывается (§5), так что ждать придётся молча.
+        """
         if symbol in self._instruments:
             return self._instruments[symbol]
         market = self._ex.markets.get(symbol)
         if market is None:
             return NotReady(reason=f"{symbol}: нет на бирже")
+        if market.get("active") is False:
+            return NotReady(reason=f"{symbol}: снят с торгов (active=False)")
         tick = _price_filter_tick(market)
         if tick is None:
             return NotReady(reason=f"{symbol}: в PRICE_FILTER нет tickSize")
@@ -102,6 +345,51 @@ class Exchange:
         inst = Instrument(symbol=symbol, market_id=str(market_id), tick_size=tick)
         self._instruments[symbol] = inst
         return inst
+
+    async def reload_markets(self, symbols: tuple[str, ...]) -> MarketsReload | NotReady:
+        """Перечитать рынки у биржи и назвать, что изменилось. Для службы 24/7 (§8).
+
+        ⚠ Кэш `_instruments` СБРАСЫВАЕТСЯ. Без сброса перечитывание было бы видимостью
+        работы: `instrument()` продолжал бы отдавать инструмент, собранный при старте, с
+        прежним шагом цены и прежним `active`.
+
+        Отказ чтения НЕ трогает ни рынки, ни кэш: прежние данные с известным возрастом
+        лучше, чем никакие. Отказ отдаётся как `NotReady` и попадает в отчёт.
+        """
+        before: dict[str, tuple[Decimal | None, bool]] = {}
+        for s in symbols:
+            m = self._ex.markets.get(s)
+            before[s] = ((_price_filter_tick(m) if m else None),
+                         bool(m) and m.get("active") is not False)
+        try:
+            await self._ex.load_markets(reload=True)
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            self.rest_errors[type(e).__name__] += 1
+            self.rest_rate_limited += 1
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            return NotReady(reason=f"перечитать рынки: лимит биржи ({type(e).__name__})")
+        except ccxt.BaseError as e:
+            self.rest_errors[type(e).__name__] += 1
+            return NotReady(reason=f"перечитать рынки: {type(e).__name__} {e}")
+        self._note_weight()
+        self._instruments.clear()
+
+        ticks: list[TickChange] = []
+        gone: list[str] = []
+        back: list[str] = []
+        for s in symbols:
+            was_tick, was_live = before[s]
+            m = self._ex.markets.get(s)
+            now_tick = _price_filter_tick(m) if m else None
+            now_live = bool(m) and m.get("active") is not False
+            if was_tick is not None and now_tick is not None and was_tick != now_tick:
+                ticks.append(TickChange(symbol=s, was=was_tick, now=now_tick))
+            if was_live and not now_live:
+                gone.append(s)
+            elif not was_live and now_live:
+                back.append(s)
+        return MarketsReload(checked=len(symbols), tick_changed=tuple(ticks),
+                             delisted=tuple(gone), restored=tuple(back))
 
     def markets_by_id(self) -> dict[str, str]:
         """ccxt-символ → идентификатор биржи (BTCUSDT). Нужен для архива."""
@@ -127,11 +415,14 @@ class Exchange:
         датированы июлем, а без него доступны только последние `limit` баров — для 15м
         это 10.4 суток, то есть до дат разборов окно не достаёт.
         """
-        raw = await self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+        raw = await self._fetch_ohlcv_guarded(symbol, timeframe, since_ms, limit)
+        if isinstance(raw, NotReady):
+            return raw
         if not raw:
             return NotReady(reason=f"{symbol} {timeframe}: биржа вернула пустой список")
         bars: list[Bar] = []
         rejected: list[str] = []
+        rejected_at: list[int] = []
         for r in raw:
             try:
                 bars.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
@@ -140,6 +431,7 @@ class Exchange:
                 why = (f"{symbol} {timeframe} бар {int(r[0])}: o={r[1]} h={r[2]} "
                        f"l={r[3]} c={r[4]} — {e.errors()[0]['msg']}")
                 rejected.append(why)
+                rejected_at.append(int(r[0]))
                 log.error("бар отклонён как битый", причина=why)
         if not bars:
             return NotReady(
@@ -156,7 +448,60 @@ class Exchange:
             return NotReady(
                 reason=f"{symbol} {timeframe}: все {len(bars)} баров ещё не закрыты"
             )
-        return OhlcvFetch(bars=closed, rejected=rejected)
+        return OhlcvFetch(bars=closed, rejected=rejected,
+                          rejected_at_ms=rejected_at)
+
+    async def _fetch_ohlcv_guarded(
+        self, symbol: str, timeframe: str, since_ms: int | None, limit: int
+    ) -> list[list[Any]] | NotReady:
+        """REST-запрос свечей с РАЗБОРОМ КЛАССА ОТКАЗА. Отдаёт `NotReady`, а не бросает.
+
+        ⚠ До 2026-08-05 обёртки не было вовсе, и это пережиток WS-схемы: тогда REST
+        работал только в засеве. После перехода на опрос REST стал ОСНОВНЫМ источником
+        баров, а необработанное исключение здесь означало:
+          * в `seed` — падение ВСЕГО прогона (засев не обёрнут в задачу);
+          * в `_poll_bars_impl` — смерть задачи ряда навсегда: `_guarded` пробрасывает,
+            и символ переставал опрашиваться до конца прогона.
+        Один сетевой сбой на 162 ряда стоил ряда целиком.
+
+        Классы разделены по указанию самой ccxt («Seven mistakes…», ошибка 4: не
+        обрабатывать все ошибки одинаково) и по практике выборки:
+
+        * `RateLimitExceeded` и `DDoSProtection` — превышение лимита. **Оба наследуют
+          `NetworkError`**, то есть общий `except NetworkError` принял бы их за обрыв и
+          пошёл бы повторять — а продолжение после `HTTP 429` даёт бан по IP (`418`) до
+          трёх суток. Поэтому отдельная ветка и ЯВНАЯ пауза, а не повтор;
+        * прочий `NetworkError` — обрыв, штатно повторяемый следующим опросом;
+        * `ExchangeError` — запрос неверен, и повтор того же запроса не поможет
+          (OctoBot: «there is a real issue … Don't loop»).
+
+        Все три считаются по классам: без счётчика отказ неотличим от пустого ответа.
+        """
+        try:
+            raw = await self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms,
+                                             limit=limit)
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            self.rest_errors[type(e).__name__] += 1
+            self.rest_rate_limited += 1
+            log.error("ЛИМИТ БИРЖИ ПРЕВЫШЕН — пауза, повтора того же запроса нет",
+                      символ=symbol, тф=timeframe, пауза_с=RATE_LIMIT_BACKOFF_S,
+                      причина=f"{type(e).__name__} {e}")
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            return NotReady(reason=f"{symbol} {timeframe}: лимит биржи ({type(e).__name__})")
+        except ccxt.NetworkError as e:
+            self.rest_errors[type(e).__name__] += 1
+            log.degraded("сетевой сбой на опросе баров", символ=symbol, тф=timeframe,
+                         причина=f"{type(e).__name__} {e}")
+            return NotReady(reason=f"{symbol} {timeframe}: сеть ({type(e).__name__})")
+        except ccxt.ExchangeError as e:
+            self.rest_errors[type(e).__name__] += 1
+            log.error("биржа отвергла запрос свечей", символ=symbol, тф=timeframe,
+                      причина=f"{type(e).__name__} {e}")
+            return NotReady(reason=f"{symbol} {timeframe}: отказ биржи ({type(e).__name__})")
+        self._note_weight()
+        # ccxt не типизирован: `fetch_ohlcv` объявлен как Any. Приведение здесь, а не
+        # у вызывающего, — граница типизированной части проекта проходит по этому классу.
+        return list(raw)
 
     async def count_history(self, symbol: str, timeframe: str, *, cap: int) -> int:
         """Сколько баров биржа отдаёт по символу и ТФ.
@@ -175,6 +520,7 @@ class Exchange:
         while True:
             r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
                                            limit=CCXT_EFFECTIVE_LIMIT)
+            self._note_weight()
             if not r:
                 break
             total += len(r)
@@ -196,7 +542,28 @@ class Exchange:
 
         Порог молчания подаётся аргументом, потому что у баров и сделок он РАЗНОЙ ПРИРОДЫ:
         бары идут по таймеру биржи (тишина = обрыв), сделки — по событию (тишина = данные).
-        Числа и их замеры — в `WS_SILENCE_S` и `WS_TRADES_SILENCE_S`.
+        Числа и их замеры — в `WS_TRADES_SILENCE_S` (порог баров удалён вместе с ними).
+
+        ⚠ Порядок ветвей ЗНАЧИМ и разобран по иерархии ccxt (находка C-6). Замер
+        2026-08-05 по `__mro__`:
+
+            RateLimitExceeded <- NetworkError    <- OperationFailed <- BaseError
+            DDoSProtection    <- NetworkError    <- OperationFailed <- BaseError
+            BadResponse       <- OperationFailed <- BaseError
+            NullResponse      <- BadResponse     <- OperationFailed <- BaseError
+            CancelPending     <- OperationFailed <- BaseError
+            UnsubscribeError                     <- BaseError
+            OperationFailed                      <- BaseError
+
+        Прежняя редакция ловила `NetworkError` и `ExchangeError`. Отсюда две дыры:
+
+          * `OperationFailed` и его дети `BadResponse`, `NullResponse`, `CancelPending`,
+            а также `UnsubscribeError` не ловились ВООБЩЕ — исключение уходило наверх и
+            убивало задачу символа навсегда;
+          * лимит биржи ловился как «сетевой сбой» и приводил к повтору через
+            `WS_RETRY_S = 1` с. Повтор после `HTTP 429` — это ровно то, за что Binance
+            банит по IP (`418`) на срок до трёх суток. OctoBot комментирует свой отказ
+            зацикливаться словами «there is a real issue … Don't loop».
         """
         try:
             return await asyncio.wait_for(factory(), timeout=silence_s)
@@ -204,6 +571,21 @@ class Exchange:
             self.ws_reconnects[key] += 1
             log.degraded(f"{what}: поток молчит дольше порога, переподключение",
                          символ=key, порог_с=silence_s)
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            # ВЫШЕ NetworkError: оба его наследуют, и общая ветвь дала бы быстрый повтор.
+            self.rest_errors[type(e).__name__] += 1
+            self.rest_rate_limited += 1
+            log.error(f"{what}: ЛИМИТ БИРЖИ — пауза, быстрого повтора нет",
+                      символ=key, пауза_с=RATE_LIMIT_BACKOFF_S,
+                      причина=f"{type(e).__name__} {e}")
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            return None
+        except ccxt.UnsubscribeError as e:
+            # НЕ ошибка: ccxt будит ожидающий `watch_*` этим классом при снятии подписки.
+            # Считается отдельно, чтобы не разбавлять счётчик сбоев штатным событием.
+            self.ws_unsubscribes[key] += 1
+            log.info(f"{what}: подписка снята, ожидание перезапущено", символ=key,
+                     причина=f"{type(e).__name__} {e}")
         except ccxt.NetworkError as e:
             self.ws_reconnects[key] += 1
             log.degraded(f"{what}: сетевой сбой, переподключение",
@@ -212,37 +594,38 @@ class Exchange:
             self.ws_errors[key] += 1
             log.error(f"{what}: ошибка биржи", символ=key,
                       причина=f"{type(e).__name__} {e}")
+        except ccxt.BaseError as e:
+            # Замыкающая сеть: `OperationFailed`, `BadResponse`, `NullResponse`,
+            # `CancelPending` и всё, что ccxt заведёт впредь. Без неё новый класс
+            # исключения тихо убивал бы задачу символа до конца прогона.
+            self.ws_errors[key] += 1
+            log.error(f"{what}: прочий отказ ccxt", символ=key,
+                      причина=f"{type(e).__name__} {e}")
         await asyncio.sleep(WS_RETRY_S)
         return None
 
-    async def watch_closed_ohlcv(self, symbol: str, timeframe: str) -> AsyncGenerator[Bar]:
-        """WS-поток. Отдаёт бар только после его закрытия (§6).
-
-        Признак закрытия — биржевое время дошло до правой границы, а не «отбросить
-        последний элемент кэша»: последний элемент бывает и закрытым, и тогда
-        отбрасывание подало бы позапрошлый бар.
-
-        Курсор `emitted` живёт ВНЕ попытки и потому переживает переподключение. Иначе
-        после обрыва уже отданные бары ушли бы повторно, а потребитель их не различает.
-        """
-        emitted: int | None = None
-        key = f"{symbol} {timeframe}"
-        while True:
-            raw = await self._watch_step(
-                "бары", key, lambda: self._ex.watch_ohlcv(symbol, timeframe),
-                WS_SILENCE_S)
-            if raw is None:
-                continue
-            now = clock.now_ms()
-            for r in raw:
-                open_ms = int(r[0])
-                if emitted is not None and open_ms <= emitted:
-                    continue
-                if now < open_ms + tf_ms(timeframe):
-                    continue
-                emitted = open_ms
-                yield Bar(open_ms=open_ms, open=float(r[1]), high=float(r[2]),
-                          low=float(r[3]), close=float(r[4]), volume=float(r[5]))
+    # ⚠ `watch_closed_ohlcv` УДАЛЁН 2026-08-05. Бары берутся `fetch_closed_ohlcv` по
+    # границам ТФ. Причина — не стоимость, а ШОВ: историю целиком отдаёт засев (ccxt
+    # режет ответ до 1000 баров, умолчание 500 — то есть на 1Н это годы за один запрос),
+    # а вебсокет добавлял только хвост, закрывшийся после старта. Ряд, склеенный из двух
+    # источников, и есть место, где живут дубликаты, немонотонность и невидимые разрывы.
+    # Удаление WS из баров не отнимает данных — оно убирает шов.
+    # Правило: ОДИН РЯД — ОДИН ИСТОЧНИК.
+    #
+    # ⚠ Хвост был не теоретическим: прогон `stage1-stack10` (2026-08-03) принял по WS
+    # 81 бар — по 2 на каждый ряд 5м и по 1 на 15м, 54 ряда из 162. Эти бары лежат в
+    # сохранённых кадрах и стоят у ПРАВОГО края ряда, где ищутся свежие структуры.
+    #
+    # Что при этом сохранено намеренно (иначе потерялось бы при переделке):
+    #   * курсор уже принятых баров — теперь `SeriesState.bars[-1].open_ms` в `run`;
+    #   * проверка `on_grid` на КАЖДОМ баре, а не только при засеве;
+    #   * отбраковка битого бара по определению свечи — она в `fetch_closed_ohlcv`.
+    #
+    # Что стало ВОЗМОЖНО проверить и было тавтологией раньше: признак «свеча закрыта»
+    # больше не берётся из тех же часов, что и решение её отдать. Ответ биржи —
+    # независимый второй источник, и `run._poll_bars_impl` сравнивает его с
+    # `expected_last_closed_open_ms`. Счётчик `poll_late` способен вырасти; прежний
+    # `ws_unclosed_violations` вырасти не мог по построению.
 
     # --- сделки ------------------------------------------------------------
 

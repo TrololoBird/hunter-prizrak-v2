@@ -97,6 +97,20 @@ def continuous_tail(bars: list[Bar], timeframe: str) -> list[Bar]:
     return list(bars[cut:])
 
 
+def steps_between(earlier: Bar, later: Bar, timeframe: str) -> int:
+    """Сколько ШАГОВ ТФ между открытиями баров. На непрерывном ряду — разность индексов.
+
+    ⚠ Функция существует ровно потому, что эти два числа расходятся, а весь расчёт
+    считал их одним. Курс говорит о свечах: «возвращается той же или следующей свечей»
+    (стр. 55), «2-3 полных тел свечей ЭТОГО ТФ» (стр. 55), — то есть о ВРЕМЕНИ. Код
+    считал позиции в списке, и при дыре в ряду (а дыры есть — `find_gaps`, отказы биржи)
+    соседние по списку бары оказывались соседними «по курсу», отстоя на часы. Прокол
+    превращался в пробой и наоборот, а от этого зависит и состояние уровня, и попадание
+    в леджер. Разбор: Р-2 в docs/audit/critical-review-2026-08-04.md
+    """
+    return (later.open_ms - earlier.open_ms) // tf_ms(timeframe)
+
+
 def find_gaps(bars: list[Bar], timeframe: str) -> list[tuple[int, int]]:
     step = tf_ms(timeframe)
     out: list[tuple[int, int]] = []

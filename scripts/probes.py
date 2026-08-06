@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import statistics
 import sys
 import time
 import urllib.request
@@ -31,10 +32,14 @@ from hunter import (
     accumulation,
     archive,
     breach,
+    engine,
     factors,
+    geometry,
     indicators,
     levels,
+    outcome,
     pereprior,
+    store,
     swings,
 )
 from hunter.bars import TIMEFRAME_MS
@@ -84,7 +89,14 @@ def _series(bars: list[Bar], expr: pl.Expr) -> list[float | None]:
 
 
 def _fetch_day(market_id: str, day: date, tick: Decimal, bucket_ms: int) -> pl.DataFrame | None:
-    """Сутки сделок из архива, сразу свёрнутые в (корзина, бин) → объём."""
+    """Сутки сделок из архива, сразу свёрнутые в (корзина, бин) → объём.
+
+    ⚠ Бинирует ТОЛЬКО через `archive.bin_expr`. Здесь была третья в проекте копия
+    выражения `(price / float(tick)).floor()` — после `models` и `archive`, — и зонд
+    `bar-vs-tick` из-за неё сравнивал «тики против баров» не с боевым бинированием, а
+    со своим двойником: часть разницы была разницей СХЕМ, а не источников данных. На BTC
+    (tick 0.1) примесь оказалась нулевой по замеру, но конструкция была неверна.
+    """
     url = f"{ARCHIVE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
     try:
         with urllib.request.urlopen(url, timeout=900) as r:
@@ -102,7 +114,7 @@ def _fetch_day(market_id: str, day: date, tick: Decimal, bucket_ms: int) -> pl.D
     return pl.read_csv(io.BytesIO(csv), columns=["price", "quantity", "transact_time"]) \
         .with_columns(
             (pl.col("transact_time") // bucket_ms * bucket_ms).alias("bucket"),
-            (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin"),
+            archive.bin_expr(pl.col("price"), tick).alias("bin"),
         ).group_by("bucket", "bin").agg(pl.col("quantity").sum().alias("qty"))
 
 
@@ -125,7 +137,27 @@ def _cached_day(market_id: str, day: date, tick: Decimal) -> pl.DataFrame | None
 def _histogram_over(
     frames: list[pl.DataFrame], symbol: str, tick: Decimal, from_ms: int, to_ms: int
 ) -> TradeHistogram | NotReady:
-    """Гистограмма по окну `[from_ms, to_ms)` поверх кэшированных суток."""
+    """Гистограмма по окну `[from_ms, to_ms)` поверх кэшированных суток.
+
+    ⚠ Границы окна ОБЯЗАНЫ лежать на сетке корзин. Фильтр ниже отбирает целые корзины, и
+    при невыровненной границе окно молча расширяется или сужается до ближайшей — до
+    `CACHE_BUCKET_MS` в каждую сторону. Боевой `BarBinnedTrades.window` в этом случае
+    возвращает `NotReady`; зонд же печатал число как точное.
+
+    Замер 2026-08-05: при нынешней корзине 300_000 мс кратны ей ВСЕ таймфреймы вселенной
+    (5м, 15м, 1ч, 4ч, 1Д, 1Н), поэтому расхождения нет. При прежней корзине 900_000 шаг
+    5м кратен ей НЕ был — и окна 5м-структур округлялись, пока протокол
+    `author-poc-2026-08-04.md` утверждал «срез точен».
+
+    Проверка оставлена не потому, что сейчас срабатывает, а потому что она — единственное,
+    что отличает «выровнено» от «не проверяли», если корзину снова поменяют.
+    """
+    step = archive.CACHE_BUCKET_MS
+    if from_ms % step or to_ms % step:
+        return NotReady(
+            reason=f"{symbol}: окно [{from_ms},{to_ms}) не на сетке корзин {step} — "
+                   f"срез был бы округлён молча"
+        )
     parts = [
         f.filter((pl.col("bucket") >= from_ms) & (pl.col("bucket") < to_ms)) for f in frames
     ]
@@ -193,7 +225,10 @@ def _levels_over(
         if isinstance(hist, NotReady):
             skipped[f"{tf}: {hist.reason.split(':')[-1].strip()}"] += 1
             continue
-        lvl = levels.build_level(a, hist, symbol, (lo, hi))
+        lvl = levels.build_level(
+            a, hist, symbol, (lo, hi),
+            levels.created_at_ms(a, series[tf], TIMEFRAME_MS[tf]),
+        )
         if isinstance(lvl, NotReady):
             skipped[f"{tf}: ПОК не построен"] += 1
             continue
@@ -277,7 +312,7 @@ async def pereprior_counts() -> None:
         sw = swings.detect(bars)
         if isinstance(sw, NotReady):
             continue
-        for pp in pereprior.detect(bars, sw):
+        for pp in pereprior.detect(bars, sw, tf):
             c[pp.kind.value] += 1
             c["с тестом"] += pp.tested_at_index is not None
             c["вырожденная зона"] += pp.zone_degenerate
@@ -298,7 +333,7 @@ async def breach_kinds() -> None:
         for a in accumulation.detect(bars, sw, tf).closed:
             for edge, d in ((a.upper.hi, breach.Direction.ABOVE),
                             (a.lower.lo, breach.Direction.BELOW)):
-                e = breach.first_breach(bars, edge, d, from_index=a.last_index + 1)
+                e = breach.first_breach(bars, edge, d, tf, from_index=a.last_index + 1)
                 c[e.kind.value if e else "заходов не было"] += 1
     print(f"пар {len(data)}, проверок {sum(c.values())}: {dict(c)}")
 
@@ -659,7 +694,7 @@ async def map_drift() -> None:
                             d += timedelta(days=1)
                     # Только то, что УЖЕ в кэше: этот зонд меряет дрейф карты, а не
                     # качает архив. Непокрытые структуры честно уходят в «нет в кэше».
-                    have = archive.cached_days(inst.market_id)
+                    have = archive.cached_days(inst.market_id, inst.tick_size)
                     frames = {}
                     for d in sorted(days & have):
                         got = archive.binned_day(inst.market_id, d, inst.tick_size)
@@ -825,6 +860,160 @@ async def bar_vs_tick() -> None:
               f"[{'в шуме' if abs(dev) < NOISE else 'вне шума'}]")
 
 
+def _pool_without_time(pool: tuple[levels.MappedLevel, ...]) -> tuple[levels.MappedLevel, ...]:
+    """Тот же пул, но моменты появления обнулены — отсев Н-1 выключен."""
+    return tuple(
+        m.model_copy(update={"level": m.level.model_copy(update={"created_at_ms": 0})})
+        for m in pool
+    )
+
+
+def _pool_without_state(pool: tuple[levels.MappedLevel, ...]) -> tuple[levels.MappedLevel, ...]:
+    """Тот же пул, но все уровни объявлены активными — отсев Н-2 выключен."""
+    active = levels.LevelState.ACTIVE
+    return tuple(
+        m.model_copy(update={
+            "status": m.status.model_copy(update={"state": active, "resolved_at_ms": None})
+        })
+        for m in pool
+    )
+
+
+async def emit_quality() -> None:
+    """Цели из будущего, цели-покойники, РР и исходы — на СОХРАНЁННЫХ кадрах прогона.
+
+    Сети не требует: бары берутся из кадров прогона `last`, профиль — из общего кэша
+    архива. Отвечает на четыре вопроса разбора (Н-1…Н-4).
+
+    ⚠ КОНТРОЛЬ обязателен по CLAUDE.md: число «отсеяно N» бессмысленно, пока не показано,
+    что прибор способен ответить иначе. Поэтому тот же самый `build_targets` зовётся
+    ЧЕТЫРЕЖДЫ — на настоящем пуле и на трёх подделанных, где отсев выключен подменой
+    ДАННЫХ, а не кода. Разница между «пул как есть» и «оба отсева выключены» и есть то,
+    что правка убрала; совпадение этих двух чисел означало бы, что отсев не работает.
+    """
+    run_id = "last"
+    dirs = store.saved_symbols(run_id)
+    if not dirs:
+        print(f"кадров прогона {run_id} нет — сначала uv run python -m hunter run")
+        return
+
+    tot = Counter[str]()
+    rr_all: list[float] = []
+    rr_emitted: list[float] = []
+    r_all: list[float] = []
+    r_emitted: list[float] = []
+    stop_pct: list[float] = []
+    outcomes_all = Counter[str]()
+    outcomes_emitted = Counter[str]()
+
+    for d in dirs:
+        meta = store.read_meta(run_id, d)
+        if isinstance(meta, NotReady):
+            print(f"  пропуск {d}: {meta.reason}")
+            continue
+        symbol, tick, bucket = meta
+        tfs = store.saved_timeframes(run_id, d)
+        series = {tf: store.read_bars(run_id, d, tf) for tf in tfs}
+        got = store.read_binned_trades(run_id, d, tick, bucket, symbol)
+        market_id = symbol.split(":")[0].replace("/", "")
+        source = archive.WindowSource(symbol, market_id, tick,
+                                      live=None if isinstance(got, NotReady) else got)
+        # Зонд идёт через ТОТ ЖЕ конвейер, что прогон: свой обход разошёлся бы с боевым
+        # ровно там, где это важно, — а мерить он должен боевой расчёт (2026-08-06).
+        pool = engine.decide(symbol, series, source, tfs).mapped
+        variants = {
+            "как есть": pool,
+            "без отсева по времени (Н-1)": _pool_without_time(pool),
+            "без отсева по состоянию (Н-2)": _pool_without_state(pool),
+            "оба отсева выключены": _pool_without_state(_pool_without_time(pool)),
+        }
+        for m in pool:
+            tot[f"состояние {m.status.state.value}"] += 1
+            for name, variant in variants.items():
+                ts = geometry.build_targets(m.level, variant)
+                tot[f"целей всего · {name}"] += len(ts)
+                tot[f"основных целей · {name}"] += sum(
+                    1 for t in ts if t.role is geometry.TargetRole.PRIMARY
+                )
+            s = geometry.build_setup(m.level, pool)
+            risk = abs(s.entry - s.stop_risky)
+            if s.entry:
+                stop_pct.append(float(risk / s.entry * 100))
+            rr = s.rr(s.stop_risky)
+            primary = [t for t in s.targets if t.role is geometry.TargetRole.PRIMARY]
+            res = outcome.resolve(
+                side=m.level.side, entry=s.entry, stop=s.stop_risky,
+                target=primary[0].price if primary else None,
+                bars=series[m.level.timeframe], from_index=m.level.created_at_index + 1,
+            )
+            outcomes_all[res.kind.value] += 1
+            if rr is not None:
+                rr_all.append(rr)
+            # R сделки: цель даёт +РР, стоп даёт −1. `not_filled`, `open` и `ambiguous`
+            # в R НЕ входят — по ним результата нет, и подстановка нуля превратила бы
+            # «сделки не было» в «сделка вышла в ноль».
+            r = _trade_r(res.kind.value, rr)
+            if r is not None:
+                r_all.append(r)
+            if m.status.state is levels.LevelState.ACTIVE and m.status.limit_orders_allowed:
+                tot["эмитируемых"] += 1
+                outcomes_emitted[res.kind.value] += 1
+                if rr is not None:
+                    rr_emitted.append(rr)
+                if r is not None:
+                    r_emitted.append(r)
+
+    built_total = sum(v for k, v in tot.items() if k.startswith("состояние "))
+    print(f"кадры прогона {run_id}: символов {len(dirs)}, уровней {built_total}")
+    for k in sorted(tot):
+        print(f"  {k}: {tot[k]}")
+    print(f"  исходы по всем     : {dict(sorted(outcomes_all.items()))}")
+    print(f"  исходы эмитируемых : {dict(sorted(outcomes_emitted.items()))}")
+    _rr_report("РР по всем уровням", rr_all)
+    _rr_report("РР по эмитируемым", rr_emitted)
+    _r_report("R по всем уровням", r_all)
+    _r_report("R по эмитируемым", r_emitted)
+    if stop_pct:
+        print(f"  медиана дистанции стопа: {statistics.median(stop_pct):.3f}% цены")
+    print("  ⚠ комиссии, фандинг и проскальзывание НЕ моделируются нигде (§4.3)")
+
+
+def _trade_r(kind: str, rr: float | None) -> float | None:
+    """R одной сделки: цель даёт +РР, стоп даёт −1, остальное результата не имеет.
+
+    ⚠ `None` и 0.0 — РАЗНОЕ. Ноль означал бы состоявшуюся сделку, закрытую в безубыток;
+    `None` — что сделки не было (`not_filled`), что она ещё открыта (`open`) или что
+    стоп и цель попали в один бар (`ambiguous`). Подстановка нуля разбавила бы среднее
+    несуществующими сделками и притянула бы его к нулю тем сильнее, чем больше
+    неисполненных — а их здесь большинство.
+    """
+    if kind == "target":
+        return rr
+    if kind == "stop":
+        return -1.0
+    return None
+
+
+def _r_report(title: str, xs: list[float]) -> None:
+    if not xs:
+        print(f"  {title}: закрытых сделок нет")
+        return
+    wins = sum(1 for x in xs if x > 0)
+    print(f"  {title}: закрыто {len(xs)}, сумма R {sum(xs):+.3f}, "
+          f"средний R {statistics.mean(xs):+.3f}, медиана {statistics.median(xs):+.3f}, "
+          f"выигрышей {wins}/{len(xs)} ({wins / len(xs) * 100:.0f}%)")
+
+
+def _rr_report(title: str, xs: list[float]) -> None:
+    if not xs:
+        print(f"  {title}: целей нет ни у одного уровня")
+        return
+    below = sum(1 for x in xs if x < 0.5) / len(xs) * 100
+    golden = sum(1 for x in xs if x >= geometry.GOLDEN_RR) / len(xs) * 100
+    print(f"  {title}: сделок {len(xs)}, медиана {statistics.median(xs):.3f}, "
+          f"РР<0.5 {below:.0f}%, РР≥{geometry.GOLDEN_RR:.0f} (стр. 9) {golden:.0f}%")
+
+
 PROBES = {
     "structures": structures,
     "pereprior": pereprior_counts,
@@ -840,6 +1029,7 @@ PROBES = {
     "archive-need": archive_need,
     "rest-history": rest_history,
     "bar-vs-tick": bar_vs_tick,
+    "emit-quality": emit_quality,
 }
 
 

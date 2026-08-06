@@ -89,7 +89,7 @@ def _test_index(bars: list[Bar], lo: float, hi: float, from_index: int) -> int |
 
 
 def _detect_side(
-    bars: list[Bar], swings: SwingSet, side: PPSide, confirm_bodies: int
+    bars: list[Bar], swings: SwingSet, side: PPSide, timeframe: str, confirm_bodies: int
 ) -> Pereprior | None:
     """Один ПП нужной стороны — самый поздний из подтверждённых."""
     broken_kind = SwingKind.LOW if side is PPSide.SHORT else SwingKind.HIGH
@@ -134,7 +134,7 @@ def _detect_side(
 
         lo, hi = _shadow_zone(bars[broken.index], broken_kind)
         edge = lo if side is PPSide.SHORT else hi
-        ev = first_breach(bars[:end], edge, direction, from_index=start,
+        ev = first_breach(bars[:end], edge, direction, timeframe, from_index=start,
                           confirm_bodies=confirm_bodies)
         if ev is None or ev.kind is not BreachKind.BREAKOUT or ev.resolved_index is None:
             # Прокол подтверждением не является (стр. 55) — переприора нет.
@@ -151,7 +151,8 @@ def _detect_side(
 
 
 def detect(
-    bars: list[Bar], swings: SwingSet, *, confirm_bodies: int = CONFIRM_BODIES
+    bars: list[Bar], swings: SwingSet, timeframe: str, *,
+    confirm_bodies: int = CONFIRM_BODIES,
 ) -> tuple[Pereprior, ...]:
     """Последний подтверждённый переприор каждой стороны.
 
@@ -160,7 +161,7 @@ def detect(
     порядку было бы правилом, которого курс не даёт.
     """
     out = [pp for side in (PPSide.SHORT, PPSide.LONG)
-           if (pp := _detect_side(bars, swings, side, confirm_bodies)) is not None]
+           if (pp := _detect_side(bars, swings, side, timeframe, confirm_bodies)) is not None]
     return tuple(out)
 
 

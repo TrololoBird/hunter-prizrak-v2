@@ -25,6 +25,8 @@ from __future__ import annotations
 import hashlib
 import http.client
 import io
+import os
+import re
 import urllib.error
 import urllib.request
 import zipfile
@@ -36,7 +38,7 @@ from pathlib import Path
 
 import polars as pl
 
-from .models import BarBinnedTrades, NotReady, TradeHistogram
+from .models import BarBinnedTrades, NotReady, TradeHistogram, tick_scale
 
 BASE = "https://data.binance.vision/data/futures/um/daily"
 
@@ -124,7 +126,35 @@ def fetch_agg_trades_day(
     )
 
 
+def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
+    """Бин цены в полярисе. ТОТ ЖЕ расчёт, что `models.bin_index`, теми же двумя числами.
+
+    Своей арифметики здесь нет умышленно: множитель и целый шаг берутся из
+    `models.tick_scale`, а выражение повторяет `floor(price·scale + 0.5) // step`
+    один в один. Прежняя редакция считала `(price / float(tick)).floor()` — и это была
+    ВТОРАЯ схема бинирования в проекте, дававшая другой ПОК на 38% часовых окон.
+
+    Согласованность двух ветвей проверяет gates/binning_agrees.py на реальной сетке цен:
+    равенство здесь держится на арифметике, а не на том, что обе строки писал один
+    человек в один день.
+    """
+    scale, step = tick_scale(tick)
+    return (price * scale + 0.5).floor().cast(pl.Int64) // step
+
+
 CACHE_DIR = Path("data/aggcache")
+CACHE_LAYOUT = "b2"
+"""Метка СХЕМЫ БИНИРОВАНИЯ в имени файла кэша.
+
+В кэш кладутся уже посчитанные НОМЕРА БИНОВ. Значит содержимое файла зависит не только
+от суток и корзины, но и от того, как считался бин, — а этого в имени не было. Правка
+бинирования (Б-1) сделала все 471 накопленных суток неверными молча: номера посчитаны
+старой схемой, а `bin_price` умножил бы их на шаг по новой.
+
+Метка растёт вместе со схемой; файлы прежней метки не читаются и не удаляются — они
+просто перестают подходить, и это видно по имени, а не по расхождению чисел.
+"""
+
 CACHE_BUCKET_MS = 300_000
 """Корзина кэша — 5 минут, самый младший ТФ проекта (§2.8: 5м/15м/1ч/4ч/1Д/1Н).
 
@@ -137,6 +167,45 @@ CACHE_BUCKET_MS = 300_000
 кэш: свернуть 15м обратно в 5м нельзя. Первая редакция кэша (в scripts/probes.py) была
 на 900_000, и переход сюда потребовал перекачки 3.6 ГБ.
 """
+
+
+def _tick_tag(tick: Decimal) -> str:
+    """Шаг цены как часть имени файла. Точка в имени допустима, но путает глаз и glob."""
+    return f"t{tick:f}".replace(".", "p")
+
+
+def cache_path(market_id: str, day: date, tick: Decimal) -> Path:
+    """Имя файла кэша. ВСЁ, от чего зависит содержимое, стоит в имени.
+
+    ⚠ Шага цены здесь не было до 2026-08-04, и это дефект того же класса, что Б-1:
+    молчаливая рассогласованность двух конвенций. Binance меняет `PRICE_FILTER` у
+    символа — штатная операция при изменении цены на порядок, — и после такой смены
+    весь накопленный кэш по символу становился неверным без единого признака: номера
+    бинов посчитаны по старому шагу, а `bin_price` умножает их на новый.
+    """
+    return (CACHE_DIR
+            / f"{market_id}-{day.isoformat()}-{CACHE_BUCKET_MS}-{_tick_tag(tick)}"
+              f"-{CACHE_LAYOUT}.parquet")
+
+
+def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
+    """Запись через временный файл в ТОМ ЖЕ каталоге плюс `os.replace`.
+
+    ⚠ Прежняя редакция писала прямо по целевому пути. Обрыв процесса (а качается до
+    сотен файлов по ~15 МБ, с таймаутом 900 с и тремя попытками) оставлял обрезанный
+    parquet, и дальше `binned_day` видел `path.exists()` и возвращал его НАВСЕГДА, не
+    перекачивая, а `cached_days` считал эти сутки загруженными. Причина потом выглядела
+    бы как «битый файл», а не как «недокачано».
+
+    `os.replace` атомарна в пределах одной файловой системы — отсюда требование класть
+    временный файл рядом, а не в системный временный каталог.
+    """
+    tmp = path.with_suffix(f".part-{os.getpid()}")
+    try:
+        frame.write_parquet(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def binned_day(
@@ -152,7 +221,7 @@ def binned_day(
     sha256 сверяется ДО свёртки и только при скачивании: в кэш кладётся уже проверенное.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = CACHE_DIR / f"{market_id}-{day.isoformat()}-{CACHE_BUCKET_MS}.parquet"
+    path = cache_path(market_id, day, tick)
     if path.exists():
         return pl.read_parquet(path)
 
@@ -161,20 +230,29 @@ def binned_day(
         return got
     binned = got.frame.with_columns(
         (pl.col("transact_time") // CACHE_BUCKET_MS * CACHE_BUCKET_MS).alias("bucket"),
-        (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin"),
+        bin_expr(pl.col("price"), tick).alias("bin"),
     ).group_by("bucket", "bin").agg(
         pl.col("quantity").sum().alias("qty"), pl.len().alias("n")
     )
-    binned.write_parquet(path)
+    _write_atomic(binned, path)
     return binned
 
 
-def cached_days(market_id: str) -> set[date]:
-    """Какие сутки уже лежат в кэше — чтобы отчёт мог назвать цену прогона заранее."""
+CACHE_STEM = re.compile(r"^(?P<market>.+)-(?P<day>\d{4}-\d{2}-\d{2})-(?P<rest>.+)$")
+
+
+def cached_days(market_id: str, tick: Decimal) -> set[date]:
+    """Какие сутки уже лежат в кэше — чтобы отчёт мог назвать цену прогона заранее.
+
+    Шаг цены — часть вопроса, а не подробность: файл, посчитанный по другому шагу, этим
+    суткам не годится, и считать его загруженным значит соврать в отчёте.
+    """
+    tail = f"-{CACHE_BUCKET_MS}-{_tick_tag(tick)}-{CACHE_LAYOUT}"
     out: set[date] = set()
-    for p in CACHE_DIR.glob(f"{market_id}-*-{CACHE_BUCKET_MS}.parquet"):
-        stem = p.stem[len(market_id) + 1: -len(str(CACHE_BUCKET_MS)) - 1]
-        out.add(date.fromisoformat(stem))
+    for p in CACHE_DIR.glob(f"{market_id}-*{tail}.parquet"):
+        m = CACHE_STEM.match(p.stem[: -len(tail)] if p.stem.endswith(tail) else "")
+        if m and m["market"] == market_id:
+            out.add(date.fromisoformat(m["day"]))
     return out
 
 
@@ -206,12 +284,26 @@ class WindowSource:
         tick: Decimal,
         live: BarBinnedTrades | None = None,
         max_open: int = 48,
+        cache_dir: Path | None = None,
     ) -> None:
         self.symbol = symbol
         self.market_id = market_id
         self.tick = tick
         self.live = live
         self.max_open = max_open
+        self.cache_dir = CACHE_DIR if cache_dir is None else cache_dir
+        """Откуда читать сутки. Прогон читает ОБЩИЙ кэш, повтор — срез, сохранённый
+        в кадрах этого прогона: иначе повтор зависит от того, что успел долить бэкфилл
+        соседнего прогона (А-3, Н-6 разбора)."""
+
+        self.used_days: set[date] = set()
+        """Сутки, ФАКТИЧЕСКИ прочитанные при построении окон.
+
+        Не «нужные по расчёту», а именно прочитанные: их и надо положить в кадры, чтобы
+        повтор был герметичен. Множество, а не список, — порядок здесь не значим, а в
+        карточку это число не попадает (карточка обязана быть детерминированной).
+        """
+
         self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
 
     def _day(self, day: date) -> pl.DataFrame | None:
@@ -219,10 +311,11 @@ class WindowSource:
         if day in self._open:
             self._open.move_to_end(day)
             return self._open[day]
-        path = CACHE_DIR / f"{self.market_id}-{day.isoformat()}-{CACHE_BUCKET_MS}.parquet"
+        path = self.cache_dir / cache_path(self.market_id, day, self.tick).name
         if not path.exists():
             return None
         frame = pl.read_parquet(path)
+        self.used_days.add(day)
         self._open[day] = frame
         while len(self._open) > self.max_open:
             self._open.popitem(last=False)
@@ -277,28 +370,10 @@ class WindowSource:
         return h
 
 
-def histogram_from_window(
-    day_data: ArchiveDay, symbol: str, tick: Decimal, from_ms: int, to_ms: int
-) -> TradeHistogram | NotReady:
-    """Гистограмма по ОКНУ внутри суток: `from_ms <= transact_time < to_ms`.
-
-    Нужна для §2.2: профиль натягивается ровно на структуру (стр. 26 — «важно захватить
-    все свечи структуры»), а не на сутки. Окно, не покрытое сутками, — отказ, а не
-    молчаливо усечённый профиль (§4.3).
-    """
-    lo, hi = int(day_data.frame["transact_time"].min()), int(  # type: ignore[arg-type]
-        day_data.frame["transact_time"].max()  # type: ignore[arg-type]
-    )
-    if from_ms < lo or to_ms > hi + 1:
-        return NotReady(
-            reason=f"{symbol}: окно [{from_ms},{to_ms}) выходит за сутки архива [{lo},{hi}]"
-        )
-    window = day_data.frame.filter(
-        (pl.col("transact_time") >= from_ms) & (pl.col("transact_time") < to_ms)
-    )
-    if window.height == 0:
-        return NotReady(reason=f"{symbol}: в окне [{from_ms},{to_ms}) нет ни одной сделки")
-    return _histogram(window, symbol, tick, window.height)
+# ⚠ `histogram_from_window(day, symbol, tick, from_ms, to_ms)` УДАЛЕНА 2026-08-06:
+# потребителя не было. Профиль по окну строит `WindowSource.window` — он читает кэш
+# суток, а не держит их целиком в памяти, и именно из-за этого был написан
+# (docs/audit/backfill-window-2026-08-04.md, MemoryError на 102 сутках).
 
 
 def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> TradeHistogram:
@@ -310,7 +385,7 @@ def _histogram(
     frame: pl.DataFrame, symbol: str, tick: Decimal, rows: int
 ) -> TradeHistogram:
     binned = frame.with_columns(
-        (pl.col("price") / pl.lit(float(tick))).floor().cast(pl.Int64).alias("bin")
+        bin_expr(pl.col("price"), tick).alias("bin")
     ).group_by("bin").agg(
         pl.col("quantity").sum().alias("qty"),
         pl.len().alias("n"),

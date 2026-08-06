@@ -52,15 +52,10 @@ class Priority(BaseModel):
     holds_for: int
 
 
-def works_on(level_timeframe: str) -> tuple[str, ...]:
-    """ТФ, на которых уровень действует: свой и МЛАДШИЕ (стр. 24, 27).
-
-    Пустой кортеж — ТФ не из основных (стр. 17), и молча подставлять его в один ряд
-    с основными нельзя.
-    """
-    if level_timeframe not in TF_ORDER:
-        return ()
-    return TF_ORDER[: TF_ORDER.index(level_timeframe) + 1]
+# ⚠ `works_on(level_timeframe)` УДАЛЕНА 2026-08-06: потребителя не было. Она отдавала
+# перечень ТФ, на которых уровень действует — свой и младшие, — и это верный факт, но ни
+# одно правило системы его не спрашивает. Отбор целей идёт в обратную сторону, по своему
+# ТФ и СТАРШИМ, и делает его geometry.build_targets.
 
 
 def resolve(trends: dict[str, Trend], above: str) -> Priority:

@@ -32,6 +32,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .bars import steps_between
 from .models import Bar
 
 CONFIRM_BODIES = 2
@@ -121,6 +122,7 @@ def first_breach(
     bars: list[Bar],
     level: float,
     direction: Direction,
+    timeframe: str,
     *,
     from_index: int = 0,
     confirm_bodies: int = CONFIRM_BODIES,
@@ -139,6 +141,13 @@ def first_breach(
     порождал бессмыслицу.
 
     Проход слева направо, каждый бар смотрится один раз — заглядывания вперёд нет (I-5).
+
+    ⚠ «Свечи» здесь считаются ВРЕМЕНЕМ, а не позициями в списке, и `timeframe` подан
+    ради этого. Обе величины курса — «той же или следующей свечей» и «2-3 полных тел
+    свечей ЭТОГО ТФ» — про подряд идущие свечи; при дыре в ряду соседние по списку бары
+    отстоят на часы, и прежняя редакция называла такой возврат проколом. Дыра теперь
+    рвёт серию тел и выводит возврат за окно прокола — то есть даёт `UNRESOLVED`,
+    «источник вердикта не даёт», а не выдуманную классификацию (Р-2 разбора).
     """
     start: int | None = None
     extreme = 0.0
@@ -152,6 +161,8 @@ def first_breach(
 
     for i in range(from_index, len(bars)):
         bar = bars[i]
+        if i > from_index and steps_between(bars[i - 1], bar, timeframe) != 1:
+            run = 0  # дыра в ряду разрывает серию подряд идущих тел (стр. 55)
         if _beyond(bar, level, direction):
             edge = bar.high if direction is Direction.ABOVE else bar.low
             if start is None:
@@ -165,7 +176,8 @@ def first_breach(
             continue
         if start is None:
             continue
-        # Цена вернулась. Прокол — только если уложилась в отведённые бары (стр. 55).
-        return made(BreachKind.PUNCTURE if i - start <= return_bars else BreachKind.UNRESOLVED, i)
+        # Цена вернулась. Прокол — только если уложилась в отведённые СВЕЧИ (стр. 55).
+        back = steps_between(bars[start], bar, timeframe)
+        return made(BreachKind.PUNCTURE if back <= return_bars else BreachKind.UNRESOLVED, i)
 
     return made(BreachKind.OPEN, None) if start is not None else None

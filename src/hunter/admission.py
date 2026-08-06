@@ -79,13 +79,9 @@ def strictest_requirement() -> int:
     return max(REQUIRED_BARS[q] for q in USED_BY_2_9)
 
 
-def available(quantity: str, bars: int) -> bool:
-    try:
-        return bars >= REQUIRED_BARS[quantity]
-    except KeyError:
-        raise ValueError(
-            f"неизвестная величина {quantity!r}; замерены {sorted(REQUIRED_BARS)}"
-        ) from None
+# ⚠ `available(quantity, bars)` УДАЛЕНА 2026-08-06: потребителя не было. Тот же вопрос
+# задают `check` (с причиной) и `unavailable_quantities` (списком) — булево между ними
+# было третьим ответом на один вопрос.
 
 
 def check(quantity: str, bars: int, symbol: str, timeframe: str) -> NotReady | None:

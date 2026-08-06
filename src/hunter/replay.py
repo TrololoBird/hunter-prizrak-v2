@@ -19,7 +19,7 @@ import difflib
 
 from pydantic import BaseModel, ConfigDict
 
-from . import archive, card, store
+from . import archive, card, engine, store
 from .models import NotReady
 
 
@@ -69,15 +69,25 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
     trades = store.read_binned_trades(run_id, dir_name, tick, bucket, symbol)
     binned = None if isinstance(trades, NotReady) else trades
 
-    # Источник тот же, что в прогоне: кэш суточных архивов плюс сохранённый живой поток.
-    # Архив для повтора ПРИГОДЕН именно потому, что неизменяем и сверен по sha256 при
-    # укладке в кэш, — это более сильная гарантия, чем пересохранённый parquet.
+    # Источник — СРЕЗ АРХИВА, сохранённый этим прогоном, плюс его же живой поток.
+    #
+    # ⚠ Прежняя редакция читала общий `data/aggcache` и доказывала это тем, что архив
+    # неизменяем. Довод верен про СОДЕРЖИМОЕ суток и неверен про их НАЛИЧИЕ: бэкфилл
+    # доливает сутки между прогонами, а профиль зависит и от того, и от другого. Прогон-
+    # пробник: кадры не тронуты, из общего кэша убраны одни сутки — карточка ETH
+    # изменилась на 483 строки, и `--diff` напечатал бы «расчёт изменился» при
+    # неизменном расчёте. §10.6 условие 2 называет этот дифф единственной проверкой, не
+    # требующей чтения кода, — то есть ломалась ровно она.
+    #
     # `market_id` восстанавливается из имени символа: сети здесь нет и быть не должно
     # (§10.3 — повтор чистый), а правило Binance «BTC/USDT:USDT → BTCUSDT» механическое.
     market_id = symbol.split(":")[0].replace("/", "")
-    source = archive.WindowSource(symbol, market_id, tick, live=binned)
+    source = archive.WindowSource(symbol, market_id, tick, live=binned,
+                                  cache_dir=store.archive_dir(run_id, dir_name))
 
-    rebuilt = card.render(symbol, series, source, tfs)
+    # Решение строится ЗАНОВО из кадров, а не берётся готовым: §10.6 условие 2 требует
+    # независимого пересчёта, иначе повтор сверял бы результат сам с собой.
+    rebuilt = card.render(engine.decide(symbol, series, source, tfs), series)
     diff = "".join(difflib.unified_diff(
         saved.splitlines(keepends=True), rebuilt.splitlines(keepends=True),
         fromfile=f"{symbol} сохранено", tofile=f"{symbol} пересчитано", n=2,
