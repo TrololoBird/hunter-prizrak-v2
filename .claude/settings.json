@@ -17,6 +17,27 @@
       "Bash(wc *)"
     ]
   },
+  "env": {
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "disableClaudeAiConnectors": true,
+  "extraKnownMarketplaces": {
+    "astral-sh": {
+      "source": {
+        "source": "github",
+        "repo": "astral-sh/claude-code-plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "astral@astral-sh": true
+  },
+  "worktree": {
+    "symlinkDirectories": [
+      "data",
+      ".venv"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
