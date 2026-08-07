@@ -21,7 +21,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 |---|---|---|---|---|---|
 | 0 | профиль объёма, ПОК | `src/hunter/volume_profile.py` | volume profile, point of control, market profile, TPO, value area | готов | [poc-projects-survey-2026-08-06.md](poc-projects-survey-2026-08-06.md) |
 | 1 | свинги | `src/hunter/swings.py` | swing high low, fractal indicator, zigzag, pivot points, williams fractals | готов | [swings-projects-2026-08-07.md](swings-projects-2026-08-07.md) — взято ничего, Г2 отвергнута нулём |
-| 2 | слом структуры (переприор) | `src/hunter/pereprior.py` | break of structure, BOS, CHoCH, market structure shift, smart money concepts | не начат | — |
+| 2 | слом структуры (переприор) | `src/hunter/pereprior.py` | break of structure, BOS, CHoCH, market structure shift, smart money concepts | решение владельца | [bos-projects-2026-08-07.md](bos-projects-2026-08-07.md) — три гипотезы перешли порог, все меняют расчёт |
 | 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout filter, wick vs close breakout, level retest | не начат | — |
 | 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | не начат | — |
 | 5 | сетка баров и закрытость | `src/hunter/bars.py` | partial candle, closed candle only, resample ohlcv, repainting indicator | не начат | — |
@@ -47,6 +47,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 |---|---:|---:|---:|---:|---:|---:|
 | 0 | 50 | 28 | 22 (17 считают ПОК + 5 строят профиль) | не считалось | 0 | 0, к сведению 1 |
 | 1 | 36 | 27 | **16** (двадцати нет) | 8 из 11; 1 «на грани», 2 «мало данных» | 4 | **0** — Г2 доведена до диффа повтора и отвергнута нулём |
+| 2 | 19 | 17 | **10** (двадцати нет) | 6 из 10; 4 «мало данных» или «нет данных» | 3 | **0** — все три перешли порог и меняют расчёт, решение владельца |
 
 ⚠ «Не считалось» — не то же самое, что ноль. Обзор ПОК прошёл ДО того, как команда стала
 требовать покрытия ПО ВОПРОСАМ; за него это число задним числом не выдумывается. Гипотезы
