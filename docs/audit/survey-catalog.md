@@ -20,7 +20,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | # | элемент | модуль | слова для поиска | статус | протокол |
 |---|---|---|---|---|---|
 | 0 | профиль объёма, ПОК | `src/hunter/volume_profile.py` | volume profile, point of control, market profile, TPO, value area | готов | [poc-projects-survey-2026-08-06.md](poc-projects-survey-2026-08-06.md) |
-| 1 | свинги | `src/hunter/swings.py` | swing high low, fractal indicator, zigzag, pivot points, williams fractals | решение владельца | [swings-projects-2026-08-07.md](swings-projects-2026-08-07.md) |
+| 1 | свинги | `src/hunter/swings.py` | swing high low, fractal indicator, zigzag, pivot points, williams fractals | готов | [swings-projects-2026-08-07.md](swings-projects-2026-08-07.md) — взято ничего, Г2 отвергнута нулём |
 | 2 | слом структуры (переприор) | `src/hunter/pereprior.py` | break of structure, BOS, CHoCH, market structure shift, smart money concepts | не начат | — |
 | 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout filter, wick vs close breakout, level retest | не начат | — |
 | 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | не начат | — |
@@ -46,7 +46,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | # | попыток | просмотрено | засчитано | вопросов с большинством | гипотез проверено | принято |
 |---|---:|---:|---:|---:|---:|---:|
 | 0 | 50 | 28 | 22 (17 считают ПОК + 5 строят профиль) | не считалось | 0 | 0, к сведению 1 |
-| 1 | 36 | 27 | **16** (двадцати нет) | 8 из 11; 1 «на грани», 2 «мало данных» | 4 | 0; Г2 — решение владельца |
+| 1 | 36 | 27 | **16** (двадцати нет) | 8 из 11; 1 «на грани», 2 «мало данных» | 4 | **0** — Г2 доведена до диффа повтора и отвергнута нулём |
 
 ⚠ «Не считалось» — не то же самое, что ноль. Обзор ПОК прошёл ДО того, как команда стала
 требовать покрытия ПО ВОПРОСАМ; за него это число задним числом не выдумывается. Гипотезы
