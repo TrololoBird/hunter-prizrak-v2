@@ -122,6 +122,23 @@ def bbands_upper(close: list[float], n: int = 20, k: float = 2.0) -> list[float 
     return out
 
 
+def bbands_lower(close: list[float], n: int = 20, k: float = 2.0) -> list[float | None]:
+    """SMA − K*sigma, sigma ПОПУЛЯЦИОННОЕ (делитель n).
+
+    ⚠ Заведена 2026-08-07. Нижнюю полосу зовёт `card.py:274`, и до этого дня её не
+    проверял НИ ОДИН гейт: сверялась только верхняя. Замечание QA, `docs/audit/09-qa.md`.
+    Отдельная функция, а не знак у верхней: копия формулы со своим знаком проверяет
+    ровно то, что читается в источнике, и не наследует ошибку соседа.
+    """
+    out: list[float | None] = [None] * len(close)
+    for t in range(n - 1, len(close)):
+        w = close[t - n + 1:t + 1]
+        m = sum(w) / n
+        var = sum((v - m) ** 2 for v in w) / n
+        out[t] = m - k * var ** 0.5
+    return out
+
+
 def adx(high: list[float], low: list[float], close: list[float],
         n: int = 14) -> list[float | None]:
     plus_dm = [0.0]
@@ -191,13 +208,16 @@ def main() -> int:
         # ⚠ Правка аудита 2026-08-06 (М-06 = Н-5): здесь стояли прямые вызовы `plta.*`,
         # то есть гейт сверял с формулой БИБЛИОТЕКУ, а не обёртку проекта. Подмена
         # периода в `hunter/indicators.py` проезжала мимо (evidence/E-020-gate-probes).
-        ("rsi14", rsi(c, 14), indicators.rsi(14)),
+        ("rsi14", rsi(c, 14), indicators.rsi()),
         ("ema200", ema(c, 200), indicators.ema(200)),
         # MACD сверяется с ПРОЕКТНЫМ определением (ema12 - ema26), а не с
         # plta.macd(): тот противоречит своим же EMA, см.
         # docs/audit/macd-talib-inconsistency-2026-08-03.md
         ("macd", macd_line(c), indicators.macd_line()),
-        ("bb_upper", bbands_upper(c, 20, 2.0), indicators.bbands_upper(20, 2.0)),
+        ("bb_upper", bbands_upper(c, 20, 2.0), indicators.bbands_upper()),
+        # ⚠ `bb_lower` добавлена 2026-08-07: её зовёт `card.py:274`, и до сих пор
+        # её не проверял НИ ОДИН гейт (замечание QA, 09-qa.md раздел «б»).
+        ("bb_lower", bbands_lower(c, 20, 2.0), indicators.bbands_lower()),
         ("adx14", adx(h, lo, c, 14),
          plta.adx(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14)),
     ]

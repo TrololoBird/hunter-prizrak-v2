@@ -170,11 +170,18 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if st.event is not None:
             out.append(f"        событие: {_event(st.event)}")
 
-    if d.unbuilt:
+    if d.reads:
         out.append("")
-        out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины (§4.3)")
-        # ⚠ СВОДКА ПО ТФ идёт ПЕРВОЙ, и это не оформление. Правка аудита 2026-08-06,
-        # находка М-02.
+        out.append("СВОДКА ПО ТФ: структур → уровней (§4.3)")
+        # ⚠ СВОДКА ПЕЧАТАЕТСЯ ВСЕГДА, а не только когда есть непостроенные. Правка аудита
+        # 2026-08-06 (находка М-02), ИСПРАВЛЕННАЯ 2026-08-07 по замечанию QA.
+        #
+        # Первая редакция стояла внутри `if d.unbuilt:` — и исчезала целиком ровно тогда,
+        # когда непостроенных нет. Это ровно тот дефект, против которого сводка и
+        # заводилась: строка «всё построено» и ОТСУТСТВИЕ строки неотличимы, а второе
+        # означает ещё и «а сколько всего структур было — неизвестно». Плюс ТФ с НУЛЁМ
+        # структур выпадал из сводки молча, то есть «на 1Н структур не нашли вовсе» и
+        # «на 1Н структур не искали» выглядели одинаково.
         #
         # Отказы печатались только поштучно, и каждый был честен: «окно выходит за
         # собранное», «сделок не собрано». Но отказ, повторённый сто раз на ОДНОМ
@@ -190,18 +197,27 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         built_per_tf: dict[str, int] = {}
         for m in d.mapped:
             built_per_tf[m.level.timeframe] = built_per_tf.get(m.level.timeframe, 0) + 1
-        out.append("  сводка по ТФ (структур → уровней):")
         for tf in timeframes:
             r = d.reads.get(tf)
             if r is None:
+                # ⚠ Ряд не разобран вовсе — это НЕ «ноль структур». Причина названа выше,
+                # в разделе «РЯД НЕ РАЗОБРАН»; здесь строка нужна, чтобы ТФ не пропал.
+                out.append(f"    {TF_LABEL.get(tf, tf):>3}  ряд не разобран")
                 continue
             total = len(r.scan.closed)
-            if not total:
-                continue
             got = built_per_tf.get(tf, 0)
+            if not total:
+                # НОЛЬ СТРУКТУР — это результат, а не отсутствие результата. Молчать о нём
+                # значит выдавать «не нашли» за «не искали».
+                out.append(f"    {TF_LABEL.get(tf, tf):>3}  структур не найдено "
+                           f"(баров {r.swings.bars_scanned}, свингов {len(r.swings.swings)})")
+                continue
             out.append(f"    {TF_LABEL.get(tf, tf):>3}  {got} из {total}"
                        f"  ({got / total * 100:.0f}%)")
-        out.append("  поштучно:")
+
+    if d.unbuilt:
+        out.append("")
+        out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины поштучно (§4.3)")
         for u in d.unbuilt:
             out.append(
                 f"  {TF_LABEL.get(u.timeframe, u.timeframe)}"

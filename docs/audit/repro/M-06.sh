@@ -14,7 +14,7 @@ restore() { cp "$BAK" src/hunter/indicators.py; rm -f "$BAK"; }
 trap restore EXIT
 
 echo "== ПРОБНИК 1: тело rsi умножается на 1.5 =="
-python - <<'PY'
+uv run python - <<'PY'
 import pathlib
 p = pathlib.Path('src/hunter/indicators.py'); s = p.read_text(encoding='utf-8')
 old = 'return _expr(plta.rsi(pl.col("close"), timeperiod=period))'
@@ -30,7 +30,7 @@ done
 restore; trap - EXIT; BAK=$(mktemp); cp src/hunter/indicators.py "$BAK"; trap restore EXIT
 
 echo "== ПРОБНИК 2: indicator_availability не вакуумен — период *3 =="
-python - <<'PY'
+uv run python - <<'PY'
 import pathlib
 p = pathlib.Path('src/hunter/indicators.py'); s = p.read_text(encoding='utf-8')
 old = 'return _expr(plta.rsi(pl.col("close"), timeperiod=period))'

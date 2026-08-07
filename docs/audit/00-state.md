@@ -181,18 +181,36 @@ grep -rn "pereprior" src/hunter/*.py | grep -v "^src/hunter/pereprior.py"
 
 ---
 
-## 0.7. `git check-ignore` — файлы, нужные для работы, но вне VCS
+## 0.7. Что из нужного для работы лежит вне VCS
+
+⚠ **Метод первой редакции был негоден, и нашёл это не я, а QA-проверка.** Я писал:
+«`git check-ignore` по всем файлам → пусто». Но `git check-ignore` отвечает на вопрос
+«прячет ли этот путь `.gitignore`», а спрашивалось другое — «есть ли нужный для работы
+файл вне репозитория». Файл, который просто не добавлен в индекс, `check-ignore` НЕ
+показывает: он молчит и для отслеживаемого, и для забытого.
+
+Годная проверка — две команды, и обе приведены:
 
 ```bash
-git check-ignore -v $(find src gates scripts config docs research -type f \( -name "*.py" -o -name "*.toml" -o -name "*.md" -o -name "*.yml" -o -name "*.json" -o -name "*.jsonl" -o -name "*.txt" -o -name "*.parquet" \))
+git ls-files --others --ignored --exclude-standard -- src gates scripts config docs research
 ```
-→ **пусто.** Ни один исходник, конфиг, документ или файл корпуса не исключён из VCS.
-`git status --porcelain --ignored=matching src gates scripts config` — тоже пусто.
+Игнорируемые файлы в рабочих каталогах: **пусто** (кроме `__pycache__` и
+`docs/course/pages/`, исключённых умышленно и обоснованно).
 
-Исключены умышленно и обоснованно: `data/`, `*.parquet` (с явным исключением для
-эталонного среза гейта), `docs/course/pages/`, `.claude/settings.local.json`.
+```bash
+git ls-files --others --exclude-standard -- src gates scripts config research
+```
+Неотслеживаемые и не игнорируемые в каталогах КОДА: **пусто**.
 
-**Находки нет.**
+```bash
+uv run python -c "import subprocess; print({d: len(subprocess.run(['git','ls-files','--',d],capture_output=True).stdout.decode().split()) for d in ['src','gates','scripts','config','research']})"
+```
+Отслеживается: `src` 30, `gates` 18, `scripts` 2, `config` 1, `research` 46.
+
+**Находки нет.** Но в `docs/audit/` неотслеживаемые файлы во время работы БЫЛИ — это
+артефакты самого аудита до коммита, и QA справедливо отметил, что среди них лежал зонд,
+дающий главное число. Порядок исправлен: каждый зонд и его вывод коммитятся вместе с
+отчётом, который на них ссылается.
 
 ---
 

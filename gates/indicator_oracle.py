@@ -62,7 +62,12 @@ def _project(df: pl.DataFrame) -> dict[str, list[float | None]]:
     (macd-talib-inconsistency-2026-08-03.md), поэтому проект собирает линию сам.
     """
     out = df.select(
-        indicators.rsi(14).alias("rsi14"),
+        # ⚠ Правка 2026-08-07 по замечанию QA (09-qa.md, раздел «б»): величины зовутся
+        # ТАК ЖЕ, КАК ИХ ЗОВЁТ БОЕВОЙ КОД — без явных аргументов. `card.py` пишет
+        # `indicators.rsi()`, `bbands_upper()`, `bbands_lower()`, то есть пользуется
+        # УМОЛЧАНИЯМИ; гейт, прибивавший период явно (`rsi(14)`), подмену умолчания не
+        # ловил. Первая редакция правки М-06 этого не заметила.
+        indicators.rsi().alias("rsi14"),
         indicators.macd_line().alias("macd"),
         indicators.ema(200).alias("ema200"),
     )
