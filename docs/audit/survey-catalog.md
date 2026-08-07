@@ -1,7 +1,7 @@
 # Каталог обзоров чужих реализаций
 
 Очередь работы по команде `/survey <элемент>` (`.claude/commands/survey.md`): для каждого
-элемента — не меньше 20 НЕЗАВИСИМЫХ проектов, каталог, сверка с нашим кодом, живая
+элемента — цель 20 НЕЗАВИСИМЫХ проектов и НИЖНИЙ ПРЕДЕЛ 10, каталог, сверка с кодом, живая
 проверка гипотез, решение.
 
 Порядок задан ожидаемой отдачей, а не размером модуля. Отдача тем выше, чем больше
@@ -22,7 +22,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 0 | профиль объёма, ПОК | `src/hunter/volume_profile.py` | volume profile, point of control, market profile, TPO, value area | готов | [poc-projects-survey-2026-08-06.md](poc-projects-survey-2026-08-06.md) |
 | 1 | свинги | `src/hunter/swings.py` | swing high low, fractal indicator, zigzag, pivot points, williams fractals | готов | [swings-projects-2026-08-07.md](swings-projects-2026-08-07.md) — взято ничего, Г2 отвергнута нулём |
 | 2 | слом структуры (переприор) | `src/hunter/pereprior.py` | break of structure, BOS, CHoCH, market structure shift, smart money concepts, **Pine Script, MQL5** | готов | [bos-projects-2026-08-07.md](bos-projects-2026-08-07.md) — приняты ближний край зоны и ретест по закрытию; Д3 (сколько сломов показывать) осталась за владельцем |
-| 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout filter, wick vs close breakout, level retest | не начат | — |
+| 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout, liquidity sweep, stop hunt, turtle soup, wyckoff spring/upthrust, bull/bear trap, 2B | **НЕДОБОР: 7 из 10** | [breach-projects-2026-08-07.md](breach-projects-2026-08-07.md) — Р1 закрыта замером, Р2 за владельцем, выборку добрать |
 | 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | не начат | — |
 | 5 | сетка баров и закрытость | `src/hunter/bars.py` | partial candle, closed candle only, resample ohlcv, repainting indicator | не начат | — |
 | 6 | часы и сдвиг биржи | `src/hunter/clock.py` | exchange server time drift, clock sync trading bot, timestamp skew | не начат | — |
@@ -48,6 +48,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 0 | 50 | 28 | 22 (17 считают ПОК + 5 строят профиль) | не считалось | 0 | 0, к сведению 1 |
 | 1 | 36 | 27 | **16** (двадцати нет) | 8 из 11; 1 «на грани», 2 «мало данных» | 4 | **0** — Г2 доведена до диффа повтора и отвергнута нулём |
 | 2 | 31 | 29 | **14** (10 питон + 4 Pine/MQL5) | 6 из 11; 5 «мало данных» или «нет данных» | 3 | **2** — ближний край зоны и ретест по закрытию, решение владельца, дифф повтора |
+| 3 | 16 | 17 | **7 — НИЖЕ ПРЕДЕЛА 10** | ни одного: при семи большинства нет | 2 | **0** — Р1 закрыта замером, Р2 за владельцем |
 
 ⚠ «Не считалось» — не то же самое, что ноль. Обзор ПОК прошёл ДО того, как команда стала
 требовать покрытия ПО ВОПРОСАМ; за него это число задним числом не выдумывается. Гипотезы
