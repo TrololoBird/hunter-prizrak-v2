@@ -173,6 +173,35 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
     if d.unbuilt:
         out.append("")
         out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины (§4.3)")
+        # ⚠ СВОДКА ПО ТФ идёт ПЕРВОЙ, и это не оформление. Правка аудита 2026-08-06,
+        # находка М-02.
+        #
+        # Отказы печатались только поштучно, и каждый был честен: «окно выходит за
+        # собранное», «сделок не собрано». Но отказ, повторённый сто раз на ОДНОМ
+        # таймфрейме, — уже не данные, а перекос: замер R-01 на 305 структурах дал
+        # 91.7% построенных на 15м против 7.8% на 1Д и 0.0% на 1Н, то есть карта
+        # состояла ровно из тех ТФ, которые курс считает слабее (стр. 48: «Чем старше
+        # ТФ — тем выше винрейт»). Поштучные строки этого не показывают: их надо
+        # сложить, а глазами их складывает не всякий и не всегда.
+        #
+        # Правило владельца от 2026-08-04 (CLAUDE.md): «у отказов обязана быть СВОДКА
+        # по измерению, вдоль которого возможен перекос». Разбор:
+        # docs/audit/backfill-window-2026-08-04.md, docs/audit/04-05-measurements.md
+        built_per_tf: dict[str, int] = {}
+        for m in d.mapped:
+            built_per_tf[m.level.timeframe] = built_per_tf.get(m.level.timeframe, 0) + 1
+        out.append("  сводка по ТФ (структур → уровней):")
+        for tf in timeframes:
+            r = d.reads.get(tf)
+            if r is None:
+                continue
+            total = len(r.scan.closed)
+            if not total:
+                continue
+            got = built_per_tf.get(tf, 0)
+            out.append(f"    {TF_LABEL.get(tf, tf):>3}  {got} из {total}"
+                       f"  ({got / total * 100:.0f}%)")
+        out.append("  поштучно:")
         for u in d.unbuilt:
             out.append(
                 f"  {TF_LABEL.get(u.timeframe, u.timeframe)}"

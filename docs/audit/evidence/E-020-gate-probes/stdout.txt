@@ -1,0 +1,11 @@
+=== ПРОБНИК 1: purity видит 'from . import clock' в чистом модуле? ===
+нарушение подсажено: from . import clock в card.py
+purity -> код возврата 1  (ожидается 1)
+после восстановления -> 0  (ожидается 0)
+
+=== ПРОБНИК 2: индикаторные гейты видят подмену atr и rsi? ===
+заменено atr/rsi период 14 -> 20: True
+  indicator_oracle -> 0
+  formula_reference -> 0
+  indicator_availability -> 0
+восстановлено

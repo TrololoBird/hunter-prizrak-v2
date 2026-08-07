@@ -28,6 +28,9 @@ import polars_talib as plta
 TOLERANCE = 1e-6  # §10.3 дословно
 SLICE = Path("docs/audit/reference-slice/BTCUSDT-1h-500.parquet")
 
+sys.path.insert(0, "src")
+from hunter import indicators  # noqa: E402
+
 # ПРОГРЕВ: сколько баров нужно, чтобы две независимые реализации сошлись в 1e-6.
 # Экспоненциальное сглаживание засевается по-разному, и разница затухает, а не
 # исчезает сразу. Замер 2026-08-03 на срезе BTCUSDT 1h, 499 баров:
@@ -42,15 +45,45 @@ WARMUP_BARS: dict[str, int] = {"atr14": 144, "rsi14": 193, "macd": 111, "ema200"
 
 
 def _project(df: pl.DataFrame) -> dict[str, list[float | None]]:
-    """Величины так, как их считает проект."""
+    """Величины так, как их считает проект — ЧЕРЕЗ `hunter.indicators`, а не через `plta`.
+
+    ⚠ Правка аудита 2026-08-06, находка М-06 (она же Н-5 разбора 2026-08-04). До неё
+    здесь стояли прямые вызовы `plta.*`, то есть гейт сравнивал `polars_talib` с
+    `pandas-ta` — ДВЕ ЧУЖИЕ БИБЛИОТЕКИ ДРУГ С ДРУГОМ — и до обёртки проекта не
+    дотягивался. §10.3 обещает другое: «Гейт считает ATR/RSI/MACD **проектным кодом** и
+    эталонной библиотекой».
+
+    Пробник, которым это найдено (evidence/E-020-gate-probes): период `rsi` в
+    `src/hunter/indicators.py` меняется с 14 на 20 — все три индикаторных гейта
+    возвращали 0. Контроль: тем же пробником `gates/purity.py` на подсаженном нарушении
+    вернул 1, то есть пробник исправен.
+
+    `macd` шёл через проект и раньше: `plta.macd` противоречит собственным EMA библиотеки
+    (macd-talib-inconsistency-2026-08-03.md), поэтому проект собирает линию сам.
+    """
     out = df.select(
-        plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14).alias("atr14"),
-        plta.rsi(pl.col("close"), timeperiod=14).alias("rsi14"),
-        plta.macd(pl.col("close"), fastperiod=12, slowperiod=26,
-                  signalperiod=9).struct.field("macd").alias("macd"),
-        plta.ema(pl.col("close"), timeperiod=200).alias("ema200"),
+        indicators.rsi(14).alias("rsi14"),
+        indicators.macd_line().alias("macd"),
+        indicators.ema(200).alias("ema200"),
     )
-    return {c: out[c].to_list() for c in out.columns}
+    got = {c: out[c].to_list() for c in out.columns}
+    # ⚠ atr14 обёртки проекта НЕ ИМЕЕТ: `indicators.atr` удалена 2026-08-06 за отсутствием
+    # потребителя (см. её некролог в src/hunter/indicators.py). Поэтому строка ниже —
+    # честно БИБЛИОТЕКА против оракула, а не проект против оракула, и печать это называет.
+    # Убрать её молча значило бы сузить охват гейта, не сказав об этом.
+    got["atr14"] = (
+        df.select(plta.atr(pl.col("high"), pl.col("low"), pl.col("close"),
+                           timeperiod=14).alias("a"))["a"].to_list()
+    )
+    return got
+
+
+LIBRARY_ONLY: frozenset[str] = frozenset({"atr14"})
+"""Величины, у которых обёртки проекта нет: сравнение идёт библиотека против оракула.
+
+Печатается рядом с результатом. Первая редакция этой правки давала ключу отдельное имя, и
+он молча выпал из сверки — «величин 3» вместо 4 при зелёном коде возврата. Ровно тот
+дефект, который эта же правка и чинит: сужение охвата, выглядящее как успех."""
 
 
 def _oracle(df: pl.DataFrame) -> dict[str, list[float | None]]:
@@ -120,8 +153,9 @@ def main() -> int:
             continue
         compared, worst, over = compare(proj[n], orac[n], warm)
         status = "СОШЛОСЬ" if over == 0 else f"РАЗОШЛОСЬ на {over}"
+        arm = " ⚠ обёртки проекта нет: библиотека против оракула" if n in LIBRARY_ONLY else ""
         print(f"  {n:8} прогрев {warm:4}  сравнено {compared:4}  "
-              f"худшее расхождение {worst:.3e}  {status}")
+              f"худшее расхождение {worst:.3e}  {status}{arm}")
         if compared == 0:
             print(f"  ПРОВАЛ {n}: сравнено 0 точек — величина не проверена")
             failed += 1
