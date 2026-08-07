@@ -30,13 +30,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from . import emit, geometry, levels, priority, swings
+from . import emit, geometry, levels, pereprior, priority, swings
 from .accumulation import AccumulationScan
 from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS
 from .geometry import Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
+from .pereprior import Pereprior, PPSide
 from .priority import Agreement, Priority
 from .swings import SwingSet, Trend
 
@@ -59,6 +60,16 @@ class SeriesRead(BaseModel):
     swings: SwingSet
     scan: AccumulationScan
     trend: Trend
+    perepriors: tuple[Pereprior, ...] = ()
+    """Переприоры этого ряда. §2.5.
+
+    ⚠ Заведено 2026-08-07, находка А-02. До этого `pereprior.detect` не вызывался из
+    расчёта ВООБЩЕ — только при печати карточки. Следствие было такое: уровень, которого
+    цена коснулась, переводился в `EntryRule.CONFIRMATION` — стр. 25: «можно рассматривать
+    вход от 2 или 3 касания только по факту слома структуры на младшем ТФ», — а
+    наступление слома система проверить не могла. Оператор получал инструкцию,
+    исполнимость которой машина не отслеживала.
+    """
 
 
 class Decision(BaseModel):
@@ -78,6 +89,14 @@ class Decision(BaseModel):
     setup: Setup | None
     hold: str
     """Пусто — уровень эмитируется. Иначе причина, по которой сделки нет."""
+
+    mtf_break: str = ""
+    """Слом структуры на МЛАДШЕМ ТФ после касания уровня — условие входа по стр. 25/31.
+
+    Пусто у уровней, которым это правило не адресовано (лимитки ещё разрешены). У
+    остальных — либо описание найденного слома, либо названная причина, почему его нет.
+    §4.3: отсутствие называется, а не подменяется пустотой.
+    """
 
     @property
     def emitted(self) -> bool:
@@ -146,7 +165,8 @@ def read_series(
             bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
             continue
         reads[tf] = SeriesRead(timeframe=tf, swings=sw, trend=swings.trend(sw),
-                               scan=detect_accumulations(bars, sw, tf))
+                               scan=detect_accumulations(bars, sw, tf),
+                               perepriors=pereprior.detect(bars, sw, tf))
     return reads, tuple(bad)
 
 
@@ -182,8 +202,63 @@ def decide(
             agreement=priority.agreement(m.level.side, pr),
             setup=None if hold else geometry.build_setup(m.level, mapped),
             hold=hold,
+            mtf_break=_mtf_break(m, series, reads, tfs),
         ))
     return SymbolDecision(symbol=symbol, timeframes=tfs, reads=reads,
                           unreadable=unreadable, unbuilt=unbuilt,
                           mapped=mapped, decisions=tuple(decisions))
 
+
+
+def _mtf_break(
+    m: MappedLevel,
+    series: dict[str, list[Bar]],
+    reads: dict[str, SeriesRead],
+    timeframes: tuple[str, ...],
+) -> str:
+    """Случился ли слом структуры на МЛАДШЕМ ТФ ПОСЛЕ касания уровня (стр. 25, 31).
+
+    ⚠ Правка аудита 2026-08-07, находка А-02. §2.5 вычислялся и в решение не входил.
+
+    Стр. 25: «можно рассматривать вход от 2 или 3 касания только по факту слома структуры
+    на младшем ТФ». Стр. 31: «Позицию от уровня смотрим только по факту слома структуры на
+    более мелких ТФ». Это условие ВХОДА, и без него `EntryRule.CONFIRMATION` — инструкция,
+    исполнимость которой не проверяется.
+
+    Здесь она проверяется и НАЗЫВАЕТСЯ, но эмиссию НЕ порождает: вход по слому — отдельный
+    путь сигнала, а его введение меняет состав эмиссии и потому решение владельца, а не
+    правка аудита. Сейчас оператор получает ответ на вопрос «слом уже был?» вместо
+    молчания.
+
+    Сторона слома должна совпадать со стороной сделки: от лонгового уровня входят вверх,
+    значит нужен ПП в лонг.
+    """
+    if m.status.limit_orders_allowed:
+        return ""  # правило адресовано не этому уровню: лимитки ещё разрешены
+    tf = m.level.timeframe
+    if tf not in timeframes:
+        return "младший ТФ не определён"
+    idx = timeframes.index(tf)
+    if idx == 0:
+        return "младше этого ТФ рядов не собрано — слом проверить негде"
+    younger = timeframes[idx - 1]
+    y_bars = series.get(younger)
+    y_read = reads.get(younger)
+    own = series.get(tf)
+    if not y_bars or y_read is None or not own:
+        return f"ряд {younger} не разобран — слом проверить негде"
+    touch = levels.first_test_index(m.level, own)
+    if touch is None:
+        return "касания ещё не было"
+    touch_ms = own[touch].open_ms + TIMEFRAME_MS[tf]
+    want = PPSide.LONG if m.level.side is levels.LevelSide.LONG else PPSide.SHORT
+    y_step = TIMEFRAME_MS[younger]
+    for pp in y_read.perepriors:
+        if pp.side is not want:
+            continue
+        at = y_bars[pp.confirmed_at_index].open_ms + y_step
+        if at >= touch_ms:
+            return (f"слом на {younger} подтверждён, зона ПП "
+                    f"{pp.zone_lo:.8g}…{pp.zone_hi:.8g}, "
+                    f"{'тест был' if pp.tested_at_index is not None else 'теста ещё не было'}")
+    return f"слома на {younger} после касания не было"

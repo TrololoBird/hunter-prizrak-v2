@@ -59,6 +59,28 @@ def bin_index(price: float, tick: Decimal) -> int:
     return math.floor(price * scale + 0.5) // step
 
 
+class RawTrade(BaseModel):
+    """Одна сделка, пришедшая от ccxt. Тип, в который превращается словарь биржи.
+
+    ⚠ Заведено 2026-08-07, находка А-5 прошлого разбора, подтверждённая на HEAD.
+    §10.1 запрещает словари между слоями: поток сделок оставался последним таким местом —
+    `watch_agg_trades` отдавал `list[dict[str, Any]]`, а `run` читал `t.get("price")`,
+    то есть ключи проверялись глазами, и гейту `no_loose_dicts` ловить было нечего.
+
+    РАЗБОР СЛОВАРЯ ЖИВЁТ НЕ ЗДЕСЬ, а в `exchange.parse_trade` — в файле, который гейт
+    `no_loose_dicts` уже объявил единственной границей с ccxt. Держать разбор здесь
+    значило бы РАСШИРИТЬ список исключений гейта на `models.py`, то есть ослабить
+    правило ради своей же правки.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    price: float = Field(gt=0)
+    amount: float = Field(gt=0)
+    timestamp: int = Field(gt=0)
+    id: str | None = None
+
+
 class NotReady(BaseModel):
     """Данных нет. Причина обязательна — §4.3 запрещает молчаливый пропуск."""
 

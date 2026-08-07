@@ -24,6 +24,7 @@ from .models import (
     MarketsReload,
     NotReady,
     OhlcvFetch,
+    RawTrade,
     TickChange,
 )
 
@@ -186,6 +187,8 @@ class Exchange:
         """Наибольший `X-MBX-USED-WEIGHT-1M` за прогон. 0 — заголовок ни разу не пришёл."""
 
         self.weight_reads = 0
+        self.trades_unparsed = 0
+        """Сделок, которые не удалось разобрать в тип. Знаменатель — принятые."""
         """Сколько ответов принесли заголовок веса. Знаменатель к `weight_peak`: без него
         ноль «не подходили к лимиту» неотличим от «ни разу не смотрели»."""
 
@@ -629,13 +632,43 @@ class Exchange:
 
     # --- сделки ------------------------------------------------------------
 
-    async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[dict[str, Any]]]:
+    async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[RawTrade]]:
+        """Поток сделок УЖЕ РАЗОБРАННЫМ в тип. §10.1: словарей между слоями нет.
+
+        ⚠ Правка 2026-08-07, находка А-5. Прежде наружу отдавался `list[dict[str, Any]]`,
+        и потребитель читал ключи руками. Неразобранная сделка не пропускается молча:
+        она считается и попадает в счётчик `trades_unparsed`, который печатает приёмка.
+        """
         while True:
             batch = await self._watch_step(
                 "сделки", symbol, lambda: self._ex.watch_trades(symbol),
                 WS_TRADES_SILENCE_S)
-            if batch is not None:
-                yield batch
+            if batch is None:
+                continue
+            out: list[RawTrade] = []
+            for raw in batch:
+                t = parse_trade(raw)
+                if isinstance(t, NotReady):
+                    self.trades_unparsed += 1
+                    log.degraded("сделка не разобрана", символ=symbol, причина=t.reason)
+                    continue
+                out.append(t)
+            if out:
+                yield out
+
+
+def parse_trade(raw: dict[str, Any]) -> RawTrade | NotReady:
+    """Словарь ccxt -> тип. Неполная сделка — НАЗВАННЫЙ отказ, а не молчаливый пропуск.
+
+    Живёт в этом файле намеренно: `gates/no_loose_dicts.py` объявил `exchange.py`
+    единственной границей с ccxt, и разбор словаря обязан быть внутри неё, а не рядом.
+    """
+    try:
+        return RawTrade(price=float(raw["price"]), amount=float(raw["amount"]),
+                        timestamp=int(raw["timestamp"]),
+                        id=None if raw.get("id") is None else str(raw["id"]))
+    except (KeyError, TypeError, ValueError, ValidationError) as exc:
+        return NotReady(reason=f"сделка не разобрана: {type(exc).__name__} {exc}")
 
 
 def _price_filter_tick(market: dict[str, Any]) -> Decimal | None:

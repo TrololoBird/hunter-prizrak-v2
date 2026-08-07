@@ -354,13 +354,11 @@ async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
         while not stop.is_set():
             batch = await anext(agen)
             for t in batch:
-                price, amount, ts = t.get("price"), t.get("amount"), t.get("timestamp")
-                if price is None or amount is None or ts is None:
-                    log.degraded("сделка без цены/объёма/метки, пропущена", символ=sym)
-                    continue
-                seq.note(t.get("id"))
-                hist.add(float(price), float(amount), int(ts))
-                binned.add(float(price), float(amount), int(ts))
+                # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
+                # здесь больше не нужно и нельзя — их нет.
+                seq.note(t.id)
+                hist.add(t.price, t.amount, t.timestamp)
+                binned.add(t.price, t.amount, t.timestamp)
     except asyncio.CancelledError:
         raise
     finally:

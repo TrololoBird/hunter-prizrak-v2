@@ -178,7 +178,11 @@ def main() -> int:
 
     total_hits = 0
     total_targets = 0
+    alive_hits = [0]
+    alive_total = [0]
+    built_total = [0]
     ctrl: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    ctrl_alive: dict[str, list[tuple[int, int]]] = defaultdict(list)
     print()
     for sym, prices in sorted(author.items()):
         tfs = series_all.get(sym)
@@ -192,6 +196,11 @@ def main() -> int:
         trades = None if loaded is None else CacheWindows(sym, loaded[0], loaded[1])
         d = decide(sym, cut, trades, tuple(cut))
         levels = [float(m.level.price) for m in d.mapped]
+        # R-05, зафиксировано ДО прогона в `docs/audit/tolerance-R-03.md`: автор публикует
+        # уровни, КОТОРЫМИ ТОРГУЕТ. Стр. 25 удаляет отработанный, стр. 43 переворачивает
+        # пробитый. Сравнивать с разметкой отработанные и флипнутые — сравнивать разные
+        # множества. Отбор взят из курса, а не из результата.
+        alive = [float(m.level.price) for m in d.mapped if m.alive_at(CUTOFF_MS)]
         by_tf: dict[str, int] = defaultdict(int)
         for m in d.mapped:
             by_tf[m.level.timeframe] += 1
@@ -210,8 +219,10 @@ def main() -> int:
             print("  уровней НЕТ — сравнивать нечем")
             continue
         hits, dists = matched(prices, levels, tol)
+        a_hits, _ = matched(prices, alive, tol)
         total_hits += hits
         total_targets += len(prices)
+        alive_hits[0] += a_hits
         fin = [x for x in dists if x != float("inf")]
         print(f"  ВОСПРОИЗВЕДЕНО {hits} из {len(prices)} ({hits / len(prices) * 100:.1f}%)")
         print(f"  расстояние до ближайшего уровня, ATR: медиана "
@@ -232,6 +243,21 @@ def main() -> int:
             ctrl[f"сдвиг {s:+.0%}"].append((s_hits, len(sh)))
             print(f"  К-2б сдвиг {s:+.0%}: {s_hits} из {len(sh)} "
                   f"({s_hits / len(sh) * 100:.1f}%)")
+        print(f"  --- R-05: только ЖИВЫЕ уровни (стр. 25, 43) — их {len(alive)} "
+              f"из {len(levels)} ---")
+        print(f"  ВОСПРОИЗВЕДЕНО {a_hits} из {len(prices)} "
+              f"({a_hits / len(prices) * 100:.1f}%)")
+        g2, _ = matched(grid, alive, tol)
+        ctrl_alive["решётка"].append((g2, len(grid)))
+        print(f"  К-2а решётка: {g2} из {len(grid)} ({g2 / len(grid) * 100:.1f}%)")
+        for s in SHIFTS:
+            sh = [p * (1 + s) for p in prices]
+            s2, _ = matched(sh, alive, tol)
+            ctrl_alive[f"сдвиг {s:+.0%}"].append((s2, len(sh)))
+            print(f"  К-2б сдвиг {s:+.0%}: {s2} из {len(sh)} "
+                  f"({s2 / len(sh) * 100:.1f}%)")
+        alive_total[0] += len(alive)
+        built_total[0] += len(levels)
         print()
 
     if not total_targets:
@@ -260,6 +286,29 @@ def main() -> int:
     if worse:
         print(f"   ⚠ {worse} нулей воспроизводятся не хуже настоящей разметки —")
         print("     число публикации не подлежит без разбора.")
+
+    print()
+    print("=" * 80)
+    print("R-05  ТО ЖЕ, но только по ЖИВЫМ уровням (отбор из курса, зафиксирован до прогона)")
+    print("=" * 80)
+    ar = alive_hits[0] / total_targets * 100
+    print(f"уровней живых {alive_total[0]} из {built_total[0]} построенных")
+    print(f"ВОСПРОИЗВЕДЕНО {alive_hits[0]} из {total_targets} ({ar:.1f}%)")
+    print(f"   {'нуль':<16} {'совпало':>9} {'доля':>8}   вердикт")
+    worse2 = 0
+    for name, pairs in ctrl_alive.items():
+        h = sum(x for x, _ in pairs)
+        n = sum(y for _, y in pairs)
+        pv = h / n * 100 if n else 0.0
+        v = "✓ хуже настоящей" if pv < ar else ("= НЕ ХУЖЕ" if pv == ar else "✗ ЛУЧШЕ")
+        if pv >= ar:
+            worse2 += 1
+        print(f"   {name:<16} {h:>4} из {n:<4} {pv:>7.1f}%   {v}")
+    print()
+    if worse2:
+        print(f"   ⚠ {worse2} нулей не хуже — конформанс НЕ ПОДТВЕРЖДЁН и на живых уровнях.")
+    else:
+        print("   ✓ ВСЕ нули хуже настоящей разметки — конформанс подтверждён.")
     return 0
 
 

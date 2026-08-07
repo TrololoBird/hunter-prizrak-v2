@@ -60,6 +60,18 @@ def ema(period: int) -> pl.Expr:
     return _expr(plta.ema(pl.col("close"), timeperiod=period))
 
 
+def sma(period: int) -> pl.Expr:
+    """Простая скользящая. Стр. 69 называет ОБЕ: «Скользящее среднее» и «(эксп.)».
+
+    ⚠ Заведена 2026-08-07, находка М-13. Курс дословно: «если местоположение этих
+    скользящих ИЛИ ОДНОЙ ИЗ НИХ совпадает с нашей точкой входа/выхода, то для нас это
+    дополнительный фактор». Считалась только экспоненциальная, то есть половина
+    названного фактора отсутствовала. Скриншот настроек на стр. 69 показывает оба
+    инструмента с длиной 200.
+    """
+    return _expr(plta.sma(pl.col("close"), timeperiod=period))
+
+
 def macd_line(fast: int = MACD_FAST, slow: int = MACD_SLOW) -> pl.Expr:
     """MACD = EMA(fast) − EMA(slow). Определение, а не вызов macd() библиотеки."""
     return ema(fast) - ema(slow)

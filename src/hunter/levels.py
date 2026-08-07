@@ -482,6 +482,18 @@ class LevelStatus(BaseModel):
     оставляют вход по слому младшего ТФ, а стр. 43 — вход по ретесту после пробоя.
     """
 
+    price_in_zone: bool = False
+    """Торгуется ли цена ПРЯМО СЕЙЧАС внутри объёмной зоны уровня.
+
+    ⚠ Заведено 2026-08-07, находка М-09. Стр. 44, вариант 2, дословно: «Приоритет – не
+    открывать позицию, если цена уже торгуется в зоне, либо быть готовым выйти в б/у при
+    пробое уровня – на ретесте». Правила не было ни в §2, ни в коде: `EntryRule.LIMIT`
+    выдавался независимо от того, где цена находится в момент печати карточки.
+
+    Считается по ПОСЛЕДНЕМУ бару ряда — это «сейчас» с точностью до таймфрейма уровня.
+    Заглядывания вперёд здесь нет: последний бар ряда уже закрыт (§6).
+    """
+
     resolved_at_ms: int | None
     """ЗАКРЫТИЕ бара, на котором событие разрешилось. None — не разрешилось (или его нет).
 
@@ -583,34 +595,61 @@ def status(
     ev = first_breach(bars, float(level.price), level.breach_direction, level.timeframe,
                       from_index=level.created_at_index + 1,
                       confirm_bodies=confirm_bodies, return_bars=return_bars)
+    # Стр. 44: «не открывать позицию, если цена уже торгуется в зоне». Считается по
+    # последнему ЗАКРЫТОМУ бару — это «сейчас» с точностью до ТФ уровня (М-09).
+    last = bars[-1] if bars else None
+    in_zone = bool(last is not None
+                   and last.low <= float(level.zone_hi)
+                   and last.high >= float(level.zone_lo))
     if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
         if first_test_index(level, bars) is not None:
             return LevelStatus(state=LevelState.ACTIVE, event=ev,
-                               limit_orders_allowed=False,
+                               limit_orders_allowed=False, price_in_zone=in_zone,
                                entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=None)
         return LevelStatus(state=LevelState.ACTIVE, event=ev, limit_orders_allowed=True,
+                           price_in_zone=in_zone,
                            entry_rule=EntryRule.LIMIT, resolved_at_ms=None)
     assert ev.resolved_index is not None  # у разрешившегося события бар есть по построению
     at = bars[ev.resolved_index].open_ms + tf_ms(level.timeframe)
     if ev.kind is BreachKind.BREAKOUT:
         return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False,
+                           price_in_zone=in_zone,
                            entry_rule=EntryRule.RETEST_FLIPPED, resolved_at_ms=at)
     return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
+                       price_in_zone=in_zone,
                        entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
 
 
 def first_test_index(level: Level, bars: list[Bar]) -> int | None:
     """Первое касание уровня после его появления. Стр. 25: дальше уровень удаляется.
 
-    Касанием считается заход цены на ПОК: `low <= ПОК <= high`. Прокол объёмной зоны
-    без достижения ПОК касанием уровня НЕ считается — стр. 30 разделяет эти события:
-    «цена забирает объемную зону» и «цена забирает идеально уровень ПОК».
+    ⚠ КАСАНИЕМ СЧИТАЕТСЯ ЗАХОД В ЗОНУ, А НЕ ДОСТИЖЕНИЕ ПОК. Правка аудита 2026-08-07,
+    находка М-08.
+
+    Прежняя редакция требовала, чтобы цена достала САМ ПОК (`low <= ПОК <= high`), и
+    обосновывала это стр. 30, которая действительно РАЗДЕЛЯЕТ события «цена забирает
+    объемную зону» и «цена забирает идеально уровень ПОК». Но снятие лимиток курс
+    привязывает именно к ЗОНЕ — стр. 31:
+
+        «ВАЖНО: если цена ранее забирала зону и уже получила от нее хорошую лонг реакцию,
+         уровень лимитными ордерами больше не торгуем - т.к. уровень стал слабее, и в
+         след раз может не отработать.»
+
+    Та же стр. 30 называет заход в зону самостоятельным вариантом отработки: «1 - цена
+    забирает объемную зону… и идет в нужном направлении». А схема стр. 24 несёт выноску,
+    которой нет в текстовом слое: "тест объемов / сам уровень не забрали" — вход берётся
+    по достижении зоны, когда линия ПОК не достигнута.
+
+    Замер расхождения до правки (docs/audit/evidence/E-040-zone-vs-poc): из 17 уровней
+    разрешение менялось у 13; у трёх цена не касалась ПОК ВООБЩЕ, то есть уровень
+    оставался бы «свежим» бесконечно. Медианная задержка ПОК против зоны — 3 бара,
+    максимум 79.
 
     `None` означает «тестов ещё не было», а не «нет данных»: диапазон поиска задан
     явно и пуст только если уровень моложе конца ряда.
     """
-    poc = float(level.price)
+    lo, hi = float(level.zone_lo), float(level.zone_hi)
     for i in range(level.created_at_index + 1, len(bars)):
-        if bars[i].low <= poc <= bars[i].high:
+        if bars[i].low <= hi and bars[i].high >= lo:
             return i
     return None

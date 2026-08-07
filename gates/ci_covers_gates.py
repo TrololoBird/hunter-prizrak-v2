@@ -26,10 +26,17 @@ def main() -> int:
     if not CI.exists():
         print(f"ПРОВАЛ: нет {CI} — проверка не состоялась")
         return 1
-    text = CI.read_text(encoding="utf-8")
+    # ⚠ Считаются только ИСПОЛНЯЕМЫЕ строки, а не весь текст. Правка 2026-08-07, находка
+    # Э-4 прошлого разбора, подтверждённая исполнением: прежде искалась ПОДСТРОКА в целом
+    # файле, поэтому ЗАКОММЕНТИРОВАННЫЙ шаг гейта проходил проверку — 18 из 18, код 0.
+    # Упоминание гейта в комментарии тоже засчитывалось. Гейт, вписанный в комментарий,
+    # это гейт, который не работает; ровно от этого он и должен защищать.
+    lines = [ln.split("#", 1)[0] for ln in CI.read_text(encoding="utf-8").splitlines()]
+    text = "\n".join(ln for ln in lines if ln.strip())
     files = sorted(p.name for p in GATES.glob("*.py") if p.name != "__init__.py")
     missing = [n for n in files if n not in text]
-    print(f"гейтов в каталоге {len(files)}, вызываются в CI {len(files) - len(missing)}")
+    print(f"гейтов в каталоге {len(files)}, вызываются в CI {len(files) - len(missing)}"
+          f" (учтены только строки вне комментариев)")
     if missing:
         print(f"ПРОВАЛ: не вызываются в CI — {len(missing)}")
         for n in missing:
