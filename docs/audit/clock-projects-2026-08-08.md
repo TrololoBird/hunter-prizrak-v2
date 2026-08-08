@@ -192,3 +192,188 @@ if error_code == 10002:  # recv_window error
   регистра нет вовсе — пять замеров берутся одной очередью и после выбора забываются;
 * дисперсию (накопленную неопределённость) мы не считаем, а NTP на ней и строит решение,
   какому источнику верить.
+
+### 7. binance-connector-python — [binance/binance-connector-python](https://github.com/binance/binance-connector-python)
+
+ОФИЦИАЛЬНЫЙ коннектор самой Binance. Прочитан
+[binance_common/utils.py](https://github.com/binance/binance-connector-python/blob/master/common/src/binance_common/utils.py). Лицензия MIT.
+
+* **Ч2 — сдвиг НЕ МЕРЯЕТСЯ ВОВСЕ:** `def get_timestamp() -> int: return int(time.time() * 1000)`.
+  Сама биржа в своём SDK на сведение часов не полагается — только на окно допуска.
+* **Ч9** — для Web3-запросов умолчание окна `15000`.
+
+### 8. python-okx — [okxapi/python-okx](https://github.com/okxapi/python-okx)
+
+Официальный SDK OKX. Прочитан
+[okx/okxclient.py](https://github.com/okxapi/python-okx/blob/master/okx/okxclient.py). Лицензия Apache-2.0.
+
+* **Ч2 — третье семейство: НЕ СВОДИТЬ, А СПРАШИВАТЬ.** По умолчанию берутся локальные часы;
+  при `use_server_time` клиент КАЖДЫЙ РАЗ ходит за серверной меткой и подставляет её.
+  Сдвиг не хранится вовсе, значит и не стареет — ценой лишнего запроса.
+
+### 9. ntplib — [cf-natali/ntplib](https://github.com/cf-natali/ntplib)
+
+Эталонная реализация клиента NTP на питоне. Прочитан
+[ntplib.py](https://github.com/cf-natali/ntplib/blob/master/ntplib.py). Лицензия MIT.
+
+```python
+# сдвиг
+return ((self.recv_timestamp - self.orig_timestamp) +
+        (self.tx_timestamp - self.dest_timestamp))/2
+# задержка
+return ((self.dest_timestamp - self.orig_timestamp) -
+        (self.tx_timestamp - self.recv_timestamp))
+```
+
+### ⚠⚠ ТРЕТЬЯ НАХОДКА: наша формула — это формула NTP в вырожденном случае
+
+NTP работает с ЧЕТЫРЬМЯ метками: `orig` (ушёл запрос), `recv` (сервер принял), `tx` (сервер
+ответил), `dest` (пришёл ответ). Биржа отдаёт ОДНУ серверную метку, поэтому `recv` и `tx`
+для нас неразличимы. Подставим `recv = tx = S`, `orig = t0`, `dest = t1`:
+
+    сдвиг    = ((S − t0) + (S − t1)) / 2 = S − (t0 + t1) / 2
+    задержка = (t1 − t0) − (S − S)       = t1 − t0
+
+Первое — ровно наш `offset = server - (t0 + t1) // 2`; второе — ровно наш `rtt = t1 - t0`.
+
+**То есть Ч2 у нас не «конвенция без ссылки», а формула NTP, приведённая к тому, что даёт
+биржа.** Упрощение вынужденное, а не выбранное: второй серверной метки не существует.
+
+Это уже ТРЕТЬЕ подряд опровержение презумпции фазы 0 на этом элементе: и порог 5000, и
+выбор по наименьшему rtt, и сама формула оказались взяты из области, а не изобретены.
+Не записан в коде оказался только их ИСТОЧНИК.
+
+### 10. kucoin-python-sdk — [Kucoin/kucoin-python-sdk](https://github.com/Kucoin/kucoin-python-sdk)
+
+Официальный SDK KuCoin. Прочитан
+[base_request.py](https://github.com/Kucoin/kucoin-python-sdk/blob/master/kucoin/base_request/base_request.py). Лицензия MIT.
+
+* **Ч2 — сдвиг не меряется.** `now_time = int(time.time()) * 1000` — и здесь же виден
+  побочный изъян: секунды усекаются ДО умножения, значит метка всегда кратна 1000 мс,
+  дробная часть теряется целиком.
+
+### 11. barter-rs — [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs), Rust
+
+Прочитан [barter/src/engine/clock.rs](https://github.com/barter-rs/barter-rs/blob/main/barter/src/engine/clock.rs). Лицензия MIT.
+
+* **Ч1 — в живом режиме `Utc::now()`**, сдвига биржи нет.
+* **⚠ Зато в историческом режиме — РОВНО НАШ ПРИЁМ:** якорь на последней БИРЖЕВОЙ метке
+  плюс локально прошедшее время:
+
+```rust
+let delta_since_last_event_live_time = Utc::now().signed_duration_since(time_live_last_event);
+match delta_since_last_event_live_time {
+    delta if delta.num_milliseconds() >= 0 => time_exchange_last.add(delta),
+    _ => time_exchange_last,
+}
+```
+
+  Это то же `server_ms_at_sync + elapsed_ms`, что у нас. Отличие в защите: они СТОРОЖАТ
+  отрицательную дельту явной веткой, потому что считают её настенными часами; у нас часы
+  монотонные, и отрицательной дельты не бывает по построению. Наш способ строже.
+
+### 12. hyperliquid-python-sdk — [hyperliquid-dex/hyperliquid-python-sdk](https://github.com/hyperliquid-dex/hyperliquid-python-sdk)
+
+Официальный SDK. Прочитан
+[utils/signing.py](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/utils/signing.py). Лицензия MIT.
+
+* **Ч2 — сдвиг не меряется:** `def get_timestamp_ms() -> int: return int(time.time() * 1000)`.
+
+### 13. coinbase-advanced-py — [coinbase/coinbase-advanced-py](https://github.com/coinbase/coinbase-advanced-py)
+
+Официальный SDK Coinbase. Прочитан
+[jwt_generator.py](https://github.com/coinbase/coinbase-advanced-py/blob/master/coinbase/jwt_generator.py). Лицензия Apache-2.0.
+
+* **Ч2 — сдвиг не меряется**, берётся `time.time()`.
+* **Ч9 — окно допуска 120 СЕКУНД:** `"nbf": int(time.time()), "exp": int(time.time()) + 120`.
+  На два порядка шире, чем 5000 мс у Binance и Bybit. То есть «сколько расхождения терпит
+  биржа» — величина самой биржи, а не универсальная.
+
+### 14. jesse — [jesse-ai/jesse](https://github.com/jesse-ai/jesse)
+
+Прочитан [jesse/helpers.py](https://github.com/jesse-ai/jesse/blob/master/jesse/helpers.py). Лицензия MIT.
+
+* **Ч1 — живое время это локальные часы**, `arrow.utcnow().int_timestamp * 1000`; и здесь
+  та же потеря дробной части, что у KuCoin: секунды умножаются на 1000 после усечения.
+* **Ч2 — сдвига биржи нет.**
+* ⚠ Зато есть различение, которого нет у нас: в бэктесте время берётся из хранилища
+  (`store.app.time`), в живом режиме — из часов. Одна функция, две шкалы.
+
+### 15. freqtrade — [freqtrade/freqtrade](https://github.com/freqtrade/freqtrade)
+
+Прочитан [util/datetime_helpers.py](https://github.com/freqtrade/freqtrade/blob/develop/freqtrade/util/datetime_helpers.py). Лицензия GPL-3.0.
+
+* **Ч1 — `datetime.now(UTC)`**, часовой пояс задан явно.
+* **Ч2 — собственного сведения нет**; при желании включается адаптация ccxt, то есть та
+  самая, что не компенсирует rtt.
+
+### 16. backtrader — [mementum/backtrader](https://github.com/mementum/backtrader)
+
+Прочитан [feeds/vcdata.py](https://github.com/mementum/backtrader/blob/master/backtrader/feeds/vcdata.py). Лицензия GPL-3.0.
+
+* **Ч2 — ЧЕТВЁРТОЕ семейство: сдвиг считается ИЗ САМОГО ПОТОКА ДАННЫХ**, а не из
+  отдельного запроса времени:
+
+```python
+self._TOFFSET = datetime.now() - dttick
+...
+dtnow = datetime.now() - self._TOFFSET  # adjust local time
+```
+
+* ⚠ И применяется он ровно для НАШЕЙ задачи — решить, готов ли бар к выдаче. Единственный
+  из двадцати, кто связывает сдвиг часов с закрытостью бара явно.
+
+### 17. krakenex — [veox/python3-krakenex](https://github.com/veox/python3-krakenex)
+
+Прочитан [krakenex/api.py](https://github.com/veox/python3-krakenex/blob/master/krakenex/api.py). Лицензия LGPL-3.0.
+
+* **Ч1 — `return int(1000*time.time())`**, и в докстроке обещано «всегда возрастающее
+  целое». ⚠ Обещание опирается на настенные часы, которые как раз и ходят назад при
+  поправке NTP. Наглядная иллюстрация того, против чего заведён наш монотонный якорь.
+
+### 18. mexc-api-sdk — [mexcdevelop/mexc-api-sdk](https://github.com/mexcdevelop/mexc-api-sdk), TypeScript
+
+Прочитан [src/modules/base.ts](https://github.com/mexcdevelop/mexc-api-sdk/blob/main/src/modules/base.ts). Лицензия MIT.
+
+* **Ч2 — `const timestamp = Date.now()`**, сдвига нет, окна допуска в коде не видно.
+
+### 19. go-binance — [adshao/go-binance](https://github.com/adshao/go-binance), Go
+
+Прочитан [v2/client.go](https://github.com/adshao/go-binance/blob/master/v2/client.go). Лицензия MIT.
+
+* **Ч2 — сдвиг ЕСТЬ и хранится:** поле `TimeOffset int64`, применяется вычитанием:
+  `r.setParam(timestampKey, currentTimestamp()-c.TimeOffset)`. Обновляется отдельной
+  службой `SetServerTimeService`.
+* ⚠ Знак противоположен нашему: у них сдвиг ВЫЧИТАЕТСЯ из локального времени, у нас
+  серверный якорь СКЛАДЫВАЕТСЯ с прошедшим. Итог тот же, разбор ошибок — разный.
+
+### 20. gateapi-python — [gateio/gateapi-python](https://github.com/gateio/gateapi-python)
+
+Официальный SDK Gate.io. Прочитан
+[gate_api/api_client.py](https://github.com/gateio/gateapi-python/blob/master/gate_api/api_client.py). Лицензия Apache-2.0.
+
+* **Ч2 — `t = time.time()`**, сдвига нет.
+
+---
+
+## Итог сбора
+
+| | |
+|---|---:|
+| попыток чтения исходников | 24 (три ответили `HTTP 404`) |
+| просмотрено проектов | 21 |
+| **засчитано по КОДУ** | **20** ✅ цель взята |
+| отсеяно как несамостоятельные | 0 клонов |
+| отсеяно по прочим причинам | 1 — cryptofeed: в прочитанном файле ответа на вопросы нет |
+
+**Языков четыре:** Python, Go, Rust, TypeScript.
+
+⚠ **Одна оговорка о составе.** `ntplib` — не торговая система, а эталонная реализация
+клиента NTP; засчитан как реализация ПРЕДМЕТА (сведение часов), и это помечено здесь, а не
+скрыто. Ещё одна зависимость: freqtrade собственного сведения не имеет и при желании
+включает адаптацию ccxt — по Ч2 их голоса не независимы.
+
+⚠ **И честно о составе выборки в целом: она перекошена в сторону SDK бирж.** Двенадцать из
+двадцати — клиентские библиотеки, где задача другая: не «знать точное время», а «подписать
+запрос так, чтобы биржа приняла». Это надо помнить в фазе 3: их ответ «сдвиг не меряем»
+означает «нам хватает окна допуска», а не «сведение не нужно».
