@@ -69,6 +69,16 @@ class BoundaryZone(BaseModel):
     edge: float
     """САМА граница — одна цена. За неё считается выход и за неё меряется прокол."""
 
+    inherited: bool = False
+    """Граница взята не у своих свингов, а у ПРЕДЫДУЩЕЙ структуры — «лесенка», стр. 40.
+
+    На схеме стр. 40 верхнее ребро прежней коробки служит нижним ребром следующей, и
+    обе подписаны «Структура 4ч тф» — то есть лесенка складывается внутри одного ряда.
+    Курс называет и другие чужие границы: ПОК прежнего стопового объёма (стр. 39) и
+    уровень старшего ТФ (стр. 46, 54). Они требуют второго прохода движка по ТФ и здесь
+    НЕ реализованы — см. docs/audit/accumulation-projects-2026-08-07.md.
+    """
+
     narrowed: int = 0
     """Сколько раз граница сдвинулась ВНУТРЬ — признак накопления в сужении (стр. 34).
 
@@ -188,6 +198,10 @@ def detect(
     бара, на котором он стал известен (`confirmed_at_index`) — иначе структура
     опиралась бы на будущее (I-5).
 
+    Граница может быть УНАСЛЕДОВАНА у предыдущей структуры ряда — «лесенка» стр. 40:
+    ребро, через которое цена вышла, становится противоположным ребром следующей базы,
+    если оно попадает между её первыми двумя точками этой стороны.
+
     Граница НИКОГДА не расширяется и МОЖЕТ сужаться. Расширение запрещено стр. 13 и 18:
     прокол получает номер, но линию не двигает. Сужение разрешено стр. 34, и
     засчитывается только когда сходятся ОБЕ стороны сразу: хай ниже предыдущего
@@ -226,10 +240,15 @@ def detect(
     lo_edge: float | None = None
     up_narrowed = 0
     lo_narrowed = 0
+    up_inherited = False
+    lo_inherited = False
+    ladder_up: float | None = None
+    ladder_lo: float | None = None
 
     def reset() -> None:
         nonlocal run_dir, run_from, hi_punct, lo_punct, resets, last_kind
         nonlocal up_edge, lo_edge, up_narrowed, lo_narrowed
+        nonlocal up_inherited, lo_inherited
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
@@ -240,6 +259,7 @@ def detect(
         last_kind = None
         up_edge = lo_edge = None
         up_narrowed = lo_narrowed = 0
+        up_inherited = lo_inherited = False
 
     def upper_zone() -> tuple[float, float]:
         return min(hi_px[:2]), max(hi_px[:2])
@@ -271,6 +291,12 @@ def detect(
                     last_kind = kind
                     if len(hi_px) == 2:
                         up_edge = min(hi_px)
+                        if (ladder_up is not None
+                                and min(hi_px) <= ladder_up <= max(hi_px)):
+                            # Лесенка (стр. 40): цена вышла ВНИЗ из прежней структуры,
+                            # и её нижнее ребро стало верхним ребром этой.
+                            up_edge = ladder_up
+                            up_inherited = True
                     continue
                 assert up_edge is not None
                 if price < up_edge:
@@ -298,6 +324,12 @@ def detect(
                     last_kind = kind
                     if len(lo_px) == 2:
                         lo_edge = max(lo_px)
+                        if (ladder_lo is not None
+                                and min(lo_px) <= ladder_lo <= max(lo_px)):
+                            # Лесенка (стр. 40): цена вышла ВВЕРХ из прежней структуры,
+                            # и её верхнее ребро стало нижним ребром этой.
+                            lo_edge = ladder_lo
+                            lo_inherited = True
                     continue
                 assert lo_edge is not None
                 if price > lo_edge:
@@ -373,10 +405,10 @@ def detect(
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
                 upper=BoundaryZone(edge=upper_edge, lo=upper_lo, hi=upper_hi,
-                                   narrowed=up_narrowed,
+                                   narrowed=up_narrowed, inherited=up_inherited,
                                    point_indices=tuple(hi_idx), puncture=hi_punct),
                 lower=BoundaryZone(edge=lower_edge, lo=lower_lo, hi=lower_hi,
-                                   narrowed=lo_narrowed,
+                                   narrowed=lo_narrowed, inherited=lo_inherited,
                                    point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction,
@@ -385,6 +417,13 @@ def detect(
                 ),
             )
         )
+        # Лесенка (стр. 40): ребро, через которое цена вышла, предлагается СЛЕДУЮЩЕЙ
+        # структуре как её противоположное ребро. Причинности это не нарушает —
+        # структура уже закрыта и лежит слева.
+        if direction is Direction.ABOVE:
+            ladder_lo = upper_edge
+        else:
+            ladder_up = lower_edge
         reset()
         resets -= 1  # эмиссия — не распад
 
@@ -398,9 +437,11 @@ def detect(
             bars_open=len(bars) - first,
             upper=BoundaryZone(edge=up_edge if up_edge is not None else ulo,
                                lo=ulo, hi=uhi, narrowed=up_narrowed,
+                               inherited=up_inherited,
                                point_indices=tuple(hi_idx), puncture=hi_punct),
             lower=BoundaryZone(edge=lo_edge if lo_edge is not None else lhi,
                                lo=llo, hi=lhi, narrowed=lo_narrowed,
+                               inherited=lo_inherited,
                                point_indices=tuple(lo_idx), puncture=lo_punct),
         )
 
