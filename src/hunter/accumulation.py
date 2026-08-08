@@ -69,6 +69,16 @@ class BoundaryZone(BaseModel):
     edge: float
     """САМА граница — одна цена. За неё считается выход и за неё меряется прокол."""
 
+    narrowed: int = 0
+    """Сколько раз граница сдвинулась ВНУТРЬ — признак накопления в сужении (стр. 34).
+
+    Стр. 34 называет базой и такую форму: сужение, поджатие и чёткие границы стоят там
+    в одном ряду. На стр. 37 у базы в сужении границы нарисованы двумя НАКЛОННЫМИ
+    сходящимися линиями, по три касания каждая, и выход из клина торгуется как обычный
+    выход из накопления.
+
+    Ноль означает «граница ни разу не двигалась» — обычная горизонтальная база."""
+
     lo: float
     hi: float
     point_indices: tuple[int, ...] = Field(min_length=2)
@@ -178,6 +188,13 @@ def detect(
     бара, на котором он стал известен (`confirmed_at_index`) — иначе структура
     опиралась бы на будущее (I-5).
 
+    Граница НИКОГДА не расширяется и МОЖЕТ сужаться. Расширение запрещено стр. 13 и 18:
+    прокол получает номер, но линию не двигает. Сужение разрешено стр. 34, и
+    засчитывается только когда сходятся ОБЕ стороны сразу: хай ниже предыдущего
+    принятого хая ПРИ лое выше предыдущего принятого лоя. Одностороннее движение внутрь
+    сужением не является — это обычное касание внутри коробки, которое курс на стр. 21
+    не нумерует вовсе.
+
     Точки границ ЧЕРЕДУЮТ сторону (стр. 21 и ещё двенадцать схем): после верхней точки
     принимается только нижняя и наоборот. Границы каждой стороны задаются ПЕРВЫМИ ДВУМЯ
     её точками — на стр. 21 это 1 и 3 у одной границы, 2 и 4 у противоположной, — и дальше
@@ -205,9 +222,14 @@ def detect(
     run_from = 0
     resets = 0
     last_kind: SwingKind | None = None
+    up_edge: float | None = None
+    lo_edge: float | None = None
+    up_narrowed = 0
+    lo_narrowed = 0
 
     def reset() -> None:
         nonlocal run_dir, run_from, hi_punct, lo_punct, resets, last_kind
+        nonlocal up_edge, lo_edge, up_narrowed, lo_narrowed
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
@@ -216,12 +238,19 @@ def detect(
         run_dir, run_from = None, 0
         resets += 1
         last_kind = None
+        up_edge = lo_edge = None
+        up_narrowed = lo_narrowed = 0
 
     def upper_zone() -> tuple[float, float]:
         return min(hi_px[:2]), max(hi_px[:2])
 
     def lower_zone() -> tuple[float, float]:
         return min(lo_px[:2]), max(lo_px[:2])
+
+    def converging() -> bool:
+        """Сходятся ли ОБЕ стороны прямо сейчас — база в сужении (стр. 34, 37)."""
+        return (len(hi_px) >= 2 and len(lo_px) >= 2
+                and hi_px[-1] < hi_px[-2] and lo_px[-1] > lo_px[-2])
 
     for k in range(len(bars)):
         for kind, index, price in by_confirm.get(k, []):
@@ -240,15 +269,26 @@ def detect(
                     hi_px.append(price)
                     hi_idx.append(index)
                     last_kind = kind
+                    if len(hi_px) == 2:
+                        up_edge = min(hi_px)
                     continue
-                zlo, zhi = upper_zone()
-                if price < zlo:
-                    continue  # локальный хай внутри базы — не точка границы
+                assert up_edge is not None
+                if price < up_edge:
+                    if not converging():
+                        continue  # касание внутри базы — курс его не нумерует (стр. 21)
+                    # Обе стороны сошлись: база в сужении (стр. 34), и верхняя граница
+                    # едет ВНИЗ вслед за точкой. Наружу граница не двигается никогда.
+                    hi_px.append(price)
+                    hi_idx.append(index)
+                    last_kind = kind
+                    up_edge = price
+                    up_narrowed += 1
+                    continue
                 hi_px.append(price)
                 hi_idx.append(index)
                 last_kind = kind
-                if price > zhi:
-                    # Прокол за границу (стр. 18): точка засчитана, зона НЕ расширена,
+                if price > up_edge:
+                    # Прокол за границу (стр. 18): точка засчитана, граница НЕ сдвинута,
                     # глубина прокола запомнена — за неё ставится стоп.
                     hi_punct = price if hi_punct is None else max(hi_punct, price)
             else:
@@ -256,14 +296,23 @@ def detect(
                     lo_px.append(price)
                     lo_idx.append(index)
                     last_kind = kind
+                    if len(lo_px) == 2:
+                        lo_edge = max(lo_px)
                     continue
-                zlo, zhi = lower_zone()
-                if price > zhi:
+                assert lo_edge is not None
+                if price > lo_edge:
+                    if not converging():
+                        continue
+                    lo_px.append(price)
+                    lo_idx.append(index)
+                    last_kind = kind
+                    lo_edge = price
+                    lo_narrowed += 1
                     continue
                 lo_px.append(price)
                 lo_idx.append(index)
                 last_kind = kind
-                if price < zlo:
+                if price < lo_edge:
                     lo_punct = price if lo_punct is None else min(lo_punct, price)
 
         if len(hi_px) < 2 or len(lo_px) < 2:
@@ -271,9 +320,10 @@ def detect(
 
         upper_lo, upper_hi = upper_zone()
         lower_lo, lower_hi = lower_zone()
-        # ГРАНИЦА — одна цена: внутренний край первых двух точек стороны. Обоснование
-        # и отвергнутое прочтение — в докстроке BoundaryZone.
-        upper_edge, lower_edge = upper_lo, lower_hi
+        # ГРАНИЦА — одна цена: внутренний край первых двух точек стороны, сдвинутый
+        # внутрь при сужении. Обоснование — в докстроке BoundaryZone.
+        assert up_edge is not None and lo_edge is not None
+        upper_edge, lower_edge = up_edge, lo_edge
         if upper_edge <= lower_edge:
             # Границы сошлись — горизонтального диапазона нет (стр. 13).
             reset()
@@ -323,8 +373,10 @@ def detect(
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
                 upper=BoundaryZone(edge=upper_edge, lo=upper_lo, hi=upper_hi,
+                                   narrowed=up_narrowed,
                                    point_indices=tuple(hi_idx), puncture=hi_punct),
                 lower=BoundaryZone(edge=lower_edge, lo=lower_lo, hi=lower_hi,
+                                   narrowed=lo_narrowed,
                                    point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction,
@@ -344,9 +396,11 @@ def detect(
         tail = OpenStructure(
             first_index=first,
             bars_open=len(bars) - first,
-            upper=BoundaryZone(edge=ulo, lo=ulo, hi=uhi,
+            upper=BoundaryZone(edge=up_edge if up_edge is not None else ulo,
+                               lo=ulo, hi=uhi, narrowed=up_narrowed,
                                point_indices=tuple(hi_idx), puncture=hi_punct),
-            lower=BoundaryZone(edge=lhi, lo=llo, hi=lhi,
+            lower=BoundaryZone(edge=lo_edge if lo_edge is not None else lhi,
+                               lo=llo, hi=lhi, narrowed=lo_narrowed,
                                point_indices=tuple(lo_idx), puncture=lo_punct),
         )
 
