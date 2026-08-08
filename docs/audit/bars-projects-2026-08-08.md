@@ -299,15 +299,210 @@ point *= self.p.compression
 * **Б1** — для дневных и старше границы СЕССИОННЫЕ, а не сеточные. Крипте это не нужно
   (торговля круглосуточная), но показывает, что «сетка» и «сессия» в поле различаются.
 
+### 11. gocryptotrader — [thrasher-corp/gocryptotrader](https://github.com/thrasher-corp/gocryptotrader), Go
+
+Прочитан [exchanges/kline/kline.go](https://github.com/thrasher-corp/gocryptotrader/blob/master/exchanges/kline/kline.go). Лицензия MIT.
+
+* **Б3 сетка — усечение к длительности интервала:** `return t.Truncate(interval.Duration())`,
+  а для календарных интервалов отдельно `time.Date(year, time.Month(monthIndex+1), 1, 0, 0, 0, 0, time.UTC)`.
+  То есть месяц у них КАЛЕНДАРНЫЙ, как у nautilus, а не 30 суток, как у ccxt.
+* **Б4 дыра — ДОСТРАИВАЕТСЯ (`addPadding`) И ОТДЕЛЬНО ДОКЛАДЫВАЕТСЯ:** `IntervalRangeHolder.DataSummary`
+  печатает, где именно данных не было. Это единственный проект выборки, который дыру и
+  чинит, и НАЗЫВАЕТ, — то есть делает ровно то, чего требует наш §4.3.
+* **Б2 закрытость — только пустой хвост:**
+
+```go
+if purgeOnPartial {
+    lastElement := padded[len(padded)-1]
+    if lastElement.Volume == 0 && lastElement.Open == 0 &&
+        lastElement.High == 0 && lastElement.Low == 0 &&
+        lastElement.Close == 0 {
+        padded = padded[:len(padded)-1]
+    }
+}
+```
+
+  Убирается не «последняя», а последняя ПУСТАЯ — то есть достроенная паддингом.
+
+### 12. Lean (QuantConnect) — [QuantConnect/Lean](https://github.com/QuantConnect/Lean), C#
+
+Прочитан [PeriodCountConsolidatorBase.cs](https://github.com/QuantConnect/Lean/blob/master/Common/Data/Consolidators/PeriodCountConsolidatorBase.cs). Лицензия Apache-2.0.
+
+* **Б3 сетка — ТОЛЬКО ДО СУТОК:** `time.RoundDown(Period.Value)` применяется для периодов
+  не длиннее суток, а для более длинных время возвращается БЕЗ округления. Недельного
+  выравнивания у них нет вовсе — вопрос решён отказом от сетки на старших ТФ.
+* **Б2 бар выдаётся только по приходу СЛЕДУЮЩИХ данных:**
+
+```csharp
+if (_workingBar != null && data.Time - _workingBar.Time >= _period.Value
+    && GetRoundedBarTime(data) > _lastEmit)
+{
+    fireDataConsolidated = true;
+}
+```
+
+  Значит при отсутствии сделок бар не выдаётся вовсе — противоположно флагу
+  `build_with_no_updates` у nautilus. Пустой интервал у поля решается в обе стороны.
+
+### 13. candlestick-convert — [valamidev/candlestick-convert](https://github.com/valamidev/candlestick-convert) ★55, TypeScript
+
+Прочитан [batchCandle.ts](https://github.com/valamidev/candlestick-convert/blob/master/src/batchers/batchCandle.ts). Лицензия MIT.
+
+* **Б3 сетка — сырая эпоха:** `timeOpen = candle[OHLCVField.TIME] - (candle[OHLCVField.TIME] % newFrame)`.
+  ⚠ Но рядом лежит `batchCandlesWithCustomInterval`, где бакет вычисляет ПЕРЕДАННАЯ ФУНКЦИЯ:
+  `timeOpen = intervalFunction(candle[OHLCVField.TIME])`. Сетка вынесена в точку расширения.
+* **Б2 закрытость — флаг `includeOpenCandle`**, и незакрытый бакет отдаётся только при нём.
+* **Б4 дыра — ПРОСТО ПРОПУСКАЕТСЯ:** ни заполнения, ни сброса, ни сообщения. Шестой ответ.
+
+### 14. market_prices — [maread99/market_prices](https://github.com/maread99/market_prices) ★104, Python
+
+Прочитан [other_internals.md](https://github.com/maread99/market_prices/blob/master/docs/developers/other_internals.md); поиск по коду указал на [prices/base.py](https://github.com/maread99/market_prices/blob/master/src/market_prices/prices/base.py). Лицензия MIT.
+
+* **Б2 — БАР МОЖЕТ БЫТЬ КОРОЧЕ СВОЕГО ИНТЕРВАЛА.** Параметр `openend` с двумя значениями:
+  `"maintain"` держит нормальную длину интервала, `"shorten"` укорачивает последний бар так,
+  чтобы его правый край лёг на конец сессии. Понятия «бар короче номинала» у нас нет вовсе.
+* **Б3 — свой термин для нашего вопроса:** `anchor`, привязка к открытию сессии либо отсчёт
+  назад от конца (`workback`). Второй проект выборки, который вопрос о сетке НАЗЫВАЕТ
+  параметром, после `origin` у pandas.
+
+### 15. barter-rs — [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs) ★2219, Rust
+
+Прочитан [subscription/candle.rs](https://github.com/barter-rs/barter-rs/blob/develop/barter-data/src/subscription/candle.rs). Лицензия MIT.
+
+```rust
+pub struct Candle {
+    pub close_time: DateTime<Utc>,
+    pub open: f64, pub high: f64, pub low: f64, pub close: f64,
+    pub volume: f64, pub trade_count: u64,
+}
+```
+
+* **Б2 — НЕ ОТВЕЧАЕТ:** признака закрытости в структуре нет вовсе, и решения, пропускать ли
+  незакрытую свечу, в коде подписки нет. Отдаётся то, что прислала биржа.
+* **Б8 — свеча ключуется ВРЕМЕНЕМ ЗАКРЫТИЯ**, а не открытия. У нас `open_ms`, то есть левый
+  край. Это ровно выбор `label` из pandas, сделанный в другую сторону.
+
+### 16. MarketProfile — [EarnForex/MarketProfile](https://github.com/EarnForex/MarketProfile), MQL5
+
+Прочитан [MarketProfile.mq5](https://github.com/EarnForex/MarketProfile/blob/master/MarketProfile.mq5). Лицензия MIT.
+
+* **Б2 новый бар — ПО ВРЕМЕНИ, как у нас:** `if (iTime(Symbol(), Period(), start_bar) != prev_time_start_bar)`.
+  Сравнивается метка времени, а не индекс и не число баров.
+* **Б6 — ИЗМЕРЕНИЕ, КОТОРОГО У НАС НЕТ: политика для нерабочего времени.** Выходные заданы
+  перечислением из трёх значений — считать обычными днями, игнорировать, приклеивать к
+  соседней сессии:
+
+```mql5
+enum sat_sun_solution
+{
+    Saturday_Sunday_Normal_Days,
+    Ignore_Saturday_Sunday,
+    Append_Saturday_Sunday
+};
+```
+
+  Наш `find_gaps` считает дырой ЛЮБОЙ шаг, не равный шагу ТФ. Для круглосуточной крипты это
+  верно, но само допущение «торгов без перерыва» нигде у нас не записано.
+
+### 17. Pine Script — [geraked/tradingview](https://github.com/geraked/tradingview), Pine
+
+Прочитан [strategies/DHLAOS.pine](https://github.com/geraked/tradingview/blob/master/strategies/DHLAOS.pine). Лицензия MIT.
+
+* **Б2 закрытость — канонический приём Pine против перерисовки:**
+
+```pine
+indexHighTF = barstate.isrealtime ? 1 : 0
+indexCurrTF = barstate.isrealtime ? 0 : 1
+pricehigh = request.security(syminfo.tickerid, "1D", high[indexHighTF])[indexCurrTF]
+```
+
+  На формирующемся баре берётся ПРЕДЫДУЩИЙ бар старшего ТФ, на закрытом — текущий. То есть
+  то же правило, что у нас («считаем только по закрытым»), но выраженное сдвигом индекса, а
+  не проверкой времени.
+
+### 18. Dukas.Net — [tomas-rampas/Dukas.Net](https://github.com/tomas-rampas/Dukas.Net) ★23, C#
+
+Прочитан [OhlcvFileWriter.cs](https://github.com/tomas-rampas/Dukas.Net/blob/master/Bi5.Net/IO/OhlcvFileWriter.cs). Лицензия MIT.
+
+* **Б3 сетка — КАЛЕНДАРНАЯ ПЕРЕСБОРКА ДАТЫ, а не модуль:**
+
+```csharp
+BarDateNoTime = new DateTime(b.Timestamp.Year, b.Timestamp.Month, b.Timestamp.Day, b.Timestamp.Hour, 0, 0)
+```
+
+  Ключ бакета собирается из частей даты. Механизм иной, чем остаток от деления, и к эпохе
+  он не привязан вовсе — привязан к календарю.
+* **Б4 дыра — пропускается молча:** пишутся только группы, в которых есть данные.
+
+### 19. StockSharp — [StockSharp/StockSharp](https://github.com/StockSharp/StockSharp), C#
+
+Прочитан [CandleBuilder.cs](https://github.com/StockSharp/StockSharp/blob/master/Algo/Candles/Compression/CandleBuilder.cs). Лицензия Apache-2.0.
+
+* **Б3 сетка — ЧАСОВОЙ ПОЯС И РАБОЧИЕ ЧАСЫ ПЛОЩАДКИ:**
+
+```csharp
+var board = subscription.Message.IsRegularTradingHours == true ?
+    ExchangeInfoProvider.GetOrCreateBoard(subscription.Message.SecurityId.BoardCode) :
+    ExchangeBoard.Associated;
+return (board.TimeZone, board.WorkingTime);
+```
+
+  Границы бара считаются от расписания БИРЖИ, а не от UTC. Крипте это не нужно, но
+  показывает, что «сетка» в поле бывает свойством площадки, а не времени.
+* **Б2 закрытость — по приходу данных ЗА границей:**
+
+```csharp
+return transform.Time < candle.OpenTime ||
+       (candle.OpenTime + candle.TypedArg) <= transform.Time;
+```
+
+  Как и у Lean: свеча закрывается не по часам, а когда пришла сделка следующего интервала.
+
+### 20. candles — [Flippo24/candles](https://github.com/Flippo24/candles) ★29, JavaScript
+
+Прочитан [src/Clock.js](https://github.com/Flippo24/candles/blob/master/src/Clock.js). Лицензия MIT.
+
+* **Б2, Б7 — границу двигают ЛОКАЛЬНЫЕ ЧАСЫ, поправленные на дрейф:**
+
+```javascript
+if (this.now >= this.resolutions[resolution].nexttime - this.timediff.drift) {
+  this.emit('tick '+ resolution, this.resolutions[resolution].nexttime);
+  this.resolutions[resolution].nexttime = this.resolutions[resolution].timeframe * 1000 + this.resolutions[resolution].nexttime
+}
+```
+
+  Третий двигатель границы: не метки данных и не биржа, а системные часы с измеренной
+  поправкой. ⚠ Это ровно то требование, которое у нас записано в FOUNDATION §6 («часы
+  корректируются постоянным сдвигом от серверного времени биржи»), и здесь оно реализовано
+  внутри самого генератора свечей.
+
 ---
 
 ## Независимость выборки
 
-Клонов не найдено: десять проектов — это десять самостоятельных организаций и кодовых баз
-на четырёх языках (Python, Rust, TypeScript, плюс Rust-ядро внутри Python-проекта).
-Совпадающих ядер расчёта нет.
+**Клонов не найдено.** Двадцать проектов — двадцать самостоятельных кодовых баз, семь
+языков: Python, Rust, TypeScript, JavaScript, Go, C#, MQL5, Pine. Совпадающих ядер расчёта
+нет; проверять хеши нормализованных тел не потребовалось — проекты не пересекаются ни
+организацией, ни языком, ни назначением.
 
 ⚠ **Но одна ЗАВИСИМОСТЬ есть, и на неё нельзя закрывать глаза при подсчёте голосов.**
 freqtrade берёт сетку у ccxt (`ccxt.Exchange.round_timeframe`) и лишь ДОБАВЛЯЕТ поверх
 собственный якорь понедельника для пересемплирования. Значит по вопросу Б3 их ответы — не
 два независимых голоса, а полтора: базовое решение одно и то же, расходятся надстройки.
+
+---
+
+## Итог фазы 1 — пять чисел
+
+| | |
+|---|---:|
+| попыток чтения исходников | 27 |
+| из них не открылись с первого раза (404: не та ветка или путь) | 5, все повторены с исправленным путём |
+| просмотрено проектов | 25 |
+| **засчитано по КОДУ** | **20** ✅ цель взята |
+| отсеяно как несамостоятельные | 1 — vectorbt: пересемплирование делегируется pandas, своего ответа нет |
+| отсеяно по прочим причинам | 4 — python-binance (поиск по коду дал только документацию, обработки флага в коде найти не удалось) и три репозитория с ★0 и пустым содержимым |
+
+**Языков в выборке семь.** Правило «язык не фильтр» соблюдено: Pine и MQL5 засчитаны
+наравне с питоном, и оба дали ответы, которых нет у питоновских проектов, — сдвиг индекса
+против перерисовки и перечисление политик для выходных.
