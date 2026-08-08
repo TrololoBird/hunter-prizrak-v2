@@ -377,8 +377,15 @@ STOP_ANCHOR_BAND_MAX_PCT = 5.0
 2-5% от границы». Числа взяты у курса, не подобраны, и §4.1 их допускает как исключение
 («величины, которые курс задаёт в процентах прямо»)."""
 
-MIN_PUNCTURE_POINTS = 3
-"""Стр. 18: «если на 3++ точках были проколы за границы - стоп всегда ставится за этот прокол»."""
+"""⚠ Здесь был `MIN_PUNCTURE_POINTS = 3`, и он СНЯТ 2026-08-08 по решению владельца.
+
+Он проверял `len(zone.point_indices) >= 3` — число точек ОДНОЙ стороны, тогда как стр. 18
+нумерует точки сквозь обе (на схеме 1, 3, 5, 7, 9 сверху и 2, 4, 6, 8, 10 снизу). Вторая
+точка любой стороны имеет сквозной номер 3 или 4 и под «3++ точках» уже подпадает, а порог
+её отбрасывал: замер на 324 рядах дал 7570 сторон из 11288, где прокол существовал, но в
+стоп не шёл. Сквозного номера зона одной стороны не содержит, поэтому отбор перенесён
+туда, где номер известен, — `accumulation.MIN_PUNCTURE_ORDINAL`. Сюда `puncture` приходит
+уже отобранным, и второй проверки быть не должно."""
 
 
 def stop_anchor(
@@ -400,7 +407,7 @@ def stop_anchor(
         band_lo, band_hi = boundary * (1 + lo_pct / 100), boundary * (1 + hi_pct / 100)
 
     found: list[float] = []
-    if len(zone.point_indices) >= MIN_PUNCTURE_POINTS and zone.puncture is not None:
+    if zone.puncture is not None:
         found.append(zone.puncture)
     for sv in stop_volumes:
         edge = sv.accumulation.lower.edge if down else sv.accumulation.upper.edge

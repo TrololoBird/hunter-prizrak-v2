@@ -70,6 +70,24 @@ MIN_BOUNDARY_POINTS = 4
 точки границ)». Курс называет только это число."""
 
 
+MIN_PUNCTURE_ORDINAL = 3
+"""С какой точки базы прокол идёт в стоп. Стр. 18: «Но если на 3++ точках были проколы
+за границы - стоп всегда ставится за этот прокол».
+
+⚠ Номер СКВОЗНОЙ, через обе стороны, и это видно на схеме стр. 18: сверху стоят 1, 3, 5,
+7, 9, снизу — 2, 4, 6, 8, 10. Значит вторая точка ЛЮБОЙ стороны получает сквозной номер
+3 или 4 и под правило уже попадает, а первая точка стороны (номер 1 или 2) — нет.
+
+⚠ Так стало 2026-08-08 по решению владельца. Раньше порог жил в `levels.py` и считал
+точки ОДНОЙ стороны (`len(zone.point_indices) >= 3`) — то есть был строже курса и
+отключал правило стр. 18 у двух третей сторон. Замер на 324 рядах: сторон ровно с двумя
+точками 7587 из 11288 (67.2%), и у 7570 из них прокол существовал, но в стоп не шёл.
+Считать сквозной номер может только `detect`: зона одной стороны его не содержит, и
+поэтому отбор перенесён сюда, в место, где номер известен.
+Разбор: docs/audit/accumulation-projects-2026-08-07.md
+"""
+
+
 class BoundaryZone(BaseModel):
     """Граница базы: ОДНА ЦЕНА `edge` плюс допуск приёма точек `lo…hi` (стр. 18).
 
@@ -138,12 +156,17 @@ class BoundaryZone(BaseModel):
     точке 2, а точка 4 — вторая точка той же стороны — лежит НИЖЕ неё. Нумерация курса
     идёт через сторону, поэтому вторая точка стороны и есть третья-плюс точка стр. 18.
 
-    Цена этого — поле почти перестало различать случаи: замер 2026-08-08 на 18 рядах дал
-    прокол у 1013 зон из 1016 (99.7%). Совпадение двух цен до последнего знака в реальном
-    ряду почти невозможно, поэтому `None` теперь исход РЕДКИЙ, а не спокойная база.
-    Читать поле как признак выхода цены за границу больше нельзя. Читать его следует
-    так: самая дальняя цена стороны, за которую и ставится стоп по стр. 18.
-    Замер: docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py
+    ⚠ И записывается прокол НЕ ВСЯКИЙ: только начиная с третьей точки по сквозной
+    нумерации — `MIN_PUNCTURE_ORDINAL`. Внешней в паре бывает и первая точка стороны, и
+    её курс проколом не считает. Поэтому у пары прокол появляется ровно тогда, когда
+    внешняя точка пришла ВТОРОЙ.
+
+    Цена этого видна числом. Замер на 324 рядах: пока отбора по номеру не было, прокол
+    имели 11271 зона из 11288 (99.8%) — поле не различало ничего; с отбором осталось 7179
+    (63.6%). Читать поле как признак выхода цены за границу нельзя по-прежнему. Читать
+    следует так: самая дальняя цена стороны, за которую ставится стоп по стр. 18.
+    Замеры: docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py и
+    docs/audit/probes/probe_two_point_sides_2026-08-08.py
     """
 
     @property
@@ -287,6 +310,14 @@ def detect(
     run_from = 0
     resets = 0
     last_kind: SwingKind | None = None
+    ordinal = 0
+    """Сквозной номер принятой точки границы внутри текущей структуры — нумерация стр. 18
+    (1, 3, 5… сверху и 2, 4, 6… снизу), а не номер внутри своей стороны."""
+    up_ord0 = 0
+    lo_ord0 = 0
+    """Сквозные номера ПЕРВЫХ точек сторон. Нужны потому, что граница фиксируется по паре,
+    и внешней в паре может оказаться как первая точка, так и вторая; под правило стр. 18
+    попадает только вторая."""
     up_edge: float | None = None
     lo_edge: float | None = None
     up_narrowed = 0
@@ -299,7 +330,7 @@ def detect(
     def reset() -> None:
         nonlocal run_dir, run_from, hi_punct, lo_punct, resets, last_kind
         nonlocal up_edge, lo_edge, up_narrowed, lo_narrowed
-        nonlocal up_source, lo_source
+        nonlocal up_source, lo_source, ordinal, up_ord0, lo_ord0
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
@@ -311,6 +342,8 @@ def detect(
         up_edge = lo_edge = None
         up_narrowed = lo_narrowed = 0
         up_source = lo_source = BorderSource.OWN
+        ordinal = 0
+        up_ord0 = lo_ord0 = 0
 
     def upper_zone() -> tuple[float, float]:
         return min(hi_px[:2]), max(hi_px[:2])
@@ -348,10 +381,13 @@ def detect(
                 continue
             if kind is SwingKind.HIGH:
                 if len(hi_px) < 2:
+                    ordinal += 1
                     hi_px.append(price)
                     hi_idx.append(index)
                     last_kind = kind
-                    if len(hi_px) == 2:
+                    if len(hi_px) == 1:
+                        up_ord0 = ordinal
+                    else:
                         up_edge = min(hi_px)
                         if (ladder_up is not None
                                 and min(hi_px) <= ladder_up <= max(hi_px)):
@@ -364,10 +400,16 @@ def detect(
                         # границе-внутреннем-крае внешняя точка пары лежит за ней ПО
                         # ПОСТРОЕНИЮ, и ровно это нарисовано на стр. 13: нижняя линия
                         # идёт по точке 2, а точка 4 лежит ниже неё.
-                        # ⚠ Добавлено 2026-08-08: раньше эта ветка уходила по
-                        # `continue` мимо учёта прокола, и стоп вставал ближе, чем
-                        # цена уже ходила внутри базы.
-                        beyond = [p for p in hi_px[:2] if p > up_edge]
+                        #
+                        # ⚠ Но засчитывается он только с 3-й точки по СКВОЗНОЙ нумерации
+                        # стр. 18 — см. MIN_PUNCTURE_ORDINAL. Внешней в паре бывает и
+                        # первая точка стороны; её сквозной номер 1 или 2, и правило
+                        # стр. 18 на неё не распространяется.
+                        beyond = [
+                            p
+                            for p, o in ((hi_px[0], up_ord0), (hi_px[1], ordinal))
+                            if p > up_edge and o >= MIN_PUNCTURE_ORDINAL
+                        ]
                         if beyond:
                             hi_punct = (max(beyond) if hi_punct is None
                                         else max(hi_punct, max(beyond)))
@@ -378,25 +420,33 @@ def detect(
                         continue  # касание внутри базы — курс его не нумерует (стр. 21)
                     # Обе стороны сошлись: база в сужении (стр. 34), и верхняя граница
                     # едет ВНИЗ вслед за точкой. Наружу граница не двигается никогда.
+                    ordinal += 1
                     hi_px.append(price)
                     hi_idx.append(index)
                     last_kind = kind
                     up_edge = price
                     up_narrowed += 1
                     continue
+                ordinal += 1
                 hi_px.append(price)
                 hi_idx.append(index)
                 last_kind = kind
-                if price > up_edge:
+                if price > up_edge and ordinal >= MIN_PUNCTURE_ORDINAL:
                     # Прокол за границу (стр. 18): точка засчитана, граница НЕ сдвинута,
-                    # глубина прокола запомнена — за неё ставится стоп.
+                    # глубина прокола запомнена — за неё ставится стоп. Условие по номеру
+                    # здесь выполнено всегда: третья точка стороны при чередовании имеет
+                    # сквозной номер не меньше пяти. Оно стоит ради одного правила на все
+                    # три ветки — читающий не должен выяснять, почему тут его нет.
                     hi_punct = price if hi_punct is None else max(hi_punct, price)
             else:
                 if len(lo_px) < 2:
+                    ordinal += 1
                     lo_px.append(price)
                     lo_idx.append(index)
                     last_kind = kind
-                    if len(lo_px) == 2:
+                    if len(lo_px) == 1:
+                        lo_ord0 = ordinal
+                    else:
                         lo_edge = max(lo_px)
                         if (ladder_lo is not None
                                 and min(lo_px) <= ladder_lo <= max(lo_px)):
@@ -405,7 +455,11 @@ def detect(
                             lo_edge = ladder_lo
                             lo_source = BorderSource.LADDER
                         # Прокол среди первых двух точек — см. верхнюю сторону.
-                        beyond = [p for p in lo_px[:2] if p < lo_edge]
+                        beyond = [
+                            p
+                            for p, o in ((lo_px[0], lo_ord0), (lo_px[1], ordinal))
+                            if p < lo_edge and o >= MIN_PUNCTURE_ORDINAL
+                        ]
                         if beyond:
                             lo_punct = (min(beyond) if lo_punct is None
                                         else min(lo_punct, min(beyond)))
@@ -414,16 +468,18 @@ def detect(
                 if price > lo_edge:
                     if not converging(price, kind):
                         continue
+                    ordinal += 1
                     lo_px.append(price)
                     lo_idx.append(index)
                     last_kind = kind
                     lo_edge = price
                     lo_narrowed += 1
                     continue
+                ordinal += 1
                 lo_px.append(price)
                 lo_idx.append(index)
                 last_kind = kind
-                if price < lo_edge:
+                if price < lo_edge and ordinal >= MIN_PUNCTURE_ORDINAL:
                     lo_punct = price if lo_punct is None else min(lo_punct, price)
 
         if len(hi_px) < 2 or len(lo_px) < 2:
