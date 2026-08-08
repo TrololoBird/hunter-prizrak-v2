@@ -39,11 +39,18 @@ def main() -> int:
     computed = {
         "adx14": plta.adx(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
         "atr14": plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
-        "rsi14": plta.rsi(pl.col("close"), timeperiod=14),
+        # ⚠ Правка аудита 2026-08-06 (М-06 = Н-5): `rsi14` и `ema200` брались прямо из
+        # `plta`, минуя обёртку проекта, и подмена периода в `hunter/indicators.py`
+        # проезжала мимо гейта (evidence/E-020-gate-probes).
+        "rsi14": indicators.rsi(),
         # MACD — проектное определение (ema12 - ema26), а не plta.macd():
         # тот противоречит своим же EMA, см. docs/audit/macd-talib-inconsistency-*.md
         "macd": indicators.macd_line(),
-        "ema200": plta.ema(pl.col("close"), timeperiod=200),
+        "ema200": indicators.ema(200),
+        # ⚠ Полосы Боллинджера добавлены 2026-08-07: их зовёт `card.py`, и
+        # доступность их не проверял никто (замечание QA, 09-qa.md раздел «б»).
+        "bb_upper": indicators.bbands_upper(),
+        "bb_lower": indicators.bbands_lower(),
     }
     out = df.select(**{k: v.alias(k) for k, v in computed.items()})
 

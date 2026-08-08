@@ -59,6 +59,21 @@ class DivergenceKind(StrEnum):
     CONVERGENCE = "convergence"
     """Лои цены падают, лои индикатора растут — «признак усиления откупа» (стр. 65)."""
 
+    HIDDEN_BEARISH = "hidden_bearish"
+    """СКРЫТАЯ медвежья: хаи цены ПАДАЮТ, хаи индикатора РАСТУТ.
+
+    ⚠ Заведено 2026-08-07, находка М-16. Схема на стр. 65 подписана НА САМОМ РИСУНКЕ
+    тремя семействами: классическая, СКРЫТЫЕ, РАСШИРЕННЫЕ — по два случая в каждом.
+    Слов "скрыт" и "расширенн" нет в текстовом слое НИ ОДНОЙ из 69 страниц, поэтому
+    правило было невидимо для всякого, кто читал курс текстом.
+
+    Геометрия взята С РИСУНКА и зеркальна классической: там, где классическая требует
+    расхождения на новом экстремуме, скрытая требует его на НЕ обновлённом.
+    """
+
+    HIDDEN_BULLISH = "hidden_bullish"
+    """СКРЫТАЯ бычья: лои цены РАСТУТ, лои индикатора ПАДАЮТ (стр. 65, рисунок)."""
+
 
 class Divergence(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -110,9 +125,15 @@ def divergences(
     ЛИБО `NaN` — см. `_absent`), фактор НЕ выдаётся: подставлять число нельзя (§4.3), а
     сравнивать с NaN — значит молча получить «дивергенции нет».
     """
+    # ⚠ РАСШИРЕННЫХ дивергенций здесь НЕТ, и это решение, а не пропуск. На стр. 65 они
+    # нарисованы как РАВНЫЕ экстремумы цены при расходящемся индикаторе; «равные» требует
+    # допуска на равенство, а курс его не даёт ни числом, ни правилом. По §0 величина без
+    # референта не пишется. Реализованы два семейства из трёх, и это сказано вслух.
+    ON_HIGHS = (DivergenceKind.DIVERGENCE, DivergenceKind.HIDDEN_BEARISH)
     out: list[Divergence] = []
-    for kind in (DivergenceKind.DIVERGENCE, DivergenceKind.CONVERGENCE):
-        sk = SwingKind.HIGH if kind is DivergenceKind.DIVERGENCE else SwingKind.LOW
+    for kind in (DivergenceKind.DIVERGENCE, DivergenceKind.CONVERGENCE,
+                 DivergenceKind.HIDDEN_BEARISH, DivergenceKind.HIDDEN_BULLISH):
+        sk = SwingKind.HIGH if kind in ON_HIGHS else SwingKind.LOW
         seq = sorted(swings.of(sk), key=lambda s: s.index)
         if len(seq) < 2:
             continue
@@ -125,8 +146,12 @@ def divergences(
         assert i_prev is not None and i_last is not None
         if kind is DivergenceKind.DIVERGENCE:
             hit = last.price > prev.price and i_last < i_prev
-        else:
+        elif kind is DivergenceKind.CONVERGENCE:
             hit = last.price < prev.price and i_last > i_prev
+        elif kind is DivergenceKind.HIDDEN_BEARISH:
+            hit = last.price < prev.price and i_last > i_prev
+        else:
+            hit = last.price > prev.price and i_last < i_prev
         if not hit:
             continue
         out.append(Divergence(

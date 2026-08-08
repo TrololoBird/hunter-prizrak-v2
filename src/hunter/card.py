@@ -41,6 +41,16 @@ SIDE_LABEL = {"long": "ЛОНГ", "short": "ШОРТ"}
 TREND_LABEL = {"up": "восходящий", "down": "нисходящий", "none": "не определён"}
 STATE_LABEL = {"active": "активен", "worked_off": "отработан", "flipped": "флипнут"}
 
+DIV_LABEL = {
+    "divergence": "дивергенция",
+    "convergence": "конвергенция",
+    # ⚠ Скрытые добавлены 2026-08-07, находка М-16: на стр. 65 схема подписана тремя
+    # семействами, а текст описывает одно. Расширенных нет — им нужен допуск на
+    # равенство экстремумов, которого курс не даёт (§0).
+    "hidden_bearish": "скрытая медвежья дивергенция",
+    "hidden_bullish": "скрытая бычья дивергенция",
+}
+
 STOP_BASIS_LABEL = {
     "anchor": "за стоповым объёмом либо проколом (стр. 18)",
     "margin": "запас за структуру (стр. 33)",
@@ -142,7 +152,11 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             f"        границы {_num(lvl.boundary_lo)}…{_num(lvl.boundary_hi)}  "
             f"вход: {ENTRY_LABEL[st.entry_rule.value]}  "
             f"{AGREE_LABEL[ag.value]}"
-            + (f" ({TF_LABEL.get(pr.timeframe, pr.timeframe)})" if pr.timeframe else "")
+            # ⚠ Глубина тренда печатается рядом со стороной (Р-6): `agreement` смотрит
+            # только направление, поэтому тренд из двух экстремумов весит как из шести.
+            # Число не влияет на решение — оно даёт оператору увидеть, на чём оно стоит.
+            + (f" ({TF_LABEL.get(pr.timeframe, pr.timeframe)}, "
+               f"держится на {pr.holds_for} экстремумах)" if pr.timeframe else "")
             + form
         )
         s = dec.setup
@@ -151,6 +165,10 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             # у сделки, которая будет взята; печатать их для уровня, который система не
             # торгует, значит печатать сигнал, которого нет. Причина названа (§4.3).
             out.append(f"        СДЕЛКИ НЕТ: {dec.hold}")
+            if dec.mtf_break:
+                # §2.5 подключён к решению 2026-08-07 (А-02): условие входа по стр. 25/31
+                # теперь ПРОВЕРЯЕТСЯ, а не только называется.
+                out.append(f"        слом на младшем ТФ: {dec.mtf_break}")
             if st.event is not None:
                 out.append(f"        событие: {_event(st.event)}")
             continue
@@ -187,9 +205,65 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if st.event is not None:
             out.append(f"        событие: {_event(st.event)}")
 
+    if d.reads:
+        out.append("")
+        out.append("СВОДКА ПО ТФ: структур → уровней (§4.3)")
+        # ⚠ СВОДКА ПЕЧАТАЕТСЯ ВСЕГДА, а не только когда есть непостроенные. Правка аудита
+        # 2026-08-06 (находка М-02), ИСПРАВЛЕННАЯ 2026-08-07 по замечанию QA.
+        #
+        # Первая редакция стояла внутри `if d.unbuilt:` — и исчезала целиком ровно тогда,
+        # когда непостроенных нет. Это ровно тот дефект, против которого сводка и
+        # заводилась: строка «всё построено» и ОТСУТСТВИЕ строки неотличимы, а второе
+        # означает ещё и «а сколько всего структур было — неизвестно». Плюс ТФ с НУЛЁМ
+        # структур выпадал из сводки молча, то есть «на 1Н структур не нашли вовсе» и
+        # «на 1Н структур не искали» выглядели одинаково.
+        #
+        # Отказы печатались только поштучно, и каждый был честен: «окно выходит за
+        # собранное», «сделок не собрано». Но отказ, повторённый сто раз на ОДНОМ
+        # таймфрейме, — уже не данные, а перекос: замер R-01 на 305 структурах дал
+        # 91.7% построенных на 15м против 7.8% на 1Д и 0.0% на 1Н, то есть карта
+        # состояла ровно из тех ТФ, которые курс считает слабее (стр. 48: «Чем старше
+        # ТФ — тем выше винрейт»). Поштучные строки этого не показывают: их надо
+        # сложить, а глазами их складывает не всякий и не всегда.
+        #
+        # Правило владельца от 2026-08-04 (CLAUDE.md): «у отказов обязана быть СВОДКА
+        # по измерению, вдоль которого возможен перекос». Разбор:
+        # docs/audit/backfill-window-2026-08-04.md, docs/audit/04-05-measurements.md
+        built_per_tf: dict[str, int] = {}
+        for m in d.mapped:
+            built_per_tf[m.level.timeframe] = built_per_tf.get(m.level.timeframe, 0) + 1
+        by_state: dict[str, int] = {}
+        for mm in d.mapped:
+            k = mm.status.state.value
+            by_state[k] = by_state.get(k, 0) + 1
+        emitted = sum(1 for x in d.decisions if x.emitted)
+        # ⚠ ВОРОНКА заведена 2026-08-07 по находке М-27: замер конформанса показал, что
+        # система строит 65 и 69 уровней на символ против 2–4, названных приёмкой §8.
+        # Само по себе число построенных уровней ничего не говорит оператору, пока рядом
+        # не сказано, сколько из них ТОРГУЕТСЯ. Это не правка расчёта, а его предъявление.
+        out.append(f"  всего уровней {len(d.mapped)}  →  торгуется лимитками {emitted}"
+                   + (f"  (по состояниям: {by_state})" if by_state else ""))
+        for tf in timeframes:
+            r = d.reads.get(tf)
+            if r is None:
+                # ⚠ Ряд не разобран вовсе — это НЕ «ноль структур». Причина названа выше,
+                # в разделе «РЯД НЕ РАЗОБРАН»; здесь строка нужна, чтобы ТФ не пропал.
+                out.append(f"    {TF_LABEL.get(tf, tf):>3}  ряд не разобран")
+                continue
+            total = len(r.scan.closed)
+            got = built_per_tf.get(tf, 0)
+            if not total:
+                # НОЛЬ СТРУКТУР — это результат, а не отсутствие результата. Молчать о нём
+                # значит выдавать «не нашли» за «не искали».
+                out.append(f"    {TF_LABEL.get(tf, tf):>3}  структур не найдено "
+                           f"(баров {r.swings.bars_scanned}, свингов {len(r.swings.swings)})")
+                continue
+            out.append(f"    {TF_LABEL.get(tf, tf):>3}  {got} из {total}"
+                       f"  ({got / total * 100:.0f}%)")
+
     if d.unbuilt:
         out.append("")
-        out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины (§4.3)")
+        out.append("УРОВЕНЬ НЕ ПОСТРОЕН — причины поштучно (§4.3)")
         for u in d.unbuilt:
             out.append(
                 f"  {TF_LABEL.get(u.timeframe, u.timeframe)}"
@@ -250,9 +324,9 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         sw = sw_tail
         for name, expr in (("RSI", indicators.rsi()), ("MACD", indicators.macd_line())):
             for div in factors.divergences(bars, sw, _series(bars, expr), name):
-                what = ("дивергенция" if div.kind is factors.DivergenceKind.DIVERGENCE
-                        else "конвергенция")
-                parts.append(f"{what} {name}")
+                # М-16: видов четыре, не два — подпись берётся из словаря, а не выводится
+                # ветвлением «если не дивергенция, значит конвергенция».
+                parts.append(f"{DIV_LABEL[div.kind.value]} {name}")
         # ⚠ Отсутствие фактора называется ЧИСЛАМИ, а не словами «истории мало». Требования
         # к истории замерены (`admission.REQUIRED_BARS`), и `admission.check` умеет
         # сказать «нужно N, есть M» — до 2026-08-06 эта функция не звалась ниоткуда, а
@@ -263,9 +337,13 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                              _series(bars, indicators.ema(20)))
         parts.append(f"полосы {sq.width_pct:.2f}% (уже {sq.percentile:.0f}% истории)"
                      if sq else _short("bb_upper", len(bars), d.symbol, tf, "полосы"))
-        ma = factors.ma_touch(_series(bars, indicators.ema(200)), bars[-1].close)
-        parts.append(f"EMA200 в {ma.distance_pct:.2f}% от цены" if ma
-                     else _short("ema200", len(bars), d.symbol, tf, "EMA200"))
+        # Стр. 69 называет ОБЕ скользящие — «этих скользящих ИЛИ ОДНОЙ ИЗ НИХ», — и на
+        # скриншоте настроек показаны обе с длиной 200. Считалась только EMA (М-16/М-13).
+        for name, expr200 in (("EMA200", indicators.ema(200)),
+                              ("MA200", indicators.sma(200))):
+            ma = factors.ma_touch(_series(bars, expr200), bars[-1].close)
+            parts.append(f"{name} в {ma.distance_pct:.2f}% от цены" if ma
+                         else _short("ema200", len(bars), d.symbol, tf, name))
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  " + " · ".join(parts))
     return "\n".join(out) + "\n"
 
