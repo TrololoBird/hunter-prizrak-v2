@@ -102,10 +102,10 @@ def _placement(small: Accumulation, host: Accumulation,
                small_bars: list[Bar], host_bars: list[Bar]) -> Placement:
     if small_bars[small.last_index].open_ms < host_bars[host.first_index].open_ms:
         return Placement.BEFORE
-    mid = (small.upper.hi + small.lower.lo) / 2
-    if mid > host.upper.hi:
+    mid = (small.upper.edge + small.lower.edge) / 2
+    if mid > host.upper.edge:
         return Placement.ABOVE
-    if mid < host.lower.lo:
+    if mid < host.lower.edge:
         return Placement.BELOW
     return Placement.INSIDE
 
@@ -125,7 +125,7 @@ def classify(
     """
     items: list[StopVolume] = []
     for a in small:
-        rng = a.upper.hi - a.lower.lo
+        rng = a.upper.edge - a.lower.edge
         if rng <= 0:
             continue
         vol = sum(b.volume for b in small_bars[a.first_index:a.last_index + 1])

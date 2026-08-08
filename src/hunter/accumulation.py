@@ -39,7 +39,23 @@ MIN_BOUNDARY_POINTS = 4
 
 
 class BoundaryZone(BaseModel):
-    """Граница базы: зона, заданная ПЕРВЫМИ ДВУМЯ точками и дальше НЕИЗМЕННАЯ (стр. 18).
+    """Граница базы: ОДНА ЦЕНА `edge` плюс допуск приёма точек `lo…hi` (стр. 18).
+
+    ⚠ Так стало 2026-08-08. Раньше границей считалась вся полоса, и наружу отдавался её
+    ДАЛЬНИЙ край. Курс рисует границу базы одной тонкой линией — стр. 13, 18, 21, 23, 35,
+    39; полоса в курсе есть у ПОК (стр. 30) и у уровня ПП (стр. 55), но не у ребра базы.
+    На стр. 39 низ коробки выглядит двумя линиями, однако вторая — это ПОК стопового
+    объёма, унаследованный как граница, а не толщина ребра.
+
+    Какая именно цена. Стр. 13 определяет флэт так, что локальные хаи и лои ПОВТОРЯЮТСЯ:
+    уровень, на котором обе первые точки стороны побывали, — это их ВНУТРЕННИЙ край
+    (для верха меньший из двух хаёв, для низа больший из двух лоёв). Проверяется по стр. 13:
+    нижняя линия проходит по точке 2, а точка 4 лежит НИЖЕ неё, то есть прокол; если бы
+    границей был дальний край, точка 4 лежала бы на линии.
+
+    Отвергнутое прочтение — граница это ПЕРВАЯ точка стороны. На стр. 13 оно даёт тот же
+    ответ и потому не опровергнуто; выбран внутренний край, потому что текст стр. 18 говорит
+    о ДВУХ точках, а не об одной. Если владелец решит иначе, менять здесь одну строку.
 
     Заморозка — не оптимизация, а требование стр. 13: «локальные хаи/лои повторяются и
     НЕ МЕНЯЮТСЯ». Первая редакция расширяла зону каждым новым экстремумом, и замер
@@ -49,6 +65,9 @@ class BoundaryZone(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    edge: float
+    """САМА граница — одна цена. За неё считается выход и за неё меряется прокол."""
 
     lo: float
     hi: float
@@ -64,7 +83,7 @@ class BoundaryZone(BaseModel):
 
     @property
     def width_pct(self) -> float:
-        """Ширина зоны в процентах от её середины. Замеряется, а не ограничивается.
+        """Ширина ДОПУСКА приёма точек в процентах. Это не граница — граница это `edge`.
 
         Курс задаёт критерий «чётко видно структуру» визуально; механического порога
         он не даёт, поэтому число сообщается наружу для калибровки на корпусе (этап 3),
@@ -252,15 +271,18 @@ def detect(
 
         upper_lo, upper_hi = upper_zone()
         lower_lo, lower_hi = lower_zone()
-        if upper_lo <= lower_hi:
-            # Зоны границ пересеклись — горизонтального диапазона нет (стр. 13).
+        # ГРАНИЦА — одна цена: внутренний край первых двух точек стороны. Обоснование
+        # и отвергнутое прочтение — в докстроке BoundaryZone.
+        upper_edge, lower_edge = upper_lo, lower_hi
+        if upper_edge <= lower_edge:
+            # Границы сошлись — горизонтального диапазона нет (стр. 13).
             reset()
             continue
 
         bar = bars[k]
-        if body_beyond(bar, upper_hi, Direction.ABOVE):
+        if body_beyond(bar, upper_edge, Direction.ABOVE):
             direction = Direction.ABOVE
-        elif body_beyond(bar, lower_lo, Direction.BELOW):
+        elif body_beyond(bar, lower_edge, Direction.BELOW):
             direction = Direction.BELOW
         else:
             # Возврат внутрь структуры обрывает серию тел: стр. 55 — «возвращается той
@@ -300,9 +322,9 @@ def detect(
                 timeframe=timeframe,
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
-                upper=BoundaryZone(lo=upper_lo, hi=upper_hi,
+                upper=BoundaryZone(edge=upper_edge, lo=upper_lo, hi=upper_hi,
                                    point_indices=tuple(hi_idx), puncture=hi_punct),
-                lower=BoundaryZone(lo=lower_lo, hi=lower_hi,
+                lower=BoundaryZone(edge=lower_edge, lo=lower_lo, hi=lower_hi,
                                    point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction,
@@ -322,8 +344,10 @@ def detect(
         tail = OpenStructure(
             first_index=first,
             bars_open=len(bars) - first,
-            upper=BoundaryZone(lo=ulo, hi=uhi, point_indices=tuple(hi_idx), puncture=hi_punct),
-            lower=BoundaryZone(lo=llo, hi=lhi, point_indices=tuple(lo_idx), puncture=lo_punct),
+            upper=BoundaryZone(edge=ulo, lo=ulo, hi=uhi,
+                               point_indices=tuple(hi_idx), puncture=hi_punct),
+            lower=BoundaryZone(edge=lhi, lo=llo, hi=lhi,
+                               point_indices=tuple(lo_idx), puncture=lo_punct),
         )
 
     return AccumulationScan(

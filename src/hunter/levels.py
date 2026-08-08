@@ -206,8 +206,8 @@ def build_level(
         structure_from_ms=window_ms[0],
         structure_to_ms=window_ms[1],
         structure_volume=profile.total_volume,
-        boundary_lo=Decimal(str(acc.lower.lo)),
-        boundary_hi=Decimal(str(acc.upper.hi)),
+        boundary_lo=Decimal(str(acc.lower.edge)),
+        boundary_hi=Decimal(str(acc.upper.edge)),
     )
 
 
@@ -386,7 +386,7 @@ def stop_anchor(
     if len(zone.point_indices) >= MIN_PUNCTURE_POINTS and zone.puncture is not None:
         found.append(zone.puncture)
     for sv in stop_volumes:
-        edge = sv.accumulation.lower.lo if down else sv.accumulation.upper.hi
+        edge = sv.accumulation.lower.edge if down else sv.accumulation.upper.edge
         if band_lo <= edge <= band_hi:
             found.append(edge)
     if not found:

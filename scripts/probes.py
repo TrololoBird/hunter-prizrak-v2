@@ -331,8 +331,8 @@ async def breach_kinds() -> None:
         if isinstance(sw, NotReady):
             continue
         for a in accumulation.detect(bars, sw, tf).closed:
-            for edge, d in ((a.upper.hi, breach.Direction.ABOVE),
-                            (a.lower.lo, breach.Direction.BELOW)):
+            for edge, d in ((a.upper.edge, breach.Direction.ABOVE),
+                            (a.lower.edge, breach.Direction.BELOW)):
                 e = breach.first_breach(bars, edge, d, tf, from_index=a.last_index + 1)
                 c[e.kind.value if e else "заходов не было"] += 1
     print(f"пар {len(data)}, проверок {sum(c.values())}: {dict(c)}")
@@ -396,8 +396,8 @@ async def author_coverage() -> None:
             continue
         sc = accumulation.detect(bars, sw, tf)
         covered = sum(1 for L in lines
-                      if any(a.lower.lo <= L <= a.upper.hi for a in sc.closed))
-        edges = [e for a in sc.closed for e in (a.lower.lo, a.upper.hi)]
+                      if any(a.lower.edge <= L <= a.upper.edge for a in sc.closed))
+        edges = [e for a in sc.closed for e in (a.lower.edge, a.upper.edge)]
         on_edge = sum(1 for L in lines
                       if edges and abs(min(edges, key=lambda x: abs(x - L)) - L) / L * 100 < NOISE)
         print(f"{s:16} {tf}: структур {len(sc.closed)}, уровней автора {len(lines)}, "
@@ -754,7 +754,7 @@ async def archive_need() -> None:
                     lo, hi = levels.structure_window_ms(a, bars, TIMEFRAME_MS[tf])
                     if hi < cut:
                         continue
-                    hits = [L for L in lines if a.lower.lo <= L <= a.upper.hi]
+                    hits = [L for L in lines if a.lower.edge <= L <= a.upper.edge]
                     if not hits:
                         continue
                     n += 1
