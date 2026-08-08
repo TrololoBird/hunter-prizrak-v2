@@ -127,7 +127,8 @@ class SymbolDecision(BaseModel):
 
 
 def read_series(
-    series: dict[str, list[Bar]], timeframes: tuple[str, ...]
+    series: dict[str, list[Bar]], timeframes: tuple[str, ...],
+    anchors: dict[str, tuple[tuple[float, int], ...]] | None = None,
 ) -> tuple[dict[str, SeriesRead], tuple[Unbuilt, ...]]:
     """Свинги, структуры и тренд по каждому ТФ. Один проход, один результат.
 
@@ -145,9 +146,41 @@ def read_series(
         if isinstance(sw, NotReady):
             bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
             continue
-        reads[tf] = SeriesRead(timeframe=tf, swings=sw, trend=swings.trend(sw),
-                               scan=detect_accumulations(bars, sw, tf))
+        reads[tf] = SeriesRead(
+            timeframe=tf, swings=sw, trend=swings.trend(sw),
+            scan=detect_accumulations(
+                bars, sw, tf, anchors=() if anchors is None else anchors.get(tf, ())
+            ),
+        )
     return reads, tuple(bad)
+
+
+def foreign_borders(
+    built: tuple[Level, ...], timeframes: tuple[str, ...]
+) -> dict[str, tuple[tuple[float, int], ...]]:
+    """Для каждого ТФ — цены уровней, посчитанных на ДРУГИХ ТФ (стр. 39, 46, 54).
+
+    Курс называет чужой границей обе стороны сразу: уровень СТАРШЕГО ТФ держит
+    младшую базу (стр. 46, 54), а ПОК стопового объёма МЛАДШЕГО ТФ держит старшую
+    (стр. 39). Поэтому фильтр здесь один — «не свой ТФ», без направления.
+
+    ⚠ Именно тут жил бы старый дефект «считали старшие ТФ позже младших». Его тут
+    нет по ПОСТРОЕНИЮ, а не по внимательности: все цены берутся из ПРОХОДА 1, где
+    чужих границ не было ни у кого, поэтому проход 2 не зависит от порядка ТФ вовсе.
+    Переставь `timeframes` как угодно — ответ тот же. Проходов ровно два, до
+    неподвижной точки никто не итерирует.
+
+    Вместе с ценой отдаётся `created_at_ms` — момент, с которого уровень СУЩЕСТВУЕТ.
+    Без него база могла бы опереться на уровень, родившийся позже неё (I-5), и это
+    ровно тот дефект, ради которого поле в `Level` и завели.
+    """
+    out: dict[str, tuple[tuple[float, int], ...]] = {}
+    for tf in timeframes:
+        out[tf] = tuple(sorted(
+            (float(lv.price), lv.created_at_ms)
+            for lv in built if lv.timeframe != tf
+        ))
+    return out
 
 
 def decide(
@@ -162,10 +195,28 @@ def decide(
 
         ряды → свинги → структуры → уровни (ПОК) → судьба уровня → приоритет → геометрия
 
-    Каждый шаг зовётся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
+    С 2026-08-08 первые два шага делаются ДВАЖДЫ, и это не дубль расчёта, а требование
+    курса: границей базы бывает чужой уровень — ПОК стопового объёма (стр. 39) или
+    уровень старшего ТФ (стр. 46, 54). Уровни считаются ИЗ структур, поэтому подать
+    их в структуры можно только вторым проходом. Проход 1 даёт цены, проход 2 —
+    ответ. Подробности и доказательство независимости от порядка ТФ — в
+    `foreign_borders`.
+
+    Остальные шаги зовутся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
     """
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
-    reads, unreadable = read_series(series, tfs)
+
+    # ПРОХОД 1 — структуры без чужих границ, и уровни по ним.
+    first_reads, _ = read_series(series, tfs)
+    first_levels, _ = levels.build_all(
+        symbol, series, trades, tfs, {tf: r.scan for tf, r in first_reads.items()}
+    )
+
+    # ПРОХОД 2 — те же структуры, но каждому ТФ поданы уровни ВСЕХ ОСТАЛЬНЫХ ТФ как
+    # кандидаты в границу. Результат прохода 2 и есть ответ; проход 1 нужен только
+    # ради этих цен.
+    anchors = foreign_borders(first_levels, tfs)
+    reads, unreadable = read_series(series, tfs, anchors)
     scans = {tf: r.scan for tf, r in reads.items()}
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans)
     mapped = levels.map_levels(frozen, series)
