@@ -23,7 +23,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 1 | свинги | `src/hunter/swings.py` | swing high low, fractal indicator, zigzag, pivot points, williams fractals | готов | [swings-projects-2026-08-07.md](swings-projects-2026-08-07.md) — взято ничего, Г2 отвергнута нулём |
 | 2 | слом структуры (переприор) | `src/hunter/pereprior.py` | break of structure, BOS, CHoCH, market structure shift, smart money concepts, **Pine Script, MQL5** | готов | [bos-projects-2026-08-07.md](bos-projects-2026-08-07.md) — приняты ближний край зоны и ретест по закрытию; Д3 (сколько сломов показывать) осталась за владельцем |
 | 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout, liquidity sweep, stop hunt, turtle soup, wyckoff spring/upthrust, bull/bear trap, 2B | решение владельца | [breach-projects-2026-08-07.md](breach-projects-2026-08-07.md) — 11 проектов, Р1 закрыта замером, Р2 за владельцем |
-| 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | **закрыт 2026-08-07**, 14 реализаций | [accumulation-projects-2026-08-07.md](accumulation-projects-2026-08-07.md): курс отвечает на 8 из 11, следуем на 5; правка цитаты внесена, 4 вопроса владельцу |
+| 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | **закрыт 2026-08-08**, 14 реализаций | [accumulation-projects-2026-08-07.md](accumulation-projects-2026-08-07.md): из гипотез принято **0**, из перечитывания курса внесено **7** правок (одна откачена); 4 вопроса владельцу, из них один — невыполненное требование курса |
 | 5 | сетка баров и закрытость | `src/hunter/bars.py` | partial candle, closed candle only, resample ohlcv, repainting indicator | не начат | — |
 | 6 | часы и сдвиг биржи | `src/hunter/clock.py` | exchange server time drift, clock sync trading bot, timestamp skew | не начат | — |
 | 7 | стоповый объём | `src/hunter/stop_volume.py` | stop run, liquidity sweep, stop hunt detection, volume spike at level | не начат | — |
@@ -49,6 +49,13 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 1 | 36 | 27 | **16** (двадцати нет) | 8 из 11; 1 «на грани», 2 «мало данных» | 4 | **0** — Г2 доведена до диффа повтора и отвергнута нулём |
 | 2 | 31 | 29 | **14** (10 питон + 4 Pine/MQL5) | 6 из 11; 5 «мало данных» или «нет данных» | 3 | **2** — ближний край зоны и ретест по закрытию, решение владельца, дифф повтора |
 | 3 | 22 | 23 | **11** (+8 по описанию), предел взят | 1 из 13 — П11; по П1 большинства нет | 2 | **0** — Р1 закрыта замером, Р2 за владельцем |
+| 4 | 20 | 23 | **14** (+4 по описанию), предел взят | 4 из 11 (Н1, Н2, Н5, Н6); 6 «мало данных», 1 «никто не рассматривает» | 4 | **0 из гипотез**, но **7 из перечитывания курса** — одна затем откачена контролем |
+
+⚠ **Строка 4 — единственная, где столбцы «гипотез проверено» и «принято» отвечают не на
+тот вопрос, который важен.** Все четыре гипотезы построены по чужим реализациям, доведены
+до замера с заранее хешированным допуском и дали ноль. Семь правок пришли из другого места
+— из перечитывания курса с четырёх страниц до 59, найденных грепом по самому PDF. Столбцы
+это не показывают, и до появления такого столбца строку надо читать вместе с оговоркой.
 
 ⚠ «Не считалось» — не то же самое, что ноль. Обзор ПОК прошёл ДО того, как команда стала
 требовать покрытия ПО ВОПРОСАМ; за него это число задним числом не выдумывается. Гипотезы
