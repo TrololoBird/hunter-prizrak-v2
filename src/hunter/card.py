@@ -32,6 +32,7 @@ from . import (
     pereprior,
     swings,
 )
+from .accumulation import BorderSource
 from .bars import TIMEFRAME_MS, continuous_tail
 from .models import Bar, NotReady
 
@@ -106,8 +107,18 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         sc, tr = r.scan, r.trend
         tail = ("нет" if sc.open_tail is None
                 else f"открыта {sc.open_tail.bars_open} баров, точек {sc.open_tail.points}")
+        # Форма найденных баз (§4.3). Курс различает базу с чёткими границами и базу
+        # в сужении (стр. 34), а граница бывает не своя (стр. 40, 39, 46). В карточке
+        # они выглядели одинаково, и оператор не мог их отличить.
+        narrowing = sum(1 for a in sc.closed
+                        if a.upper.narrowed or a.lower.narrowed)
+        ladder = sum(1 for a in sc.closed if BorderSource.LADDER
+                     in (a.upper.source, a.lower.source))
+        foreign = sum(1 for a in sc.closed if BorderSource.FOREIGN
+                      in (a.upper.source, a.lower.source))
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  баров {sc.bars_scanned}  "
                    f"структур {len(sc.closed)}  распадов {sc.resets}  "
+                   f"в сужении {narrowing}  лесенка {ladder}  чужой ТФ {foreign}  "
                    f"тренд {TREND_LABEL[tr.direction.value]} (держится на {tr.holds_for})  "
                    f"незакрытая структура: {tail}")
 
@@ -122,11 +133,21 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             f"ПОК {_num(lvl.price)}  зона {_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}  "
             f"объём {_num(lvl.structure_volume, 2)}  {STATE_LABEL[st.state.value]}"
         )
+        # Форма базы печатается ТОЛЬКО когда она не обычная: строка «горизонтальная,
+        # свои границы» ничего не сообщала бы, а шум мешал бы увидеть остальное.
+        form = ""
+        if lvl.boundary_narrowed:
+            form += f"  база в сужении (стр. 34), шагов {lvl.boundary_narrowed}"
+        if lvl.boundary_ladder:
+            form += "  граница от прежней структуры (стр. 40)"
+        if lvl.boundary_foreign:
+            form += "  граница с другого ТФ (стр. 39, 46)"
         out.append(
             f"        границы {_num(lvl.boundary_lo)}…{_num(lvl.boundary_hi)}  "
             f"вход: {ENTRY_LABEL[st.entry_rule.value]}  "
             f"{AGREE_LABEL[ag.value]}"
             + (f" ({TF_LABEL.get(pr.timeframe, pr.timeframe)})" if pr.timeframe else "")
+            + form
         )
         s = dec.setup
         if s is None:

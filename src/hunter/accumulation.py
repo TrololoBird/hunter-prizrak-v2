@@ -26,12 +26,35 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from .bars import steps_between
 from .breach import CONFIRM_BODIES, Direction, body_beyond
 from .models import Bar
 from .swings import SwingKind, SwingSet
+
+
+class BorderSource(StrEnum):
+    """Откуда взялась цена границы. Разделено 2026-08-08 и вот почему.
+
+    Один общий признак «граница не своя» на 5м срабатывал у 17 структур из 17 — то
+    есть не мог быть другим и оператору ничего не сообщал. Причина оказалась
+    смешением: на плотном младшем ряду структуры идут встык, и ЛЕСЕНКА (стр. 40)
+    работает почти всегда, а чужой ТФ (стр. 39, 46, 54) — редко. Это разные события
+    и разное доверие к уровню, поэтому и признака теперь два.
+    """
+
+    OWN = "own"
+    """Свои свинги: внутренний край первых двух точек стороны (стр. 18)."""
+
+    LADDER = "ladder"
+    """Ребро предыдущей структуры ЭТОГО ряда — лесенка (стр. 40)."""
+
+    FOREIGN = "foreign"
+    """Уровень с ДРУГОГО ТФ: ПОК стопового объёма (стр. 39) либо старший ТФ (стр. 46, 54)."""
+
 
 MIN_BOUNDARY_POINTS = 4
 """Стр. 22: «4 и более точек»; стр. 23: «(4+6+ точки границ)»; стр. 24: «(4+
@@ -69,8 +92,8 @@ class BoundaryZone(BaseModel):
     edge: float
     """САМА граница — одна цена. За неё считается выход и за неё меряется прокол."""
 
-    inherited: bool = False
-    """Граница взята не у своих свингов, а у ПРЕДЫДУЩЕЙ структуры — «лесенка», стр. 40.
+    source: BorderSource = BorderSource.OWN
+    """Откуда взялась цена границы: свои точки, лесенка или чужой ТФ.
 
     На схеме стр. 40 верхнее ребро прежней коробки служит нижним ребром следующей, и
     обе подписаны «Структура 4ч тф» — то есть лесенка складывается внутри одного ряда.
@@ -261,8 +284,8 @@ def detect(
     lo_edge: float | None = None
     up_narrowed = 0
     lo_narrowed = 0
-    up_inherited = False
-    lo_inherited = False
+    up_source = BorderSource.OWN
+    lo_source = BorderSource.OWN
     sorted_anchors = tuple(sorted(anchors))
     now_ms = 0
     ladder_up: float | None = None
@@ -271,7 +294,7 @@ def detect(
     def reset() -> None:
         nonlocal run_dir, run_from, hi_punct, lo_punct, resets, last_kind
         nonlocal up_edge, lo_edge, up_narrowed, lo_narrowed
-        nonlocal up_inherited, lo_inherited
+        nonlocal up_source, lo_source
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
@@ -282,7 +305,7 @@ def detect(
         last_kind = None
         up_edge = lo_edge = None
         up_narrowed = lo_narrowed = 0
-        up_inherited = lo_inherited = False
+        up_source = lo_source = BorderSource.OWN
 
     def upper_zone() -> tuple[float, float]:
         return min(hi_px[:2]), max(hi_px[:2])
@@ -337,7 +360,7 @@ def detect(
                             # Лесенка (стр. 40): цена вышла ВНИЗ из прежней структуры,
                             # и её нижнее ребро стало верхним ребром этой.
                             up_edge = ladder_up
-                            up_inherited = True
+                            up_source = BorderSource.LADDER
                         else:
                             # Лесенка не подошла — пробуем чужую границу с другого ТФ.
                             # Порядок именно такой: стр. 40 рисует СОВПАДЕНИЕ рёбер, а
@@ -346,7 +369,7 @@ def detect(
                             far = foreign(min(hi_px), max(hi_px), up_edge)
                             if far is not None:
                                 up_edge = far
-                                up_inherited = True
+                                up_source = BorderSource.FOREIGN
                     continue
                 assert up_edge is not None
                 if price < up_edge:
@@ -379,12 +402,12 @@ def detect(
                             # Лесенка (стр. 40): цена вышла ВВЕРХ из прежней структуры,
                             # и её верхнее ребро стало нижним ребром этой.
                             lo_edge = ladder_lo
-                            lo_inherited = True
+                            lo_source = BorderSource.LADDER
                         else:
                             far = foreign(min(lo_px), max(lo_px), lo_edge)
                             if far is not None:
                                 lo_edge = far
-                                lo_inherited = True
+                                lo_source = BorderSource.FOREIGN
                     continue
                 assert lo_edge is not None
                 if price > lo_edge:
@@ -460,10 +483,10 @@ def detect(
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
                 upper=BoundaryZone(edge=upper_edge, lo=upper_lo, hi=upper_hi,
-                                   narrowed=up_narrowed, inherited=up_inherited,
+                                   narrowed=up_narrowed, source=up_source,
                                    point_indices=tuple(hi_idx), puncture=hi_punct),
                 lower=BoundaryZone(edge=lower_edge, lo=lower_lo, hi=lower_hi,
-                                   narrowed=lo_narrowed, inherited=lo_inherited,
+                                   narrowed=lo_narrowed, source=lo_source,
                                    point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction,
@@ -492,11 +515,11 @@ def detect(
             bars_open=len(bars) - first,
             upper=BoundaryZone(edge=up_edge if up_edge is not None else ulo,
                                lo=ulo, hi=uhi, narrowed=up_narrowed,
-                               inherited=up_inherited,
+                               source=up_source,
                                point_indices=tuple(hi_idx), puncture=hi_punct),
             lower=BoundaryZone(edge=lo_edge if lo_edge is not None else lhi,
                                lo=llo, hi=lhi, narrowed=lo_narrowed,
-                               inherited=lo_inherited,
+                               source=lo_source,
                                point_indices=tuple(lo_idx), puncture=lo_punct),
         )
 
