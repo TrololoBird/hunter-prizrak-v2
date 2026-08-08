@@ -127,8 +127,7 @@ class SymbolDecision(BaseModel):
 
 
 def read_series(
-    series: dict[str, list[Bar]], timeframes: tuple[str, ...],
-    anchors: dict[str, tuple[tuple[float, int], ...]] | None = None,
+    series: dict[str, list[Bar]], timeframes: tuple[str, ...]
 ) -> tuple[dict[str, SeriesRead], tuple[Unbuilt, ...]]:
     """Свинги, структуры и тренд по каждому ТФ. Один проход, один результат.
 
@@ -146,12 +145,8 @@ def read_series(
         if isinstance(sw, NotReady):
             bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
             continue
-        reads[tf] = SeriesRead(
-            timeframe=tf, swings=sw, trend=swings.trend(sw),
-            scan=detect_accumulations(
-                bars, sw, tf, anchors=() if anchors is None else anchors.get(tf, ())
-            ),
-        )
+        reads[tf] = SeriesRead(timeframe=tf, swings=sw, trend=swings.trend(sw),
+                               scan=detect_accumulations(bars, sw, tf))
     return reads, tuple(bad)
 
 
@@ -195,28 +190,14 @@ def decide(
 
         ряды → свинги → структуры → уровни (ПОК) → судьба уровня → приоритет → геометрия
 
-    С 2026-08-08 первые два шага делаются ДВАЖДЫ, и это не дубль расчёта, а требование
-    курса: границей базы бывает чужой уровень — ПОК стопового объёма (стр. 39) или
-    уровень старшего ТФ (стр. 46, 54). Уровни считаются ИЗ структур, поэтому подать
-    их в структуры можно только вторым проходом. Проход 1 даёт цены, проход 2 —
-    ответ. Подробности и доказательство независимости от порядка ТФ — в
-    `foreign_borders`.
+    ⚠ Второй проход за чужой границей (стр. 39, 46, 54) был внесён и ОТКАЧЕН
+    2026-08-08: критерий не прошёл контроль на заведомо неверных анкерах. Причина
+    записана в `accumulation.BorderSource`. Проход снова ОДИН.
 
-    Остальные шаги зовутся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
+    Каждый шаг зовётся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
     """
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
-
-    # ПРОХОД 1 — структуры без чужих границ, и уровни по ним.
-    first_reads, _ = read_series(series, tfs)
-    first_levels, _ = levels.build_all(
-        symbol, series, trades, tfs, {tf: r.scan for tf, r in first_reads.items()}
-    )
-
-    # ПРОХОД 2 — те же структуры, но каждому ТФ поданы уровни ВСЕХ ОСТАЛЬНЫХ ТФ как
-    # кандидаты в границу. Результат прохода 2 и есть ответ; проход 1 нужен только
-    # ради этих цен.
-    anchors = foreign_borders(first_levels, tfs)
-    reads, unreadable = read_series(series, tfs, anchors)
+    reads, unreadable = read_series(series, tfs)
     scans = {tf: r.scan for tf, r in reads.items()}
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans)
     mapped = levels.map_levels(frozen, series)

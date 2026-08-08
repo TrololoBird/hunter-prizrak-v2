@@ -71,10 +71,10 @@ def bars(*ohlc: tuple[float, float, float, float], start: int = 0, gap_at: int =
 
 def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
           born_ms: int | None = None, lo: float = 90.0, hi: float = 110.0,
-          narrowed: int = 0, ladder: bool = False, foreign: bool = False) -> Level:
+          narrowed: int = 0, ladder: bool = False) -> Level:
     """Уровень с минимальным правдоподобным окружением. Цена — единственное, что важно.
 
-    Форма базы (`narrowed`, `ladder`, `foreign`) по умолчанию обычная — горизонтальная коробка на
+    Форма базы (`narrowed`, `ladder`) по умолчанию обычная — горизонтальная коробка на
     своих точках. Умолчание стоит ЗДЕСЬ, а не в модели: у `Level` эти поля обязательны,
     чтобы продюсер не мог забыть их проставить, и это правило поймало данный пробник.
     """
@@ -88,7 +88,7 @@ def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
         structure_volume=100.0,
         boundary_lo=Decimal(str(lo)), boundary_hi=Decimal(str(hi)),
         boundary_narrowed=narrowed,
-        boundary_ladder=ladder, boundary_foreign=foreign,
+        boundary_ladder=ladder,
     )
 
 

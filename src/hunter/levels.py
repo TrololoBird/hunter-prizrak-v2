@@ -135,16 +135,10 @@ class Level(BaseModel):
     """Хоть одна граница взята у ПРЕДЫДУЩЕЙ структуры этого ряда — лесенка (стр. 40).
 
     Оператору это меняет доверие к уровню: граница держится на точках ТОЙ структуры,
-    а не этой."""
+    а не этой.
 
-    boundary_foreign: bool
-    """Хоть одна граница взята с ДРУГОГО ТФ: ПОК стопового объёма (стр. 39) либо
-    уровень старшего ТФ (стр. 46, 54).
-
-    ⚠ Отделено от лесенки 2026-08-08. Общий признак «граница не своя» на 5м
-    срабатывал у 17 структур из 17 и потому не сообщал ничего: почти всё это была
-    лесенка, а редкий и важный случай чужого ТФ в ней тонул."""
-    """Границы структуры — за них ставится стоп (стр. 33)."""
+    ⚠ Признака «граница с другого ТФ» здесь БОЛЬШЕ НЕТ: механизм внесён и откачен
+    2026-08-08, причина — в докстроке `accumulation.BorderSource`."""
 
     @property
     def breach_direction(self) -> Direction:
@@ -231,7 +225,6 @@ def build_level(
         boundary_hi=Decimal(str(acc.upper.edge)),
         boundary_narrowed=acc.upper.narrowed + acc.lower.narrowed,
         boundary_ladder=BorderSource.LADDER in (acc.upper.source, acc.lower.source),
-        boundary_foreign=BorderSource.FOREIGN in (acc.upper.source, acc.lower.source),
     )
 
 

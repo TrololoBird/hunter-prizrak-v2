@@ -114,11 +114,9 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                         if a.upper.narrowed or a.lower.narrowed)
         ladder = sum(1 for a in sc.closed if BorderSource.LADDER
                      in (a.upper.source, a.lower.source))
-        foreign = sum(1 for a in sc.closed if BorderSource.FOREIGN
-                      in (a.upper.source, a.lower.source))
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  баров {sc.bars_scanned}  "
                    f"структур {len(sc.closed)}  распадов {sc.resets}  "
-                   f"в сужении {narrowing}  лесенка {ladder}  чужой ТФ {foreign}  "
+                   f"в сужении {narrowing}  лесенка {ladder}  "
                    f"тренд {TREND_LABEL[tr.direction.value]} (держится на {tr.holds_for})  "
                    f"незакрытая структура: {tail}")
 
@@ -140,8 +138,6 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             form += f"  база в сужении (стр. 34), шагов {lvl.boundary_narrowed}"
         if lvl.boundary_ladder:
             form += "  граница от прежней структуры (стр. 40)"
-        if lvl.boundary_foreign:
-            form += "  граница с другого ТФ (стр. 39, 46)"
         out.append(
             f"        границы {_num(lvl.boundary_lo)}…{_num(lvl.boundary_hi)}  "
             f"вход: {ENTRY_LABEL[st.entry_rule.value]}  "
