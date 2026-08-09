@@ -25,7 +25,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 3 | прокол против пробоя | `src/hunter/breach.py` | false breakout, fakeout, liquidity sweep, stop hunt, turtle soup, wyckoff spring/upthrust, bull/bear trap, 2B | решение владельца | [breach-projects-2026-08-07.md](breach-projects-2026-08-07.md) — 11 проектов, Р1 закрыта замером, Р2 за владельцем |
 | 4 | накопление и выход из него | `src/hunter/accumulation.py` | accumulation range, consolidation detection, wyckoff accumulation, range breakout | **закрыт 2026-08-08**, 14 реализаций | [accumulation-projects-2026-08-07.md](accumulation-projects-2026-08-07.md): из гипотез принято **0**, из перечитывания курса внесено **7** правок (одна откачена); 4 вопроса владельцу, из них один — невыполненное требование курса |
 | 5 | сетка баров и закрытость | `src/hunter/bars.py` | partial candle, closed candle only, resample ohlcv, repainting indicator | **закрыт 2026-08-08**, 20 реализаций | [bars-projects-2026-08-08.md](bars-projects-2026-08-08.md): курс отвечает на 3 из 9, следуем на 3 из 3, расхождений НОЛЬ; внесено 5 правок докстрок, расчёт не менялся; отозвано невоспроизводимое число |
-| 6 | часы и сдвиг биржи | `src/hunter/clock.py` | exchange server time drift, clock sync trading bot, timestamp skew | не начат | — |
+| 6 | часы и сдвиг биржи | `src/hunter/clock.py` | exchange server time drift, clock sync trading bot, timestamp skew | **закрыт 2026-08-08**, 20 реализаций | [clock-projects-2026-08-08.md](clock-projects-2026-08-08.md): курс молчит по ВСЕМ девяти; принято 0 из 3 гипотез, но три решения получили НАЗВАННЫЙ ИСТОЧНИК (NTP RFC 5905, recvWindow биржи) |
 | 7 | стоповый объём | `src/hunter/stop_volume.py` | stop run, liquidity sweep, stop hunt detection, volume spike at level | не начат | — |
 | 8 | уровни BUY/SELL | `src/hunter/levels.py` | support resistance detection, price level clustering, level strength scoring | не начат | — |
 | 9 | приоритет таймфреймов | `src/hunter/priority.py` | multi timeframe confluence, higher timeframe bias, mtf alignment | не начат | — |
@@ -51,6 +51,7 @@ grep -c '| готов' docs/audit/survey-catalog.md; grep -c '| не начат'
 | 3 | 22 | 23 | **11** (+8 по описанию), предел взят | 1 из 13 — П11; по П1 большинства нет | 2 | **0** — Р1 закрыта замером, Р2 за владельцем |
 | 4 | 20 | 23 | **14** (+4 по описанию), предел взят | 4 из 11 (Н1, Н2, Н5, Н6); 6 «мало данных», 1 «никто не рассматривает» | 4 | **0 из гипотез**, но **7 из перечитывания курса** — одна затем откачена контролем |
 | 5 | 27 | 25 | **20** ✅ цель 20 взята | 2 из 9 (Б2, Б3); 6 «мало данных», 1 «никто не рассматривает» | 3 | **1** — Г3, предпосылка записана; Г1 и Г2 вердикта не получили |
+| 6 | 24 | 21 | **20** ✅ цель 20 взята | 2 из 9 (Ч1, Ч2); 6 «мало данных», 1 «никто не рассматривает» | 3 | **0** — К2 отвергнута замером, К3 теоретическая, К1 без вердикта (нуль негоден) |
 
 ⚠ **Строка 4 — единственная, где столбцы «гипотез проверено» и «принято» отвечают не на
 тот вопрос, который важен.** Все четыре гипотезы построены по чужим реализациям, доведены
