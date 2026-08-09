@@ -74,6 +74,31 @@ class DivergenceKind(StrEnum):
     HIDDEN_BULLISH = "hidden_bullish"
     """СКРЫТАЯ бычья: лои цены РАСТУТ, лои индикатора ПАДАЮТ (стр. 65, рисунок)."""
 
+    EXTENDED_BEARISH = "extended_bearish"
+    """РАСШИРЕННАЯ медвежья: хаи цены РАВНЫ (двойная вершина), хаи индикатора падают.
+
+    ⚠ Заведено 2026-08-09. Третье семейство схемы стр. 65 (М-16); «равные» получили
+    допуск из классики — см. `EXTENDED_EQUAL_TOL_PCT`.
+    """
+
+    EXTENDED_BULLISH = "extended_bullish"
+    """РАСШИРЕННАЯ бычья: лои цены РАВНЫ (двойное дно), лои индикатора растут (стр. 65)."""
+
+
+EXTENDED_EQUAL_TOL_PCT = 3.0
+"""Допуск «равенства» экстремумов цены для расширенных дивергенций, % от цены.
+
+Курс числа не даёт (стр. 65 рисует равные вершины/донья без допуска). По §0.1 молчание
+курса заполняет классика; решение владельца 2026-08-09 («решения принимай сам по
+источникам»), разбор — docs/audit/classics-tolerance-2026-08-09.md (11 источников):
+Булковски, Encyclopedia of Chart Patterns (Adam & Adam Double Top): «variation between
+price peaks is small, usually less than 3%» — то же 3% у него граница «одного уровня»
+при разграничении triple top; индустриальный default открытых детекторов — 2%
+(подмножество трёх процентов). Взята граница Булковски как единственная книжная.
+Эдвардс-Маги и Шабакер числа не дают. Значение вынесено константой, чтобы
+чувствительность к нему замерялась, а не предполагалась.
+"""
+
 
 class Divergence(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -104,6 +129,37 @@ class SqueezeFactor(BaseModel):
     """
 
 
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
+"""Уровни RSI с настроек автора (скриншот стр. 64: пунктиры 70/50/30) и из классики —
+Уайлдер, New Concepts in Technical Trading Systems, 1978: 70/30 как зоны
+перекупленности/перепроданности. Середина 50 фактором не является: «RSI около 50»
+требует допуска близости, которого нет ни у курса, ни у классики. Заведено 2026-08-09
+(реестр долга, строка 8): уровни были сняты со скриншота проходом курса и нигде не
+читались — RSI участвовал только в дивергенциях."""
+
+
+class RsiZoneFactor(BaseModel):
+    """RSI за уровнем 70/30 (стр. 64). Доп-фактор §2.9 — сопровождает, не гейтит."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    value: float
+    overbought: bool
+    """True — выше 70, перекупленность; False — ниже 30, перепроданность."""
+
+
+def rsi_zone(value: float | None) -> RsiZoneFactor | None:
+    """None — RSI в середине диапазона либо не посчитан; фактора нет."""
+    if value is None or math.isnan(value):
+        return None
+    if value >= RSI_OVERBOUGHT:
+        return RsiZoneFactor(value=value, overbought=True)
+    if value <= RSI_OVERSOLD:
+        return RsiZoneFactor(value=value, overbought=False)
+    return None
+
+
 class MaTouchFactor(BaseModel):
     """MA/EMA 200 рядом с точкой входа (стр. 69)."""
 
@@ -125,14 +181,17 @@ def divergences(
     ЛИБО `NaN` — см. `_absent`), фактор НЕ выдаётся: подставлять число нельзя (§4.3), а
     сравнивать с NaN — значит молча получить «дивергенции нет».
     """
-    # ⚠ РАСШИРЕННЫХ дивергенций здесь НЕТ, и это решение, а не пропуск. На стр. 65 они
-    # нарисованы как РАВНЫЕ экстремумы цены при расходящемся индикаторе; «равные» требует
-    # допуска на равенство, а курс его не даёт ни числом, ни правилом. По §0 величина без
-    # референта не пишется. Реализованы два семейства из трёх, и это сказано вслух.
-    ON_HIGHS = (DivergenceKind.DIVERGENCE, DivergenceKind.HIDDEN_BEARISH)
+    # Три семейства стр. 65 (М-16). Расширенные добавлены 2026-08-09: допуск равенства
+    # получил референт из классики (`EXTENDED_EQUAL_TOL_PCT`). В ПОЛОСЕ равенства
+    # приоритет у расширенной: пара «хаи отличаются на 1%, индикатор ниже» — это
+    # двойная вершина по Булковски, а не «хаи растут», и выдавать обе значило бы
+    # посчитать одно наблюдение дважды.
+    ON_HIGHS = (DivergenceKind.DIVERGENCE, DivergenceKind.HIDDEN_BEARISH,
+                DivergenceKind.EXTENDED_BEARISH)
     out: list[Divergence] = []
     for kind in (DivergenceKind.DIVERGENCE, DivergenceKind.CONVERGENCE,
-                 DivergenceKind.HIDDEN_BEARISH, DivergenceKind.HIDDEN_BULLISH):
+                 DivergenceKind.HIDDEN_BEARISH, DivergenceKind.HIDDEN_BULLISH,
+                 DivergenceKind.EXTENDED_BEARISH, DivergenceKind.EXTENDED_BULLISH):
         sk = SwingKind.HIGH if kind in ON_HIGHS else SwingKind.LOW
         seq = sorted(swings.of(sk), key=lambda s: s.index)
         if len(seq) < 2:
@@ -144,14 +203,19 @@ def divergences(
         if _absent(i_prev) or _absent(i_last):
             continue
         assert i_prev is not None and i_last is not None
+        equal = abs(last.price - prev.price) / prev.price * 100 < EXTENDED_EQUAL_TOL_PCT
         if kind is DivergenceKind.DIVERGENCE:
-            hit = last.price > prev.price and i_last < i_prev
+            hit = not equal and last.price > prev.price and i_last < i_prev
         elif kind is DivergenceKind.CONVERGENCE:
-            hit = last.price < prev.price and i_last > i_prev
+            hit = not equal and last.price < prev.price and i_last > i_prev
         elif kind is DivergenceKind.HIDDEN_BEARISH:
-            hit = last.price < prev.price and i_last > i_prev
+            hit = not equal and last.price < prev.price and i_last > i_prev
+        elif kind is DivergenceKind.HIDDEN_BULLISH:
+            hit = not equal and last.price > prev.price and i_last < i_prev
+        elif kind is DivergenceKind.EXTENDED_BEARISH:
+            hit = equal and i_last < i_prev
         else:
-            hit = last.price > prev.price and i_last < i_prev
+            hit = equal and i_last > i_prev
         if not hit:
             continue
         out.append(Divergence(
