@@ -99,3 +99,79 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 торговля как обычное накопление (стр. 37), граница будущего накопления (стр. 39), якорь
 стопа (стр. 18). Реализована последняя, и то наполовину — «или Лой того же ТФ или ТФ-1»
 из той же фразы стр. 18 в коде отсутствует.
+
+---
+
+## Фаза 1. Сбор чужих реализаций
+
+**Интернет проверен**, поиск по коду через `gh api search/code` отвечает.
+
+⚠ **Предмет в поле называется иначе, и это пришлось перебрать.** Русского «стоповый объём»
+в чужих репозиториях нет; ближайшие имена — *order block* (ICT), *supply/demand zone*,
+*high volume node* (профиль объёма), *liquidity sweep*, *Wyckoff accumulation*. Поиск по
+нашему имени дал бы ноль.
+
+### Поисковые запросы, дословно (все 2026-08-09)
+
+1. `order_block language:python` — 10 432 совпадения
+2. `high_volume_node language:python` — 272
+3. `liquidity_sweep language:python` — 3 896
+4. `demand_zone supply_zone language:python` — 690
+5. `wyckoff spring accumulation detection language:python`
+6. `volume cluster consolidation before breakout language:python`
+7. `smart-money-concepts` (поиск репозиториев по звёздам)
+
+## Каталог прочитанных реализаций
+
+### 1. smart-money-concepts — [joshyattridge/smart-money-concepts](https://github.com/joshyattridge/smart-money-concepts) ★1920
+
+Самая популярная библиотека ICT-разметки. Прочитана
+[smartmoneyconcepts/smc.py](https://github.com/joshyattridge/smart-money-concepts/blob/master/smartmoneyconcepts/smc.py). Лицензия MIT.
+
+* **С1 что считается зоной** — не накопление, а ОДНА СВЕЧА: экстремум перед сломом
+  структуры. `obBtm = _low[candidate_index]`, `obTop = _high[candidate_index]`.
+* **С4, С6 — объём считается и НЕ ОТБИРАЕТ.** `obVolume = vol_cur + vol_prev1 + vol_prev2`
+  и `percentage`, но, как и у нас, это выходные величины, а не критерий. **Совпадение с
+  нашей находкой 1 буквальное.**
+* **С2 — старшего ТФ нет вовсе:** функция работает на одном ряду.
+
+### 2. PyIndicators — [coding-kitties/PyIndicators](https://github.com/coding-kitties/PyIndicators)
+
+Прочитан [volumetric_supply_demand_zones.py](https://github.com/coding-kitties/PyIndicators/blob/main/pyindicators/indicators/volumetric_supply_demand_zones.py). Лицензия Apache-2.0.
+
+* **С1** — зона это свинг плюс импульс не меньше `1.2 × ATR`.
+* **С4 — объём РАСПРЕДЕЛЯЕТСЯ по ценовым строкам зоны** (`alloc_vol = bar_vol * overlap_pct`),
+  но плотности на единицу цены нет, ранга силы нет.
+* ⚠ **Есть то, чего нет у нас: ОГРАНИЧЕНИЕ ВЫСОТЫ ЗОНЫ** — `max_zone_atr` по умолчанию
+  `4.0 × ATR`. У нас размер стопового не ограничен ничем.
+* **С2** — старшего ТФ нет.
+
+### 3. ai-crypto-trader — [zd87pl/ai-crypto-trader](https://github.com/zd87pl/ai-crypto-trader)
+
+Прочитан [volume_profile_analyzer.py](https://github.com/zd87pl/ai-crypto-trader/blob/main/services/utils/volume_profile_analyzer.py).
+
+* **С4, С6 — ПОРОГ ЕСТЬ, и он абсолютный относительный:**
+  `hvn_threshold = 0.7 * max_volume`, узлом считается корзина с объёмом не ниже 70% от
+  максимума. У нас порога нет вовсе, только перцентиль.
+* Ширина узла не учитывается: сетка из 20 корзин фиксирована.
+* **С2** — старшего ТФ нет.
+
+### 4. CryptoTrade — [faishaltsq/CryptoTrade](https://github.com/faishaltsq/CryptoTrade)
+
+Прочитан [app/analysis/smc.py](https://github.com/faishaltsq/CryptoTrade/blob/main/app/analysis/smc.py).
+
+* **С1** — зона по свече: `(recent['close'] < recent['open']) & ((recent['high'] - recent['low']) > atr * 0.5)`.
+* **С4 — объём НЕ УЧАСТВУЕТ ВОВСЕ**, столбец объёма не читается ни одной функцией.
+* **С2** — старшего ТФ нет.
+
+### 5. StockSharp AlgoTrading — [StockSharp/AlgoTrading](https://github.com/StockSharp/AlgoTrading)
+
+Стратегия «накопление по Вайкоффу». Прочитан
+[wyckoff_accumulation_strategy.py](https://github.com/StockSharp/AlgoTrading/blob/master/API/0101-0200/0108_Wyckoff_Accumulation/PY/wyckoff_accumulation_strategy.py).
+
+* **С1** — диапазон из недавних экстремумов, вход при `close <= lowest + rng * 0.2`.
+* ⚠ **«Плотность» считается СОВСЕМ ИНАЧЕ: по узким свечам, а не по объёму** —
+  `is_narrow = candle_range < rng * 0.4`, и такие свечи считаются счётчиком. Это ответ на
+  наш вопрос С4, которого нет ни у нас, ни у остальных четырёх.
+* **С4 — объём не читается вовсе.**
+* **С2** — старшего ТФ нет.
