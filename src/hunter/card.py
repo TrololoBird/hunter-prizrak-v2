@@ -337,7 +337,13 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"{sw_tail.reason}")
             continue
         sw = sw_tail
-        for name, expr in (("RSI", indicators.rsi()), ("MACD", indicators.macd_line())):
+        for name, quantity, expr in (("RSI", "rsi14", indicators.rsi()),
+                                     ("MACD", "macd", indicators.macd_line())):
+            # ⚠ Допуск спрашивается ЯВНО с 2026-08-09: EMA в конвенции TV определена с
+            # бара 0, и «значение есть в ряду» перестало означать «значение каноничное».
+            # Раньше эту работу молча делала затравка TA-Lib (null до N-го бара).
+            if admission.check(quantity, len(bars), d.symbol, tf) is not None:
+                continue
             for div in factors.divergences(bars, sw, _series(bars, expr), name):
                 # М-16: видов четыре, не два — подпись берётся из словаря, а не выводится
                 # ветвлением «если не дивергенция, значит конвергенция».
@@ -359,6 +365,12 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # скриншоте настроек показаны обе с длиной 200. Считалась только EMA (М-16/М-13).
         for name, expr200 in (("EMA200", indicators.ema(200)),
                               ("MA200", indicators.sma(200))):
+            # Тот же явный допуск: ewm отдаёт числа с первого бара, но каноничны они
+            # с 200-го (admission.CANONICAL_FROM_BARS — раннее значение зависит от
+            # точки старта ряда, замер: до 6.7% от цены).
+            if admission.check("ema200", len(bars), d.symbol, tf) is not None:
+                parts.append(_short("ema200", len(bars), d.symbol, tf, name))
+                continue
             ma = factors.ma_touch(_series(bars, expr200), bars[-1].close)
             parts.append(f"{name} в {ma.distance_pct:.2f}% от цены" if ma
                          else _short("ema200", len(bars), d.symbol, tf, name))
