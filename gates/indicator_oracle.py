@@ -101,12 +101,20 @@ def _oracle(df: pl.DataFrame) -> dict[str, list[float | None]]:
         "low": df["low"].to_list(),
         "close": df["close"].to_list(),
     })
-    macd = pdf.ta.macd(fast=12, slow=26, signal=9, talib=False)
+    # ⚠ EMA — `pandas.ewm(span, adjust=False)`: затравка первым значением, конвенция
+    # TradingView, на которую проект перешёл 2026-08-09 (см. `hunter.indicators.ema`).
+    # НЕ `pdf.ta.ema(sma=False)`: проверено на срезе — тот даёт третью затравку
+    # (расхождение 8.8e-5 с TV-рекурсией на баре 300), а `pandas.ewm(adjust=False)`
+    # совпадает с рукописной TV-рекурсией в ноль. MACD собирается из тех же EMA, а не
+    # из `pdf.ta.macd`: тот сеет SMA и сверял бы затравки, а не расчёт. Независимость
+    # оракула сохранена: pandas против polars.
+    ema12 = pdf["close"].ewm(span=12, adjust=False).mean()
+    ema26 = pdf["close"].ewm(span=26, adjust=False).mean()
     return {
         "atr14": pdf.ta.atr(length=14, talib=False, mamode="rma").tolist(),
         "rsi14": pdf.ta.rsi(length=14, talib=False).tolist(),
-        "macd": macd.iloc[:, 0].tolist(),
-        "ema200": pdf.ta.ema(length=200, talib=False).tolist(),
+        "macd": (ema12 - ema26).tolist(),
+        "ema200": pdf["close"].ewm(span=200, adjust=False).mean().tolist(),
     }
 
 

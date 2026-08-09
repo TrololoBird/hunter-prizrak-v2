@@ -41,14 +41,21 @@ from hunter.admission import CANONICAL_FROM_BARS  # noqa: E402
 
 
 def ema(x: list[float], n: int) -> list[float | None]:
-    """s_t = a*x_t + (1-a)*s_{t-1}, a = 2/(n+1); затравка — SMA первых n."""
+    """s_t = a*x_t + (1-a)*s_{t-1}, a = 2/(n+1); затравка — ПЕРВЫМ значением (TV).
+
+    ⚠ До 2026-08-09 эталон сеялся SMA первых n (конвенция TA-Lib/StockCharts). Проект
+    перевёл боевую EMA на конвенцию TradingView — инструмента курса (стр. 69), — и
+    эталон переведён ТОЙ ЖЕ правкой: расхождение конвенций не «прогревом гасится»,
+    а именно конвенция. Реализации остаются независимыми: рукописная рекурсия против
+    `ewm_mean` polars.
+    """
     out: list[float | None] = [None] * len(x)
-    if len(x) < n:
+    if not x:
         return out
     a = 2.0 / (n + 1)
-    prev = sum(x[:n]) / n
-    out[n - 1] = prev
-    for t in range(n, len(x)):
+    prev = x[0]
+    out[0] = prev
+    for t in range(1, len(x)):
         prev = a * x[t] + (1 - a) * prev
         out[t] = prev
     return out

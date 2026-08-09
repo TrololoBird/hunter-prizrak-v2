@@ -57,7 +57,26 @@ def rsi(period: int = 14) -> pl.Expr:
 
 
 def ema(period: int) -> pl.Expr:
-    return _expr(plta.ema(pl.col("close"), timeperiod=period))
+    """Экспоненциальная скользящая В КОНВЕНЦИИ TRADINGVIEW: затравка первым close.
+
+    ⚠ Переведена с TA-Lib-затравки (SMA первых N) 2026-08-09. Формула одна —
+    s_t = a·x_t + (1−a)·s_{t−1}, a = 2/(N+1), — конвенции затравки две, и обе законны
+    (Wikipedia EMA описывает обе; TA-Lib/StockCharts сеют SMA, TradingView `ta.ema` —
+    первым значением). Инструмент курса — TradingView (скриншоты стр. 69), и по решению
+    владельца о переносе инструментов TV (docs/audit/tv-transfer-2026-08-09.md) референт
+    фактора — то, что видит автор на экране.
+
+    Цена вопроса ЗАМЕРЕНА (docs/audit/probes/probe_ema_seed_2026-08-09.py, 318 серий):
+    медиана расхождения двух конвенций 0.035% от цены, но на коротких рядах — до 6.7%
+    (ряд 345 баров): свежий листинг у нас и в TV давал бы РАЗНЫЕ «EMA200 в X% от цены».
+
+    `ewm_mean(adjust=False, min_samples=1)` polars — ровно рекурсия TV с бара 0.
+    Каноничность по-прежнему признаётся с бара N (admission.CANONICAL_FROM_BARS):
+    ранние значения зависят от точки старта ряда, и фактор до N баров не печатается.
+    MACD (разность ema) переезжает на ту же конвенцию согласованно — как и в TV.
+    """
+    return _expr(pl.col("close").ewm_mean(alpha=2.0 / (period + 1),
+                                          adjust=False, min_samples=1))
 
 
 def sma(period: int) -> pl.Expr:
