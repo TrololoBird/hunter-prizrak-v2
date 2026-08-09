@@ -175,3 +175,173 @@ density, density_percentile, StopVolumeSet, placement — потребителе
   наш вопрос С4, которого нет ни у нас, ни у остальных четырёх.
 * **С4 — объём не читается вовсе.**
 * **С2** — старшего ТФ нет.
+
+### 6. smartmoney-analysic — [taydhcm/smartmoney-analysic](https://github.com/taydhcm/smartmoney-analysic)
+
+Прочитан [analytics/accumulation_detection.py](https://github.com/taydhcm/smartmoney-analysic/blob/main/analytics/accumulation_detection.py).
+
+* **С4 — объём участвует в ОПОЗНАНИИ, а не в ранге:** порог кульминации `vol_mean + 2.5 * vol_std`,
+  признак скрытого набора `recent.volume.mean() > previous.volume.mean() * 1.2`.
+* **С1** — фазы Вайкоффа, допуск плоскости 3%.
+* **С2** — старшего ТФ нет.
+
+### 7. ai-market-maker — [olaxbt/ai-market-maker](https://github.com/olaxbt/ai-market-maker)
+
+Прочитан [scripts/token_screeners/wyckoff_scanner.py](https://github.com/olaxbt/ai-market-maker/blob/main/scripts/token_screeners/wyckoff_scanner.py).
+
+* ⚠ **ВЫСОТА ДИАПАЗОНА ОГРАНИЧЕНА:** `range_max_width_pct: 40.0` — не шире 40% от середины.
+  **Второй проект с ограничением размера зоны.**
+* Пружина по недорезу `spring_undercut_pct: 1.5`; объём входит только в подтверждение
+  выхода (`vol_z >= sos_volume_z_min`).
+* **С2** — один ТФ, `scan_tf: 1h`.
+
+### 8. aqrs_fx_v3_pro — [TshifhunguCodes/aqrs_fx_v3_pro](https://github.com/TshifhunguCodes/aqrs_fx_v3_pro)
+
+Прочитан [strategy/liquidity.py](https://github.com/TshifhunguCodes/aqrs_fx_v3_pro/blob/main/strategy/liquidity.py).
+
+* Съём ликвидности по сравнению с окном `lookback=10`; **объём не читается вовсе**;
+  ограничения размера нет; **старшего ТФ нет.**
+
+### 9. freqtradestrategies — [jaredrsommer/freqtradestrategies](https://github.com/jaredrsommer/freqtradestrategies)
+
+Стратегия KitchenSink для freqtrade, узлы объёма внутри стратегии. Прочитан
+[KitchenSink.py](https://github.com/jaredrsommer/freqtradestrategies/blob/main/KitchenSink.py).
+
+* **С4, С6 — порог ДИНАМИЧЕСКИЙ**, считается на каждой свече от среднего объёма периода,
+  плюс жёсткое условие `volume_in_bin / total_volume_period >= 0.2`.
+* Ширина узла не учитывается: берётся первая подошедшая корзина.
+* **С2 — информативного ТФ не используется**, хотя freqtrade его прямо поддерживает
+  (`merge_informative_pair`). То есть возможность была под рукой и не взята.
+
+### 10. MT5-SMC-trading-bot — [KVignesh122/MT5-SMC-trading-bot](https://github.com/KVignesh122/MT5-SMC-trading-bot), MQL5
+
+Прочитан [EA_Script.mq5](https://github.com/KVignesh122/MT5-SMC-trading-bot/blob/main/EA_Script.mq5).
+
+* **С1** — блок по паре свечей плюс смещение: `bullishOB = (open_i > close_i) && (close_p > open_p) && HasDisplacement(i-1)`.
+* **С4 — объёма нет вовсе**; ограничения размера нет.
+* **С2 — старшего ТФ нет:** всё считается на `_Period`, окно 120 баров.
+
+### 11. rust_quant — [fairwic/rust_quant](https://github.com/fairwic/rust_quant)
+
+Прочитан [scripts/analyze_volume_profile_buckets.py](https://github.com/fairwic/rust_quant/blob/main/scripts/analyze_volume_profile_buckets.py).
+
+* **С4, С6** — узел объёма при `close_bin_volume >= average_bin_volume * 1.25`, низкий узел
+  при `<= * 0.75`. Порог кратный среднему, не перцентиль. 24 корзины, окно 48 свечей.
+* **С2** — старшего ТФ нет.
+
+### 12. Titannia-Cronjob-scripts — [Reddy7860/Titannia-Cronjob-scripts](https://github.com/Reddy7860/Titannia-Cronjob-scripts)
+
+Прочитан [demand_and_supply_zone_automation.py](https://github.com/Reddy7860/Titannia-Cronjob-scripts/blob/master/demand_and_supply_zone_automation.py).
+
+* **С1 — база это РОВНО ОДНА свеча** между двумя импульсными: тело не больше 30% диапазона
+  у базовой и больше 50% у соседних. У нас база это накопление из 4+ точек.
+* **С4 — объёма нет вовсе**; **С2** — старшего ТФ нет.
+
+### 13. AlgoTrading — [pintusahi1428/AlgoTrading](https://github.com/pintusahi1428/AlgoTrading)
+
+Прочитан [smart_money.py](https://github.com/pintusahi1428/AlgoTrading/blob/main/smart_money.py).
+Блок по отклонению от среднего десяти свечей, съём ликвидности по окну 25.
+**Объёма нет вовсе, ограничения размера нет, старшего ТФ нет.**
+
+### 14. profittown-sniper-smc — [manuelinfosec/profittown-sniper-smc](https://github.com/manuelinfosec/profittown-sniper-smc)
+
+Прочитан [shared/rules/ob_filters.py](https://github.com/manuelinfosec/profittown-sniper-smc/blob/main/shared/rules/ob_filters.py).
+Блок — последняя противоположная свеча перед импульсом, окно `df.iloc[-20:-1]`.
+**Объёма нет, ограничения размера нет, старшего ТФ нет** (данные берутся одним запросом с
+`granularity: 14400`).
+
+### 15. ChartNagari — [Ju571nK/ChartNagari](https://github.com/Ju571nK/ChartNagari), Go
+
+Прочитан [internal/indicator/volume_profile.go](https://github.com/Ju571nK/ChartNagari/blob/main/internal/indicator/volume_profile.go).
+
+* **С6 — ПОРОГА НЕТ ВОВСЕ, отбор по РАНГУ:** берутся три корзины с наибольшим объёмом,
+  кроме ПОК. Это ближе всего к нашему перцентилю из всех двадцати.
+* **С2** — старшего ТФ нет.
+
+### 16. jsupremetradinginstitute — [Jordan-sketch-hue/jsupremetradinginstitute](https://github.com/Jordan-sketch-hue/jsupremetradinginstitute), TypeScript
+
+Прочитан [lib/orderBlockDetection.ts](https://github.com/Jordan-sketch-hue/jsupremetradinginstitute/blob/main/lib/orderBlockDetection.ts).
+
+* **С1** — консолидация (свеча внутри предыдущей) плюс пробой.
+* ⚠ **Поле `volume` в интерфейсе свечи ЕСТЬ и не читается НИ РАЗУ** — третий случай
+  «объём посчитан и не применён» в этой выборке.
+* **С2** — старшего ТФ нет.
+
+### 17. go-coffee — [DimaJoyti/go-coffee](https://github.com/DimaJoyti/go-coffee), Go
+
+Прочитан [crypto-terminal/internal/orderflow/volume_profiler.go](https://github.com/DimaJoyti/go-coffee/blob/main/crypto-terminal/internal/orderflow/volume_profiler.go).
+
+* **С6 — порог `hvnThreshold = 1.5`** от среднего объёма уровня; область стоимости 70%.
+* Корзины по `PriceTickSize` — как у нас в профиле объёма (§5).
+* **С2** — ТФ не участвует в опознании узла; сессия фильтруется отдельно, ДО построения.
+
+### 18. quant-trading — [asifrahaman13/quant-trading](https://github.com/asifrahaman13/quant-trading), Go
+
+Прочитан [internal/core/volumeprofile.go](https://github.com/asifrahaman13/quant-trading/blob/main/internal/core/volumeprofile.go).
+
+* ⚠ **Самый тонкий подход к плотности из двадцати:** ядерная оценка с шириной по Сильверману
+  и отбор пиков по выступанию — `findPeaksWithProminence(smoothedVolumes, cfg.MinProminenceRatio)`,
+  умолчание 0.15. 500 уровней.
+* **С2** — ТФ не участвует.
+
+### 19. quantalogic — [quantalogic/quantalogic](https://github.com/quantalogic/quantalogic)
+
+Прочитан [examples/finance_advanced_analysis/technical_analysis.py](https://github.com/quantalogic/quantalogic/blob/main/examples/finance_advanced_analysis/technical_analysis.py).
+
+* **С4 — «узел объёма» здесь ВООБЩЕ НЕ ПРО ЦЕНУ:** `Volume > Volume_MA + volume_std`, то
+  есть это свеча с большим объёмом, а не область цены. Ширина не участвует.
+* **С2** — ТФ только определяет, какие данные скачаны.
+
+### 20. CYPHER-V3 — [0xjc65eth/CYPHER-V3](https://github.com/0xjc65eth/CYPHER-V3), TypeScript
+
+Прочитан [src/lib/smc/types.ts](https://github.com/0xjc65eth/CYPHER-V3/blob/main/src/lib/smc/types.ts).
+
+```typescript
+export interface OrderBlock {
+  type: 'bullish' | 'bearish'
+  high: number
+  low: number
+  timestamp: Date
+  strength: number // 0-100
+  tested: boolean
+  volume: number
+  mitigated: boolean
+}
+```
+
+⚠ **Модель зоны в поле: есть `volume` и `strength`, и НЕТ поля таймфрейма.** Это самое
+короткое доказательство общего ответа выборки — у зоны нет принадлежности к ТФ вовсе.
+
+---
+
+## Итог сбора
+
+| | |
+|---|---:|
+| попыток чтения исходников | 24 (три ответили `HTTP 404`, один файл оказался не тем) |
+| просмотрено проектов | 22 |
+| **засчитано по КОДУ** | **20** ✅ цель взята |
+| отсеяно как несамостоятельные | 0 |
+| отсеяно по прочим причинам | 2 — файл не найден либо путь не установлен |
+
+**Языков четыре:** Python, Go, TypeScript, MQL5.
+
+## ⚠⚠ Главный ответ выборки: НИ ОДИН из двадцати не связывает зону со СТАРШИМ ТФ
+
+Двадцать проектов из двадцати опознают зону на ОДНОМ ряду. Определяющее свойство стопового
+объёма по стр. 34 — «на более мелком ТФ, чем основное движение актива» — в поле не выражено
+ни разу. Короче всего это видно в модели `OrderBlock` у CYPHER-V3: поля `volume` и
+`strength` есть, поля таймфрейма нет.
+
+⚠ **Отсюда НЕ следует, что мы правы.** Следует, что вопрос С2 у поля не с кем сравнивать, и
+в фазе 3 он пойдёт с пометкой «никто не рассматривает», а не с выводом.
+
+## ⚠ Три случая «объём посчитан и не применён» — включая самый популярный проект области
+
+* **smart-money-concepts** (★1920): `obVolume` и `percentage` считаются, отбор не ведут;
+* **jsupremetradinginstitute**: поле `volume` в интерфейсе свечи не читается ни разу;
+* **CryptoTrade**, **MT5-SMC**, **aqrs_fx**, **AlgoTrading**, **profittown**: объёма нет вовсе.
+
+Наша находка 1 (плотность считается и не читается) оказалась **типовой болезнью области**,
+а не нашей личной. Это не оправдание, но это меняет вес: приём не «изобретён здесь», он
+воспроизводится и у других.
