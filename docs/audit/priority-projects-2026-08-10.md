@@ -169,3 +169,126 @@ b1 076a1e4c83e60e6b   c2 b6c4f95b1288ad19   c4 44243f30de5bf73f
 ТФ засчитывается КАК СОГЛАСИЕ (`return htf_trend in (HTFTrend.UP, HTFTrend.NEUTRAL)`), а
 второй вдобавок пропускает сигнал и при нехватке данных. У нас это `NO_PRIORITY` — третье
 значение, не «согласие». Курс по П3 молчит, так что здесь голос поля будет решать.
+
+---
+
+## Фаза 2. Каталог: семейства, покрытие по вопросам, контроль
+
+### ⚠ Наблюдение о самой выборке: библиотек нет, есть личные боты
+
+Звёзды у двадцати: 340, 139, 4, 2 — и **шестнадцать нулей**. Это не придирка к
+популярности (она аргументом не является), а факт об устройстве области: приоритет
+таймфрейма **не оформлен библиотекой**. Он живёт внутри личных ботов как две-три функции
+рядом со входом. Для сравнения, у обзора уровней в выборке были пакеты на 1.9k и 722
+звезды.
+
+Практическое следствие одно: у этих двадцати нет ни тестов приёма, ни документации на
+него, поэтому клетки «не отвечает» здесь встречаются чаще обычного и это свойство поля,
+а не небрежность чтения.
+
+### Семейства по ГЛАВНОМУ вопросу: кто задаёт сторону
+
+| семейство | сколько | кто |
+|---|---:|---|
+| **А. Взвешенная сумма или балл по нескольким ТФ** | **8** | SignalRankAI, Zenimac021, qbtc-futures-system, ict-knowledge-engine, pinescript-agents, ReagenBotTrade, trade-bot-2, Scanstream |
+| **Б. Ровно ОДИН старший ТФ — параметром или картой** | **6** | hermes-trader, PythonBot, trading_bot (Dryik), strategies-and-indicators, algo-trade, xauusd-statergy-analyser |
+| **В. Разметка по всем ТФ, решение — вызывающему** | **3** | Spot-Ai-Agent, tradingview-pinescript-lab, collect-tradingview |
+| **Г. Структура или зоны старшего ТФ фильтруют младшие** | **3** | Top-Down-Pullback-Retest-EA, Institutional-Trading-Bot, go-trader |
+
+**Нашего ответа в этой таблице нет.** Мы идём по лестнице ТФ СВЕРХУ ВНИЗ и берём первый,
+где тренд определён; ни один из двадцати так не делает. Семейство Б берёт один заранее
+назначенный ТФ, семейство А смешивает все с весами.
+
+⚠ Это НЕ пункт 9 шкалы («изобретено здесь»): пункт 9 требует, чтобы курс молчал, а он
+говорит — стр. 47 заголовком. Расхождение с полем здесь ожидаемо и разбирается в фазе 3.
+
+### Приёмы дословно
+
+Веса по таймфреймам, [vigoferrel/qbtc-futures-system](https://github.com/vigoferrel/qbtc-futures-system),
+файл [engines/enhanced-multitimeframe-confluence-engine.js](https://github.com/vigoferrel/qbtc-futures-system/blob/main/engines/enhanced-multitimeframe-confluence-engine.js), лицензия не распознана GitHub:
+
+```javascript
+// MACRO TREND (40% weight) - Timeframes superiores
+'1M': { weight: 0.15, role: 'SUPER_TREND', influence: 'DOMINANT' },
+'1w': { weight: 0.15, role: 'MAJOR_TREND', influence: 'STRONG' },
+'1d': { weight: 0.10, role: 'DAILY_TREND', influence: 'MEDIUM' }
+```
+
+Согласие со старшим ТФ как ОДНО слагаемое из многих,
+[sixscriptssoftware/ict-knowledge-engine](https://github.com/sixscriptssoftware/ict-knowledge-engine),
+файл [src/data/ict/confluence-weights.ts](https://github.com/sixscriptssoftware/ict-knowledge-engine/blob/main/src/data/ict/confluence-weights.ts), лицензия MIT:
+
+```typescript
+thresholds: { minimum_for_trade: 5.0, good_setup: 7.0, a_plus_setup: 9.0 },
+critical: { displacement: 2.5, liquidity_sweep: 2.5, htf_bias_aligned: 2.0 }
+```
+
+Карта «младший → ровно один старший», [Dryik/trading_bot](https://github.com/Dryik/trading_bot),
+файл [strategy/mtf_filter.py](https://github.com/Dryik/trading_bot/blob/main/strategy/mtf_filter.py), лицензии нет:
+
+```python
+def get_higher_timeframe(self, ltf: str) -> str:
+    """Get the higher timeframe for a given lower timeframe."""
+    return self.TIMEFRAME_MAP.get(ltf, "4h")
+```
+
+Отсутствие тренда засчитано за согласие — там же:
+
+```python
+if signal_upper == "LONG":
+    return htf_trend in (HTFTrend.UP, HTFTrend.NEUTRAL)
+```
+
+Фиксированная пара таймфреймов,
+[jasoncarty/strategies-and-indicators](https://github.com/jasoncarty/strategies-and-indicators),
+файл [Experts/MultiTimeframe_Trend_EA/MultiTimeframe_Trend_EA.mq5](https://github.com/jasoncarty/strategies-and-indicators/blob/main/Experts/MultiTimeframe_Trend_EA/MultiTimeframe_Trend_EA.mq5), лицензии нет:
+
+```mql5
+input ENUM_TIMEFRAMES HigherTimeframe = PERIOD_H4;    // Higher timeframe for trend analysis
+input ENUM_TIMEFRAMES LowerTimeframe  = PERIOD_M15;   // Lower timeframe for entry signals
+```
+
+### Покрытие ПО ВОПРОСАМ (из 20)
+
+| вопрос | отвечают | достаточно ли для «у большинства так» |
+|---|---:|---|
+| **П1** кто задаёт сторону | **20** | да |
+| **П2** какой именно старший ТФ | **20** | да |
+| **П9** свёртка в балл | **20** | да — делают 8, не делают 12 |
+| **П3** что если тренда нет | **12** | да |
+| **П4** лестница ТФ | **10** | ровно половина, на грани |
+| **П5** сделка против приоритета | **9** | мало данных |
+| **П8** старший ТФ надёжнее | **3** | мало данных, и все трое выражают это ВЕСОМ |
+| **П10** младшие структуры внутри старшей | **1** | никто не рассматривает |
+| **П6** где смотреть отработку | **0** | **никто не рассматривает** |
+| **П7** ловушка таймфрейма | **0** | **никто не рассматривает** |
+
+Заполнено 95 клеток из 200.
+
+### ⚠⚠ Два нуля — и оба там, где курс говорит прямо
+
+П6 (стр. 27: отработку смотрим на ТФ структуры) и П7 (стр. 46: всегда соблюдаем таймфрейм)
+не рассматривает НИ ОДИН из двадцати. По этим двум вопросам поле в фазе 3 — не голос, а
+пустое место: сравнивать не с кем, решает только курс. Та же картина была у стопового
+объёма, и там она означала ровно то же.
+
+### П3 — единственный вопрос, где голос поля решает
+
+Курс по нему молчит. Из двенадцати отвечающих:
+
+* **отсутствие тренда = согласие** — так делают Dryik/trading_bot и WOLFIEEEE/PythonBot,
+  причём второй пропускает сигнал и при НЕХВАТКЕ ДАННЫХ на старшем ТФ;
+* **нейтраль как третье значение** — так делают остальные десять: она есть в перечислении,
+  но в согласие не превращается.
+
+То есть большинство поля ближе к нам, чем к «нейтраль значит да». Это будет записано в
+фазе 3 как совпадение с полем, а не как наша находка.
+
+### Контроль случайностью — у скольких проектов он есть
+
+**У нуля из двадцати.** Ни у одного нет нулевого варианта, перемешивания или иной проверки,
+что согласие ТФ отличимо от случайного. У восьми проектов семейства А есть ВЕСА — то есть
+числа, подобранные без единого свидетельства, что подбор что-то улучшает.
+
+Это прямо относится к нашему §4.2: запрет на весовые суммы выглядит строгим ограничением
+ровно до того момента, пока не видишь, что у поля веса есть, а обоснования у них нет.
