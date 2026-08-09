@@ -69,3 +69,103 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 * **винрейт по ТФ (стр. 48)** — прямое утверждение про порядок надёжности. Не выражено.
 
 Оба — кандидаты в фазу 3, и оба относятся к части А: курс говорит.
+
+---
+
+## Фаза 1. Сбор чужих реализаций
+
+**Интернет проверен**: `gh api search/code` и `search/repositories` отвечают.
+
+⚠ **Предмет в поле называется иначе.** Русского «приоритет таймфрейма» в чужих
+репозиториях нет; ближайшие имена — *higher timeframe bias*, *HTF trend filter*,
+*MTF alignment*, *multi-timeframe confluence*, *top-down analysis*. Поиск по нашему
+термину дал бы ноль.
+
+### Поисковые запросы, дословно (все 2026-08-10)
+
+1. `higher_timeframe_bias language:python`
+2. `htf_trend mtf language:python`
+3. `multi_timeframe_confluence language:python`
+4. `higher timeframe trend filter extension:mq5`
+5. `top_down_analysis trend timeframe language:python`
+6. `trend_alignment higher lower timeframe language:javascript`
+7. `htf_bias language:typescript`
+8. `multi timeframe trend alignment extension:pine`
+
+### Числа фазы 1
+
+| | |
+|---|---:|
+| попыток (запросов файлов) | 24 |
+| просмотрено проектов | 23 |
+| **засчитано ПО КОДУ** | **20** ✅ цель взята |
+| отсеяно как несамостоятельные | **1** — два файла оказались одним репозиторием |
+| отсеяно по прочим причинам | **2** |
+
+**Языков пять:** Python, Pine Script, MQL5, JavaScript, TypeScript.
+
+Отсеяно по прочим причинам:
+
+* один файл считает признаки стакана, а не приоритет ТФ (не по теме);
+* один — диагностический скрипт, который ЗОВЁТ чужой `MTFManager`, а сам решения не
+  принимает. Это вызывающий, а не реализация, и по правилу фазы 1 в зачёт не идёт.
+
+### ⚠⚠ Отдельно: репозиторий того же автора, что и наш
+
+Поиск №2 выдал файл
+[bot/policy/mtf.py](https://github.com/TrololoBird/Crypto-Analytic-Signal-Bot/blob/main/bot/policy/mtf.py)
+в репозитории TrololoBird/Crypto-Analytic-Signal-Bot. Владелец этого репозитория —
+владелец нашего проекта.
+
+**В зачёт он НЕ идёт и голосом области не является.** Обзор меряет, что делает ПОЛЕ; свой
+же проект, попавший в выборку, дал бы согласие с собой и выглядел бы как независимое
+подтверждение. Записан здесь, чтобы след не потерялся.
+
+### Проверка независимости
+
+Ядро — функция, отвечающая на главный вопрос («какой ТФ задаёт сторону»), — вырезано,
+нормализовано (комментарии, докстроки, отступы убраны, имена приведены к позиционным) и
+хешировано у одиннадцати питоновских участников:
+
+```
+a1 b7f52ba9b19ad65c   a2 e6149e1866acc528   a3 5b426a241e112b8e   a4 1509d3de936be78a
+a5 7aaaec4249447d7a   a6 f0c633bc782993b1   a7 eed427a74927c374   a10 ea07622dd0213555
+b1 076a1e4c83e60e6b   c2 b6c4f95b1288ad19   c4 44243f30de5bf73f
+СЕМЕЙ (совпавших хешей): 0
+```
+
+⚠ Хеш работает внутри одного языка; между Pine, MQL5 и JS он бессмыслен. Там независимость
+проверена глазами, и **одна семья найдена именно так**: два файла из выдачи по Pine
+(`examples/simple/mtf-trend-alignment.pine` и `examples/advanced/multi-timeframe-analysis-suite.pine`)
+лежат в ОДНОМ репозитории TradersPost/pinescript-agents и засчитаны за один проект. Ещё
+одна выдача, `ainell-owi/LePine`, содержит копию того же репозитория целиком — не бралась.
+
+### Первые ответы, ради которых обзор и делается
+
+По главному вопросу («кто задаёт сторону») в выборке уже видны три разных лагеря, и наш —
+самый малочисленный:
+
+* **взвешенная сумма по ТФ.** [vigoferrel/qbtc-futures-system](https://github.com/vigoferrel/qbtc-futures-system)
+  задаёт веса прямо в конфигурации: `'1M': { weight: 0.15, role: 'SUPER_TREND' }`,
+  `'1w': { weight: 0.15 }`, `'1d': { weight: 0.10 }`, а группа старших ТФ помечена как 40%
+  общего веса. [theninthfoundry/trade-bot-2](https://github.com/theninthfoundry/trade-bot-2)
+  — то же короче: `weights = {"4h": 0.50, "1h": 0.35, "15m": 0.15}`;
+* **балл согласия с порогами.** [sixscriptssoftware/ict-knowledge-engine](https://github.com/sixscriptssoftware/ict-knowledge-engine)
+  делает совпадение со старшим ТФ ОДНИМ слагаемым из многих: `htf_bias_aligned: 2.0`
+  при порогах сделки 5.0, 7.0 и 9.0;
+* **ровно один старший ТФ, заданный параметром или картой.**
+  [jasoncarty/strategies-and-indicators](https://github.com/jasoncarty/strategies-and-indicators)
+  — `HigherTimeframe = PERIOD_H4` и `LowerTimeframe = PERIOD_M15` фиксированной парой;
+  [Dryik/trading_bot](https://github.com/Dryik/trading_bot) — карта `TIMEFRAME_MAP` из
+  младшего в ОДИН старший с запасным `4h`.
+
+Наш ответ — самый старший ТФ, где тренд определён, без веса и без порога — пока не совпал
+ни с одним из троих. Это ровно тот случай, ради которого команда завела презумпцию: считать
+голоса в фазе 2, а решать по курсу в фазе 3.
+
+⚠ И там же вскрылась развилка по вопросу П3, которой я не ожидал: у
+[Dryik/trading_bot](https://github.com/Dryik/trading_bot) и
+[WOLFIEEEE/PythonBot](https://github.com/WOLFIEEEE/PythonBot) отсутствие тренда на старшем
+ТФ засчитывается КАК СОГЛАСИЕ (`return htf_trend in (HTFTrend.UP, HTFTrend.NEUTRAL)`), а
+второй вдобавок пропускает сигнал и при нехватке данных. У нас это `NO_PRIORITY` — третье
+значение, не «согласие». Курс по П3 молчит, так что здесь голос поля будет решать.
