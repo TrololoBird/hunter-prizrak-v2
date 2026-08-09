@@ -278,7 +278,7 @@ def build_all(
         if not bars or scan is None:
             continue
         accs = scan.closed
-        younger = _younger_tf(tf, timeframes)
+        younger = _younger_tfs(tf, timeframes)
         for acc in accs:
             if trades is None:
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
@@ -296,13 +296,23 @@ def build_all(
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=lvl.reason))
                 continue
-            # Стоповый объём — накопления ТФ-1, отнесённые к этой структуре (стр. 34-37).
+            # Стоповый объём — накопления ВСЕХ младших ТФ, отнесённые к этой структуре
+            # (стр. 34; пример стр. 40 — база 4ч и стоповый на 15м, то есть ТФ−2).
             # Якорь стопа считается ЗДЕСЬ, где есть оба ряда баров: у `build_setup` их нет.
-            svs: tuple[StopVolume, ...] = ()
-            y_scan = scans.get(younger) if younger is not None else None
-            y_bars = series.get(younger) if younger is not None else None
-            if y_scan is not None and y_bars:
-                svs = classify_stop_volume(y_scan.closed, y_bars, acc, bars, tf).items
+            #
+            # ⚠ Ранг плотности (`StopVolumeSet.densities`) при склейке нескольких ТФ
+            # теряет общую базу: каждый вызов `classify` ранжирует внутри своего ряда.
+            # Это осознанно и безвредно ровно потому, что ранг не читает НИКТО — обзор
+            # 2026-08-09 это и нашёл. Когда ранг понадобится, склейку придётся заменить
+            # одним вызовом на объединённый набор.
+            collected: list[StopVolume] = []
+            for y in younger:
+                y_scan = scans.get(y)
+                y_bars = series.get(y)
+                if y_scan is not None and y_bars:
+                    collected.extend(classify_stop_volume(
+                        y_scan.closed, y_bars, acc, bars, tf).items)
+            svs: tuple[StopVolume, ...] = tuple(collected)
             down = lvl.side is LevelSide.LONG
             anchor = stop_anchor(lvl.side, float(lvl.boundary_lo if down else lvl.boundary_hi),
                                  acc.lower if down else acc.upper, svs)
@@ -418,15 +428,26 @@ def stop_anchor(
     return Decimal(str(min(found) if down else max(found)))
 
 
-def _younger_tf(tf: str, available: tuple[str, ...]) -> str | None:
-    """Ближайший МЛАДШИЙ ТФ из имеющихся — «ТФ-1» курса (стр. 18, 24, 34).
+def _younger_tfs(tf: str, available: tuple[str, ...]) -> tuple[str, ...]:
+    """ВСЕ младшие ТФ из имеющихся, от ближайшего к самому мелкому (стр. 34).
 
-    `None` — младше нечего взять, и тогда стоповый объём не ищется вовсе. Это НЕ значит
-    «стопового объёма нет»: значит, что ряд, на котором он виден, не собран.
+    ⚠ Здесь была `_younger_tf`, возвращавшая РОВНО ОДИН ближайший младший ТФ. Обзор
+    2026-08-09 нашёл, что это расходится с курсом: стр. 34 говорит «на более мелком ТФ»,
+    без указания на один шаг, а стр. 40 приводит собственный ПРИМЕР — база 4ч и стоповый
+    объём на 15м. В лестнице стр. 17 (5м/15м/час/4ч/1Д/1Н) 15м отстоит от 4ч на два шага,
+    то есть пример самого курса прежний код увидеть не мог.
+
+    Цена правки замерена ДО внесения: стоповых объёмов 91795 при одном ТФ−1 против 262517
+    при всех младших, прибавка 186%; частный случай стр. 40 появился — 19154 зоны.
+    ⚠ И там же названа беда, которую правка усиливает: 46 зон на структуру в среднем при
+    полном отсутствии отсева. Разбор: docs/audit/stopvol-projects-2026-08-09.md
+
+    Пустой кортеж — младше нечего взять. Это НЕ значит «стопового объёма нет»: значит, что
+    ряд, на котором он виден, не собран.
     """
     rank = _tf_rank(tf)
     younger = [t for t in available if _tf_rank(t) < rank]
-    return max(younger, key=_tf_rank) if younger else None
+    return tuple(sorted(younger, key=_tf_rank, reverse=True))
 
 
 def _tf_rank(tf: str) -> int:
