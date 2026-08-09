@@ -219,7 +219,8 @@ def decide(
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
     reads, unreadable = read_series(series, tfs)
     scans = {tf: r.scan for tf, r in reads.items()}
-    frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans)
+    frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans,
+                                       {tf: r.swings for tf, r in reads.items()})
     mapped = levels.map_levels(frozen, series)
     trends = {tf: r.trend for tf, r in reads.items()}
 
