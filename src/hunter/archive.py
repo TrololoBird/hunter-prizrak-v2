@@ -343,14 +343,34 @@ class WindowSource:
                 cnt[idx] = cnt.get(idx, 0) + int(row["n"])
 
         if missing and self.live is not None:
-            # Сутки без архива добираются из живого потока — но только те, что он
-            # реально покрывает; иначе окно остаётся неполным и об этом говорится.
-            got = self.live.window(from_ms, to_ms)
-            if not isinstance(got, NotReady):
+            # Сутки без архива добираются из живого потока — РОВНО недостающие, а не всё
+            # окно. До 2026-08-09 живой добор просился на всё окно [from_ms, to_ms), и
+            # любой непустой ответ обнулял весь `missing`. Это несло два дефекта сразу:
+            #   * ДВОЙНОЙ СЧЁТ: живой буфер держит LIVE_TRADES_KEEP_DAYS суток, включая
+            #     те, что УЖЕ сложены из архива строками выше; при пересечении покрытий
+            #     (архив суток опубликован, а live их ещё помнит) объём этих суток
+            #     складывался дважды — молча, профиль просто «тяжелел»;
+            #   * ЛОЖНАЯ ПОЛНОТА: `missing = []` ставился без проверки, что живой ответ
+            #     покрыл именно недостающие сутки.
+            # Смягчало обе беды только то, что `BarBinnedTrades.window` отказывает, когда
+            # окно шире собранного, — на старых недостающих сутках добор не срабатывал
+            # вовсе. Ревизия транспорта 2026-08-09 (§5 п.4) и собственное правило
+            # transport-decision §3.3 требуют добора по суткам. Контроль:
+            # docs/audit/probes/probe_live_overlap_2026-08-09.py — на подстроенном
+            # пересечении прежний способ удваивает, посуточный нет.
+            still: list[date] = []
+            for day in missing:
+                day0 = int(datetime(day.year, day.month, day.day, tzinfo=UTC)
+                           .timestamp() * 1000)
+                got = self.live.window(max(from_ms, day0),
+                                       min(to_ms, day0 + 86_400_000))
+                if isinstance(got, NotReady):
+                    still.append(day)
+                    continue
                 for idx, q in got.qty_by_bin.items():
                     qty[idx] = qty.get(idx, 0.0) + q
                     cnt[idx] = cnt.get(idx, 0) + got.count_by_bin.get(idx, 0)
-                missing = []
+            missing = still
 
         if missing:
             return NotReady(
