@@ -229,6 +229,123 @@ K-means по ценам, elbow для числа кластеров. (1) цен�
 
 ---
 
+## Добор фазы 1, 2026-08-09: семь проектов, выборка доведена до двадцати
+
+⚠ **Сначала поправка к собственному счёту.** Раздел «Числа выборки» объявлял 16 засчитанных
+и тут же помечал три из них (№10, №12, №16) как прочитанные по описанию. Команда `/survey`
+такие источники в зачёт НЕ берёт. Значит по коду было **13**, а не 16, и до нижнего предела
+оставалось три, а не семь. Число исправлено ниже.
+
+Поисковые запросы добора, дословно (все 2026-08-09, `gh api search/code` и `search/repositories`):
+
+1. `value_area_low value_area_high language:python`
+2. `value_area_high language:python`
+3. `poc_price volume_profile language:python`
+4. `darvas box breakout language:python`
+5. `support resistance zone extension:mq5`
+6. `support resistance detection` (поиск репозиториев по звёздам)
+
+⚠ Поиск по коду дважды ответил `HTTP 503 too many shards unavailable` и на повторе прошёл —
+это перегрузка индекса GitHub, а не запрет шлюза, как было в обзоре ПОК.
+
+### 17. [tristcoil/zero-sum-public](https://github.com/tristcoil/zero-sum-public) — Python, ★118, посл. коммит 2026-03-27, MIT
+
+Файл [backend/ta_engine/volume_profile.py](https://github.com/tristcoil/zero-sum-public/blob/main/backend/ta_engine/volume_profile.py).
+(1) ПОК = строка с максимумом; (2) **область стоимости 70%, расширение от ПОК к большему
+соседу**; (3) **диапазон сетки — `min(lows)`…`max(highs)` всех баров**, плюс поля 0.5%;
+80 строк. Объём бара размазывается: 60% равномерно по диапазону свечи, 40% в строку закрытия.
+
+```python
+price_min = float(np.min(lows))
+price_max = float(np.max(highs))
+margin = (price_max - price_min) * 0.005
+price_min -= margin
+price_max += margin
+bin_size = (price_max - price_min) / n_bins
+```
+
+### 18. [KirillKas17/ATB](https://github.com/KirillKas17/ATB) — Python, ★1, посл. коммит 2025-08-09, лицензии нет
+
+Файл [domain/value_objects/volume_profile.py](https://github.com/KirillKas17/ATB/blob/main/domain/value_objects/volume_profile.py).
+Профиль сам не считает — держит готовый и **выводит из него уровни порогом**:
+`get_support_resistance_levels(threshold=0.1)` берёт ВСЕ ценовые строки с объёмом не ниже
+10% от максимума и делит их на поддержку и сопротивление по положению относительно ПОК.
+Единственный в выборке, у кого уровней из одного профиля МНОГО, а не один.
+
+### 19. [Hitheshkaranth/OpenTerminalUI](https://github.com/Hitheshkaranth/OpenTerminalUI) — Python, ★100, посл. коммит 2026-07-11, MIT
+
+Файл [backend/services/volume_profile_service.py](https://github.com/Hitheshkaranth/OpenTerminalUI/blob/main/backend/services/volume_profile_service.py).
+(1) ПОК = середина строки-максимума; (2) область стоимости, доля параметром `value_area_ratio`
+с умолчанием **0.70**; (3) сетка `global_low`…`global_high`. Границы зоны берутся у КРАЙНИХ
+СТРОК целиком: `value_area_low = profile[val_idx]["price_low"]`, `..._high = ...["price_high"]`.
+
+### 20. [kimseunghyun-kr/binanceTradingBot](https://github.com/kimseunghyun-kr/binanceTradingBot) — Python, ★0, посл. коммит 2026-02-11, MIT
+
+Файл [app/indicators/volume_profile.py](https://github.com/kimseunghyun-kr/binanceTradingBot/blob/main/app/indicators/volume_profile.py).
+Тот же контур: сетка `lows.min()`…`highs.max()`, 20 строк, `value_area_pct=0.7`, расширение
+от ПОК. Объём свечи раскладывается выборкой из 10 точек по её диапазону.
+
+### 21. [EarnForex/Support-and-Resistance-Lines](https://github.com/EarnForex/Support-and-Resistance-Lines) — MQL5, ★12, посл. коммит 2026-04-10, Apache-2.0
+
+(1) уровень = **среднее фракталов**, попавших в одно окно; окно = `ATR × точность`, то есть
+шаг кластеризации задаётся волатильностью, а не ценой; (2) зоны рисуются опцией `DrawZones`;
+(8) есть понятие безопасного расстояния до ближайшего уровня (`SafeDistance`) и уведомление
+о входе в опасную близость. Объёма нет вовсе.
+
+### 22. [ripper7375/trading-alerts-saas-public](https://github.com/ripper7375/trading-alerts-saas-public) — MQL5, ★0, посл. коммит 2026-08-09, лицензии нет
+
+Индикатор k-means по касаниям, файл
+[k-mean-support-and-resistance-level.mq5](https://github.com/ripper7375/trading-alerts-saas-public/blob/main/mql5-indicators/interesting-indicators/horizontal-cluster-analysis/k-means-cluster-indicator/k-mean-support-and-resistance-level.mq5).
+(1) уровень = **центроид кластера k-means**, число уровней задано параметром `LNo = 15`.
+
+⚠⚠ **Единственный в выборке, кто требует РЕАКЦИИ, чтобы касание засчиталось:**
+`Jumpmulti = 100.0` — минимальный отскок после касания в процентах от ATR. Это ближайший
+чужой аналог формулы стр. 25 про хорошую реакцию, и до этого добора в выборке его не было.
+
+### 23. [srpatcha/Stocks_Trading_Scripts](https://github.com/srpatcha/Stocks_Trading_Scripts) — Python, ★0, посл. коммит 2026-08-07, лицензии нет
+
+Коробка Дарваса, файл
+[strategies/examples/darvas_box.py](https://github.com/srpatcha/Stocks_Trading_Scripts/blob/main/strategies/examples/darvas_box.py).
+(1) уровень = потолок и пол коробки, а не одна цена внутри; (3) коробка закрывается после
+`box_confirm_bars = 3` баров без обновления потолка; (5) вход по закрытию выше потолка с
+подтверждением объёмом `volume_surge_mult = 1.5`.
+
+⚠ **Ограничение размера коробки задано с двух сторон:** `min_box_height_pct = 3.0` и
+`max_box_height_pct = 30.0`. Это прямой чужой образец для находки Т1 обзора стопового
+объёма, где 18.3% зон оказались не меньше своей структуры-хозяина.
+
+## Проверка независимости: клонов 0, но алгоритм один у троих
+
+Ядро (участок расширения области стоимости) нормализовано — убраны комментарии, докстроки,
+отступы, имена приведены к позиционным, — и хешировано:
+
+```
+p17 zero-sum       9df92fbf14d1cba3   длина ядра 317
+p19 OpenTerminalUI 513424f58e62927e   длина ядра 362
+p20 binanceTradingBot 88fc7839eee4cefb длина ядра 191
+```
+
+**Хеши разные — дословных копий НЕТ, семей ноль.** Но по существу это один и тот же
+алгоритм у трёх из трёх: старт с ПОК, шаг к БОЛЬШЕМУ из двух соседей, остановка на 70%.
+Совпадение здесь — конвергенция на стандартном приёме, а не заимствование, и в фазе 3 эти
+три голоса нельзя считать за три независимых свидетельства о ДОЛЕ 70%.
+
+## Числа фазы 1 после добора
+
+| | |
+|---|---:|
+| попыток (уникальных ссылок и запросов файлов) | 42 |
+| просмотрено проектов | 24 |
+| **засчитано ПО КОДУ** | **20** ✅ цель взята |
+| отдельно: по описанию, в зачёт не идут | 3 (№10, №12, №16) |
+| отсеяно как несамостоятельные | 0 (проверка хешей выше) |
+| отсеяно по прочим причинам | 1 |
+
+**Языков пять:** Python, Pine Script, MQL5, Go отсутствует, добавились MQL5-кластеризация и
+коробка Дарваса как отдельные семейства.
+
+---
+
 ## Сводная таблица по развилкам
 
 | # | Развилка | Распределение выборки (из 16) | Наш ответ | Большинство? |
