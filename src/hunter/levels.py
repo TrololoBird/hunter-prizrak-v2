@@ -32,7 +32,7 @@ from .models import Bar, NotReady, TradeHistogram, TradeWindows
 from .stop_volume import StopVolume
 from .stop_volume import classify as classify_stop_volume
 from .swings import SwingKind, SwingSet
-from .volume_profile import VolumeProfile, build
+from .volume_profile import TV_ROWS, TVProfile, build_tv
 
 
 class LevelSide(StrEnum):
@@ -223,7 +223,19 @@ def build_level(
     что и окно: ряда баров здесь нет, а выводить момент из `structure_to_ms` арифметикой
     («плюс два тела») неверно на ряду с разрывом.
     """
-    profile: VolumeProfile | NotReady = build(hist)
+    # ⚠ С 2026-08-09 профиль строится ПРИБОРОМ АВТОРА — сеткой TV (`build_tv`), а не
+    # тиковыми бинами: решение владельца о переносе инструментов TV
+    # (docs/audit/tv-transfer-2026-08-09.md). Диапазон сетки — границы структуры (у TV
+    # это выделение автора по коробке); сделки проколов за границами прижимаются к
+    # крайним строкам и считаются (`clamped_volume`). Число строк — `TV_ROWS`, его
+    # источники — в докстроке константы. Прежний тиковый профиль (`build`) остаётся в
+    # модуле для замеров.
+    profile: TVProfile | NotReady = build_tv(
+        hist,
+        bottom=Decimal(str(acc.lower.edge)),
+        top=Decimal(str(acc.upper.edge)),
+        rows=TV_ROWS,
+    )
     if isinstance(profile, NotReady):
         return NotReady(reason=f"{symbol} {acc.timeframe}: ПОК не построен — {profile.reason}")
 
