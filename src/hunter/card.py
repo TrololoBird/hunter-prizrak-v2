@@ -347,9 +347,12 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # сказать «нужно N, есть M» — до 2026-08-06 эта функция не звалась ниоткуда, а
         # карточка сочиняла причину на месте. §4.3 требует названной причины, и причина с
         # числом проверяема, а без числа — нет.
+        # ⚠ Средняя линия — SMA20 (`bbands_middle`), не EMA20. До 2026-08-09 здесь
+        # стояла `ema(20)`, и ширина полос делилась на чужую величину — расхождение
+        # нашла сверка с первоисточниками (Боллинджер считает и σ, и середину по SMA).
         sq = factors.squeeze(_series(bars, indicators.bbands_upper()),
                              _series(bars, indicators.bbands_lower()),
-                             _series(bars, indicators.ema(20)))
+                             _series(bars, indicators.bbands_middle()))
         parts.append(f"полосы {sq.width_pct:.2f}% (уже {sq.percentile:.0f}% истории)"
                      if sq else _short("bb_upper", len(bars), d.symbol, tf, "полосы"))
         # Стр. 69 называет ОБЕ скользящие — «этих скользящих ИЛИ ОДНОЙ ИЗ НИХ», — и на

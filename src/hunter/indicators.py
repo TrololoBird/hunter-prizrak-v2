@@ -93,6 +93,19 @@ def bbands_upper(period: int = 20, dev: float = 2.0) -> pl.Expr:
                              nbdevdn=dev)).struct.field("upperband")
 
 
+def bbands_middle(period: int = 20, dev: float = 2.0) -> pl.Expr:
+    """Средняя линия полос — ПРОСТАЯ скользящая, не экспоненциальная.
+
+    Заведена 2026-08-09: сверка с источниками нашла, что знаменатель ширины полос в
+    карточке считался по `ema(20)`, тогда как средняя линия Боллинджера — SMA той же
+    длины, что и σ (Bollinger «Bollinger on Bollinger Bands»; StockCharts; TradingView
+    `ta.bb`; TA-Lib `BBANDS` отдаёт `middleband` = SMA). Поле берётся из ТОГО ЖЕ вызова
+    `bbands`, что верх и низ, — три линии не могут разъехаться по параметрам.
+    """
+    return _expr(plta.bbands(pl.col("close"), timeperiod=period, nbdevup=dev,
+                             nbdevdn=dev)).struct.field("middleband")
+
+
 def bbands_lower(period: int = 20, dev: float = 2.0) -> pl.Expr:
     return _expr(plta.bbands(pl.col("close"), timeperiod=period, nbdevup=dev,
                              nbdevdn=dev)).struct.field("lowerband")

@@ -47,6 +47,7 @@ docs/audit/value-area-2026-08-03.md, реестр — docs/sources.toml
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from enum import StrEnum
 
@@ -81,6 +82,150 @@ class VolumeProfile(BaseModel):
     @property
     def covered_fraction(self) -> float:
         return self.covered_volume / self.total_volume
+
+
+class TVProfile(BaseModel):
+    """Профиль по сетке инструмента TradingView «Фиксированный профиль объема».
+
+    Перенос прибора автора курса (решение владельца 2026-08-09). Спецификация собрана
+    по 12 источникам — свод: docs/audit/tv-transfer-2026-08-09.md. Дословно по справке
+    TradingView взяты:
+
+      СЕТКА — режим Number of Rows: высота строки в тиках =
+      round((top − bottom) / rows / tickSize), строк может выйти больше или меньше
+      заданного (support/solutions/43000502040, «basic concepts»);
+
+      VALUE AREA 70% — ПОСТРОЧНОЕ расширение (не парное CBOT): сравниваются строка над
+      верхней границей и строка под нижней, берётся большая; ничья решается близостью
+      к ПОК, при равном расстоянии — верхняя; строка, добавление которой ПЕРЕВАЛИВАЕТ
+      цель, не добавляется (support/solutions/43000480324, Fixed Range VP indicator).
+
+    Чего справка НЕ документирует — и что взято РЕШЕНИЕМ, названным вслух:
+
+      РАСКЛАДКА ОБЪЁМА. TV кладёт объём intrabar-баров младшего ТФ (первый из
+      1м…1Д, дающий < 5000 баров), и как объём одного бара делится по строкам —
+      не сказано нигде. У нас есть сделки, поэтому объём кладётся ПО СДЕЛКАМ — это
+      вернее самого прибора и точка расхождения с ним записана явно;
+
+      ЦЕНА СТРОКИ — центр. Замер E-070: при 24 строках центр даёт наилучшее согласие
+      с тиковым ПОК (29.1% против 18.3% у низа), у TV конвенция не документирована;
+
+      НИЧЬЯ ПОК — NotReady, как у тикового профиля (§4.3): справка молчит, а выбор
+      «первая попавшаяся строка» был бы молчаливым решением.
+
+    ⚠ Число строк ПАРАМЕТР БЕЗ УМОЛЧАНИЯ: прежнее допущение «24 по умолчанию»
+    официальной справкой не подтверждено (Trader Dale по живому TV 02.2026 — «около
+    100»; LuxAlgo — «24…100, зависит от платформы»). Значение снимается с живого TV
+    владельца, до этого боевой расчёт уровней остаётся на тиковом профиле.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    rows_requested: int = Field(gt=0)
+    ticks_per_row: int = Field(gt=0)
+    rows_built: int = Field(gt=0)
+    poc_row: int
+    poc_price: Decimal
+    poc_volume: float = Field(gt=0)
+    val_price: Decimal
+    vah_price: Decimal
+    covered_volume: float = Field(gt=0)
+    total_volume: float = Field(gt=0)
+    clamped_volume: float = Field(ge=0)
+    """Объём сделок вне [bottom, top], прижатый к крайним строкам. TV такого объёма не
+    видит вовсе (его диапазон — экстремумы баров); ненулевое значение здесь означает,
+    что переданный диапазон у́же реального и это видно, а не молчит."""
+
+
+def build_tv(
+    hist: TradeHistogram,
+    bottom: Decimal,
+    top: Decimal,
+    rows: int,
+    fraction: float = VALUE_AREA_FRACTION,
+) -> TVProfile | NotReady:
+    """Профиль по сетке TV: строки поверх тиковой гистограммы, VA по алгоритму TV.
+
+    `bottom`/`top` — диапазон инструмента (у TV это экстремумы выделенных баров).
+    Объём агрегируется из тиковых бинов `hist`: сделка ложится в строку по своей цене.
+    """
+    if top <= bottom:
+        return NotReady(reason=f"{hist.symbol}: диапазон вырожден — top {top} ≤ bottom {bottom}")
+    if not hist.qty_by_bin:
+        return NotReady(reason=f"{hist.symbol}: профиль пуст, сделок нет")
+
+    ticks_total = int((top - bottom) / hist.tick_size)
+    if ticks_total < 1:
+        return NotReady(reason=f"{hist.symbol}: диапазон у́же одного тика")
+    ticks_per_row = max(1, round(ticks_total / rows))
+    rows_built = -(-ticks_total // ticks_per_row)  # ceil: хвост диапазона — тоже строка
+
+    row_height = hist.tick_size * ticks_per_row
+    vol_by_row: dict[int, float] = {}
+    clamped = 0.0
+    for bin_idx, qty in hist.qty_by_bin.items():
+        price = hist.bin_price(bin_idx)
+        # floor, а не int(): int() усекает К НУЛЮ, и цена на полтика НИЖЕ bottom попала
+        # бы в строку 0 как своя, а не как прижатая.
+        row = math.floor((price - bottom) / row_height)
+        if row < 0 or row >= rows_built:
+            clamped += qty
+            row = min(max(row, 0), rows_built - 1)
+        vol_by_row[row] = vol_by_row.get(row, 0.0) + qty
+
+    peak = max(vol_by_row.values())
+    winners = [r for r, v in vol_by_row.items() if v == peak]
+    if len(winners) > 1:
+        return NotReady(
+            reason=f"{hist.symbol}: ПОК по сетке TV неоднозначен — {len(winners)} строк "
+                   f"с равным объёмом {peak}"
+        )
+    poc = winners[0]
+
+    total = sum(vol_by_row.values())
+    target = total * fraction
+    lo = hi = poc
+    covered = vol_by_row[poc]
+    while covered < target:
+        up = vol_by_row.get(hi + 1) if hi + 1 < rows_built else None
+        down = vol_by_row.get(lo - 1, 0.0) if lo - 1 >= 0 else None
+        up_v = up if up is not None else (0.0 if hi + 1 < rows_built else None)
+        down_v = down if lo - 1 >= 0 else None
+        if up_v is None and down_v is None:
+            break
+        # Выбор стороны — дословно по справке TV: большая строка; ничья — ближняя к
+        # ПОК; при равном расстоянии — верхняя. Расстояния |hi+1−poc| и |poc−(lo−1)|.
+        if down_v is None or (up_v is not None and (
+                up_v > down_v
+                or (up_v == down_v and (hi + 1 - poc) <= (poc - (lo - 1))))):
+            chosen, at_top = up_v, True
+        else:
+            chosen, at_top = down_v, False
+        assert chosen is not None
+        if covered + chosen > target:
+            break  # переваливающая строка не добавляется (справка TV)
+        covered += chosen
+        if at_top:
+            hi += 1
+        else:
+            lo -= 1
+
+    def row_center(r: int) -> Decimal:
+        return bottom + row_height * r + row_height / 2
+
+    return TVProfile(
+        rows_requested=rows,
+        ticks_per_row=ticks_per_row,
+        rows_built=rows_built,
+        poc_row=poc,
+        poc_price=row_center(poc),
+        poc_volume=peak,
+        val_price=bottom + row_height * lo,
+        vah_price=bottom + row_height * (hi + 1),
+        covered_volume=covered,
+        total_volume=total,
+        clamped_volume=clamped,
+    )
 
 
 def point_of_control(hist: TradeHistogram) -> int | NotReady:

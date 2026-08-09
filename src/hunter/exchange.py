@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import zlib
 from collections import Counter
 from collections.abc import AsyncGenerator
 from decimal import Decimal
@@ -122,10 +123,11 @@ med 7.91 с, p90 21.63 с, p99 43.37 с, **max 43.37 с**. Промежутко�
 """
 
 WS_RETRY_S = 1.0
-"""Пауза перед повторной подпиской. Число ПОДОБРАНО, а не замерено, и здесь названо так."""
+"""База паузы перед повторной подпиской. Число ПОДОБРАНО, а не замерено, и здесь названо
+так. Спится не сама база, а база с ДЖИТТЕРОМ — см. `_ws_retry_jitter_s`."""
 
 RATE_LIMIT_BACKOFF_S = 60.0
-"""Пауза после ответа «лимит превышен». ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — выбрано по документации.
+"""НИЖНЯЯ граница паузы после ответа «лимит превышен». ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — по документации.
 
 Лимит веса у Binance считается в окне ОДНОЙ МИНУТЫ (`X-MBX-USED-WEIGHT-1M`,
 `REQUEST_WEIGHT/MINUTE/1` в `exchangeInfo`), поэтому минута — наименьшая пауза, после
@@ -133,9 +135,25 @@ RATE_LIMIT_BACKOFF_S = 60.0
 продолжение после `HTTP 429` карается баном по IP (`418`) на срок от 2 минут до 3 суток:
 цена ошибки в сторону «мало» несопоставимо выше цены ошибки в сторону «много».
 
-Заголовок `Retry-After` биржа присылает при `418` и `429`; здесь он НЕ читается, и это
-известное упрощение — пауза фиксированная.
+С 2026-08-09 при `429`/`418` дополнительно читается заголовок `Retry-After` — биржа сама
+называет длину паузы, и при бане она бывает СИЛЬНО больше минуты (см.
+`_rate_limit_pause_s`; ревизия транспорта 2026-08-09, Binance General Info). Прежняя
+фиксированная минута при бане 418 на сутки означала бы 1440 бесполезных повторов.
 """
+
+
+def desync_s(key: str, base_s: float) -> float:
+    """Пауза повтора с ДЕТЕРМИНИРОВАННЫМ фазовым сдвигом: [0.5, 1.5) от базы по crc32 ключа.
+
+    Без сдвига 27 задач сделок, разбуженных ОДНИМ сетевым событием, переподписываются
+    синхронной волной через ровно `base_s` — классическое «стадо» по AWS («Exponential
+    Backoff And Jitter»; ревизия транспорта 2026-08-09). Случайность при этом запрещена
+    §10.3 (`random` забанен линтером — детерминированный повтор), поэтому вместо джиттера
+    — постоянный сдвиг фазы из crc32 ключа задачи: у разных ключей разные паузы, у одного
+    ключа — одна и та же в любом прогоне. Декорреляцию стада это даёт ту же, воспроизводимость
+    не трогает; `hash()` не годится — он засолен per-process (PYTHONHASHSEED).
+    """
+    return base_s * (0.5 + zlib.crc32(key.encode()) % 1000 / 1000)
 
 
 REQUIRED_CAPABILITIES: dict[str, str] = {
@@ -279,6 +297,26 @@ class Exchange:
                 return
         log.degraded("в exchangeInfo нет строки REQUEST_WEIGHT/MINUTE/1",
                      строк=len(info.get("rateLimits", [])))
+
+    def _rate_limit_pause_s(self) -> float:
+        """Длина паузы после 429/418: `Retry-After` биржи, но не короче минуты.
+
+        Binance присылает `Retry-After` при обоих кодах — «number of seconds required
+        to wait» (General Info; ревизия транспорта 2026-08-09). При 418 это длина БАНА:
+        фиксированная минута означала бы сотни бесполезных повторов в забаненном
+        состоянии. Ниже `RATE_LIMIT_BACKOFF_S` пауза не опускается (окно веса — минута),
+        поэтому мусорное значение заголовка сделать хуже не может. Регистр ключа ищется
+        явно — та же ловушка асинхронного клиента, что у `_note_weight`.
+        """
+        headers = self._ex.last_response_headers or {}
+        raw = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        if raw is None:
+            return RATE_LIMIT_BACKOFF_S
+        try:
+            return max(RATE_LIMIT_BACKOFF_S, float(raw))
+        except ValueError:
+            log.degraded("Retry-After нечитаем — пауза по умолчанию", значение=str(raw))
+            return RATE_LIMIT_BACKOFF_S
 
     def _note_weight(self) -> None:
         """Запомнить потребление веса из заголовка последнего ответа.
@@ -486,10 +524,11 @@ class Exchange:
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
+            pause = self._rate_limit_pause_s()
             log.error("ЛИМИТ БИРЖИ ПРЕВЫШЕН — пауза, повтора того же запроса нет",
-                      символ=symbol, тф=timeframe, пауза_с=RATE_LIMIT_BACKOFF_S,
+                      символ=symbol, тф=timeframe, пауза_с=pause,
                       причина=f"{type(e).__name__} {e}")
-            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            await asyncio.sleep(pause)
             return NotReady(reason=f"{symbol} {timeframe}: лимит биржи ({type(e).__name__})")
         except ccxt.NetworkError as e:
             self.rest_errors[type(e).__name__] += 1
@@ -578,10 +617,11 @@ class Exchange:
             # ВЫШЕ NetworkError: оба его наследуют, и общая ветвь дала бы быстрый повтор.
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
+            pause = self._rate_limit_pause_s()
             log.error(f"{what}: ЛИМИТ БИРЖИ — пауза, быстрого повтора нет",
-                      символ=key, пауза_с=RATE_LIMIT_BACKOFF_S,
+                      символ=key, пауза_с=pause,
                       причина=f"{type(e).__name__} {e}")
-            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            await asyncio.sleep(pause)
             return None
         except ccxt.UnsubscribeError as e:
             # НЕ ошибка: ccxt будит ожидающий `watch_*` этим классом при снятии подписки.
@@ -604,7 +644,8 @@ class Exchange:
             self.ws_errors[key] += 1
             log.error(f"{what}: прочий отказ ccxt", символ=key,
                       причина=f"{type(e).__name__} {e}")
-        await asyncio.sleep(WS_RETRY_S)
+        # Сдвиг фазы по ключу — 27 задач не переподписываются одной волной (см. desync_s).
+        await asyncio.sleep(desync_s(key, WS_RETRY_S))
         return None
 
     # ⚠ `watch_closed_ohlcv` УДАЛЁН 2026-08-05. Бары берутся `fetch_closed_ohlcv` по
