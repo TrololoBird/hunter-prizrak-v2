@@ -207,6 +207,7 @@ def build_level(
     symbol: str,
     window_ms: tuple[int, int],
     born_ms: int,
+    price_range: tuple[Decimal, Decimal],
 ) -> Level | NotReady:
     """Уровень из закрытого накопления.
 
@@ -222,18 +223,35 @@ def build_level(
     `born_ms` — `created_at_ms(acc, bars, tf_ms)`. Тоже аргументом, и по той же причине,
     что и окно: ряда баров здесь нет, а выводить момент из `structure_to_ms` арифметикой
     («плюс два тела») неверно на ряду с разрывом.
+
+    `price_range` — крайние цены баров структуры, `(min low, max high)`. Аргументом по той
+    же причине: ряда баров здесь нет.
     """
     # ⚠ С 2026-08-09 профиль строится ПРИБОРОМ АВТОРА — сеткой TV (`build_tv`), а не
     # тиковыми бинами: решение владельца о переносе инструментов TV
-    # (docs/audit/tv-transfer-2026-08-09.md). Диапазон сетки — границы структуры (у TV
-    # это выделение автора по коробке); сделки проколов за границами прижимаются к
-    # крайним строкам и считаются (`clamped_volume`). Число строк — `TV_ROWS`, его
-    # источники — в докстроке константы. Прежний тиковый профиль (`build`) остаётся в
-    # модуле для замеров.
+    # (docs/audit/tv-transfer-2026-08-09.md). Число строк — `TV_ROWS`, его источники — в
+    # докстроке константы. Прежний тиковый профиль (`build`) остаётся в модуле для замеров.
+    #
+    # ⚠ ДИАПАЗОН СЕТКИ — КРАЙНИЕ ЦЕНЫ БАРОВ, а не границы структуры. Правка У3 обзора
+    # уровней (docs/audit/levels-projects-2026-08-09.md, фаза 6). До 2026-08-10 сюда шли
+    # `acc.lower.edge` и `acc.upper.edge`, и сделки за границами прижимались к крайним
+    # строкам.
+    #
+    # Источник — рисунок: на стр. 26 и 30 строки профиля продолжаются НИЖЕ коробки
+    # структуры, а на стр. 30 низ коробки отдельно подписан. Это фиксированный профиль,
+    # натянутый на ценовой размах выбранных свечей. То же самое говорит докстрока
+    # `TVProfile.clamped_volume` — «его диапазон — экстремумы баров», — то есть модуль
+    # знал правило, а вызывающий подавал другое. Шесть профильных реализаций из шести в
+    # обзоре берут `min(low)`…`max(high)`.
+    #
+    # Цена правки замерена ДО внесения на 3326 структурах (54 кадра, 716 файлов суток):
+    # ПОК уезжает дальше половины строки у 99.8%, а ВНЕ прежней зоны оказывается у 46.4%
+    # — у почти половины уровней меняется сама ТВХ. Прижималось при этом 44.39% объёма по
+    # медиане, потому что размах баров шире границ в 3.156 раза.
     profile: TVProfile | NotReady = build_tv(
         hist,
-        bottom=Decimal(str(acc.lower.edge)),
-        top=Decimal(str(acc.upper.edge)),
+        bottom=price_range[0],
+        top=price_range[1],
         rows=TV_ROWS,
     )
     if isinstance(profile, NotReady):
@@ -328,8 +346,11 @@ def build_all(
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=hist.reason))
                 continue
+            seg = bars[acc.first_index:acc.last_index + 1]
             lvl = build_level(acc, hist, symbol, (lo, hi),
-                              created_at_ms(acc, bars, TIMEFRAME_MS[tf]))
+                              created_at_ms(acc, bars, TIMEFRAME_MS[tf]),
+                              (Decimal(str(min(b.low for b in seg))),
+                               Decimal(str(max(b.high for b in seg)))))
             if isinstance(lvl, NotReady):
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=lvl.reason))

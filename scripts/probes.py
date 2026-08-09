@@ -225,9 +225,11 @@ def _levels_over(
         if isinstance(hist, NotReady):
             skipped[f"{tf}: {hist.reason.split(':')[-1].strip()}"] += 1
             continue
+        seg = series[tf][a.first_index:a.last_index + 1]
         lvl = levels.build_level(
             a, hist, symbol, (lo, hi),
             levels.created_at_ms(a, series[tf], TIMEFRAME_MS[tf]),
+            (Decimal(str(min(b.low for b in seg))), Decimal(str(max(b.high for b in seg)))),
         )
         if isinstance(lvl, NotReady):
             skipped[f"{tf}: ПОК не построен"] += 1
