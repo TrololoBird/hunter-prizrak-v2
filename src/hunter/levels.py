@@ -31,6 +31,7 @@ from .breach import CONFIRM_BODIES, RETURN_BARS, Breach, BreachKind, Direction, 
 from .models import Bar, NotReady, TradeHistogram, TradeWindows
 from .stop_volume import StopVolume
 from .stop_volume import classify as classify_stop_volume
+from .swings import SwingKind, SwingSet
 from .volume_profile import VolumeProfile, build
 
 
@@ -105,6 +106,10 @@ class Level(BaseModel):
     Берётся ДАЛЬНИЙ из применимых якорей: оба правила говорят «стоп за X», и стоп за
     самым дальним удовлетворяет обоим сразу.
 
+    ⚠ 2026-08-09 к двум видам якоря добавился третий — лой того же ТФ или ТФ−1, вторая
+    половина той же фразы стр. 18, не реализованная до обзора стопового объёма. Чем
+    оказался якорь, теперь видно в `stop_anchor_source`.
+
     ⚠ Заведено 2026-08-05. До него `geometry.build_setup` печатал ТРИ стопа —
     безопасный ближний, безопасный дальний и рисковый, — и выбор оставался оператору.
     Выставить можно только один; значит РР был не определён, а все замеры РР и R
@@ -112,6 +117,21 @@ class Level(BaseModel):
     реализован целиком и НЕ ВЫЗЫВАЛСЯ ниоткуда, а `BoundaryZone.puncture` вычислялся и
     не читался: оба входа правила стр. 18 существовали и не были соединены с ним.
     """
+
+    stop_anchor_source: StopAnchorSource | None = None
+    """Чем оказался якорь: прокол, стоповый объём или свинг. `None` — якоря нет.
+
+    ⚠ Заведено 2026-08-09. До этого наружу уходила одна цена, и оператор не мог сказать,
+    откуда взялся стоп; §4.3 требует, чтобы найденное было ВИДНО. Обзор стопового объёма
+    нашёл, что о стоповом объёме до карточки не доходило вообще ничего — даже сам факт,
+    что якорь взят у него."""
+
+    stop_anchor_narrowed: bool = False
+    """Якорь взят у стопового объёма, который был В СУЖЕНИИ (стр. 34, 57).
+
+    Стр. 57 приравнивает: треугольник это структура накопления, то есть стоповый, просто в
+    сужении. Признак вычислялся с 2026-08-08 (правка Н10 обзора накопления) и до карточки
+    не доходил."""
 
     structure_volume: float = Field(gt=0)
     """Объём структуры. Стр. 22: сила = ТФ И объём, РАЗДЕЛЬНО.
@@ -254,6 +274,7 @@ def build_all(
     trades: TradeWindows | None,
     timeframes: tuple[str, ...],
     scans: dict[str, AccumulationScan],
+    swings: dict[str, SwingSet] | None = None,
 ) -> LevelBuild:
     """Все уровни по всем ТФ плюс НАЗВАННЫЕ причины, где уровень не построен.
 
@@ -272,6 +293,11 @@ def build_all(
     """
     built: list[Level] = []
     unbuilt: list[Unbuilt] = []
+    # ⚠ Свинги приходят готовыми из `engine.SeriesRead`, а не считаются здесь заново: до
+    # 2026-08-06 этот разбор жил в трёх местах сразу. Умолчание `None` оставлено для
+    # зондов и старых вызовов — тогда третий вид якоря (свинг, стр. 18) просто не ищется,
+    # и это ВИДНО по `stop_anchor_source`, а не молчит.
+    sw_by_tf: dict[str, SwingSet] = swings or {}
     for tf in timeframes:
         bars = series.get(tf)
         scan = scans.get(tf)
@@ -314,9 +340,21 @@ def build_all(
                         y_scan.closed, y_bars, acc, bars, tf).items)
             svs: tuple[StopVolume, ...] = tuple(collected)
             down = lvl.side is LevelSide.LONG
+            # Лои своего ТФ и ТФ−1 для лонга, хаи для шорта — вторая половина фразы
+            # стр. 18, внесённая 2026-08-09.
+            kind = SwingKind.LOW if down else SwingKind.HIGH
+            sw_prices: list[float] = []
+            for stf in (tf, *younger[:1]):
+                sw = sw_by_tf.get(stf)
+                if sw is not None:
+                    sw_prices.extend(s.price for s in sw.swings if s.kind is kind)
             anchor = stop_anchor(lvl.side, float(lvl.boundary_lo if down else lvl.boundary_hi),
-                                 acc.lower if down else acc.upper, svs)
-            built.append(lvl.model_copy(update={"stop_anchor": anchor}))
+                                 acc.lower if down else acc.upper, svs, tuple(sw_prices))
+            built.append(lvl.model_copy(update={
+                "stop_anchor": None if anchor is None else anchor.price,
+                "stop_anchor_source": None if anchor is None else anchor.source,
+                "stop_anchor_narrowed": bool(anchor is not None and anchor.narrowed),
+            }))
     return tuple(built), tuple(unbuilt)
 
 
@@ -398,16 +436,61 @@ STOP_ANCHOR_BAND_MAX_PCT = 5.0
 уже отобранным, и второй проверки быть не должно."""
 
 
+class StopAnchorSource(StrEnum):
+    """Чем оказался якорь стопа. Стр. 18 называет ТРИ вида, и все три здесь."""
+
+    PUNCTURE = "puncture"
+    """Прокол за границу базы: «стоп всегда ставится за этот прокол» (стр. 18)."""
+
+    STOP_VOLUME = "stop_volume"
+    """Стоповый объём — база мелкого ТФ (стр. 18, 34)."""
+
+    SWING = "swing"
+    """Лой (для лонга) или хай (для шорта) того же ТФ либо ТФ−1 — стр. 18.
+
+    ⚠ Заведено 2026-08-09 обзором стопового объёма. Фраза стр. 18 называет ДВА якоря в
+    одном предложении — «стоповый объем – база мелкого ТФ - или Лой того же ТФ или ТФ-1», —
+    а реализована была только первая половина. Замер до правки: свинг в полосе 2-5%
+    находится у 8163 сторон из 11288, то есть у 72.3%.
+    Разбор: docs/audit/stopvol-projects-2026-08-09.md
+    """
+
+
+class StopAnchor(BaseModel):
+    """Якорь стопа: цена И ЧЕМ он оказался.
+
+    ⚠ Прежде отдавалась одна цена, и карточка не могла сказать, откуда взялся стоп. §4.3
+    требует, чтобы найденное было видно; обзор 2026-08-09 нашёл, что до оператора не
+    доходило вообще ничего о стоповом объёме — даже сам факт, что якорь взят у него.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    price: Decimal
+    source: StopAnchorSource
+    narrowed: bool = False
+    """Стоповый объём был В СУЖЕНИИ (стр. 34: «может быть в сужении, в поджатии»).
+
+    Осмысленно только при `source = STOP_VOLUME`. Замер 2026-08-09: в сужении 16.3%
+    стоповых объёмов, 14918 из 91795.
+    """
+
+
 def stop_anchor(
     side: LevelSide,
     boundary: float,
     zone: BoundaryZone,
     stop_volumes: tuple[StopVolume, ...],
-) -> Decimal | None:
-    """Цена, за которую прячется стоп по стр. 18. `None` — якоря нет.
+    swing_prices: tuple[float, ...] = (),
+) -> StopAnchor | None:
+    """Якорь стопа по стр. 18. `None` — якоря нет.
 
-    Возвращается ДАЛЬНИЙ якорь: прокол и стоповый объём — оба вида «стоп за X», и стоп
-    за самым дальним из них удовлетворяет обоим требованиям сразу.
+    Возвращается ДАЛЬНИЙ якорь: прокол, стоповый объём и свинг — все три вида «стоп за X»,
+    и стоп за самым дальним из них удовлетворяет всем требованиям сразу.
+
+    `swing_prices` — лои своего ТФ и ТФ−1 для лонга, хаи для шорта. Пустой кортеж означает
+    «свинги не поданы», а не «свингов нет»: умолчание оставлено, чтобы зонды могли звать
+    функцию, не собирая ряды.
     """
     down = side is LevelSide.LONG          # лонг: якоря НИЖЕ границы, шорт — выше
     lo_pct, hi_pct = STOP_ANCHOR_BAND_MIN_PCT, STOP_ANCHOR_BAND_MAX_PCT
@@ -416,16 +499,22 @@ def stop_anchor(
     else:
         band_lo, band_hi = boundary * (1 + lo_pct / 100), boundary * (1 + hi_pct / 100)
 
-    found: list[float] = []
+    found: list[tuple[float, StopAnchorSource, bool]] = []
     if zone.puncture is not None:
-        found.append(zone.puncture)
+        found.append((zone.puncture, StopAnchorSource.PUNCTURE, False))
     for sv in stop_volumes:
-        edge = sv.accumulation.lower.edge if down else sv.accumulation.upper.edge
+        acc = sv.accumulation
+        edge = acc.lower.edge if down else acc.upper.edge
         if band_lo <= edge <= band_hi:
-            found.append(edge)
+            narrow = bool(acc.upper.narrowed or acc.lower.narrowed)
+            found.append((edge, StopAnchorSource.STOP_VOLUME, narrow))
+    for p in swing_prices:
+        if band_lo <= p <= band_hi:
+            found.append((p, StopAnchorSource.SWING, False))
     if not found:
         return None
-    return Decimal(str(min(found) if down else max(found)))
+    best = min(found, key=lambda x: x[0]) if down else max(found, key=lambda x: x[0])
+    return StopAnchor(price=Decimal(str(best[0])), source=best[1], narrowed=best[2])
 
 
 def _younger_tfs(tf: str, available: tuple[str, ...]) -> tuple[str, ...]:
