@@ -141,6 +141,24 @@ class Level(BaseModel):
     накоплении». §3 запрещает составные метрики, курс это подтверждает.
     """
 
+    vrvp_zone_qty: float | None = None
+    """Объём ЗОНЫ уровня по композиту всех структур символа — замена VRVP (стр. 22, 63).
+
+    ⚠ Заведено 2026-08-10 (реестр долга, строка 7 — М-12). Автор смотрит «объём» силы
+    уровня по VRVP — профилю видимой области экрана; у системы экрана нет, и «типичного
+    N видимых баров» не существует (vrvp-visible-range-2026-08-09: это жест пользователя).
+    Безэкранная замена — якорь ОТ СТРУКТУРЫ, как у официального Auto Anchored VP самого
+    TV и композитов Далтона: окно = объединение окон всех структур символа, объём зоны —
+    сумма тиковых бинов композита внутри [zone_lo, zone_hi]. `None` — композит не покрыт
+    сделками; причина в `vrvp_note`."""
+
+    vrvp_total_qty: float | None = None
+    """Полный объём того же композита — знаменатель для чтения `vrvp_zone_qty`."""
+
+    vrvp_note: str = ""
+    """При посчитанном композите — какое окно им было (структура какого ТФ); при
+    отсутствии — названная причина (§4.3)."""
+
     boundary_lo: Decimal
     boundary_hi: Decimal
 
@@ -388,7 +406,43 @@ def build_all(
                 "stop_anchor_source": None if anchor is None else anchor.source,
                 "stop_anchor_narrowed": bool(anchor is not None and anchor.narrowed),
             }))
+    built = _with_vrvp(built, trades)
     return tuple(built), tuple(unbuilt)
+
+
+def _with_vrvp(built: list[Level], trades: TradeWindows | None) -> list[Level]:
+    """Объём зоны каждого уровня по КОМПОЗИТУ — замена VRVP (стр. 22, 63).
+
+    Композит — самое ШИРОКОЕ покрытое окно среди структур символа (окно самой длинной
+    структуры): якорь от структуры, как у Auto Anchored VP и композитов Далтона
+    (обоснование — докстрока `Level.vrvp_zone_qty`).
+
+    ⚠ Первая редакция брала ОБЪЕДИНЕНИЕ окон всех структур — и на первых же кадрах
+    честно отказала по всем уровням сразу: объединение требует непрерывного покрытия
+    сделками от самой старой структуры до самой свежей, а бэкфилл держит не все сутки.
+    Окно самой длинной структуры покрыто ПО ПОСТРОЕНИЮ — её уровень уже построен из
+    этих сделок. Урок backfill-window-2026-08-04 («сто честных отказов подряд читаются
+    как рынок») здесь сработал заранее: отказ по всем уровням одной причиной — дефект
+    выбора окна, а не данные.
+    """
+    if not built or trades is None:
+        return built
+    widest = max(built, key=lambda lv: lv.structure_to_ms - lv.structure_from_ms)
+    comp = trades.window(widest.structure_from_ms, widest.structure_to_ms)
+    if isinstance(comp, NotReady):
+        # Покрыто при построении уровня, но повторное чтение могло упереться в
+        # вытесненный кэш — причина называется, а не глотается.
+        note = f"композит (окно структуры {widest.timeframe}) не прочитан: {comp.reason}"
+        return [lv.model_copy(update={"vrvp_note": note}) for lv in built]
+    out: list[Level] = []
+    for lv in built:
+        lo, hi = float(lv.zone_lo), float(lv.zone_hi)
+        zone = sum(q for b, q in comp.qty_by_bin.items()
+                   if lo <= float(comp.bin_price(b)) <= hi)
+        out.append(lv.model_copy(update={
+            "vrvp_zone_qty": zone, "vrvp_total_qty": comp.qty_seen,
+            "vrvp_note": f"окно композита — структура {widest.timeframe}"}))
+    return out
 
 
 NESTED_MAX_STEPS = 1
@@ -785,6 +839,66 @@ def status(
     return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
                        price_in_zone=in_zone,
                        entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
+
+
+class PressedKind(StrEnum):
+    """Конфигурации отработки стр. 28, выраженные новым накоплением у уровня."""
+
+    BELOW = "below"
+    """Конфигурация 2: накопление ПОД уровнем — «цена не дошла до уровня, остановилась
+    в зоне» (стр. 44, вариант 2). Вход курс рисует свечами от ПОК нового накопления
+    (стр. 28, находка М-29)."""
+
+    ABOVE = "above"
+    """Конфигурация 5: новая структура НАД уровнем (стр. 28)."""
+
+    ASTRIDE = "astride"
+    """Конфигурация 7: «пила» — накопление НА уровне; курс: выйти в бу и дождаться
+    выхода из пилы (стр. 28)."""
+
+
+class PressedStructure(BaseModel):
+    """Закрытое накопление, прижатое к зоне уровня, — конфигурации 2/5/7 стр. 28.
+
+    ⚠ Заведено 2026-08-10 (реестр долга, строка 1). До этого система различала четыре
+    исхода события на уровне, а конфигурации «новое накопление у уровня» не выражала
+    ничем — при том, что у 2 и 7 курс даёт СВОИ правила действий. Здесь конфигурация
+    ОБНАРУЖИВАЕТСЯ И НАЗЫВАЕТСЯ; эмиссию она не порождает — тот же выбор, что у слома
+    на младшем ТФ (А-02): новый путь сигнала меняет состав эмиссии.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: PressedKind
+    first_index: int
+    last_index: int
+    box_lo: float
+    box_hi: float
+
+
+def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStructure, ...]:
+    """Закрытые накопления ТОГО ЖЕ ТФ, закрывшиеся после появления уровня и прижатые
+    к его зоне (пересечение коробки с [zone_lo, zone_hi]).
+
+    Сторона относительно ЦЕНЫ уровня (ПОК) делит их на 2/5/7: коробка целиком ниже —
+    ПОД уровнем; целиком выше — НАД; ПОК внутри коробки — «пила». Открытая структура
+    у уровня сюда не входит: она видна в `open_tail`, а стр. 28 рисует исходы по
+    ЗАКРЫТЫМ (стр. 23: пока цена не вышла, структуры-события нет).
+    """
+    lo_z, hi_z = float(level.zone_lo), float(level.zone_hi)
+    price = float(level.price)
+    out: list[PressedStructure] = []
+    for acc in scan.closed:
+        if acc.last_index <= level.created_at_index:
+            continue
+        lo, hi = acc.lower.edge, acc.upper.edge
+        if hi < lo_z or lo > hi_z:
+            continue
+        kind = (PressedKind.ASTRIDE if lo <= price <= hi
+                else PressedKind.BELOW if hi < price else PressedKind.ABOVE)
+        out.append(PressedStructure(kind=kind, first_index=acc.first_index,
+                                    last_index=acc.last_index, box_lo=lo, box_hi=hi))
+    return tuple(out)
 
 
 def first_test_index(level: Level, bars: list[Bar]) -> int | None:

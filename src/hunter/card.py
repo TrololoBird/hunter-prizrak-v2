@@ -194,6 +194,16 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             # у сделки, которая будет взята; печатать их для уровня, который система не
             # торгует, значит печатать сигнал, которого нет. Причина названа (§4.3).
             out.append(f"        СДЕЛКИ НЕТ: {dec.hold}")
+            if dec.pressed:
+                out.append(f"        накопление у уровня: {dec.pressed}")
+            lv = dec.level
+            if lv.vrvp_zone_qty is not None and lv.vrvp_total_qty:
+                share = lv.vrvp_zone_qty / lv.vrvp_total_qty * 100
+                out.append(f"        сила по композиту (замена VRVP, стр. 22): "
+                           f"зона {lv.vrvp_zone_qty:.6g} — {share:.1f}% композита; "
+                           f"{lv.vrvp_note}")
+            elif lv.vrvp_note:
+                out.append(f"        {lv.vrvp_note}")
             if dec.mtf_break:
                 # §2.5 подключён к решению 2026-08-07 (А-02): условие входа по стр. 25/31
                 # теперь ПРОВЕРЯЕТСЯ, а не только называется.
@@ -316,7 +326,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if r is None:
             continue
         bars, sw = series[tf], r.swings
-        for pp in pereprior.detect(bars, sw, tf):
+        detected = pereprior.detect(bars, sw, tf)
+        for pp in detected:
             any_pp = True
             width = (pp.zone_hi - pp.zone_lo) / pp.zone_lo * 100 if pp.zone_lo else 0.0
             test = ("теста не было" if pp.tested_at_index is None
@@ -325,6 +336,34 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"{SIDE_LABEL[pp.side.value]}  слом {_num(pp.broken_price)}  "
                        f"зона тени {_num(pp.zone_lo)}…{_num(pp.zone_hi)} ({width:.3f}%)  "
                        f"{test}")
+            # Подтверждение ПП структурой — стр. 53, второй способ (реестр, строка 5):
+            # закрытое накопление того же ТФ, сформированное ПОСЛЕ слома и опирающееся
+            # на зону ПП (лонг — над зоной, шорт — под). Находка называется; эмиссию
+            # не порождает.
+            for acc in r.scan.closed:
+                if acc.first_index <= pp.confirmed_at_index:
+                    continue
+                fits = (acc.lower.edge >= pp.zone_lo
+                        if pp.side is pereprior.PPSide.LONG
+                        else acc.upper.edge <= pp.zone_hi)
+                if fits:
+                    out.append(f"        подтверждён структурой "
+                               f"{'над' if pp.side is pereprior.PPSide.LONG else 'под'}"
+                               f" ПП (стр. 53): коробка {_num(acc.lower.edge)}…"
+                               f"{_num(acc.upper.edge)}")
+                    break
+            # Сделка от ПП — стр. 50 (реестр, строка 3). Печатается, не эмитируется:
+            # конвенции и причина — в докстроке `geometry.PPSetup`.
+            opposite = next((o for o in detected if o.side is not pp.side), None)
+            ps = geometry.build_pp_setup(pp, opposite)
+            if ps.target is not None and ps.rr is not None:
+                tgt = f"цель {_num(ps.target)}  РР {ps.rr:.2f}"
+            elif opposite is None:
+                tgt = "цели нет — противоположного ПП нет (маршрут ПП→ПП, стр. 49)"
+            else:
+                tgt = "цели нет — противоположный ПП позади входа, не по направлению"
+            out.append(f"        сделка от ПП (стр. 50): вход {_num(ps.entry)}  "
+                       f"стоп {_num(ps.stop)}  {tgt}")
         for fac in pereprior.failed_update(bars, sw):
             any_pp = True
             what = "хай" if fac.side.value == "short" else "лой"

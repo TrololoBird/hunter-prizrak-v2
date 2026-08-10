@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .levels import Level, LevelSide, MappedLevel
 from .levels import nested as nested_levels
+from .pereprior import Pereprior, PPSide
 
 TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
 """Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2."""
@@ -276,3 +277,53 @@ def build_setup(
     )
 
 
+
+
+class PPSetup(BaseModel):
+    """Геометрия сделки ОТ ПЕРЕПРИОРА — стр. 50: «Торговля ПП – точкой входа является
+    тест ПП, со стопом за хай/лой или базу в месте слома».
+
+    ⚠ Заведено 2026-08-10 (реестр долга, строка 3 — М-11). До этого `tested_at_index`
+    вычислялся, а геометрии сделки от ПП не существовало: сетап строился только от
+    уровня ПОК. Здесь сделка СТРОИТСЯ И ПЕЧАТАЕТСЯ картой; в эмиссию она не идёт —
+    новый ТИП сигнала меняет состав леджера, и это отдельный заход (тот же выбор, что
+    у слома на младшем ТФ и конфигураций стр. 28).
+
+    Конвенции, названные вслух:
+      * вход — БЛИЖНИЙ край зоны тени: решение владельца по обзору слома структуры
+        (docs/audit/bos-projects-2026-08-07.md, принят ближний край и ретест по
+        закрытию);
+      * стоп — за ДАЛЬНИЙ край зоны (это и есть хай/лой слома, стр. 50); запаса курс
+        для ПП не даёт, поэтому стоп РОВНО за краем, без процента;
+      * цель — ближний край ПРОТИВОПОЛОЖНОГО ПП: стр. 49 задаёт горизонт от переприора
+        до переприора в обратном направлении (пересказ схемы). Нет противоположного —
+        цели нет, и это названо, а не подменено числом (§4.3).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    side: str
+    entry: float
+    stop: float
+    target: float | None
+    rr: float | None
+
+
+def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
+    """Сделка от ПП. `opposite` — последний ПП противоположной стороны того же ТФ."""
+    # Цель законна только ПО НАПРАВЛЕНИЮ сделки: противоположный ПП, стоящий позади
+    # входа, целью не является — маршрут «от ПП до ПП» идёт вперёд, а не назад. Первая
+    # редакция это не проверяла и печатала отрицательный РР — поймано первым же диффом.
+    if pp.side is PPSide.SHORT:
+        entry, stop = pp.zone_lo, pp.zone_hi
+        cand = opposite.zone_hi if opposite is not None else None
+        target = cand if cand is not None and cand < entry else None
+        risk = stop - entry
+        rr = (entry - target) / risk if target is not None and risk > 0 else None
+    else:
+        entry, stop = pp.zone_hi, pp.zone_lo
+        cand = opposite.zone_lo if opposite is not None else None
+        target = cand if cand is not None and cand > entry else None
+        risk = entry - stop
+        rr = (target - entry) / risk if target is not None and risk > 0 else None
+    return PPSetup(side=pp.side.value, entry=entry, stop=stop, target=target, rr=rr)

@@ -98,6 +98,13 @@ class Decision(BaseModel):
     §4.3: отсутствие называется, а не подменяется пустотой.
     """
 
+    pressed: str = ""
+    """Конфигурации 2/5/7 стр. 28 — новое накопление, прижатое к зоне уровня.
+
+    Заведено 2026-08-10 (реестр долга, строка 1). Пусто — прижатых структур нет; это
+    штатный случай, а не отказ, поэтому пустота здесь законна. Найденное называется с
+    правилом действия курса; эмиссию не порождает (как и слом на младшем ТФ)."""
+
     @property
     def emitted(self) -> bool:
         return self.setup is not None
@@ -236,11 +243,37 @@ def decide(
             setup=None if hold else geometry.build_setup(m.level, mapped),
             hold=hold,
             mtf_break=_mtf_break(m, series, reads, tfs),
+            pressed=_pressed_note(m, reads),
         ))
     return SymbolDecision(symbol=symbol, timeframes=tfs, reads=reads,
                           unreadable=unreadable, unbuilt=unbuilt,
                           mapped=mapped, decisions=tuple(decisions))
 
+
+
+_PRESSED_RULE = {
+    levels.PressedKind.BELOW: "конфигурация 2, под уровнем — вход курс рисует от ПОК "
+                              "нового накопления (стр. 28)",
+    levels.PressedKind.ABOVE: "конфигурация 5, над уровнем (стр. 28)",
+    levels.PressedKind.ASTRIDE: "конфигурация 7, \"пила\" на уровне — выйти в бу и "
+                                "дождаться выхода (стр. 28)",
+}
+
+
+def _pressed_note(m: MappedLevel, reads: dict[str, SeriesRead]) -> str:
+    """Конфигурации 2/5/7 стр. 28 у этого уровня — сгруппированы по виду для карточки."""
+    r = reads.get(m.level.timeframe)
+    if r is None:
+        return ""
+    found = levels.pressed_structures(m.level, r.scan)
+    parts: list[str] = []
+    for kind in (levels.PressedKind.BELOW, levels.PressedKind.ABOVE,
+                 levels.PressedKind.ASTRIDE):
+        boxes = [p for p in found if p.kind is kind]
+        if boxes:
+            coords = ", ".join(f"{p.box_lo:.8g}…{p.box_hi:.8g}" for p in boxes)
+            parts.append(f"{_PRESSED_RULE[kind]}: {coords}")
+    return "; ".join(parts)
 
 
 def _mtf_break(
