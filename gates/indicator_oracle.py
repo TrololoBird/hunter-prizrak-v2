@@ -19,6 +19,7 @@ pandas здесь — единственное место в проекте, г�
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -131,7 +132,11 @@ def compare(
     for i, (x, y) in enumerate(zip(a, b, strict=True)):
         if i < warmup:
             continue
-        if x is None or y is None or x != x or y != y:  # None и NaN
+        # `math.isnan`, а не идиома `x != x`. Обе верны, но вторую CodeQL помечает как
+        # «сравнение выражения с самим собой» (2026-08-10), и предупреждение висело бы
+        # вечно. Постоянный шум учит не смотреть — то же правило, по которому из CI
+        # убран заведомо красный живой прогон.
+        if x is None or y is None or math.isnan(x) or math.isnan(y):
             continue
         compared += 1
         denom = max(abs(x), abs(y), 1e-9)

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -192,7 +193,8 @@ def compare(a: list[float | None], b: list[float | None],
     for i, (x, y) in enumerate(zip(a, b, strict=True)):
         if i < skip:
             continue
-        if x is None or y is None or x != x or y != y:
+        # `math.isnan` вместо идиомы `x != x` — см. пояснение в indicator_oracle.py.
+        if x is None or y is None or math.isnan(x) or math.isnan(y):
             continue
         compared += 1
         rel = abs(x - y) / max(abs(x), abs(y), 1e-9)

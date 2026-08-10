@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -26,7 +27,9 @@ SLICE = Path("docs/audit/reference-slice/BTCUSDT-1h-500.parquet")
 
 def first_defined(values: list[float | None]) -> int | None:
     for i, v in enumerate(values):
-        if v is not None and v == v:
+        # `not math.isnan(v)` вместо идиомы `v == v` — см. пояснение в
+        # indicator_oracle.py: обе верны, но вторая даёт вечное предупреждение CodeQL.
+        if v is not None and not math.isnan(v):
             return i
     return None
 
