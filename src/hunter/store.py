@@ -22,6 +22,7 @@ import polars as pl
 from pydantic import BaseModel, ConfigDict
 
 from . import log
+from .bars import tf_ms
 from .levels import Level, LevelState
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
@@ -66,6 +67,17 @@ CREATE TABLE IF NOT EXISTS outcomes (
     r          REAL,
     CHECK ((kind = 'ambiguous') = (r IS NULL)),
     CHECK ((kind = 'ambiguous') = (exit_price IS NULL))
+);
+
+-- Состояние сигнала, ещё НЕ ставшего исходом (v4, 2026-08-10). Ровно два значения:
+-- `not_filled` — цена не дошла до входа, сделки не было (стр. 30: вход лимитками);
+-- `open` — вход состоялся, ни стоп, ни цель не достигнуты.
+-- Строка перезаписывается каждым прогоном (`as_of` — до какого бара считали): это
+-- СОСТОЯНИЕ, а не событие. Событие необратимо и живёт в `outcomes`.
+CREATE TABLE IF NOT EXISTS signal_states (
+    signal_id INTEGER PRIMARY KEY REFERENCES signals(id),
+    state     TEXT    NOT NULL CHECK (state IN ('not_filled', 'open')),
+    as_of     INTEGER NOT NULL CHECK (as_of > 0)
 );
 
 CREATE TABLE IF NOT EXISTS levels (
@@ -126,8 +138,17 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+3 → 4 (2026-08-10): заведена `signal_states` — состояние сигнала, ЕЩЁ НЕ ставшего
+исходом. До неё `emit.outcome_of` каждый прогон различал `not_filled` (цена не дошла до
+входа) и `open` (сделка идёт), и оба ответа ВЫБРАСЫВАЛИСЬ: в леджер попадали только
+`stop`/`target`/`ambiguous`, а различие жило одним счётчиком в отчёте прогона. Цена
+потери вскрылась сводкой исходов: клетка «6 сигналов, 1441 бар прожито, ноль исходов»
+неотличима от дефекта, хотя может означать «цена ни разу не дошла до входа» — то есть
+законный ответ системы. Прежние строки не меняются: таблица новая и пустая, старые
+сигналы состояния не получают, пока их не пересчитает прогон.
 
 2 → 3 (2026-08-10): появился `kind` — тип сигнала: `level` (сделка от уровня ПОК) и
 `pp` (сделка от переприора, стр. 50; реестр долга, строка 3). Уникальный ключ расширен
@@ -412,7 +433,14 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return SCHEMA_VERSION  # базы ещё нет: создастся сразу свежей
     if "recorded_at" not in cols:
         return "1"
-    return SCHEMA_VERSION if "kind" in cols else "2"
+    if "kind" not in cols:
+        return "2"
+    # 3 → 4 отличается не колонкой `signals`, а НАЛИЧИЕМ таблицы состояний: сама
+    # `signals` при этом переходе не меняется.
+    has_states = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='signal_states'"
+    ).fetchone()
+    return SCHEMA_VERSION if has_states else "3"
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -480,6 +508,9 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         _migrate_1_to_2(conn)
     if _schema_version(conn) == "2":
         _migrate_2_to_3(conn)
+    # 3 → 4 отдельной функции не требует: переход добавляет ПУСТУЮ таблицу, а
+    # `CREATE TABLE IF NOT EXISTS` ниже её и создаёт. Перестройка (как в 2 → 3) нужна
+    # только там, где меняется смысл существующих строк — здесь не меняется ни одной.
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -573,6 +604,34 @@ def record_outcome(
         conn.commit()
     except sqlite3.IntegrityError as e:
         return NotReady(reason=f"исход {signal_id}: строка отклонена схемой — {e}")
+    return None
+
+
+def record_signal_state(
+    conn: sqlite3.Connection, signal_id: int, state: str, as_of: int
+) -> NotReady | None:
+    """Записать СОСТОЯНИЕ незакрытой сделки: `not_filled` или `open` (v4, 2026-08-10).
+
+    Перезаписывается каждым прогоном — состояние сегодняшнее, а не событие. Сделка,
+    ставшая исходом, состояние теряет: `outcomes` старше по определению, и держать оба
+    ответа значило бы завести две правды об одной сделке.
+
+    Зачем это в леджере, а не в отчёте прогона. `not_filled` — ЗАКОННЫЙ ответ системы
+    (цена до входа не дошла; вход стоит лимитками на ПОК и зону, стр. 30), и на вопрос
+    "сколько раз совет не сработал" он отвечает иначе, чем `stop`. Пока ответ жил
+    счётчиком одного прогона, клетка сводки "сигналов 6, исходов 0" была неотличима от
+    дефекта расчёта.
+    """
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO signal_states (signal_id, state, as_of)"
+            " VALUES (?, ?, ?)", (signal_id, state, as_of),
+        )
+        conn.execute("DELETE FROM signal_states WHERE signal_id IN"
+                     " (SELECT signal_id FROM outcomes)")
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        return NotReady(reason=f"состояние {signal_id}: строка отклонена схемой — {e}")
     return None
 
 
@@ -712,6 +771,202 @@ def carried_levels(
         )
         for r in rows
     )
+
+
+class OutcomeCell(BaseModel):
+    """Исходы одной клетки разреза: ТФ × сторона × тип сигнала.
+
+    ⚠ Здесь ЧЕТЫРЕ знаменателя, и все обязательны. Урок backfill-window (2026-08-04):
+    сто девяносто честных отказов подряд читались как «рынок такой», пока их не сложили
+    ПО ТАЙМФРЕЙМУ — и оказалось, что 4ч и 1Д не дали НИ ОДНОГО уровня. То же самое
+    возможно с исходами: «средний R = +0.4» по всему леджеру молчит о том, что весь плюс
+    сделан одним ТФ, а другой стабильно минусовой.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str
+    """Тип сигнала: level | pp."""
+
+    timeframe: str
+    direction: str
+
+    signals: int
+    """Сколько сигналов эмитировано. ГЛАВНЫЙ знаменатель."""
+
+    closed: int
+    """Сколько получило исход. `signals - closed` — ещё открытые или не наполненные:
+    они в средний R не входят, и без этого числа доля выигрышей посчитана по другому
+    множеству, чем «сколько раз система советовала»."""
+
+    by_target: int
+    by_stop: int
+    ambiguous: int
+    """Неоднозначные (стоп и цель в одном баре) — у них `r` нет по схеме, и в сумму R
+    они не идут. Считаются отдельно, а не растворяются в «не закрыто»."""
+
+    sum_r: float | None
+    avg_r: float | None
+    """`None` — закрытых с числовым R нет вовсе. Не 0.0: ноль означал бы «в сумме
+    вышли в ноль», а это другое утверждение (§4.3)."""
+
+    not_filled: int
+    """Сделок, где цена НЕ ДОШЛА до входа (стр. 30). Законный ответ системы, а не
+    отсутствие ответа: исхода у них не будет никогда, и в знаменателе «средний R» им
+    не место."""
+
+    still_open: int
+    """Сделок, где вход состоялся, а стоп и цель ещё не достигнуты."""
+
+    unknown_state: int
+    """Сигналов БЕЗ исхода и БЕЗ записанного состояния. Ровно они и есть подозрение на
+    дефект: система про них не сказала ничего. Сюда же попадают сигналы, записанные до
+    появления схемы v4, — и это видно по возрасту."""
+
+    age_bars_max: int
+    """Сколько баров СВОЕГО ТФ прожил самый старый сигнал клетки к последнему моменту,
+    о котором знает леджер.
+
+    ⚠ Поле заведено вместе со сводкой и ровно затем, чтобы клетку без исходов нельзя
+    было объяснить словами. Пустая клетка допускает две причины: «сигналы молоды —
+    закрыться не успели» и «исход не считается вовсе». Различает их ТОЛЬКО возраст:
+    ноль исходов при возрасте в три бара — данные, ноль исходов при возрасте в двести
+    баров — дефект. Правило CLAUDE.md: ноль с красивой причиной опаснее всего, потому
+    что не выглядит дефектом.
+    """
+
+
+class OutcomeSurvey(BaseModel):
+    """Сводка исходов ПО ИЗМЕРЕНИЯМ, вдоль которых возможен систематический перекос.
+
+    Заведено 2026-08-10. До этого исходы писались и складывались ТОЛЬКО целиком по
+    леджеру (`OWNER_QUERIES['результат в R']`) плюс разрез по ТФ без стороны и без типа
+    сигнала. Перекос вида «весь плюс сделан лонгами на 1ч, а ПП-сигналы стабильно
+    минусовые» не был виден ничем.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cells: tuple[OutcomeCell, ...]
+    signals_total: int
+    closed_total: int
+    fingerprint: str
+    """ОТПЕЧАТОК ДАННЫХ: состав леджера на момент замера. Правило 2026-08-09 — замер по
+    растущему хранилищу без отпечатка воспроизводится только до первой доливки."""
+
+
+def outcome_survey(conn: sqlite3.Connection) -> OutcomeSurvey:
+    """Исходы в разрезе тип × ТФ × сторона. Соединение — только на чтение.
+
+    Клетки БЕЗ единого исхода тоже попадают в сводку (`closed = 0`): именно они и есть
+    признак перекоса, а фильтрация по `INNER JOIN outcomes` их бы молча съела.
+    """
+    # «Последний момент, о котором знает леджер» — самая свежая запись. Часы здесь
+    # не спрашиваются намеренно: сводка читается и из процессов без сведения с биржей
+    # (§6 запрещает судить о времени по локальным часам), а для возраста в барах
+    # достаточно внутренней шкалы самого леджера.
+    horizon = conn.execute(
+        "SELECT MAX(m) FROM (SELECT MAX(recorded_at) AS m FROM signals"
+        " UNION ALL SELECT MAX(closed_at) FROM outcomes)"
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT s.kind, s.timeframe, s.direction, COUNT(*) AS signals,"
+        " SUM(CASE WHEN o.signal_id IS NOT NULL THEN 1 ELSE 0 END) AS closed,"
+        " SUM(CASE WHEN o.kind='target' THEN 1 ELSE 0 END) AS by_target,"
+        " SUM(CASE WHEN o.kind='stop' THEN 1 ELSE 0 END) AS by_stop,"
+        " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS ambiguous,"
+        " SUM(o.r) AS sum_r, AVG(o.r) AS avg_r, MIN(s.recorded_at) AS oldest,"
+        " SUM(CASE WHEN st.state='not_filled' THEN 1 ELSE 0 END) AS not_filled,"
+        " SUM(CASE WHEN st.state='open' THEN 1 ELSE 0 END) AS still_open"
+        " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
+        " LEFT JOIN signal_states st ON st.signal_id = s.id"
+        " GROUP BY s.kind, s.timeframe, s.direction"
+        " ORDER BY s.kind, s.timeframe, s.direction"
+    ).fetchall()
+    cells = tuple(
+        OutcomeCell(
+            kind=r[0], timeframe=r[1], direction=r[2], signals=int(r[3]),
+            closed=int(r[4]), by_target=int(r[5]), by_stop=int(r[6]),
+            ambiguous=int(r[7]),
+            sum_r=None if r[8] is None else float(r[8]),
+            avg_r=None if r[9] is None else float(r[9]),
+            not_filled=int(r[11]), still_open=int(r[12]),
+            unknown_state=int(r[3]) - int(r[4]) - int(r[11]) - int(r[12]),
+            age_bars_max=(0 if horizon is None or r[10] is None
+                          else max(0, (int(horizon) - int(r[10])) // tf_ms(r[1]))),
+        )
+        for r in rows
+    )
+    n_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    n_closed = conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0]
+    n_levels = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+    return OutcomeSurvey(
+        cells=cells, signals_total=int(n_signals), closed_total=int(n_closed),
+        fingerprint=f"сигналов {n_signals}, исходов {n_closed}, уровней карты {n_levels}",
+    )
+
+
+def format_outcome_survey(s: OutcomeSurvey) -> list[str]:
+    """Сводка словами для владельца (§7.6). Отдаёт строки, печать — дело вызывающего.
+
+    Перекос называется ЯВНО, а не оставляется читателю: клетки без исходов и клетки,
+    где все закрытия одного знака, перечисляются отдельной строкой. Один отказ — данные;
+    все отказы на одном ТФ — дефект (правило CLAUDE.md).
+    """
+    out = [f"ОТПЕЧАТОК ДАННЫХ: {s.fingerprint}"]
+    if not s.cells:
+        out.append("   сигналов нет — сводить нечего (это данные, а не отказ)")
+        return out
+    out.append(f"   всего сигналов {s.signals_total}, с исходом {s.closed_total}, "
+               f"без исхода {s.signals_total - s.closed_total}")
+    out.append("   тип   ТФ    сторона  сигн.  закр.  цель  стоп  неодн.  средний R  "
+               "мимо  идёт  ?  возраст")
+    for c in s.cells:
+        avg = "     —" if c.avg_r is None else f"{c.avg_r:6.3f}"
+        out.append(f"   {c.kind:5} {c.timeframe:5} {c.direction:8} {c.signals:5} "
+                   f"{c.closed:6} {c.by_target:5} {c.by_stop:5} {c.ambiguous:7} {avg}  "
+                   f"{c.not_filled:4} {c.still_open:5} {c.unknown_state:2} "
+                   f"{c.age_bars_max:8}")
+    out.append("   «мимо» — цена не дошла до входа (стр. 30); «идёт» — вход был, "
+               "исхода ещё нет; «?» — система не сказала ничего")
+
+    silent = [c for c in s.cells if c.closed == 0]
+    if silent:
+        out.append(f"   ⚠ клеток БЕЗ единого исхода: {len(silent)} — "
+                   + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction} ({c.signals} сигн.,"
+                               f" {c.age_bars_max} бар.)" for c in silent[:6])
+                   + (f" и ещё {len(silent) - 6}" if len(silent) > 6 else ""))
+        # Возраст и состояние РАЗЛИЧАЮТ три причины пустоты, и потому названы все три,
+        # а не одна правдоподобная. Порог — один бар: раньше него исход невозможен по
+        # построению (`outcome.resolve` смотрит только бары ПОСЛЕ `recorded_at`).
+        young = [c for c in silent if c.age_bars_max <= 1]
+        explained = [c for c in silent
+                     if c.age_bars_max > 1 and c.unknown_state == 0]
+        aged = [c for c in silent if c.age_bars_max > 1 and c.unknown_state > 0]
+        if young:
+            out.append(f"     МОЛОДЫЕ (≤1 бара своего ТФ): {len(young)} — исход "
+                       "невозможен по построению, это данные")
+        if explained:
+            out.append(f"     ОБЪЯСНЁННЫЕ состоянием: {len(explained)} — "
+                       + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
+                                   f" (мимо {c.not_filled}, идёт {c.still_open})"
+                                   for c in explained[:6])
+                       + "; система ответила, просто ответ не «стоп/цель»")
+        if aged:
+            out.append(f"     ⚠ БЕЗ ОБЪЯСНЕНИЯ: {len(aged)} — "
+                       + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
+                                   f" ({c.unknown_state} сигн., {c.age_bars_max} бар.)"
+                                   for c in aged[:6])
+                       + "; ноль исходов при прожитых барах и без записанного состояния "
+                         "объяснения не имеет и требует разбора по шагам "
+                         "(backfill-window-2026-08-04)")
+    one_sided = [c for c in s.cells
+                 if c.closed >= 3 and (c.by_target == 0 or c.by_stop == 0)]
+    if one_sided:
+        out.append(f"   ⚠ клеток, где ВСЕ закрытия одного знака (≥3): {len(one_sided)} — "
+                   + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
+                               for c in one_sided[:6]))
+    return out
 
 
 OWNER_QUERIES: dict[str, str] = {

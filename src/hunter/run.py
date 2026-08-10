@@ -863,6 +863,16 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         log.degraded("исход не записан", причина=err.reason)
                     else:
                         report.outcomes_recorded += 1
+                else:
+                    # Состояние незакрытой сделки — в леджер (v4). До 2026-08-10 ответ
+                    # «цена до входа не дошла» вычислялся и выбрасывался, из-за чего
+                    # клетка сводки без исходов была неотличима от дефекта расчёта.
+                    serr = store.record_signal_state(
+                        conn, sig.id, res.kind.value, bars[-1].open_ms)
+                    if isinstance(serr, NotReady):
+                        log.degraded("состояние сигнала не записано", причина=serr.reason)
+                    else:
+                        report.states_recorded += 1
 
             # Сигналы от переприора — второй тип (kind='pp', стр. 50; реестр строка 3,
             # эмиссия добавлена 2026-08-10). В леджер идут только сделки С ЦЕЛЬЮ:
@@ -907,6 +917,14 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         log.degraded("исход ПП-сигнала не записан", причина=err.reason)
                     else:
                         report.outcomes_recorded += 1
+                else:
+                    serr = store.record_signal_state(
+                        conn, row.id, pres.kind.value, pbars[-1].open_ms)
+                    if isinstance(serr, NotReady):
+                        log.degraded("состояние ПП-сигнала не записано",
+                                     причина=serr.reason)
+                    else:
+                        report.states_recorded += 1
     finally:
         conn.close()
 
@@ -927,7 +945,7 @@ LIVE_TRADES_KEEP_DAYS = 3
 CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
-    "outcomes_recorded", "emitted_outcomes",
+    "outcomes_recorded", "states_recorded", "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",

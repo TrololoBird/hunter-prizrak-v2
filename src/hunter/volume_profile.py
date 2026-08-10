@@ -105,6 +105,24 @@ TV_ROWS = 100
 """
 
 
+class RowSize(StrEnum):
+    """Режим настройки Row Size у инструмента TradingView. Их РОВНО два (справка TV,
+    Fixed Range Volume Profile → Inputs → Row Size)."""
+
+    ROWS = "rows"
+    """Number of Rows: задано число строк, высота выводится из диапазона."""
+
+    TICKS = "ticks"
+    """Ticks Per Row: задана ВЫСОТА строки в тиках, число строк выводится из диапазона.
+
+    ⚠ Режим заведён 2026-08-10 по находке покадрового прохода видео автора: на его
+    экране постоянна ЦЕНА СТРОКИ (~1.36 USD ≈ 0.07% цены при видимых ~56 строках), а не
+    их число — это подпись режима Ticks Per Row, а не Number of Rows. Находка НЕ меняет
+    боевой расчёт сама по себе: она даёт вторую гипотезу, цена которой замеряется
+    (probes/probe_tv_row_size_2026-08-10.py), а решение о переключении — владельца.
+    """
+
+
 class TVProfile(BaseModel):
     """Профиль по сетке инструмента TradingView «Фиксированный профиль объема».
 
@@ -142,7 +160,14 @@ class TVProfile(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    rows_requested: int = Field(gt=0)
+    row_size: RowSize
+    """Каким режимом Row Size построена сетка. Без него `ticks_per_row` в отчёте
+    неотличим — задан он или выведен из числа строк."""
+
+    rows_requested: int | None = Field(default=None, gt=0)
+    """Сколько строк ЗАПРОШЕНО. `None` в режиме Ticks Per Row: там число строк не
+    запрашивается, а выводится из диапазона."""
+
     ticks_per_row: int = Field(gt=0)
     rows_built: int = Field(gt=0)
     poc_row: int
@@ -162,14 +187,29 @@ def build_tv(
     hist: TradeHistogram,
     bottom: Decimal,
     top: Decimal,
-    rows: int,
+    rows: int | None = None,
     fraction: float = VALUE_AREA_FRACTION,
+    *,
+    ticks_per_row: int | None = None,
 ) -> TVProfile | NotReady:
     """Профиль по сетке TV: строки поверх тиковой гистограммы, VA по алгоритму TV.
 
     `bottom`/`top` — диапазон инструмента (у TV это экстремумы выделенных баров).
     Объём агрегируется из тиковых бинов `hist`: сделка ложится в строку по своей цене.
+
+    Режим сетки — как у прибора, РОВНО ОДИН из двух (см. `RowSize`): либо `rows`
+    (Number of Rows), либо `ticks_per_row` (Ticks Per Row). Оба сразу или ни одного —
+    ошибка вызывающего, а не рыночный отказ, поэтому `ValueError`, а не `NotReady`.
     """
+    if (rows is None) == (ticks_per_row is None):
+        raise ValueError(
+            "build_tv: задаётся РОВНО ОДИН режим Row Size — либо rows, либо ticks_per_row"
+        )
+    if rows is not None and rows <= 0:
+        raise ValueError(f"build_tv: rows обязан быть > 0, получено {rows}")
+    if ticks_per_row is not None and ticks_per_row <= 0:
+        raise ValueError(
+            f"build_tv: ticks_per_row обязан быть > 0, получено {ticks_per_row}")
     if top <= bottom:
         return NotReady(reason=f"{hist.symbol}: диапазон вырожден — top {top} ≤ bottom {bottom}")
     if not hist.qty_by_bin:
@@ -178,7 +218,12 @@ def build_tv(
     ticks_total = int((top - bottom) / hist.tick_size)
     if ticks_total < 1:
         return NotReady(reason=f"{hist.symbol}: диапазон у́же одного тика")
-    ticks_per_row = max(1, round(ticks_total / rows))
+    if ticks_per_row is None:
+        assert rows is not None
+        mode = RowSize.ROWS
+        ticks_per_row = max(1, round(ticks_total / rows))
+    else:
+        mode = RowSize.TICKS
     rows_built = -(-ticks_total // ticks_per_row)  # ceil: хвост диапазона — тоже строка
 
     row_height = hist.tick_size * ticks_per_row
@@ -235,6 +280,7 @@ def build_tv(
         return bottom + row_height * r + row_height / 2
 
     return TVProfile(
+        row_size=mode,
         rows_requested=rows,
         ticks_per_row=ticks_per_row,
         rows_built=rows_built,

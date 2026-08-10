@@ -199,9 +199,24 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     try:
         conn = store.open_readonly()
         n = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        # Сводка исходов ПО ИЗМЕРЕНИЯМ (2026-08-10): «средний R» по всему леджеру
+        # молчит о том, что весь плюс сделан одним ТФ или одной стороной. Перекос
+        # виден только в разрезе — урок backfill-window-2026-08-04.
+        survey = store.outcome_survey(conn)
         conn.close()
         lines.append(("Леджер читается", True, f"записей о сигналах: {n}"))
         print(f"   записей: {n}")
+        for row in store.format_outcome_survey(survey):
+            print(f"   {row}" if not row.startswith(" ") else row)
+        skewed = [c for c in survey.cells if c.closed == 0 and c.signals > 0]
+        lines.append((
+            "Исходы сведены по ТФ, стороне и типу сигнала",
+            not skewed,
+            (f"клеток без единого исхода: {len(skewed)} из {len(survey.cells)} — "
+             "перекос вдоль измерения, пока не показано обратное")
+            if skewed else
+            f"перекоса нет: во всех {len(survey.cells)} клетках есть закрытые сделки",
+        ))
     except FileNotFoundError:
         lines.append(("Леджер читается", False,
                       "базы нет; создать: uv run python -m hunter ledger --init"))
