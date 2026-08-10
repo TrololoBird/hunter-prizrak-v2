@@ -896,6 +896,16 @@ class OutcomeCell(BaseModel):
     дефект: система про них не сказала ничего. Сюда же попадают сигналы, записанные до
     появления схемы v4, — и это видно по возрасту."""
 
+    no_target: int
+    """Сигналов, которые ДОРЕШАТЬ НЕЧЕМ: цель не сохранена (записаны до схемы v5).
+
+    ⚠ Поле заведено 2026-08-11, и это правка прибора, а не данных. Первый же прогон
+    после v5 показал: все клетки, которые сводка называла «БЕЗ ОБЪЯСНЕНИЯ», состояли
+    ЦЕЛИКОМ из таких сигналов — то есть объяснение было известно, а прибор кричал о
+    дефекте. Ложная тревога обесценивает приёмку ровно так же, как ложное «битых 0»
+    обесценивает гейт: обе учат не верить показаниям.
+    """
+
     age_bars_max: int
     """Сколько баров СВОЕГО ТФ прожил самый старый сигнал клетки к последнему моменту,
     о котором знает леджер.
@@ -950,7 +960,9 @@ def outcome_survey(conn: sqlite3.Connection) -> OutcomeSurvey:
         " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS ambiguous,"
         " SUM(o.r) AS sum_r, AVG(o.r) AS avg_r, MIN(s.recorded_at) AS oldest,"
         " SUM(CASE WHEN st.state='not_filled' THEN 1 ELSE 0 END) AS not_filled,"
-        " SUM(CASE WHEN st.state='open' THEN 1 ELSE 0 END) AS still_open"
+        " SUM(CASE WHEN st.state='open' THEN 1 ELSE 0 END) AS still_open,"
+        " SUM(CASE WHEN o.signal_id IS NULL AND st.signal_id IS NULL"
+        "          AND s.target IS NULL THEN 1 ELSE 0 END) AS no_target"
         " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
         " LEFT JOIN signal_states st ON st.signal_id = s.id"
         " GROUP BY s.kind, s.timeframe, s.direction"
@@ -963,8 +975,12 @@ def outcome_survey(conn: sqlite3.Connection) -> OutcomeSurvey:
             ambiguous=int(r[7]),
             sum_r=None if r[8] is None else float(r[8]),
             avg_r=None if r[9] is None else float(r[9]),
-            not_filled=int(r[11]), still_open=int(r[12]),
-            unknown_state=int(r[3]) - int(r[4]) - int(r[11]) - int(r[12]),
+            not_filled=int(r[11]), still_open=int(r[12]), no_target=int(r[13]),
+            # «Неизвестно» — это остаток ПОСЛЕ вычета всего, чему причина известна:
+            # исхода, состояния и отсутствия цели. Иначе прибор кричал бы о дефекте
+            # там, где ответ есть.
+            unknown_state=(int(r[3]) - int(r[4]) - int(r[11]) - int(r[12])
+                           - int(r[13])),
             age_bars_max=(0 if horizon is None or r[10] is None
                           else max(0, (int(horizon) - int(r[10])) // tf_ms(r[1]))),
         )
@@ -993,15 +1009,16 @@ def format_outcome_survey(s: OutcomeSurvey) -> list[str]:
     out.append(f"   всего сигналов {s.signals_total}, с исходом {s.closed_total}, "
                f"без исхода {s.signals_total - s.closed_total}")
     out.append("   тип   ТФ    сторона  сигн.  закр.  цель  стоп  неодн.  средний R  "
-               "мимо  идёт  ?  возраст")
+               "мимо  идёт  б/ц  ?  возраст")
     for c in s.cells:
         avg = "     —" if c.avg_r is None else f"{c.avg_r:6.3f}"
         out.append(f"   {c.kind:5} {c.timeframe:5} {c.direction:8} {c.signals:5} "
                    f"{c.closed:6} {c.by_target:5} {c.by_stop:5} {c.ambiguous:7} {avg}  "
-                   f"{c.not_filled:4} {c.still_open:5} {c.unknown_state:2} "
-                   f"{c.age_bars_max:8}")
+                   f"{c.not_filled:4} {c.still_open:5} {c.no_target:4} "
+                   f"{c.unknown_state:2} {c.age_bars_max:8}")
     out.append("   «мимо» — цена не дошла до входа (стр. 30); «идёт» — вход был, "
-               "исхода ещё нет; «?» — система не сказала ничего")
+               "исхода ещё нет; «б/ц» — цель не сохранена, дорешать нечем (до v5); "
+               "«?» — система не сказала ничего")
 
     silent = [c for c in s.cells if c.closed == 0]
     if silent:
@@ -1020,11 +1037,16 @@ def format_outcome_survey(s: OutcomeSurvey) -> list[str]:
             out.append(f"     МОЛОДЫЕ (≤1 бара своего ТФ): {len(young)} — исход "
                        "невозможен по построению, это данные")
         if explained:
-            out.append(f"     ОБЪЯСНЁННЫЕ состоянием: {len(explained)} — "
+            legacy = sum(c.no_target for c in explained)
+            out.append(f"     ОБЪЯСНЁННЫЕ: {len(explained)} — "
                        + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
-                                   f" (мимо {c.not_filled}, идёт {c.still_open})"
+                                   f" (мимо {c.not_filled}, идёт {c.still_open},"
+                                   f" б/ц {c.no_target})"
                                    for c in explained[:6])
-                       + "; система ответила, просто ответ не «стоп/цель»")
+                       + "; система ответила, просто ответ не «стоп/цель»"
+                       + (f". Из них {legacy} сигналов без сохранённой цели — их не "
+                          f"дорешать никогда, это цена журнала, накопленного до v5"
+                          if legacy else ""))
         if aged:
             out.append(f"     ⚠ БЕЗ ОБЪЯСНЕНИЯ: {len(aged)} — "
                        + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
