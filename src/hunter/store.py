@@ -42,6 +42,7 @@ LEDGER_PATH = DATA_DIR / "ledger.sqlite3"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
     id          INTEGER PRIMARY KEY,
+    kind        TEXT    NOT NULL DEFAULT 'level' CHECK (kind IN ('level', 'pp')),
     symbol      TEXT    NOT NULL,
     timeframe   TEXT    NOT NULL,
     direction   TEXT    NOT NULL CHECK (direction IN ('long', 'short')),
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS signals (
     CHECK (entry > 0),
     CHECK (stop > 0),
     CHECK (recorded_at > 0),
-    UNIQUE (symbol, timeframe, direction, opened_at)
+    UNIQUE (kind, symbol, timeframe, direction, opened_at)
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -125,8 +126,14 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+2 → 3 (2026-08-10): появился `kind` — тип сигнала: `level` (сделка от уровня ПОК) и
+`pp` (сделка от переприора, стр. 50; реестр долга, строка 3). Уникальный ключ расширен
+типом: сигнал от ПП и сигнал от уровня с совпавшими (символ, ТФ, сторона, бар) — разные
+сигналы, и прежний ключ дедуплицировал бы их друг о друга. Прежние строки все от
+уровней — при перестройке получают `kind = 'level'`, их смысл не меняется.
 
 1 → 2 (2026-08-04): появился `recorded_at`, ключ сигнала расширен ТФ и стороной, исход
 считается только по будущим барам. Строки версии 1 — переигранная история, и сложить их
@@ -403,7 +410,9 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
     if not cols:
         return SCHEMA_VERSION  # базы ещё нет: создастся сразу свежей
-    return SCHEMA_VERSION if "recorded_at" in cols else "1"
+    if "recorded_at" not in cols:
+        return "1"
+    return SCHEMA_VERSION if "kind" in cols else "2"
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -422,6 +431,43 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Достроить `kind` перестройкой таблицы: SQLite не расширяет UNIQUE на месте.
+
+    Строки сохраняются все и получают `kind = 'level'` — до версии 3 других типов не
+    существовало. `id` переносятся как есть: на них смотрит `outcomes.signal_id`, и
+    ровно поэтому внешние ключи на время перестройки выключаются (штатный порядок
+    миграций SQLite: DROP старой таблицы при включённых FK отклоняется, хотя новая
+    встаёт на её место тем же именем и теми же id).
+    """
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript(
+        "BEGIN;"
+        "CREATE TABLE signals_v3 ("
+        " id INTEGER PRIMARY KEY,"
+        " kind TEXT NOT NULL DEFAULT 'level' CHECK (kind IN ('level', 'pp')),"
+        " symbol TEXT NOT NULL,"
+        " timeframe TEXT NOT NULL,"
+        " direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),"
+        " opened_at INTEGER NOT NULL,"
+        " recorded_at INTEGER NOT NULL,"
+        " entry REAL NOT NULL,"
+        " stop REAL NOT NULL,"
+        " frames_ref TEXT NOT NULL,"
+        " CHECK (stop != entry), CHECK (entry > 0), CHECK (stop > 0),"
+        " CHECK (recorded_at > 0),"
+        " UNIQUE (kind, symbol, timeframe, direction, opened_at));"
+        "INSERT INTO signals_v3 (id, kind, symbol, timeframe, direction, opened_at,"
+        " recorded_at, entry, stop, frames_ref)"
+        " SELECT id, 'level', symbol, timeframe, direction, opened_at,"
+        " recorded_at, entry, stop, frames_ref FROM signals;"
+        "DROP TABLE signals;"
+        "ALTER TABLE signals_v3 RENAME TO signals;"
+        "COMMIT;"
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     """Соединение на запись. ЕДИНСТВЕННАЯ точка записи в боевую базу (§10.2).
 
@@ -432,6 +478,8 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     _tune(conn)
     if _schema_version(conn) == "1":
         _migrate_1_to_2(conn)
+    if _schema_version(conn) == "2":
+        _migrate_2_to_3(conn)
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -475,6 +523,7 @@ class SignalRow(BaseModel):
 def record_signal(
     conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
     opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str, recorded_at: int,
+    kind: str = "level",
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -487,18 +536,18 @@ def record_signal(
     том прогоне, где сигнал появился, и считался он тогда по уже известной истории.
     Именно из этой пары и получался бэктест под именем журнала.
     """
-    key = (symbol, timeframe, direction, opened_at)
+    key = (kind, symbol, timeframe, direction, opened_at)
     row = conn.execute(
-        "SELECT id, recorded_at FROM signals WHERE symbol=? AND timeframe=? AND"
-        " direction=? AND opened_at=?", key,
+        "SELECT id, recorded_at FROM signals WHERE kind=? AND symbol=? AND timeframe=?"
+        " AND direction=? AND opened_at=?", key,
     ).fetchone()
     if row is not None:
         return SignalRow(id=int(row[0]), recorded_at=int(row[1]), fresh=False)
     try:
         cur = conn.execute(
-            "INSERT INTO signals (symbol, timeframe, direction, opened_at, recorded_at,"
-            " entry, stop, frames_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (symbol, timeframe, direction, opened_at, recorded_at,
+            "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
+            " recorded_at, entry, stop, frames_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop), frames_ref),
         )
         conn.commit()

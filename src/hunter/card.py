@@ -326,9 +326,13 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if r is None:
             continue
         bars, sw = series[tf], r.swings
-        detected = pereprior.detect(bars, sw, tf)
-        for pp in detected:
+        # ⚠ ПП, подтверждение структурой и сделка от ПП считаются в `engine.decide`
+        # (PPSignal) — здесь только печать. До 2026-08-10 карточка звала
+        # `pereprior.detect` и `build_pp_setup` сама: второй расчёт вне decide, та же
+        # форма, из-за которой в 2026-08-06 удаляли `emit.select`.
+        for sig in (s for s in d.pp_signals if s.timeframe == tf):
             any_pp = True
+            pp, ps = sig.pp, sig.setup
             width = (pp.zone_hi - pp.zone_lo) / pp.zone_lo * 100 if pp.zone_lo else 0.0
             test = ("теста не было" if pp.tested_at_index is None
                     else f"тест через {pp.tested_at_index - pp.confirmed_at_index} баров")
@@ -336,29 +340,11 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"{SIDE_LABEL[pp.side.value]}  слом {_num(pp.broken_price)}  "
                        f"зона тени {_num(pp.zone_lo)}…{_num(pp.zone_hi)} ({width:.3f}%)  "
                        f"{test}")
-            # Подтверждение ПП структурой — стр. 53, второй способ (реестр, строка 5):
-            # закрытое накопление того же ТФ, сформированное ПОСЛЕ слома и опирающееся
-            # на зону ПП (лонг — над зоной, шорт — под). Находка называется; эмиссию
-            # не порождает.
-            for acc in r.scan.closed:
-                if acc.first_index <= pp.confirmed_at_index:
-                    continue
-                fits = (acc.lower.edge >= pp.zone_lo
-                        if pp.side is pereprior.PPSide.LONG
-                        else acc.upper.edge <= pp.zone_hi)
-                if fits:
-                    out.append(f"        подтверждён структурой "
-                               f"{'над' if pp.side is pereprior.PPSide.LONG else 'под'}"
-                               f" ПП (стр. 53): коробка {_num(acc.lower.edge)}…"
-                               f"{_num(acc.upper.edge)}")
-                    break
-            # Сделка от ПП — стр. 50 (реестр, строка 3). Печатается, не эмитируется:
-            # конвенции и причина — в докстроке `geometry.PPSetup`.
-            opposite = next((o for o in detected if o.side is not pp.side), None)
-            ps = geometry.build_pp_setup(pp, opposite)
+            if sig.structure_note:
+                out.append(f"        {sig.structure_note}")
             if ps.target is not None and ps.rr is not None:
-                tgt = f"цель {_num(ps.target)}  РР {ps.rr:.2f}"
-            elif opposite is None:
+                tgt = f"цель {_num(ps.target)}  РР {ps.rr:.2f} — эмитируется в леджер"
+            elif next((o for o in r.perepriors if o.side is not pp.side), None) is None:
                 tgt = "цели нет — противоположного ПП нет (маршрут ПП→ПП, стр. 49)"
             else:
                 tgt = "цели нет — противоположный ПП позади входа, не по направлению"

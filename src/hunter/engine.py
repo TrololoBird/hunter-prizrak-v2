@@ -110,6 +110,29 @@ class Decision(BaseModel):
         return self.setup is not None
 
 
+class PPSignal(BaseModel):
+    """Сделка от переприора — второй тип сигнала (стр. 50; реестр долга, строка 3).
+
+    ⚠ Заведено 2026-08-10. Считается ЗДЕСЬ, а не в карточке: до этого карточка звала
+    `geometry.build_pp_setup` сама — второй расчёт вне `decide`, ровно та форма, из-за
+    которой в 2026-08-06 удаляли `emit.select`. В леджер идут только сигналы с целью
+    (`setup.target`): исход сделки без цели не измерим, и записывать его значило бы
+    завести строку, у которой не может быть исхода.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    pp: Pereprior
+    setup: geometry.PPSetup
+    structure_note: str = ""
+    """Подтверждение структурой (стр. 53): описание коробки либо пусто."""
+
+    @property
+    def emitted(self) -> bool:
+        return self.setup.target is not None
+
+
 class SymbolDecision(BaseModel):
     """Полный расчёт по символу. То, что печатает карточка И что пишет леджер."""
 
@@ -133,6 +156,7 @@ class SymbolDecision(BaseModel):
 
     mapped: tuple[MappedLevel, ...]
     decisions: tuple[Decision, ...]
+    pp_signals: tuple[PPSignal, ...] = ()
 
     @property
     def trends(self) -> dict[str, Trend]:
@@ -245,10 +269,40 @@ def decide(
             mtf_break=_mtf_break(m, series, reads, tfs),
             pressed=_pressed_note(m, reads),
         ))
+    pp_signals: list[PPSignal] = []
+    for tf in tfs:
+        r = reads.get(tf)
+        if r is None:
+            continue
+        for pp in r.perepriors:
+            opposite = next((o for o in r.perepriors if o.side is not pp.side), None)
+            pp_signals.append(PPSignal(
+                timeframe=tf, pp=pp,
+                setup=geometry.build_pp_setup(pp, opposite),
+                structure_note=_pp_structure_note(pp, r.scan),
+            ))
+
     return SymbolDecision(symbol=symbol, timeframes=tfs, reads=reads,
                           unreadable=unreadable, unbuilt=unbuilt,
+                          pp_signals=tuple(pp_signals),
                           mapped=mapped, decisions=tuple(decisions))
 
+
+
+def _pp_structure_note(pp: Pereprior, scan: AccumulationScan) -> str:
+    """Подтверждение ПП структурой — стр. 53 (реестр, строка 5): закрытое накопление
+    того же ТФ, сформированное ПОСЛЕ слома и опирающееся на зону ПП (лонг — над зоной,
+    шорт — под). Пусто — не найдено."""
+    for acc in scan.closed:
+        if acc.first_index <= pp.confirmed_at_index:
+            continue
+        fits = (acc.lower.edge >= pp.zone_lo if pp.side is PPSide.LONG
+                else acc.upper.edge <= pp.zone_hi)
+        if fits:
+            where = "над" if pp.side is PPSide.LONG else "под"
+            return (f"подтверждён структурой {where} ПП (стр. 53): "
+                    f"коробка {acc.lower.edge:.8g}…{acc.upper.edge:.8g}")
+    return ""
 
 
 _PRESSED_RULE = {

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import ccxt
 
@@ -38,6 +39,7 @@ from .models import (
     TradeWindows,
 )
 from .outcome import OutcomeKind
+from .outcome import resolve as outcome_resolve
 from .swings import detect as detect_swings
 
 
@@ -830,6 +832,50 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         log.degraded("исход не записан", причина=err.reason)
                     else:
                         report.outcomes_recorded += 1
+
+            # Сигналы от переприора — второй тип (kind='pp', стр. 50; реестр строка 3,
+            # эмиссия добавлена 2026-08-10). В леджер идут только сделки С ЦЕЛЬЮ:
+            # исход без цели не измерим. opened_at — бар ПОДТВЕРЖДЕНИЯ слома: раньше
+            # него сигнала не существовало, а бар теста может быть далеко позже.
+            for pssig in d.pp_signals:
+                ps = pssig.setup
+                if ps.target is None:
+                    continue
+                pbars = series.get(pssig.timeframe)
+                if not pbars:
+                    continue
+                opened_at = pbars[pssig.pp.confirmed_at_index].open_ms
+                row = store.record_signal(
+                    conn, sym, pssig.timeframe, ps.side, opened_at,
+                    Decimal(str(ps.entry)), Decimal(str(ps.stop)), run_id, stamp_ms,
+                    kind="pp",
+                )
+                if isinstance(row, NotReady):
+                    log.degraded("ПП-сигнал не записан", причина=row.reason)
+                    continue
+                if row.fresh:
+                    report.pp_signals_recorded += 1
+                else:
+                    report.pp_signals_known += 1
+                pres = outcome_resolve(
+                    side=(levels.LevelSide.LONG if ps.side == "long"
+                          else levels.LevelSide.SHORT),
+                    entry=Decimal(str(ps.entry)), stop=Decimal(str(ps.stop)),
+                    target=Decimal(str(ps.target)), bars=pbars,
+                    from_index=emit.first_bar_after(
+                        pbars, pssig.timeframe, row.recorded_at,
+                        pssig.pp.confirmed_at_index + 1),
+                )
+                if pres.kind.value in ("stop", "target", "ambiguous"):
+                    assert pres.closed_at_index is not None
+                    err = store.record_outcome(
+                        conn, row.id, pres.kind.value,
+                        pbars[pres.closed_at_index].open_ms, pres.exit_price, pres.r,
+                    )
+                    if isinstance(err, NotReady):
+                        log.degraded("исход ПП-сигнала не записан", причина=err.reason)
+                    else:
+                        report.outcomes_recorded += 1
     finally:
         conn.close()
 
@@ -849,7 +895,8 @@ LIVE_TRADES_KEEP_DAYS = 3
 
 CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
-    "signals_recorded", "signals_known", "outcomes_recorded", "emitted_outcomes",
+    "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
+    "outcomes_recorded", "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
@@ -1373,6 +1420,8 @@ def print_report(r: RunReport) -> int:
     print("\n7. ЛЕДЖЕР (§8 этап 7)")
     print(f"   сигналов записано ВПЕРВЫЕ: {r.signals_recorded}, "
           f"было известно раньше: {r.signals_known}")
+    print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
+          f"известно раньше: {r.pp_signals_known}")
     print(f"   исходов записано: {r.outcomes_recorded} "
           f"(открытые и несостоявшиеся не пишутся — §4.3)")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
