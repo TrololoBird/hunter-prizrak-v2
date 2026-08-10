@@ -20,6 +20,11 @@
   "env": {
     "PYTHONIOENCODING": "utf-8"
   },
+  "statusLine": {
+    "type": "command",
+    "command": "uv run --no-project python .claude/statusline.py",
+    "padding": 0
+  },
   "disableClaudeAiConnectors": true,
   "extraKnownMarketplaces": {
     "astral-sh": {
