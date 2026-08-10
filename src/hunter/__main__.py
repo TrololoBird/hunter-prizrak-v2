@@ -275,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
     led = sub.add_parser("ledger", help="три проверочных запроса к леджеру (§10.6)")
     led.add_argument("--init", action="store_true", help="создать базу со схемой")
 
+    sub.add_parser("bot", help="ТЕЛЕГРАМ-БОТ доставки: тикер → скриншоты карты + сводка")
+
     rep = sub.add_parser("replay",
                          help="ПОВТОР: пересобрать карточку из кадров и показать разницу")
     rep.add_argument("--run-id", default="last")
@@ -296,6 +298,9 @@ def main(argv: list[str] | None = None) -> int:
         return _ledger(args)
     if args.cmd == "replay":
         return _replay(args)
+    if args.cmd == "bot":
+        from .tgbot import main as bot_main
+        return asyncio.run(bot_main())
     return 2
 
 
