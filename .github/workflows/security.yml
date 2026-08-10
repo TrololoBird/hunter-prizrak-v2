@@ -1,0 +1,86 @@
+name: Security
+
+# Три проверки, которых не делает ci.yml, и все три — про то, что ломается БЕЗ нашего
+# участия. Заведено 2026-08-10.
+#
+# ⚠ ЗАЧЕМ РАСПИСАНИЕ, а не только пуш. Уязвимость в зависимости появляется не тогда,
+# когда мы что-то меняем, а когда её опубликовали. Проект может неделями не трогать
+# `uv.lock` — и всё это время висеть на дырявой версии, не зная. Гейт `pip-audit` в
+# ci.yml ловит это на пуше; здесь он же ходит по будильнику.
+#
+# ⚠ ПОЧЕМУ ЭТО ОТДЕЛЬНЫЙ ФАЙЛ, а не шаги в ci.yml. У ci.yml один смысл: он обязан быть
+# зелёным всегда, и красный ci.yml значит «мы сломали». Здесь краснеет ВНЕШНИЙ МИР, и
+# смешивать эти два сигнала нельзя — иначе «CI красный» перестаёт значить одно и то же.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Понедельник, 06:17 UTC. Минуты НЕ круглые намеренно: в 00:00 планировщик GitHub
+    # перегружен запусками всего мира и задерживает их на десятки минут.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Уязвимости в зависимостях ────────────────────────────────────────────
+  # Dependabot по этому проекту умеет только ПОЛОВИНУ работы: алерты шлёт (граф
+  # читает uv.lock), а исправления не создаёт — `uv` в списке его экосистем
+  # отсутствует. Разбор — в .github/dependabot.yml.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        with:
+          enable-cache: true
+      - name: 'pip-audit по замку'
+        run: |
+          uv export --no-hashes --format requirements-txt > /tmp/requirements-audit.txt
+          uv run --with pip-audit pip-audit -r /tmp/requirements-audit.txt
+
+  # ── 2. Аудит самих рабочих процессов ────────────────────────────────────────
+  # zizmor уже находил в этом репозитории три вещи (excessive-permissions,
+  # artipacked, unpinned-uses), и все три чинились РУКАМИ после того, как я его
+  # запустил вручную. Проверка, которую надо помнить запустить, не запускается.
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      - name: 'zizmor: аудит .github/workflows'
+        # `--persona regular` — правила с внятной причиной; `pedantic` шумит стилем.
+        # Код возврата ненулевой при находках уровня medium и выше.
+        run: uvx zizmor --persona regular .github/workflows/
+
+  # ── 3. CodeQL ───────────────────────────────────────────────────────────────
+  # Бесплатен для публичных репозиториев. Ищет не то же, что гейты: гейты знают
+  # правила ЭТОГО проекта, CodeQL знает типовые дефекты языка.
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c7eb380a2dc368f2d129e4c65e51d172983a1e  # v4
+        with:
+          languages: python
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@24c7eb380a2dc368f2d129e4c65e51d172983a1e  # v4

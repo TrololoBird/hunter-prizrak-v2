@@ -39,6 +39,25 @@ KNOWN_KEYS = Path("config/claude-code-settings-keys.txt")
 HOOKS_DIR = Path(".claude/hooks")
 SKILLS_DIR = Path(".claude/skills")
 COMMANDS_DIR = Path(".claude/commands")
+AGENTS_DIR = Path(".claude/agents")
+
+AGENT_NAME = re.compile(r"^[a-z0-9-]{1,64}$")
+
+KNOWN_TOOLS = frozenset({
+    "Task", "Agent", "Bash", "Glob", "Grep", "Read", "Edit", "MultiEdit", "Write",
+    "NotebookEdit", "WebFetch", "WebSearch", "TodoWrite", "SlashCommand", "Skill",
+    "BashOutput", "KillShell", "ExitPlanMode", "ListMcpResourcesTool",
+    "ReadMcpResourceTool", "ToolSearch", "Artifact", "AskUserQuestion",
+})
+"""Имена инструментов, которые можно назвать в `tools` шапки агента.
+
+⚠ Регистр ЗНАЧИМ: `bash` вместо `Bash` — не инструмент, а опечатка, и агент с ней
+получит пустой набор молча. Проверять по списку, а не по регулярке, потому что
+опечатка вроде `Wrtie` регулярку прошла бы.
+"""
+
+KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku", "fable", "inherit"})
+"""Псевдонимы уровня модели. Полный идентификатор (`claude-*`) тоже допустим."""
 
 # Значения permissions.defaultMode из той же схемы, что и список ключей.
 DEFAULT_MODES = {"acceptEdits", "bypassPermissions", "default", "delegate",
@@ -199,16 +218,61 @@ def check_commands(bad: list[str]) -> int:
     return len(found)
 
 
+def check_agents(bad: list[str]) -> int:
+    """Шапки субагентов. Форма отказа та же, что у навыков: МОЛЧАНИЕ.
+
+    ⚠ Добавлено 2026-08-10 вместе с первыми агентами проекта. Claude Code берёт из
+    шапки `name`, `description`, `tools` и `model`; при опечатке агент не поднимается и
+    узнать об этом можно только по тому, что он «почему-то не вызывается» — ровно тот
+    класс, ради которого гейт и написан.
+
+    `tools` сверяется со списком РЕАЛЬНЫХ имён: строка `Bash, Read` работает, а
+    `bash, read` — нет, имена чувствительны к регистру. `model` — из значений, которые
+    принимает поле: псевдонимы уровней либо полный идентификатор модели.
+    """
+    if not AGENTS_DIR.is_dir():
+        return 0
+    found = sorted(AGENTS_DIR.glob("*.md"))
+    for path in found:
+        head = frontmatter(path.read_text(encoding="utf-8"))
+        if head is None:
+            bad.append(f"{path.as_posix()}: нет закрытой шапки YAML — агент не поднимется")
+            continue
+        name = head.get("name", "")
+        if not AGENT_NAME.match(name):
+            bad.append(f"{path.as_posix()}: имя {name!r} — нужны строчные латинские "
+                       f"буквы, цифры и дефис")
+        if name and name != path.stem:
+            bad.append(f"{path.as_posix()}: имя {name!r} не совпадает с файлом "
+                       f"{path.stem!r}")
+        desc = head.get("description", "")
+        if not desc:
+            bad.append(f"{path.as_posix()}: пустое description — по нему агента и "
+                       f"выбирают для задачи")
+        raw_tools = head.get("tools", "")
+        if raw_tools:
+            for tool in (t.strip() for t in raw_tools.split(",")):
+                if tool and tool not in KNOWN_TOOLS:
+                    bad.append(f"{path.as_posix()}: инструмент {tool!r} не существует — "
+                               f"имена чувствительны к регистру")
+        model = head.get("model", "")
+        if model and model not in KNOWN_MODELS and not model.startswith("claude-"):
+            bad.append(f"{path.as_posix()}: model {model!r} — ожидается один из "
+                       f"{sorted(KNOWN_MODELS)} либо полный идентификатор claude-*")
+    return len(found)
+
+
 def main() -> int:
     bad: list[str] = []
     keys, hooks = check_settings(bad)
     servers = check_mcp(bad)
     skills = check_skills(bad)
     commands = check_commands(bad)
+    agents = check_agents(bad)
 
     print(f"гейт конфигурации Claude Code: ключей настроек {keys}, хуков {hooks}, "
           f"серверов MCP {servers}, навыков {skills}, команд {commands}, "
-          f"нарушений {len(bad)}")
+          f"агентов {agents}, нарушений {len(bad)}")
     for b in bad:
         print(f"  НАРУШЕНИЕ {b}")
     return 1 if bad else 0

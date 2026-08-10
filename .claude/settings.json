@@ -30,7 +30,11 @@
     }
   },
   "enabledPlugins": {
-    "astral@astral-sh": true
+    "astral@astral-sh": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "claude-security@claude-plugins-official": true
   },
   "worktree": {
     "symlinkDirectories": [
