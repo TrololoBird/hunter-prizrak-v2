@@ -10,14 +10,24 @@ name: Claude
 # ему доступен ровно один — ГЕЙТЫ. Живые прогоны и замеры остаются на машине владельца,
 # и это ограничение названо здесь, чтобы ответ «я проверил» не читался шире, чем есть.
 #
-# ⚠ КЛЮЧ. Действию нужен `ANTHROPIC_API_KEY` в секретах репозитория. Пока секрета нет,
-# задание не падает шумно на каждом комментарии — оно СНИМАЕТСЯ условием ниже, и это
-# осознанный выбор: красная работа, висящая постоянно, учит не смотреть на CI (то же
-# правило записано в ci.yml про живой прогон).
+# ⚠ ЧЕМ ДЕЙСТВИЕ АВТОРИЗУЕТСЯ. Способа два, и для владельца этого проекта верен ВТОРОЙ.
 #
-# Поставить ключ (делает владелец, в своём терминале):
-#   gh secret set ANTHROPIC_API_KEY
-# Ключ берётся в Claude Console: https://console.anthropic.com/settings/keys
+#   1. `ANTHROPIC_API_KEY` — ключ из Claude Console. Это ОТДЕЛЬНАЯ оплата по токенам
+#      (pay-as-you-go); подписка Claude Max её НЕ включает, то есть при наличии Max
+#      этот путь означал бы платить дважды.
+#   2. `CLAUDE_CODE_OAUTH_TOKEN` — токен ПОДПИСКИ (Pro, Max, Team, Enterprise).
+#      Порождается локально командой `claude setup-token` и привязан к подписке того,
+#      кто её выполнил.
+#
+# Поставить (делает владелец, в своём терминале — токены и ключи ввожу не я):
+#   claude setup-token          # выдаст токен
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN
+#
+# Оба входа переданы действию ниже: непустой и будет использован. Пока не задан ни
+# один, шаг СНИМАЕТСЯ по `env.HAS_AUTH` — задание не краснеет на каждом комментарии.
+# Постоянно красная работа учит не смотреть на CI (то же правило в ci.yml про живой
+# прогон), а `secrets` в условии САМОГО ЗАДАНИЯ недоступен — отсюда проверка через
+# `env` на шаге, а не `if` на задании.
 
 on:
   issue_comment:
@@ -52,6 +62,10 @@ jobs:
           || contains(github.event.review.body, '@claude'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # `secrets` в `jobs.<id>.if` недоступен, а в `env` задания — доступен. Отсюда
+      # признак, по которому шаг ниже снимается, пока авторизации нет.
+      HAS_AUTH: ${{ (secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -69,11 +83,21 @@ jobs:
       # (находка zizmor `unpinned-uses`): тег подвижен, хеш нет. Версия в комментарии,
       # чтобы Dependabot обновлял хеш вместе с ней.
       - uses: anthropics/claude-code-action@bd4488507006939d8b3b7f098a2231b36e22f8c1  # v1
+        if: env.HAS_AUTH == 'true'
         env:
-          # Все 21 гейт печатают по-русски, а раннер отдаёт вывод в cp1252 —
+          # Все 22 гейта печатают по-русски, а раннер отдаёт вывод в cp1252 —
           # без этого первый же гейт падает UnicodeEncodeError (замер 2026-08-06).
           PYTHONIOENCODING: utf-8
         with:
+          # Токен подписки — основной путь; ключ Console оставлен как запасной.
+          # Пустой вход действие игнорирует, поэтому переданы оба.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "@claude"
           claude_args: --max-turns 30
+
+      - name: 'сказать, чего не хватает'
+        if: env.HAS_AUTH != 'true'
+        run: |
+          echo "Claude не запущен: нет ни CLAUDE_CODE_OAUTH_TOKEN, ни ANTHROPIC_API_KEY."
+          echo "Для подписки Max: claude setup-token, затем gh secret set CLAUDE_CODE_OAUTH_TOKEN"
