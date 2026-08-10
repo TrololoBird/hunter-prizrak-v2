@@ -51,9 +51,9 @@ from hunter import archive  # noqa: E402
 from hunter.accumulation import detect  # noqa: E402
 from hunter.bars import TIMEFRAME_MS  # noqa: E402
 from hunter.swings import detect as detect_swings  # noqa: E402
-from hunter.levels import TV_ROWS, structure_window_ms  # noqa: E402
+from hunter.levels import structure_window_ms  # noqa: E402
 from hunter.models import Bar, NotReady  # noqa: E402
-from hunter.volume_profile import build_tv  # noqa: E402
+from hunter.volume_profile import TV_ROWS, build_tv  # noqa: E402
 
 REACTION_BARS = 10
 PERCENT_THRESHOLDS = (0.0, 5.0, 10.0, 21.27, 100.0)

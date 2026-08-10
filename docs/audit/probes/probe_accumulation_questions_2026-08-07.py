@@ -215,9 +215,15 @@ def detect_variant(
                 timeframe=timeframe,
                 first_index=min(hi_idx + lo_idx),
                 last_index=k,
-                upper=BoundaryZone(lo=upper_lo, hi=upper_hi,
+                # ⚠ `edge` добавлен 2026-08-10 при починке пробника. Поле появилось у
+                # `BoundaryZone` 2026-08-08 («граница базы — ОДНА ЦЕНА»), а этот
+                # пробник писался 07.08 по прежней модели, где границей считалась вся
+                # полоса и наружу отдавался её ДАЛЬНИЙ край. Здесь воспроизведена
+                # ровно прежняя семантика — дальний край, — чтобы числа замера
+                # остались теми же: верх берёт `hi`, низ берёт `lo`.
+                upper=BoundaryZone(edge=upper_hi, lo=upper_lo, hi=upper_hi,
                                    point_indices=tuple(hi_idx), puncture=hi_punct),
-                lower=BoundaryZone(lo=lower_lo, hi=lower_hi,
+                lower=BoundaryZone(edge=lower_lo, lo=lower_lo, hi=lower_hi,
                                    point_indices=tuple(lo_idx), puncture=lo_punct),
                 exit=StructureExit(
                     direction=direction, first_body_index=run_from, confirmed_at_index=k
@@ -235,8 +241,10 @@ def detect_variant(
         tail = OpenStructure(
             first_index=first,
             bars_open=len(bars) - first,
-            upper=BoundaryZone(lo=ulo, hi=uhi, point_indices=tuple(hi_idx), puncture=hi_punct),
-            lower=BoundaryZone(lo=llo, hi=lhi, point_indices=tuple(lo_idx), puncture=lo_punct),
+            upper=BoundaryZone(edge=uhi, lo=ulo, hi=uhi,
+                               point_indices=tuple(hi_idx), puncture=hi_punct),
+            lower=BoundaryZone(edge=llo, lo=llo, hi=lhi,
+                               point_indices=tuple(lo_idx), puncture=lo_punct),
         )
 
     scan = AccumulationScan(

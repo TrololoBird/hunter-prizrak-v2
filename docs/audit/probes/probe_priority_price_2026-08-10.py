@@ -50,12 +50,12 @@ from hunter.accumulation import detect  # noqa: E402
 from hunter.bars import TIMEFRAME_MS  # noqa: E402
 from hunter.breach import BreachKind, Direction, first_breach  # noqa: E402
 from hunter.geometry import TF_ORDER  # noqa: E402
-from hunter.levels import TV_ROWS, LevelSide, created_at_ms, structure_window_ms  # noqa: E402
+from hunter.levels import LevelSide, created_at_ms, structure_window_ms  # noqa: E402
 from hunter.models import Bar, NotReady  # noqa: E402
 from hunter.priority import Agreement, agreement, resolve  # noqa: E402
 from hunter.swings import detect as detect_swings  # noqa: E402
 from hunter.swings import trend as trend_of  # noqa: E402
-from hunter.volume_profile import build_tv  # noqa: E402
+from hunter.volume_profile import TV_ROWS, build_tv  # noqa: E402
 
 SHIFTS = (0.07, -0.07)
 

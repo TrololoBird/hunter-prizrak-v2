@@ -26,13 +26,24 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 GATES = "scripts/check.sh"
 TAIL_LINES = 25
 """Сколько строк провала показать. Весь вывод — сотни строк; нужен хвост с причиной."""
 
 
-def _block(reason: str) -> None:
+def _block(reason: str) -> NoReturn:
+    """Отменить вызов. ⚠ Возвращаемый тип `NoReturn`, а не `None`, и это не украшение.
+
+    Найдено CodeQL 2026-08-10 (`py/uninitialized-local-variable`, уровень error): при
+    `-> None` анализатор считает, что после `_block(...)` в ветке `except` выполнение
+    ПРОДОЛЖИТСЯ, и тогда ниже читается неприсвоенная `event`. Сегодня этого не
+    случается — внутри `sys.exit(2)`, — но контракт функции об этом молчал, и первая же
+    правка, убравшая выход, дала бы `UnboundLocalError` в хуке, который защищает
+    коммиты. `NoReturn` делает обещание проверяемым: и mypy, и CodeQL теперь знают, что
+    возврата нет.
+    """
     print(reason, file=sys.stderr)
     sys.exit(2)
 
