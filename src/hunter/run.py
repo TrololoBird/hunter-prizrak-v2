@@ -368,12 +368,43 @@ async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
     try:
         while not stop.is_set():
             batch = await anext(agen)
+            # Границы разрывов снимаются ДО учёта: `seq.note` двигает курсор, и после
+            # цикла спрашивать «где был разрыв» уже не у чего.
+            gaps: list[tuple[int, int]] = []
+            prev = seq.last
             for t in batch:
+                try:
+                    tid: int | None = int(str(t.id))
+                except (TypeError, ValueError):
+                    tid = None
+                if tid is not None:
+                    if prev is not None and tid > prev + 1:
+                        gaps.append((prev + 1, tid))
+                    prev = tid if prev is None else max(prev, tid)
                 # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
                 # здесь больше не нужно и нельзя — их нет.
                 seq.note(t.id)
                 hist.add(t.price, t.amount, t.timestamp)
                 binned.add(t.price, t.amount, t.timestamp)
+            for lo, hi in gaps:
+                # Догон потерянного КУРСОРОМ по номерам (2026-08-10): раньше разрыв
+                # только считался, и профиль тех минут молча строился без сделок.
+                # `gaps`-счётчики при этом НЕ трогаются — они меряют потерю ПОТОКА,
+                # и добор её не отменяет, а компенсирует другим источником.
+                got = await ex.fetch_agg_trades_from(sym, lo, hi)
+                if isinstance(got, NotReady):
+                    ex.trades_unrecovered += hi - lo
+                    log.degraded("разрыв потока сделок не добран", символ=sym,
+                                 потеряно=hi - lo, причина=got.reason)
+                    continue
+                for t in got:
+                    hist.add(t.price, t.amount, t.timestamp)
+                    binned.add(t.price, t.amount, t.timestamp)
+                left = (hi - lo) - len(got)
+                if left > 0:
+                    ex.trades_unrecovered += left
+                    log.degraded("разрыв потока сделок добран частично", символ=sym,
+                                 добрано=len(got), осталось=left)
     except asyncio.CancelledError:
         raise
     finally:
@@ -1056,11 +1087,14 @@ class Collector:
         rep.weight_peak = self.ex.weight_peak
         rep.weight_reads = self.ex.weight_reads
         rep.rest_rate_limited = self.ex.rest_rate_limited
+        rep.rest_gate_held = self.ex.rest_gate_held
         rep.rest_errors = dict(sorted(self.ex.rest_errors.items()))
         rep.ws_reconnects = sum(self.ex.ws_reconnects.values())
         rep.ws_stream_errors = sum(self.ex.ws_errors.values())
         rep.trade_gaps = sum(s.gaps for s in self.seq.values())
         rep.trade_gap_events = sum(s.gap_events for s in self.seq.values())
+        rep.trade_gaps_recovered = self.ex.trades_recovered
+        rep.trade_gaps_unrecovered = self.ex.trades_unrecovered
         rep.trade_ids_checked = sum(s.checked for s in self.seq.values())
         # ⚠ Принятое считается ВМЕСТЕ с ещё не перенесённым в снимок. Иначе «принято» и
         # «номеров сверено» описывают разные окна: первое — до последнего снимка, второе
@@ -1167,11 +1201,20 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         await asyncio.sleep(seconds)
 
         # Повторный замер часов — оценить, насколько сдвиг уползает (задача 1.3).
+        # ⚠ Обёрнут 2026-08-10 (хвост ревизии транспорта): сетевой сбой ЗДЕСЬ ронял
+        # весь пакетный прогон уже ПОСЛЕ удавшегося сбора — часы с известным возрастом
+        # лучше, чем потерянные данные. Служба (`_resync_clock_impl`) обёрнута давно.
         before = c.report.sync.offset_ms
-        again = await clock.measure(c.ex.fetch_server_ms)
-        c.report.clock_drift_ms = again.offset_ms - before
-        c.report.clock_recheck_after_s = seconds
-        clock.set_sync(again)
+        try:
+            again = await clock.measure(c.ex.fetch_server_ms)
+        except ccxt.BaseError as e:
+            c.report.clock_resync_failures += 1
+            log.degraded("повторный замер часов не удался — оставлены прежние",
+                         возраст_мс=clock.age_ms(), причина=f"{type(e).__name__} {e}")
+        else:
+            c.report.clock_drift_ms = again.offset_ms - before
+            c.report.clock_recheck_after_s = seconds
+            clock.set_sync(again)
 
         report = c.snapshot()
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
@@ -1364,7 +1407,8 @@ def print_report(r: RunReport) -> int:
         print(f"   лимит биржи: {r.weight_limit} веса в минуту (прочитан у неё же)")
         print(f"   пик потребления: {r.weight_peak} — {weight_share:.1f}% лимита "
               f"(замеров {r.weight_reads})")
-    print(f"   ответов «лимит превышен»: {r.rest_rate_limited}")
+    print(f"   ответов «лимит превышен»: {r.rest_rate_limited}"
+          f" (придержано глобальной паузой: {r.rest_gate_held})")
     if r.rest_errors:
         print(f"   отказы REST по классам: "
               f"{', '.join(f'{k} {v}' for k, v in r.rest_errors.items())}")
@@ -1405,6 +1449,9 @@ def print_report(r: RunReport) -> int:
               "ноль разрывов ниже ничего не значит")
     print(f"   ПОТЕРЯНО потоком (разрывы номеров aggTrade): {r.trade_gaps} сделок "
           f"в {r.trade_gap_events} местах; номеров сверено {r.trade_ids_checked}")
+    if r.trade_gaps:
+        print(f"   из них добрано REST-догоном fromId: {r.trade_gaps_recovered}, "
+              f"осталось потерянными: {r.trade_gaps_unrecovered}")
 
     print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
     print(f"   файлов parquet записано: {r.frames_written}")

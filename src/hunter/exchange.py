@@ -126,6 +126,24 @@ WS_RETRY_S = 1.0
 """База паузы перед повторной подпиской. Число ПОДОБРАНО, а не замерено, и здесь названо
 так. Спится не сама база, а база с ДЖИТТЕРОМ — см. `_ws_retry_jitter_s`."""
 
+TRADE_RECOVER_MAX_IDS = 3000
+"""Предел ДОГОНА потерянных сделок за одно событие разрыва (в номерах aggTrade).
+
+Разрыв в номерах — сделки, не дошедшие потоком (обрыв сокета, вытеснение из кэша ccxt).
+До 2026-08-10 разрыв только СЧИТАЛСЯ (`TradeSequence`), но не закрывался: профиль тех
+минут строился без потерянных сделок молча. Курсор `fromId` эндпоинта aggTrades отдаёт
+сделки строго по номерам, то есть закрывает разрыв точно, без нахлёста и щелей —
+предложение ревизии транспорта 2026-08-09, исполнено 2026-08-10.
+
+Предел нужен, потому что догон платный: вес aggTrades ПО ДОКУМЕНТАЦИИ Binance — 20 за
+запрос (⚠ не замерен нами, в отличие от klines; фактическое потребление видно в
+`weight_peak`). 3000 номеров — это до 3 запросов ≈ 60 веса на событие при лимите 2400/мин.
+Разрыв шире предела добирается ЧАСТИЧНО, и остаток называется в логе, а не молчит.
+"""
+
+TRADE_RECOVER_PAGE = 1000
+"""Сделок за один запрос догона. 1000 — максимум aggTrades по документации Binance."""
+
 RATE_LIMIT_BACKOFF_S = 60.0
 """НИЖНЯЯ граница паузы после ответа «лимит превышен». ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — по документации.
 
@@ -218,6 +236,29 @@ class Exchange:
         """Сколько раз биржа ответила превышением лимита. После перехода на REST это
         главный отказ системы, и он обязан быть виден отдельной строкой, а не тонуть
         среди сетевых сбоев: `RateLimitExceeded` наследует `NetworkError`."""
+
+        self._rest_quiet_until_ns = 0
+        """До какого МОНОТОННОГО момента REST молчит после 429/418. 0 — тишины нет.
+
+        ⚠ До 2026-08-10 пауза лимита была ЛОКАЛЬНОЙ: спал только тот вызов, который
+        поймал 429, а параллельные задачи остальных рядов продолжали слать запросы в то
+        же минутное окно веса — ровно то, за что Binance банит по IP (418, до трёх
+        суток). Хвост ревизии транспорта 2026-08-09: пауза обязана быть ОДНА НА КЛИЕНТА.
+        Монотонные часы, а не биржевые: тишина нужна и тогда, когда сведение часов ещё
+        не состоялось или устарело.
+        """
+
+        self.rest_gate_held = 0
+        """Сколько REST-вызовов придержано глобальной паузой. Знаменатель осмысленности
+        `_rest_quiet_until_ns`: ноль при ненулевом `rest_rate_limited` значил бы, что
+        пауза объявлялась, но никого не остановила."""
+
+        self.trades_recovered = 0
+        """Сделок, ДОБРАННЫХ REST-догоном по fromId после разрыва потока."""
+
+        self.trades_unrecovered = 0
+        """Сделок из разрывов, оставшихся НЕ добранными (разрыв шире предела или отказ
+        REST). Пара к `trades_recovered`: без неё «добрано N» молчит о недобранном."""
 
         self.ws_unsubscribes: Counter[str] = Counter()
         """Пробуждения `watch_*` через `UnsubscribeError`. Это ШТАТНОЕ событие ccxt, а не
@@ -318,6 +359,27 @@ class Exchange:
             log.degraded("Retry-After нечитаем — пауза по умолчанию", значение=str(raw))
             return RATE_LIMIT_BACKOFF_S
 
+    def _declare_quiet(self, pause_s: float) -> None:
+        """Объявить глобальную тишину REST на `pause_s` от СЕЙЧАС. Только удлиняет:
+        две паузы подряд не укорачивают друг друга."""
+        until = clock.monotonic_ns() + int(pause_s * 1e9)
+        self._rest_quiet_until_ns = max(self._rest_quiet_until_ns, until)
+
+    async def _quiet_gate(self) -> None:
+        """Подождать объявленную тишину ПЕРЕД REST-запросом.
+
+        Зовётся в начале каждого REST-метода класса. Пока тишина не объявлена (обычный
+        режим), стоит ноль: одна вычитание и сравнение. После 429/418 здесь ждут ВСЕ
+        задачи, а не только поймавшая отказ, — окно веса у биржи одно на IP, и запрос
+        любой задачи внутри окна одинаково приближает бан.
+        """
+        wait_s = (self._rest_quiet_until_ns - clock.monotonic_ns()) / 1e9
+        if wait_s <= 0:
+            return
+        self.rest_gate_held += 1
+        log.degraded("REST придержан глобальной паузой лимита", секунд=round(wait_s, 1))
+        await asyncio.sleep(wait_s)
+
     def _note_weight(self) -> None:
         """Запомнить потребление веса из заголовка последнего ответа.
 
@@ -343,6 +405,7 @@ class Exchange:
         await self._ex.close()
 
     async def fetch_server_ms(self) -> int:
+        await self._quiet_gate()
         got = int(await self._ex.fetch_time())
         self._note_weight()
         return got
@@ -402,12 +465,15 @@ class Exchange:
             m = self._ex.markets.get(s)
             before[s] = ((_price_filter_tick(m) if m else None),
                          bool(m) and m.get("active") is not False)
+        await self._quiet_gate()
         try:
             await self._ex.load_markets(reload=True)
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
-            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            # Тишина объявляется ГЛОБАЛЬНО, а не высыпается здесь: ждать будут все
+            # REST-задачи у ворот, включая эту при следующей попытке.
+            self._declare_quiet(self._rate_limit_pause_s())
             return NotReady(reason=f"перечитать рынки: лимит биржи ({type(e).__name__})")
         except ccxt.BaseError as e:
             self.rest_errors[type(e).__name__] += 1
@@ -518,6 +584,7 @@ class Exchange:
 
         Все три считаются по классам: без счётчика отказ неотличим от пустого ответа.
         """
+        await self._quiet_gate()
         try:
             raw = await self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms,
                                              limit=limit)
@@ -525,10 +592,13 @@ class Exchange:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
             pause = self._rate_limit_pause_s()
-            log.error("ЛИМИТ БИРЖИ ПРЕВЫШЕН — пауза, повтора того же запроса нет",
+            log.error("ЛИМИТ БИРЖИ ПРЕВЫШЕН — глобальная пауза, повтора того же запроса нет",
                       символ=symbol, тф=timeframe, пауза_с=pause,
                       причина=f"{type(e).__name__} {e}")
-            await asyncio.sleep(pause)
+            # Пауза объявляется НА КЛИЕНТА, а не спится локально: до 2026-08-10 спал
+            # только поймавший вызов, а параллельные ряды продолжали слать запросы в то
+            # же минутное окно веса. Следующий REST любого ряда встанет у `_quiet_gate`.
+            self._declare_quiet(pause)
             return NotReady(reason=f"{symbol} {timeframe}: лимит биржи ({type(e).__name__})")
         except ccxt.NetworkError as e:
             self.rest_errors[type(e).__name__] += 1
@@ -560,6 +630,7 @@ class Exchange:
             raise ValueError(f"count_history({symbol} {timeframe}): cap обязан быть > 0")
         total, since = 0, 0
         while True:
+            await self._quiet_gate()
             r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
                                            limit=CCXT_EFFECTIVE_LIMIT)
             self._note_weight()
@@ -621,6 +692,9 @@ class Exchange:
             log.error(f"{what}: ЛИМИТ БИРЖИ — пауза, быстрого повтора нет",
                       символ=key, пауза_с=pause,
                       причина=f"{type(e).__name__} {e}")
+            # Тишина объявляется и REST-воротам: окно веса одно на IP, и запрос
+            # опроса баров в него бьёт так же, как повтор подписки.
+            self._declare_quiet(pause)
             await asyncio.sleep(pause)
             return None
         except ccxt.UnsubscribeError as e:
@@ -672,6 +746,70 @@ class Exchange:
     # `ws_unclosed_violations` вырасти не мог по построению.
 
     # --- сделки ------------------------------------------------------------
+
+    async def fetch_agg_trades_from(
+        self, symbol: str, from_id: int, upto_id: int
+    ) -> list[RawTrade] | NotReady:
+        """Добрать сделки с номерами `[from_id, upto_id)` REST-курсором fromId.
+
+        Закрывает РАЗРЫВ потока: сделки, потерянные вебсокетом (обрыв, вытеснение из
+        кэша ccxt), до 2026-08-10 только считались (`TradeSequence.gaps`) — профиль тех
+        минут строился без них молча. Курсор по номерам, а не по времени: у времени на
+        плотной минуте нет однозначной границы, у номера aggTrade есть — биржа ведёт их
+        строго последовательно по символу.
+
+        Добор ЧАСТИЧЕН по построению: не больше `TRADE_RECOVER_MAX_IDS` номеров за
+        вызов (цена — вес aggTrades, см. константу). Недобранное считает вызывающий:
+        этот метод отдаёт только то, что реально пришло в границах.
+        """
+        want = upto_id - from_id
+        if want <= 0:
+            return []
+        capped = min(want, TRADE_RECOVER_MAX_IDS)
+        out: list[RawTrade] = []
+        cursor = from_id
+        while cursor < from_id + capped:
+            await self._quiet_gate()
+            page = min(TRADE_RECOVER_PAGE, from_id + capped - cursor)
+            try:
+                raw = await self._ex.fetch_trades(symbol, limit=page,
+                                                  params={"fromId": cursor})
+            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+                self.rest_errors[type(e).__name__] += 1
+                self.rest_rate_limited += 1
+                self._declare_quiet(self._rate_limit_pause_s())
+                return out or NotReady(
+                    reason=f"{symbol}: догон сделок — лимит биржи ({type(e).__name__})")
+            except ccxt.NetworkError as e:
+                self.rest_errors[type(e).__name__] += 1
+                return out or NotReady(
+                    reason=f"{symbol}: догон сделок — сеть ({type(e).__name__})")
+            except ccxt.ExchangeError as e:
+                self.rest_errors[type(e).__name__] += 1
+                return out or NotReady(
+                    reason=f"{symbol}: догон сделок — отказ биржи ({type(e).__name__})")
+            self._note_weight()
+            if not raw:
+                break
+            top = cursor
+            for r in raw:
+                t = parse_trade(r)
+                if isinstance(t, NotReady):
+                    self.trades_unparsed += 1
+                    continue
+                if t.id is None:
+                    self.trades_unparsed += 1
+                    continue
+                tid = int(t.id)
+                top = max(top, tid)
+                # Строго в границах разрыва: хвост страницы за upto_id уже пришёл потоком.
+                if from_id <= tid < upto_id:
+                    out.append(t)
+            if top >= upto_id - 1 or top < cursor:
+                break  # разрыв покрыт — или страница не продвинула курсор
+            cursor = top + 1
+        self.trades_recovered += len(out)
+        return out
 
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[RawTrade]]:
         """Поток сделок УЖЕ РАЗОБРАННЫМ в тип. §10.1: словарей между слоями нет.

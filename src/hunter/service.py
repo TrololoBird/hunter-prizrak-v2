@@ -204,5 +204,8 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
           f"(тактов {c.report.heartbeats})")
     print(f"   сделок принято: {c.report.trades_total}, потеряно потоком: "
           f"{c.report.trade_gaps} (номеров сверено {c.report.trade_ids_checked})")
+    if c.report.trade_gaps:
+        print(f"   из потерянного добрано REST-догоном: {c.report.trade_gaps_recovered}, "
+              f"осталось: {c.report.trade_gaps_unrecovered}")
     print("=" * 78)
     return bad_cycles
