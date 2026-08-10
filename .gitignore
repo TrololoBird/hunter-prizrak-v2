@@ -16,3 +16,4 @@ docs/course/pages/
 # Общие настройки, хуки и команды проекта (.claude/settings.json, hooks/, commands/)
 # наоборот КОММИТЯТСЯ: они часть того, как проект проверяется.
 .claude/settings.local.json
+.scratch/
