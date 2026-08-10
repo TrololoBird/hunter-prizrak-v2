@@ -194,6 +194,27 @@ jobs:
       - name: 'гейт: каждый гейт вызывается в CI'
         run: uv run python gates/ci_covers_gates.py
 
+      # ⚠ Добавлено 2026-08-10, и это НЕ дубль Dependabot. Замер того же дня: GitHub
+      # строит граф зависимостей из `uv.lock` (SBOM отдаёт наши 67 пакетов) и алерты по
+      # нему шлёт — но ЧИНИТЬ не умеет: `uv` в списке экосистем Dependabot отсутствует
+      # (docs.github.com, «Supported ecosystems and repositories»), значит запрос на
+      # слияние с исправлением он не создаст НИКОГДА. Настройка
+      # `dependabot_security_updates: enabled` при этом стоит «включено» — то есть
+      # включена проверка, которая ничего не делает. Ровно та форма дефекта, которую
+      # проект ловит везде: зелёное, потому что не смотрели.
+      #
+      # `pip-audit` — от PyPA, сверяет с базой PyPI Advisory / OSV. Контроль
+      # фальсифицируемости проведён: на замке до правки того же дня
+      # (`aiohttp==3.14.1`, `cryptography==49.0.0`) он печатает 4 уязвимости и код 1,
+      # на исправленном — «No known vulnerabilities found» и код 0.
+      #
+      # Только ubuntu: база уязвимостей одна на обе ОС, а сеть в шаге — плата за запрос.
+      - name: 'гейт: в зависимостях нет известных уязвимостей'
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          uv export --no-hashes --format requirements-txt > /tmp/requirements-audit.txt
+          uv run --with pip-audit pip-audit -r /tmp/requirements-audit.txt
+
       - name: 'гейт: вселенная читается (§5)'
         run: |
           uv run python -c "from hunter.config import load_universe as l; u=l(); print('вселенная: символов', len(u.symbols), 'ТФ', len(u.timeframes))"
