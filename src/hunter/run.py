@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -783,6 +784,68 @@ def persist_archive(run_id: str, report: RunReport,
             report.archive_slices_written += 1
 
 
+def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
+                     uni: Universe) -> None:
+    """Дорешать сигналы леджера, у которых исхода ещё нет. Схема v5, 2026-08-10.
+
+    ⚠ ЗАЧЕМ ЭТО ЕСТЬ. До 2026-08-10 исход считался ТОЛЬКО у сигналов, эмитируемых в
+    этом же прогоне (`decided[sym].emissions`). Сигнал, чей уровень ушёл из карты —
+    отработан (стр. 25), пробит (стр. 43) или просто не отобран, — не досчитывался
+    НИКОГДА. Замер на боевом леджере: 76 сигналов из 112 навсегда без ответа, то есть
+    «средний R» считался по трети журнала, смещённой в сторону уровней, которые система
+    продолжает отбирать. Это форма дефекта «смещение отбора в леджер» из реестра
+    CLAUDE.md, обнаруженная сводкой исходов.
+
+    Здесь исход считается ПО БАРАМ и никак не зависит от того, живёт ли ещё уровень.
+    Правило §8 этапа 7 сохранено полностью: бары берутся только те, что закрылись ПОЗЖЕ
+    `recorded_at`, — журнал, а не бэктест.
+
+    Отказы называются числами, а не молчанием: сигнал без цели (записан до v5), символ
+    без рядов в этом прогоне и ТФ без баров считаются раздельно.
+    """
+    no_target = no_bars = 0
+    for sym in uni.symbols:
+        series = bars_of(report, sym)
+        if not series:
+            continue
+        for p in store.pending_signals(conn, sym):
+            bars = series.get(p.timeframe)
+            if not bars:
+                no_bars += 1
+                continue
+            if p.target is None:
+                no_target += 1
+                continue
+            side = (levels.LevelSide.LONG if p.direction == "long"
+                    else levels.LevelSide.SHORT)
+            res = outcome_resolve(
+                side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
+                from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
+            )
+            if res.kind.value in ("stop", "target", "ambiguous"):
+                assert res.closed_at_index is not None
+                err = store.record_outcome(
+                    conn, p.id, res.kind.value, bars[res.closed_at_index].open_ms,
+                    res.exit_price, res.r)
+                if isinstance(err, NotReady):
+                    log.degraded("дорешанный исход не записан", причина=err.reason)
+                else:
+                    report.outcomes_recorded += 1
+                    report.outcomes_resolved_late += 1
+            else:
+                serr = store.record_signal_state(
+                    conn, p.id, res.kind.value, bars[-1].open_ms)
+                if isinstance(serr, NotReady):
+                    log.degraded("состояние не записано", причина=serr.reason)
+                else:
+                    report.states_recorded += 1
+    report.pending_no_target = no_target
+    report.pending_no_bars = no_bars
+    if no_target or no_bars:
+        log.degraded("часть сигналов дорешать нельзя", без_цели=no_target,
+                     без_баров=no_bars)
+
+
 def record(run_id: str, report: RunReport, uni: Universe,
            decided: dict[str, engine.SymbolDecision]) -> None:
     """ШАГ 4 из четырёх: записать эмиссии и их исходы в боевой леджер (§8 этап 7).
@@ -804,6 +867,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
     conn = store.open_production_ledger()
     stamp_ms = clock.now_ms()
     try:
+        _resolve_pending(conn, report, uni)
         for sym in uni.symbols:
             d = decided.get(sym)
             if d is None:
@@ -831,9 +895,15 @@ def record(run_id: str, report: RunReport, uni: Universe,
             for em in d.emissions:
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
+                targets = [t for t in em.setup.targets
+                           if t.role is geometry.TargetRole.PRIMARY]
                 sig = store.record_signal(
                     conn, sym, em.level.timeframe, em.direction, opened_at,
                     em.setup.entry, em.ledger_stop, run_id, stamp_ms,
+                    # Цель — та же ПЕРВАЯ основная, по которой считается РР (стр. 9).
+                    # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
+                    # ни в одном прогоне, кроме выдавшего сигнал.
+                    target=targets[0].price if targets else None,
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)
@@ -890,6 +960,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     conn, sym, pssig.timeframe, ps.side, opened_at,
                     Decimal(str(ps.entry)), Decimal(str(ps.stop)), run_id, stamp_ms,
                     kind="pp",
+                    target=None if ps.target is None else Decimal(str(ps.target)),
                 )
                 if isinstance(row, NotReady):
                     log.degraded("ПП-сигнал не записан", причина=row.reason)
@@ -945,7 +1016,8 @@ LIVE_TRADES_KEEP_DAYS = 3
 CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
-    "outcomes_recorded", "states_recorded", "emitted_outcomes",
+    "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
+    "pending_no_target", "pending_no_bars", "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
@@ -1487,8 +1559,13 @@ def print_report(r: RunReport) -> int:
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
           f"известно раньше: {r.pp_signals_known}")
-    print(f"   исходов записано: {r.outcomes_recorded} "
-          f"(открытые и несостоявшиеся не пишутся — §4.3)")
+    print(f"   исходов записано: {r.outcomes_recorded}, из них ДОРЕШАНО у сигналов, "
+          f"которые прогон заново не эмитировал: {r.outcomes_resolved_late}")
+    print(f"   состояний незакрытых сделок записано: {r.states_recorded} "
+          f"(мимо входа / сделка идёт — §4.3, схема v4)")
+    if r.pending_no_target or r.pending_no_bars:
+        print(f"   дорешать НЕЛЬЗЯ: без сохранённой цели {r.pending_no_target} "
+              f"(записаны до схемы v5), без ряда ТФ в этом прогоне {r.pending_no_bars}")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS signals (
     recorded_at INTEGER NOT NULL,
     entry       REAL    NOT NULL,
     stop        REAL    NOT NULL,
+    target      REAL,
     frames_ref  TEXT    NOT NULL,
     CHECK (stop != entry),
     CHECK (entry > 0),
@@ -138,8 +139,20 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+4 → 5 (2026-08-10): у сигнала появилась ЦЕЛЬ (`target`). Без неё исход сделки нельзя
+досчитать ни в каком прогоне, кроме того, который её выдал, — и отсюда шло СМЕЩЕНИЕ
+ОТБОРА, найденное сводкой исходов в тот же день. Исход считался только для сигналов,
+эмитируемых ЗАНОВО (`decided[sym].emissions`); сигнал, чей уровень ушёл из карты
+(отработан по стр. 25, пробит по стр. 43 или просто не отобран), не досчитывался
+НИКОГДА. Замер на боевом леджере: 76 сигналов из 112 — то есть две трети журнала —
+навсегда оставались без ответа, а «средний R» считался по оставшейся трети, смещённой
+в сторону уровней, которые система продолжает отбирать.
+
+Старые строки получают `target = NULL`: цель у них не сохранялась и восстановлению не
+подлежит. Дорешать их нельзя, и сводка обязана называть их отдельно, а не молчать.
 
 3 → 4 (2026-08-10): заведена `signal_states` — состояние сигнала, ЕЩЁ НЕ ставшего
 исходом. До неё `emit.outcome_of` каждый прогон различал `not_filled` (цена не дошла до
@@ -440,7 +453,9 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     has_states = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='signal_states'"
     ).fetchone()
-    return SCHEMA_VERSION if has_states else "3"
+    if not has_states:
+        return "3"
+    return SCHEMA_VERSION if "target" in cols else "4"
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -511,6 +526,11 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     # 3 → 4 отдельной функции не требует: переход добавляет ПУСТУЮ таблицу, а
     # `CREATE TABLE IF NOT EXISTS` ниже её и создаёт. Перестройка (как в 2 → 3) нужна
     # только там, где меняется смысл существующих строк — здесь не меняется ни одной.
+    if _schema_version(conn) == "4":
+        # 4 → 5: колонка добавляется НА МЕСТЕ. Перестройка не нужна — `UNIQUE` не
+        # трогается, а `ALTER TABLE ADD COLUMN` в SQLite дёшев и не переписывает строк.
+        conn.execute("ALTER TABLE signals ADD COLUMN target REAL")
+        conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -554,7 +574,7 @@ class SignalRow(BaseModel):
 def record_signal(
     conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
     opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str, recorded_at: int,
-    kind: str = "level",
+    kind: str = "level", target: Decimal | None = None,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -577,9 +597,11 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, frames_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, frames_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
-             float(entry), float(stop), frames_ref),
+             float(entry), float(stop),
+             None if target is None else float(target), frames_ref),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -605,6 +627,57 @@ def record_outcome(
     except sqlite3.IntegrityError as e:
         return NotReady(reason=f"исход {signal_id}: строка отклонена схемой — {e}")
     return None
+
+
+class PendingSignal(BaseModel):
+    """Сигнал БЕЗ исхода, который надо дорешать по барам. Схема v5, 2026-08-10.
+
+    Заведён вместе с проходом дорешивания: до него исход считался только у сигналов,
+    эмитируемых заново, и две трети журнала не получали ответа никогда (см.
+    `SCHEMA_VERSION`, переход 4 → 5).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: int
+    symbol: str
+    timeframe: str
+    direction: str
+    entry: Decimal
+    stop: Decimal
+    target: Decimal | None
+    """`None` — сигнал записан до схемы v5: цель не сохранялась. Такой не дорешать, и
+    считать его «без объяснения» нельзя — причина известна и названа."""
+
+    recorded_at: int
+
+
+def pending_signals(
+    conn: sqlite3.Connection, symbol: str | None = None
+) -> tuple[PendingSignal, ...]:
+    """Сигналы без исхода — все либо по одному символу. Только чтение.
+
+    Состояние (`not_filled`/`open`) наличие здесь НЕ отменяет: оно временное и на
+    следующих барах может смениться исходом. Отменяет только сам исход.
+    """
+    sql = ("SELECT s.id, s.symbol, s.timeframe, s.direction, s.entry, s.stop,"
+           " s.target, s.recorded_at FROM signals s"
+           " LEFT JOIN outcomes o ON o.signal_id = s.id"
+           " WHERE o.signal_id IS NULL")
+    args: tuple[str, ...] = ()
+    if symbol is not None:
+        sql += " AND s.symbol = ?"
+        args = (symbol,)
+    rows = conn.execute(sql + " ORDER BY s.id", args).fetchall()
+    return tuple(
+        PendingSignal(
+            id=int(r[0]), symbol=r[1], timeframe=r[2], direction=r[3],
+            entry=Decimal(str(r[4])), stop=Decimal(str(r[5])),
+            target=None if r[6] is None else Decimal(str(r[6])),
+            recorded_at=int(r[7]),
+        )
+        for r in rows
+    )
 
 
 def record_signal_state(
@@ -975,6 +1048,13 @@ OWNER_QUERIES: dict[str, str] = {
         "SELECT (SELECT COUNT(*) FROM signals) AS всего_советов, "
         "COUNT(*) AS из_них_закрыто, "
         "(SELECT COUNT(*) FROM signals) - COUNT(*) AS ещё_без_исхода, "
+        # ⚠ Подвыборка называется ЗДЕСЬ, а не в чьей-то голове: 2026-08-10 выяснилось,
+        # что «средний R» считался по трети журнала — исход досчитывался лишь у
+        # сигналов, чей уровень система ещё отбирает. Три столбца ниже показывают, из
+        # чего состоит остаток, чтобы «ещё_без_исхода» не читалось как «скоро закроются».
+        "(SELECT COUNT(*) FROM signal_states WHERE state='not_filled') AS мимо_входа, "
+        "(SELECT COUNT(*) FROM signal_states WHERE state='open') AS сделка_идёт, "
+        "(SELECT COUNT(*) FROM signals WHERE target IS NULL) AS без_цели_не_дорешать, "
         "SUM(CASE WHEN kind='target' THEN 1 ELSE 0 END) AS по_цели, "
         "SUM(CASE WHEN kind='stop' THEN 1 ELSE 0 END) AS по_стопу, "
         "SUM(CASE WHEN kind='ambiguous' THEN 1 ELSE 0 END) AS неоднозначно, "
