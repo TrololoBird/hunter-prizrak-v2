@@ -466,9 +466,95 @@ class Exchange:
     async def close(self) -> None:
         await self._ex.close()
 
-    async def fetch_server_ms(self) -> int:
+    async def _rest(
+        self, what: str, key: str, call: Callable[[], Any]
+    ) -> Any | NotReady:
+        """ЕДИНСТВЕННОЕ место, где исключение ccxt превращается в названный отказ.
+
+        ⚠ ПОЯВИЛОСЬ 2026-08-11 ПО ОБРАТНОЙ СВЕРКЕ, и повод — не стиль, а дефект.
+        Прежде каждый REST-вызов писал свою цепочку `except`, и они разошлись:
+
+            метод                        ловил
+            fetch_agg_trades_window      RateLimit, DDoS, NetworkError, ExchangeError,
+                                         OperationFailed
+            _fetch_ohlcv_guarded         RateLimit, DDoS, NetworkError, ExchangeError
+            fetch_agg_trades_from        RateLimit, DDoS, NetworkError, ExchangeError
+            count_history                НИЧЕГО
+
+        Третья ветвь стояла ровно в том методе, где её нашёл зонд, — то есть починено
+        было МЕСТО ПАДЕНИЯ, а не КЛАСС дефекта. Дерево ccxt 4.5.71 (замер по `__mro__`):
+        под `BaseError` три ветви — `ExchangeError`, `OperationFailed`, `UnsubscribeError`,
+        и `NetworkError` лежит под `OperationFailed`, а не рядом. Значит пара
+        `except NetworkError` + `except ExchangeError` пропускает `OperationFailed`,
+        `BadResponse`, `NullResponse`, `CancelPending`, `UnsubscribeError`.
+
+        Достижимость проверена по карте ошибок САМОЙ ccxt для binanceusdm
+        (`describe()['exceptions']`): в непойманную ветвь отображено 57 кодов Binance,
+        из них на публичных эндпоинтах достижимы как минимум `-1000` (UNKNOWN),
+        `-1001` (DISCONNECTED), `-1006` (UNEXPECTED_RESP), `-1010` (ERROR_MSG_RECEIVED) и
+        `linear/-1008` («Server is currently overloaded»). Код `-1000` уже наблюдался
+        живым зондом 2026-08-11 — он и уронил тогда добор окна.
+
+        Замыкающая ветвь ловит `BaseError`, а НЕ `OperationFailed` поимённо: поимённая
+        оставила бы мимо `UnsubscribeError` и любой класс, который ccxt заведёт впредь.
+
+        ⚠ Замыкающая ветвь тишину НЕ объявляет, и это выбор, а не недосмотр. Пауза на
+        минуту оправдана превышением лимита, где она названа документацией; распространять
+        её на всякий неизвестный отказ значило бы замораживать весь REST на минуту из-за,
+        например, ошибки разбора ответа. Цена обратного выбора для `-1008` не замерена и
+        замерена быть не может без намеренной перегрузки биржи — это названо в отчёте
+        обратной сверки, а не решено молча.
+        """
         await self._quiet_gate()
-        got = int(await self._ex.fetch_time())
+        try:
+            got = await call()
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            self.rest_errors[type(e).__name__] += 1
+            self.rest_rate_limited += 1
+            pause = self._rate_limit_pause_s()
+            log.error(f"{what}: ЛИМИТ БИРЖИ ПРЕВЫШЕН — глобальная пауза, повтора нет",
+                      ключ=key, пауза_с=pause, причина=f"{type(e).__name__} {e}")
+            # Пауза объявляется НА КЛИЕНТА: окно веса у биржи одно на IP, и запрос
+            # любой другой задачи внутри окна одинаково приближает бан по 418.
+            self._declare_quiet(pause)
+            return NotReady(reason=f"{key}: {what} — лимит биржи ({type(e).__name__})")
+        except ccxt.NetworkError as e:
+            self.rest_errors[type(e).__name__] += 1
+            log.degraded(f"{what}: сетевой сбой", ключ=key,
+                         причина=f"{type(e).__name__} {e}")
+            return NotReady(reason=f"{key}: {what} — сеть ({type(e).__name__})")
+        except ccxt.ExchangeError as e:
+            self.rest_errors[type(e).__name__] += 1
+            log.error(f"{what}: биржа отвергла запрос", ключ=key,
+                      причина=f"{type(e).__name__} {e}")
+            return NotReady(reason=f"{key}: {what} — отказ биржи ({type(e).__name__})")
+        except ccxt.BaseError as e:
+            self.rest_errors[type(e).__name__] += 1
+            log.error(f"{what}: прочий отказ ccxt (третья ветвь дерева исключений)",
+                      ключ=key, причина=f"{type(e).__name__} {e}")
+            return NotReady(reason=f"{key}: {what} — отказ ({type(e).__name__})")
+        self._note_weight()
+        return got
+
+    async def fetch_server_ms(self) -> int:
+        """Время биржи. БРОСАЕТ, а не отдаёт `NotReady`: оба вызывающих ловят `BaseError`
+        сами и оставляют прежнее сведение часов (`run._resync_clock_impl`, `observe`).
+
+        ⚠ Ветвь лимита здесь всё же нужна, и это находка обратной сверки: без неё
+        единственный REST-вызов проекта, не объявляющий глобальную тишину, — как раз тот,
+        что ходит на биржу по таймеру круглые сутки. `429` на нём считался бы обычным
+        отказом пересведения, и остальные задачи продолжали бы слать запросы в то же
+        минутное окно веса. Исключение после объявления тишины пробрасывается дальше —
+        вызывающий по-прежнему сам решает, что делать с часами.
+        """
+        await self._quiet_gate()
+        try:
+            got = int(await self._ex.fetch_time())
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            self.rest_errors[type(e).__name__] += 1
+            self.rest_rate_limited += 1
+            self._declare_quiet(self._rate_limit_pause_s())
+            raise
         self._note_weight()
         return got
 
@@ -645,40 +731,24 @@ class Exchange:
           (OctoBot: «there is a real issue … Don't loop»).
 
         Все три считаются по классам: без счётчика отказ неотличим от пустого ответа.
+
+        ⚠ Разбор ветвей переехал в `_rest` 2026-08-11: цепочка здесь пропускала ТРЕТЬЮ
+        ветвь дерева ccxt (`OperationFailed` и потомки). Разбор — в докстроке `_rest`.
         """
-        await self._quiet_gate()
-        try:
-            raw = await self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms,
-                                             limit=limit)
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-            self.rest_errors[type(e).__name__] += 1
-            self.rest_rate_limited += 1
-            pause = self._rate_limit_pause_s()
-            log.error("ЛИМИТ БИРЖИ ПРЕВЫШЕН — глобальная пауза, повтора того же запроса нет",
-                      символ=symbol, тф=timeframe, пауза_с=pause,
-                      причина=f"{type(e).__name__} {e}")
-            # Пауза объявляется НА КЛИЕНТА, а не спится локально: до 2026-08-10 спал
-            # только поймавший вызов, а параллельные ряды продолжали слать запросы в то
-            # же минутное окно веса. Следующий REST любого ряда встанет у `_quiet_gate`.
-            self._declare_quiet(pause)
-            return NotReady(reason=f"{symbol} {timeframe}: лимит биржи ({type(e).__name__})")
-        except ccxt.NetworkError as e:
-            self.rest_errors[type(e).__name__] += 1
-            log.degraded("сетевой сбой на опросе баров", символ=symbol, тф=timeframe,
-                         причина=f"{type(e).__name__} {e}")
-            return NotReady(reason=f"{symbol} {timeframe}: сеть ({type(e).__name__})")
-        except ccxt.ExchangeError as e:
-            self.rest_errors[type(e).__name__] += 1
-            log.error("биржа отвергла запрос свечей", символ=symbol, тф=timeframe,
-                      причина=f"{type(e).__name__} {e}")
-            return NotReady(reason=f"{symbol} {timeframe}: отказ биржи ({type(e).__name__})")
-        self._note_weight()
+        raw = await self._rest(
+            "опрос свечей", f"{symbol} {timeframe}",
+            lambda: self._ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit),
+        )
+        if isinstance(raw, NotReady):
+            return raw
         # ccxt не типизирован: `fetch_ohlcv` объявлен как Any. Приведение здесь, а не
         # у вызывающего, — граница типизированной части проекта проходит по этому классу.
         return list(raw)
 
-    async def count_history(self, symbol: str, timeframe: str, *, cap: int) -> int:
-        """Сколько баров биржа отдаёт по символу и ТФ.
+    async def count_history(
+        self, symbol: str, timeframe: str, *, cap: int
+    ) -> int | NotReady:
+        """Сколько баров биржа отдаёт по символу и ТФ. `NotReady` — счёт не состоялся.
 
         `cap` — считать до отсечки и остановиться: для допуска важно «хватает ли», а не
         точное число. Возвращённое значение при достижении отсечки означает «не меньше cap».
@@ -687,15 +757,25 @@ class Exchange:
         «без предела» по умолчанию: пагинация шла до исчерпания истории — по 5м это 15
         страниц на символ, на 27 символах × 6 ТФ сотни запросов подряд. Оба нынешних
         вызывающих отсечку передают, так что мина была скрытой; умолчание её и прятало.
+
+        ⚠ ТИП ВОЗВРАТА РАСШИРЕН 2026-08-11 обратной сверкой, и это не косметика. Метод
+        ходил в ccxt БЕЗ единого `except`: сетевой сбой на второй странице ронял весь
+        обзор допуска стеком. Одно лишь обёртывание в `_rest` сделало бы хуже — частичный
+        счёт вернулся бы ЧИСЛОМ, неотличимым от честного, и символ молча не прошёл бы
+        допуск (§4.3, молчаливая деградация). Поэтому «не знаю» стало отдельным
+        значением, а не маленьким числом: печатать его обязан вызывающий.
         """
         if cap <= 0:
             raise ValueError(f"count_history({symbol} {timeframe}): cap обязан быть > 0")
         total, since = 0, 0
         while True:
-            await self._quiet_gate()
-            r = await self._ex.fetch_ohlcv(symbol, timeframe, since=since,
-                                           limit=CCXT_EFFECTIVE_LIMIT)
-            self._note_weight()
+            r = await self._rest(
+                "счёт истории", f"{symbol} {timeframe}",
+                lambda s=since: self._ex.fetch_ohlcv(  # type: ignore[misc]
+                    symbol, timeframe, since=s, limit=CCXT_EFFECTIVE_LIMIT),
+            )
+            if isinstance(r, NotReady):
+                return r
             if not r:
                 break
             total += len(r)
@@ -831,26 +911,16 @@ class Exchange:
         out: list[RawTrade] = []
         cursor = from_id
         while cursor < from_id + capped:
-            await self._quiet_gate()
             page = min(TRADE_RECOVER_PAGE, from_id + capped - cursor)
-            try:
-                raw = await self._ex.fetch_trades(symbol, limit=page,
-                                                  params={"fromId": cursor})
-            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-                self.rest_errors[type(e).__name__] += 1
-                self.rest_rate_limited += 1
-                self._declare_quiet(self._rate_limit_pause_s())
-                return out or NotReady(
-                    reason=f"{symbol}: догон сделок — лимит биржи ({type(e).__name__})")
-            except ccxt.NetworkError as e:
-                self.rest_errors[type(e).__name__] += 1
-                return out or NotReady(
-                    reason=f"{symbol}: догон сделок — сеть ({type(e).__name__})")
-            except ccxt.ExchangeError as e:
-                self.rest_errors[type(e).__name__] += 1
-                return out or NotReady(
-                    reason=f"{symbol}: догон сделок — отказ биржи ({type(e).__name__})")
-            self._note_weight()
+            raw = await self._rest(
+                "догон сделок", symbol,
+                lambda p=page, c=cursor: self._ex.fetch_trades(  # type: ignore[misc]
+                    symbol, limit=p, params={"fromId": c}),
+            )
+            if isinstance(raw, NotReady):
+                # Уже добранное отдаётся, а не выбрасывается: недобранный остаток считает
+                # вызывающий (`trades_unrecovered`), так что частичность не молчит.
+                return out or raw
             if not raw:
                 break
             top = cursor
@@ -932,40 +1002,18 @@ class Exchange:
         """Номера aggTrade сделок, лежащих РОВНО на миллисекунде курсора: следующая
         страница просится с неё же и приносит их повторно — повтор отсеивается здесь."""
         for _ in range(BACKFILL_DAY_MAX_PAGES):
-            await self._quiet_gate()
-            try:
-                raw = await self._ex.fetch_trades(
-                    symbol, since=cursor_ts, limit=TRADE_RECOVER_PAGE)
-            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-                self.rest_errors[type(e).__name__] += 1
-                self.rest_rate_limited += 1
-                self._declare_quiet(self._rate_limit_pause_s())
+            raw = await self._rest(
+                "REST-добор окна", symbol,
+                lambda c=cursor_ts: self._ex.fetch_trades(  # type: ignore[misc]
+                    symbol, since=c, limit=TRADE_RECOVER_PAGE),
+            )
+            if isinstance(raw, NotReady):
+                # Покрытие, набранное до отказа, отдаётся честно обрезанным до последней
+                # ПОЛНОЙ корзины: вызывающий по нему видит, докуда сутки действительно
+                # закрыты. Ноль страниц — отказ целиком, без выдуманного покрытия.
                 if total:
                     return total, covered(last_ts)
-                return NotReady(
-                    reason=f"{symbol}: REST-добор окна — лимит биржи ({type(e).__name__})")
-            except ccxt.NetworkError as e:
-                self.rest_errors[type(e).__name__] += 1
-                if total:
-                    return total, covered(last_ts)
-                return NotReady(
-                    reason=f"{symbol}: REST-добор окна — сеть ({type(e).__name__})")
-            except ccxt.ExchangeError as e:
-                self.rest_errors[type(e).__name__] += 1
-                if total:
-                    return total, covered(last_ts)
-                return NotReady(
-                    reason=f"{symbol}: REST-добор окна — отказ биржи ({type(e).__name__})")
-            except ccxt.OperationFailed as e:
-                # ⚠ НЕ дубль веток выше: `OperationFailed` — прямой наследник `BaseError`,
-                # сюда падает то, что не сеть и не `ExchangeError` (замер 2026-08-11:
-                # код -1000 у fromId старше 24 ч летел именно так, мимо обоих ловцов).
-                self.rest_errors[type(e).__name__] += 1
-                if total:
-                    return total, covered(last_ts)
-                return NotReady(
-                    reason=f"{symbol}: REST-добор окна — отказ ({type(e).__name__})")
-            self._note_weight()
+                return raw
             if not raw:
                 # ⚠ ЗДЕСЬ БЫЛ ВЫВОД «после since сделок нет, окно покрыто целиком», и он
                 # НЕВЕРЕН. ccxt сам дописывает верхнюю границу запроса в ОДИН ЧАС —

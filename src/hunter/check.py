@@ -19,7 +19,7 @@ from .admission import REQUIRED_BARS, USED_BY_2_9, strictest_requirement
 from .bars import expected_last_closed_open_ms, tf_ms
 from .config import Universe
 from .exchange import Exchange
-from .models import RunReport
+from .models import NotReady, RunReport
 from .run import collect, explained_gaps
 
 
@@ -45,11 +45,13 @@ def _verdict(lines: list[tuple[str, bool, str]]) -> int:
     return bad
 
 
-async def _admission_survey(uni: Universe, required: int) -> dict[str, dict[str, int]]:
+async def _admission_survey(
+    uni: Universe, required: int
+) -> dict[str, dict[str, int | NotReady]]:
     ex = Exchange()
     await ex.open()
     try:
-        out: dict[str, dict[str, int]] = {}
+        out: dict[str, dict[str, int | NotReady]] = {}
         for sym in uni.symbols:
             out[sym] = {tf: await ex.count_history(sym, tf, cap=required)
                         for tf in (uni.timeframes[-1],)}
@@ -58,23 +60,42 @@ async def _admission_survey(uni: Universe, required: int) -> dict[str, dict[str,
         await ex.close()
 
 
-def _report_admission(counts: dict[str, dict[str, int]], top_tf: str) -> tuple[bool, str]:
-    """§2.9 не гейтит сигнал — поэтому это не «плохо», а именно перечень недоступного."""
+def _report_admission(
+    counts: dict[str, dict[str, int | NotReady]], top_tf: str
+) -> tuple[bool, str]:
+    """§2.9 не гейтит сигнал — поэтому это не «плохо», а именно перечень недоступного.
+
+    ⚠ НЕСОСТОЯВШИЙСЯ СЧЁТ отделён от малого счёта 2026-08-11 (обратная сверка с ccxt).
+    До этого `count_history` не ловила ничего и роняла обзор стеком; починка ветвей без
+    отдельного значения превратила бы отказ сети в маленькое число, и символ попал бы в
+    строку «доп-факторов нет» по причине, не имеющей отношения к его истории. Такой отказ
+    печатается своей строкой и своим числом — знаменатель у вывода обязан быть виден.
+    """
     print("\n2. КАКИЕ ДОП-ФАКТОРЫ НЕДОСТУПНЫ (§2.9, §4.3)")
     print(f"   Проверяется старший ТФ: {top_tf}")
     print("   Индикаторы по §2.9 сигнал НЕ порождают и НЕ гейтят — сторону задаёт")
     print("   структура старшего ТФ. Недоступность фактора видна, но сигнал не блокирует.")
     missing_any = 0
+    unknown: list[str] = []
     for sym, by_tf in sorted(counts.items()):
         bars = by_tf[top_tf]
+        if isinstance(bars, NotReady):
+            unknown.append(sym)
+            print(f"   {sym:22} {top_tf}: счёт истории НЕ СОСТОЯЛСЯ — {bars.reason}")
+            continue
         miss = [q for q in USED_BY_2_9 if bars < REQUIRED_BARS[q]]
         if miss:
             missing_any += 1
             print(f"   {sym:22} {top_tf}: {bars:4} баров → НЕТ {', '.join(miss)}")
     total = len(counts)
-    print(f"   символов со всеми доп-факторами: {total - missing_any} из {total}")
-    return True, (f"{total - missing_any} из {total} символов имеют все доп-факторы; "
-                  f"у остальных недостающие названы поимённо")
+    counted = total - len(unknown)
+    print(f"   символов со всеми доп-факторами: {counted - missing_any} из {counted} "
+          f"сосчитанных (всего в выборке {total})")
+    if unknown:
+        print(f"   ⚠ счёт не состоялся у {len(unknown)} из {total}: "
+              f"{', '.join(unknown)} — про них вывод НЕ СЛЕДУЕТ")
+    return True, (f"{counted - missing_any} из {counted} сосчитанных символов имеют все "
+                  f"доп-факторы; не сосчитано {len(unknown)} из {total}")
 
 
 def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:

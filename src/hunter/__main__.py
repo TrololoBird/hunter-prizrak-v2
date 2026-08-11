@@ -215,15 +215,27 @@ def _admission(args: argparse.Namespace) -> int:
     uni = load_universe(args.universe)
     required = args.required or max(REQUIRED_BARS.values())
 
-    async def survey() -> list[tuple[str, dict[str, int]]]:
+    async def survey() -> list[tuple[str, dict[str, int], tuple[str, ...]]]:
+        """⚠ Третий элемент — ТФ, на которых счёт НЕ СОСТОЯЛСЯ (обратная сверка с ccxt,
+        2026-08-11). `count_history` теперь отдаёт `NotReady` вместо стека при сетевом
+        сбое, и без отдельного списка отказ печатался бы нулём баров, то есть читался бы
+        как «у символа нет истории» (§4.3)."""
+        from .models import NotReady
+
         ex = Exchange()
         await ex.open()
         try:
-            out: list[tuple[str, dict[str, int]]] = []
+            out: list[tuple[str, dict[str, int], tuple[str, ...]]] = []
             for sym in uni.symbols:
-                counts = {tf: await ex.count_history(sym, tf, cap=required)
-                          for tf in uni.timeframes}
-                out.append((sym, counts))
+                counts: dict[str, int] = {}
+                unknown: list[str] = []
+                for tf in uni.timeframes:
+                    got = await ex.count_history(sym, tf, cap=required)
+                    if isinstance(got, NotReady):
+                        unknown.append(tf)
+                    else:
+                        counts[tf] = got
+                out.append((sym, counts, tuple(unknown)))
             return out
         finally:
             await ex.close()
@@ -239,20 +251,36 @@ def _admission(args: argparse.Namespace) -> int:
     print(head)
     passed: list[str] = []
     failed: list[str] = []
-    for sym, counts in sorted(rows, key=lambda x: min(x[1].values())):
+    unknown_rows: list[tuple[str, tuple[str, ...]]] = []
+    for sym, counts, unknown in sorted(rows,
+                                       key=lambda x: min(x[1].values(), default=-1)):
+        line = f"{sym:22}" + "".join(
+            f"{counts[tf]:>8}" if tf in counts else f"{'?':>8}" for tf in tfs)
+        if unknown:
+            # Вердикта НЕТ: «не прошёл» и «не сосчитан» — разные ответы, и склеивать их
+            # значило бы объявить отказ сети свойством символа.
+            unknown_rows.append((sym, unknown))
+            print(line + "   ?     счёт не состоялся: " + ", ".join(unknown))
+            continue
         ok, short = admits(counts, required)
-        line = f"{sym:22}" + "".join(f"{counts[tf]:>8}" for tf in tfs)
         line += f"  {'ДА ' if ok else 'НЕТ'}    {','.join(short) if short else '—'}"
         print(line)
         (passed if ok else failed).append(sym)
+    judged = len(passed) + len(failed)
     print()
-    print(f"проходят: {len(passed)} из {len(rows)}   не проходят: {len(failed)}")
+    print(f"проходят: {len(passed)} из {judged} с вердиктом   не проходят: {len(failed)}"
+          f"   без вердикта: {len(unknown_rows)} из {len(rows)}")
     if failed:
         print(f"не проходят: {', '.join(failed)}")
+    if unknown_rows:
+        print(f"⚠ счёт не состоялся: {', '.join(s for s, _ in unknown_rows)} — "
+              f"вывод о допуске этих символов НЕ СЛЕДУЕТ")
     print()
     print("Что именно недоступно у непрошедших (по самому старшему ТФ):")
-    for sym, counts in rows:
+    for sym, counts, _ in rows:
         top = tfs[-1]
+        if top not in counts:
+            continue
         miss = unavailable_quantities(counts[top])
         if miss:
             print(f"  {sym:22} {top}: {counts[top]} баров → нет {', '.join(miss)}")
