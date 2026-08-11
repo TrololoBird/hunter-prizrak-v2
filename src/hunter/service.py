@@ -154,7 +154,10 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
     # Сборщик создаётся ПЕРВЫМ, но сети ещё не трогает: `start()` ниже. Порядок нужен,
     # чтобы обработчики сигналов встали на его событие остановки и Ctrl+C ловился уже
     # на засеве — самой долгой части запуска (162 REST-запроса на полной вселенной).
-    c = run.Collector(uni, seed_limit, keep_bars=seed_limit)
+    # ⚠ `keep_bars` — размер кольца живых баров, и он ОСТАЁТСЯ одним числом на все ТФ:
+    # это предел памяти службы, а не глубина истории. Глубину с 2026-08-11 задаёт горизонт
+    # отдельно по каждому ТФ (`run.seed_depth`), и она живёт на диске, а не в кольце.
+    c = run.Collector(uni, seed_limit, keep_bars=seed_limit, horizon_days=horizon_days)
     stop_signals = _install_stop_handlers(c.stop)
     log.info("служба запускается", такт_с=cycle_seconds, циклов=max_cycles or "без предела",
              сигналы_остановки=",".join(stop_signals) or "НИ ОДНОГО")

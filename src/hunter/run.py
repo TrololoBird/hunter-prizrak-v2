@@ -20,7 +20,14 @@ import polars as pl
 
 from . import archive, barstore, card, clock, emit, engine, geometry, levels, log, store
 from .accumulation import detect as detect_accumulations
-from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, on_grid, tf_ms
+from .bars import (
+    TIMEFRAME_MS,
+    bars_needed,
+    expected_last_closed_open_ms,
+    find_gaps,
+    on_grid,
+    tf_ms,
+)
 from .config import Universe
 from .exchange import (
     CATCHUP_MAX_BARS,
@@ -47,7 +54,27 @@ from .outcome import resolve as outcome_resolve
 from .swings import detect as detect_swings
 
 
-async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> None:
+def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
+    """Сколько баров просить на этом ТФ. Единственное место, где решается глубина ряда.
+
+    `seed_limit > 0` — прямое указание оператора, действует как раньше и одинаково для
+    всех ТФ. `seed_limit <= 0` — глубина ВЫВОДИТСЯ из горизонта отдельно для каждого ТФ
+    (`bars.bars_needed`), и ряды становятся сопоставимыми: 180 суток на 5м это 51 840
+    баров, на 1Д — 180, и оба накрывают одно и то же календарное окно.
+
+    Нижняя граница — самое длинное требование величин §2.9, и это `adx14` с 304 барами,
+    а не ema200 с 200: ряд короче не даёт доп-факторов независимо от горизонта.
+    """
+    from .admission import REQUIRED_BARS
+
+    floor = max(REQUIRED_BARS.values())
+    if seed_limit > 0:
+        return max(floor, seed_limit)
+    return bars_needed(timeframe, horizon_days, floor)
+
+
+async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
+               horizon_days: int = 0) -> None:
     """Засев рядов: хранилище на диске плюс добор хвоста у биржи.
 
     ⚠ ДО 2026-08-11 БАРЫ НЕ СОХРАНЯЛИСЬ ВОВСЕ, и каждый прогон качал все 162 ряда заново.
@@ -72,7 +99,10 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> No
             report.series[(sym, tf)] = st
             report.seed_checked += 1
 
-            want_from = clock.now_ms() - limit * tf_ms(tf)
+            # Глубина решается ЗДЕСЬ и по каждому ТФ отдельно: одна цифра на все ТФ
+            # делала карту несопоставимой самой с собой (см. `seed_depth`).
+            depth = seed_depth(tf, horizon_days, limit)
+            want_from = clock.now_ms() - depth * tf_ms(tf)
             stored: list[Bar] = []
             since_ms: int | None = None
             if market_id is not None:
@@ -83,7 +113,7 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> No
 
             # Хвост меньше окна просится с явного `since`; полное окно — как раньше,
             # без `since`, чтобы биржа отдала своё умолчание последних `limit` баров.
-            ask = limit if since_ms is None else CATCHUP_MAX_BARS
+            ask = depth if since_ms is None else CATCHUP_MAX_BARS
             got = await ex.fetch_closed_ohlcv(sym, tf, limit=ask, since_ms=since_ms)
             if isinstance(got, NotReady):
                 if not stored:
@@ -119,7 +149,7 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> No
             # тогда как этап 1 обязан быть безразличным к нему. Глубина меняется на
             # этапе 2, осознанно и с диффом повтора. Хранилище при этом копит ВСЁ, что
             # пришло: обрезается только выдача.
-            merged = merged[-limit:]
+            merged = merged[-depth:]
 
             if not merged:
                 st.not_ready = NotReady(reason=f"{sym} {tf}: ряд пуст и в хранилище, и у биржи")
@@ -1422,9 +1452,14 @@ class Collector:
     """
 
     def __init__(self, uni: Universe, seed_limit: int, *, keep_bars: int = 0,
-                 keep_trade_days: int = LIVE_TRADES_KEEP_DAYS) -> None:
+                 keep_trade_days: int = LIVE_TRADES_KEEP_DAYS,
+                 horizon_days: int = 0) -> None:
         self.uni = uni
         self.seed_limit = seed_limit
+        self.horizon_days = horizon_days
+        """Горизонт нужен ЗДЕСЬ, а не только доборщику сделок: с 2026-08-11 из него
+        выводится глубина каждого ряда (`seed_depth`). Ноль означает «глубину задаёт
+        `seed_limit`», то есть прежнее поведение."""
         self.keep_bars = keep_bars
         self.keep_trade_days = keep_trade_days
         self.ex = Exchange(uni.venue)
@@ -1457,7 +1492,8 @@ class Collector:
         self._started_ns = clock.monotonic_ns()
         log.info("засев", символов=len(self.uni.symbols), тф=len(self.uni.timeframes),
                  баров_на_ряд=self.seed_limit)
-        await seed(self.ex, self.uni, self.report, self.seed_limit)
+        await seed(self.ex, self.uni, self.report, self.seed_limit,
+                   self.horizon_days)
         log.info("засеяно", баров=self.report.seeded_bars,
                  запросов=self.report.seed_checked)
         self._launch()
@@ -1671,7 +1707,7 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
     Оба построены на `Collector`, и различаются ровно тем, сколько раз берётся снимок:
     здесь один, там — по одному на цикл, бесконечно.
     """
-    c = Collector(uni, seed_limit)
+    c = Collector(uni, seed_limit, horizon_days=horizon_days)
     try:
         await c.start()
         log.info("наблюдение", потоков=len(c.tasks), секунд=seconds)
