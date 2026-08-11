@@ -35,6 +35,7 @@ from .exchange import (
     POLL_LIMIT,
     POLL_OFFSET_S,
     REQUIRED_CAPABILITIES,
+    CapabilityMissing,
     Exchange,
 )
 from .models import (
@@ -1509,6 +1510,19 @@ class Collector:
     async def start(self) -> None:
         """Открыть биржу, засеять ряды и поднять задачи наблюдения."""
         sync = await self.ex.open()
+        # ⚠ Соответствие вселенной площадке проверяется ДО сбора и ОДИН раз. Иначе
+        # неверная пара «площадка + список символов» проявлялась бы отдельным отказом на
+        # каждый символ в засеве, то есть выглядела бы проблемой данных, а не
+        # конфигурации. `BTC/USDT` и `BTC/USDT:USDT` — разные рынки.
+        if bad := self.ex.check_symbols(self.uni.symbols):
+            log.error("СИМВОЛЫ ВСЕЛЕННОЙ НЕ СООТВЕТСТВУЮТ ПЛОЩАДКЕ",
+                      площадка=self.uni.venue, недоступно=len(bad),
+                      всего=len(self.uni.symbols), примеры="; ".join(bad[:3]))
+            if len(bad) == len(self.uni.symbols):
+                raise CapabilityMissing(
+                    f"площадка {self.uni.venue!r}: недоступны ВСЕ {len(bad)} символов "
+                    f"вселенной — похоже, площадка и список символов из разных миров. "
+                    f"Первый отказ: {bad[0]}")
         self._report = RunReport(sync=sync)
         self._started_ns = clock.monotonic_ns()
         log.info("засев", символов=len(self.uni.symbols), тф=len(self.uni.timeframes),
