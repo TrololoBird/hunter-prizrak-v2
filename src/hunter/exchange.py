@@ -416,6 +416,22 @@ class Exchange:
             # потому что цена таймаута у нас — потеря опроса, а не деньги. Счётчик
             # `rest_errors['RequestTimeout']` показывает, помогает ли оно.
             "timeout": REST_TIMEOUT_MS,
+            # ⚠⚠ `maxRetriesOnFailure` НЕ ВКЛЮЧАЕТСЯ, И ЭТО РЕШЕНИЕ, А НЕ ЗАБЫВЧИВОСТЬ.
+            # Руководство (Manual.md, «Retry Mechanism») предлагает его как безопасное
+            # улучшение и обещает: «only server/network-related issues will be part of the
+            # retry mechanism; if the user gets an error due to InsufficientFunds or
+            # InvalidOrder, the request will not be repeated».
+            #
+            # Код говорит другое. Условие повтора — `isinstance(e, OperationFailed)`
+            # (ccxt/async_support/base/exchange.py, `fetch2`), а `RateLimitExceeded` и
+            # `DDoSProtection` наследуют `NetworkError`, который лежит ПОД
+            # `OperationFailed`. То есть механизм повторяет запрос ПОСЛЕ ПРЕВЫШЕНИЯ
+            # ЛИМИТА — ровно то, за что Binance банит по IP на срок до трёх суток (418).
+            # Про лимиты руководство молчит.
+            #
+            # Наш путь другой и остаётся: `_rest` ловит лимит ОТДЕЛЬНОЙ ветвью, объявляет
+            # глобальную тишину на всех задачах и НЕ повторяет. Повтор сетевого сбоя
+            # делает следующий круг опроса.
             # ⚠ ЗАКРЕПЛЕНО ЯВНО 2026-08-11, и не из перестраховки: РУКОВОДСТВО ccxt И
             # КОД РАСХОДЯТСЯ. Руководство (wiki/ccxt.pro.manual.md, «newUpdates mode»)
             # предупреждает: «in the future `newUpdates: true` will be the default mode»,
@@ -1747,6 +1763,19 @@ class Exchange:
         Порог молчания подаётся аргументом, потому что у баров и сделок он РАЗНОЙ ПРИРОДЫ:
         бары идут по таймеру биржи (тишина = обрыв), сделки — по событию (тишина = данные).
         Числа и их замеры — в `WS_TRADES_SILENCE_S` (порог баров удалён вместе с ними).
+
+        ⚠ ИЕРАРХИЯ ВЗЯТА ИЗ КОДА, А НЕ ИЗ ДИАГРАММЫ РУКОВОДСТВА, и это не придирка:
+        сверка 2026-08-12 нашла у диаграммы (Manual.md, «Exception Hierarchy») три
+        расхождения, и все три меняют смысл на противоположный.
+
+            класс                       диаграмма            код
+            BadResponse, NullResponse   под ExchangeError    под OperationFailed
+            CancelPending               под InvalidOrder     под OperationFailed
+            UnsubscribeError            НЕ ПОКАЗАН           под BaseError
+
+        Руководство описывает `ExchangeError` как «запрос неверен, повторять бессмысленно»,
+        а `OperationFailed` — как «временное, повтор уместен». Значит для трёх классов
+        диаграмма советует ПРОТИВОПОЛОЖНУЮ политику по сравнению с тем, что даёт код.
 
         ⚠ Порядок ветвей ЗНАЧИМ и разобран по иерархии ccxt (находка C-6). Замер
         2026-08-05 по `__mro__`:
