@@ -20,14 +20,20 @@ from . import clock, log
 from .bars import closed_only, on_grid, tf_ms
 from .models import (
     Bar,
+    BookLevel,
     BookTop,
     ClockSync,
     FundingRate,
     Instrument,
+    Liquidation,
+    LongShortRatio,
     MarketsReload,
+    MarkPrice,
     NotReady,
     OhlcvFetch,
     OpenInterest,
+    OrderBook,
+    Quote,
     RawTrade,
     TickChange,
     Ticker24h,
@@ -1169,6 +1175,199 @@ class Exchange:
     # Добавлено 2026-08-11 по обратной сверке: из 30 публичных эндпоинтов площадки мы
     # звали 4. Остальные не были «не нужны» — они не были рассмотрены.
 
+    def _unsupported(self, method: str) -> NotReady | None:
+        """`NotReady` с названной причиной, если площадка метода не умеет.
+
+        ⚠ Проверка по карте `has` — НЕ гарантия, и это доказано: ccxt объявляет
+        `fetchOHLCVWs: True` для USDⓈ-M, где эндпоинта нет вовсе (вызов даёт `-5000`).
+        Здесь она нужна ровно затем, чтобы отсутствие метода стало НАЗВАННЫМ отказом, а не
+        `AttributeError` из середины стека. Ложное «умеет» ловится вызовом и приходит
+        обычным отказом биржи через `_rest`.
+        """
+        if self._ex.has.get(method):
+            return None
+        return NotReady(reason=f"{self.venue.ccxt_class}: не умеет {method}")
+
+    async def fetch_ticker(self, symbol: str) -> Ticker24h | NotReady:
+        """Суточная статистика ОДНОГО рынка. Вес 1 против 40 у запроса всех сразу."""
+        if (no := self._unsupported("fetchTicker")) is not None:
+            return no
+        got = await self._rest("суточная статистика", symbol,
+                               lambda: self._ex.fetch_ticker(symbol))
+        if isinstance(got, NotReady):
+            return got
+        return _ticker_from(symbol, got) or NotReady(
+            reason=f"{symbol}: тикер неполон — нет цены или оборота")
+
+    async def fetch_quotes(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, Quote] | NotReady:
+        """Лучшие бид и аск по многим рынкам одним запросом.
+
+        Самый дешёвый способ узнать цену: по таблице весов ccxt `ticker/bookTicker` без
+        символа стоит 2 за ВСЕ рынки сразу, тогда как суточная статистика — 40.
+        """
+        if (no := self._unsupported("fetchBidsAsks")) is not None:
+            return no
+        got = await self._rest("лучшие цены", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_bids_asks(symbols))
+        if isinstance(got, NotReady):
+            return got
+        return {str(s): _quote_from(str(s), row) for s, row in got.items()}
+
+    async def fetch_last_prices(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, float] | NotReady:
+        """Последняя цена по многим рынкам. Самый дешёвый вызов площадки: у USDⓈ-M
+        `ticker/price` во второй версии имеет вес НОЛЬ."""
+        if (no := self._unsupported("fetchLastPrices")) is not None:
+            return no
+        got = await self._rest("последние цены", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_last_prices(symbols))
+        if isinstance(got, NotReady):
+            return got
+        out: dict[str, float] = {}
+        for s, row in got.items():
+            price = row.get("price") if isinstance(row, dict) else row
+            if price is not None:
+                out[str(s)] = float(price)
+        return out
+
+    async def fetch_order_book(self, symbol: str, depth: int = 100) -> OrderBook | NotReady:
+        """Стакан ЦЕЛИКОМ. Вес растёт ступенями: 2 до 50 уровней, 5 до 100, 10 до 500,
+        20 до 1000 — поэтому глубина задаётся явно, а не берётся максимальной."""
+        if (no := self._unsupported("fetchOrderBook")) is not None:
+            return no
+        got = await self._rest("стакан", symbol,
+                               lambda: self._ex.fetch_order_book(symbol, depth))
+        if isinstance(got, NotReady):
+            return got
+        return OrderBook(
+            symbol=symbol,
+            bids=tuple(BookLevel(price=float(p), qty=float(q))
+                       for p, q in (got.get("bids") or [])),
+            asks=tuple(BookLevel(price=float(p), qty=float(q))
+                       for p, q in (got.get("asks") or [])),
+            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+            nonce=None if got.get("nonce") is None else int(got["nonce"]),
+        )
+
+    async def fetch_mark_prices(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, MarkPrice] | NotReady:
+        """Маркировочная и индексная цена по многим контрактам. ⚠ Только контракты."""
+        if (no := self._unsupported("fetchMarkPrices")) is not None:
+            return no
+        got = await self._rest("маркировочные цены", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_mark_prices(symbols))
+        if isinstance(got, NotReady):
+            return got
+        return {
+            str(s): MarkPrice(
+                symbol=str(s),
+                mark=None if row.get("markPrice") is None else float(row["markPrice"]),
+                index=None if row.get("indexPrice") is None else float(row["indexPrice"]),
+                timestamp_ms=(None if row.get("timestamp") is None
+                              else int(row["timestamp"])),
+            )
+            for s, row in got.items()
+        }
+
+    async def fetch_funding_rates(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, FundingRate] | NotReady:
+        """Ставки финансирования по многим контрактам одним запросом."""
+        if (no := self._unsupported("fetchFundingRates")) is not None:
+            return no
+        got = await self._rest("ставки финансирования", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_funding_rates(symbols))
+        if isinstance(got, NotReady):
+            return got
+        return {str(s): _funding_from(str(s), row) for s, row in got.items()}
+
+    async def fetch_funding_history(
+        self, symbol: str, since_ms: int | None = None, limit: int = 100
+    ) -> list[FundingRate] | NotReady:
+        """История ставки финансирования."""
+        if (no := self._unsupported("fetchFundingRateHistory")) is not None:
+            return no
+        got = await self._rest(
+            "история ставки", symbol,
+            lambda: self._ex.fetch_funding_rate_history(symbol, since_ms, limit))
+        if isinstance(got, NotReady):
+            return got
+        return [_funding_from(symbol, row) for row in got]
+
+    async def fetch_open_interests(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, OpenInterest] | NotReady:
+        """Открытый интерес по многим контрактам."""
+        if (no := self._unsupported("fetchOpenInterests")) is not None:
+            return no
+        got = await self._rest("открытый интерес", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_open_interests(symbols))
+        if isinstance(got, NotReady):
+            return got
+        out: dict[str, OpenInterest] = {}
+        for s, row in got.items():
+            oi = _open_interest_from(str(s), row)
+            if oi is not None:
+                out[str(s)] = oi
+        return out
+
+    async def fetch_open_interest_history(
+        self, symbol: str, timeframe: str = "5m",
+        since_ms: int | None = None, limit: int = 100,
+    ) -> list[OpenInterest] | NotReady:
+        """История открытого интереса ПО ТАЙМФРЕЙМУ — ряд, соизмеримый с барами."""
+        if (no := self._unsupported("fetchOpenInterestHistory")) is not None:
+            return no
+        got = await self._rest(
+            "история интереса", f"{symbol} {timeframe}",
+            lambda: self._ex.fetch_open_interest_history(symbol, timeframe,
+                                                         since_ms, limit))
+        if isinstance(got, NotReady):
+            return got
+        return [oi for row in got if (oi := _open_interest_from(symbol, row)) is not None]
+
+    async def fetch_long_short_ratio(
+        self, symbol: str, period: str = "5m",
+        since_ms: int | None = None, limit: int = 100,
+    ) -> list[LongShortRatio] | NotReady:
+        """История соотношения длинных и коротких позиций. ⚠ Только контракты."""
+        if (no := self._unsupported("fetchLongShortRatioHistory")) is not None:
+            return no
+        got = await self._rest(
+            "длинные против коротких", f"{symbol} {period}",
+            lambda: self._ex.fetch_long_short_ratio_history(symbol, period,
+                                                            since_ms, limit))
+        if isinstance(got, NotReady):
+            return got
+        out: list[LongShortRatio] = []
+        for row in got:
+            if row.get("longShortRatio") is None:
+                continue
+            out.append(LongShortRatio(
+                symbol=symbol, ratio=float(row["longShortRatio"]),
+                period=None if row.get("timeframe") is None else str(row["timeframe"]),
+                timestamp_ms=(None if row.get("timestamp") is None
+                              else int(row["timestamp"])),
+            ))
+        return out
+
+    async def fetch_liquidations(
+        self, symbol: str, since_ms: int | None = None, limit: int = 100
+    ) -> list[Liquidation] | NotReady:
+        """Публичные ликвидации. ⚠ Только контракты и маржа."""
+        if (no := self._unsupported("fetchLiquidations")) is not None:
+            return no
+        got = await self._rest(
+            "ликвидации", symbol,
+            lambda: self._ex.fetch_liquidations(symbol, since_ms, limit))
+        if isinstance(got, NotReady):
+            return got
+        return [_liquidation_from(symbol, row) for row in got]
+
     async def fetch_tickers(
         self, symbols: tuple[str, ...] | None = None
     ) -> dict[str, Ticker24h] | NotReady:
@@ -1184,20 +1383,13 @@ class Exchange:
             return got
         out: dict[str, Ticker24h] = {}
         for sym, row in got.items():
-            last = row.get("last") if row.get("last") is not None else row.get("close")
-            if last is None or row.get("quoteVolume") is None:
+            t = _ticker_from(str(sym), row)
+            if t is None:
                 # Неполный тикер пропускается ПОИМЁННО: биржа отдаёт их и для рынков,
                 # где суток ещё не набралось.
                 self.tickers_unparsed += 1
                 continue
-            out[str(sym)] = Ticker24h(
-                symbol=str(sym), last=float(last),
-                quote_volume=float(row["quoteVolume"]),
-                change_pct=(None if row.get("percentage") is None
-                            else float(row["percentage"])),
-                timestamp_ms=(None if row.get("timestamp") is None
-                              else int(row["timestamp"])),
-            )
+            out[str(sym)] = t
         return out
 
     async def fetch_alt_price_series(
@@ -1265,15 +1457,10 @@ class Exchange:
                                lambda: self._ex.fetch_open_interest(symbol))
         if isinstance(got, NotReady):
             return got
-        amount = got.get("openInterestAmount")
-        if amount is None:
+        oi = _open_interest_from(symbol, got)
+        if oi is None:
             return NotReady(reason=f"{symbol}: в ответе нет openInterestAmount")
-        return OpenInterest(
-            symbol=symbol, amount=float(amount),
-            value=(None if got.get("openInterestValue") is None
-                   else float(got["openInterestValue"])),
-            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
-        )
+        return oi
 
     async def fetch_funding(self, symbol: str) -> FundingRate | NotReady:
         """Ставка финансирования и маркировочная цена. ⚠ Только бессрочные контракты."""
@@ -1284,15 +1471,7 @@ class Exchange:
                                lambda: self._ex.fetch_funding_rate(symbol))
         if isinstance(got, NotReady):
             return got
-        return FundingRate(
-            symbol=symbol,
-            rate=None if got.get("fundingRate") is None else float(got["fundingRate"]),
-            next_ms=(None if got.get("fundingTimestamp") is None
-                     else int(got["fundingTimestamp"])),
-            mark=None if got.get("markPrice") is None else float(got["markPrice"]),
-            index=None if got.get("indexPrice") is None else float(got["indexPrice"]),
-            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
-        )
+        return _funding_from(symbol, got)
 
     async def count_history(
         self, symbol: str, timeframe: str, *, cap: int
@@ -1629,6 +1808,117 @@ class Exchange:
                  страниц=BACKFILL_DAY_MAX_PAGES, сделок=total)
         return total, covered(last_ts)
 
+    # --- потоки рыночного контекста ---------------------------------------
+    #
+    # Все идут через тот же `_watch_step`, что и сделки: переподключение, счётчики отказов
+    # и разбор трёх ветвей дерева исключений ccxt — общие. Ни один из них НЕ участвует в
+    # расчёте сигнала (см. границу выше); это задел транспорта.
+
+    async def watch_ohlcv(
+        self, symbol: str, timeframe: str
+    ) -> AsyncGenerator[list[Bar]]:
+        """Поток свечей. ⚠ В боевой ряд НЕ ИДЁТ: правило «ОДИН РЯД — ОДИН ИСТОЧНИК»
+        стоит с 2026-08-05, и склейка потока с REST-историей уже однажды дала 81 бар,
+        принятый двумя источниками разом."""
+        while True:
+            got = await self._watch_step(
+                f"свечи {timeframe}", f"{symbol} {timeframe}",
+                lambda: self._ex.watch_ohlcv(symbol, timeframe),
+                WS_SILENCE_S["ohlcv"])
+            if got is None:
+                continue
+            out: list[Bar] = []
+            for r in got:
+                try:
+                    out.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
+                                   low=float(r[3]), close=float(r[4]), volume=float(r[5])))
+                except ValueError as e:
+                    log.degraded("бар потока отклонён", символ=symbol, тф=timeframe,
+                                 причина=str(e))
+            if out:
+                yield out
+
+    async def watch_order_book(
+        self, symbol: str, depth: int = 20
+    ) -> AsyncGenerator[OrderBook]:
+        """Поток стакана. ccxt держит книгу инкрементально и отдаёт согласованный снимок."""
+        while True:
+            got = await self._watch_step(
+                "стакан", symbol, lambda: self._ex.watch_order_book(symbol, depth),
+                WS_SILENCE_S["orderbook"])
+            if got is None:
+                continue
+            yield OrderBook(
+                symbol=symbol,
+                bids=tuple(BookLevel(price=float(p), qty=float(q))
+                           for p, q in (got.get("bids") or [])[:depth]),
+                asks=tuple(BookLevel(price=float(p), qty=float(q))
+                           for p, q in (got.get("asks") or [])[:depth]),
+                timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+                nonce=None if got.get("nonce") is None else int(got["nonce"]),
+            )
+
+    async def watch_ticker(self, symbol: str) -> AsyncGenerator[Ticker24h]:
+        """Поток суточной статистики."""
+        while True:
+            got = await self._watch_step(
+                "тикер", symbol, lambda: self._ex.watch_ticker(symbol),
+                WS_SILENCE_S["ticker"])
+            if got is None:
+                continue
+            t = _ticker_from(symbol, got)
+            if t is None:
+                self.tickers_unparsed += 1
+                continue
+            yield t
+
+    async def watch_quotes(
+        self, symbols: tuple[str, ...]
+    ) -> AsyncGenerator[dict[str, Quote]]:
+        """Поток лучших цен по многим рынкам одной подпиской."""
+        while True:
+            got = await self._watch_step(
+                "лучшие цены", ",".join(symbols),
+                lambda: self._ex.watch_bids_asks(list(symbols)),
+                WS_SILENCE_S["quotes"])
+            if got is None:
+                continue
+            yield {str(s): _quote_from(str(s), row) for s, row in got.items()}
+
+    async def watch_mark_prices(
+        self, symbols: tuple[str, ...]
+    ) -> AsyncGenerator[dict[str, MarkPrice]]:
+        """Поток маркировочных цен. ⚠ Только контракты."""
+        while True:
+            got = await self._watch_step(
+                "маркировочные цены", ",".join(symbols),
+                lambda: self._ex.watch_mark_prices(list(symbols)),
+                WS_SILENCE_S["markprice"])
+            if got is None:
+                continue
+            yield {
+                str(s): MarkPrice(symbol=str(s), mark=_f(row, "markPrice"),
+                                  index=_f(row, "indexPrice"), timestamp_ms=_ms(row))
+                for s, row in got.items()
+            }
+
+    async def watch_liquidations(self, symbol: str) -> AsyncGenerator[list[Liquidation]]:
+        """Поток публичных ликвидаций. ⚠ Только контракты.
+
+        Порог молчания здесь ЧАС, а не минута: ликвидация — событие редкое, и на тонком
+        символе её может не быть сутками. Короткий порог давал бы переподключение на
+        пустом месте — та же ошибка, что была с порогом сделок до замера 2026-08-04.
+        """
+        while True:
+            got = await self._watch_step(
+                "ликвидации", symbol, lambda: self._ex.watch_liquidations(symbol),
+                WS_SILENCE_S["liquidations"])
+            if got is None:
+                continue
+            out = [_liquidation_from(symbol, row) for row in got]
+            if out:
+                yield out
+
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[RawTrade]]:
         """Поток сделок УЖЕ РАЗОБРАННЫМ в тип. §10.1: словарей между слоями нет.
 
@@ -1663,6 +1953,89 @@ class Exchange:
                 out.append(t)
             if out:
                 yield out
+
+
+# --- разбор словарей рыночного контекста -----------------------------------
+#
+# ⚠ Живут в ЭТОМ файле намеренно, как и `parse_trade`: гейт `no_loose_dicts` объявил
+# `exchange.py` единственной границей с ccxt, и разбор словаря обязан быть внутри неё.
+# Вынести их в отдельный модуль значило бы расширить список исключений гейта, то есть
+# ослабить правило ради собственного удобства.
+
+
+def _f(row: dict[str, Any], key: str) -> float | None:
+    v = row.get(key)
+    return None if v is None else float(v)
+
+
+def _ms(row: dict[str, Any]) -> int | None:
+    v = row.get("timestamp")
+    return None if v is None else int(v)
+
+
+def _ticker_from(symbol: str, row: dict[str, Any]) -> Ticker24h | None:
+    """`None` — тикер неполон. Биржа отдаёт их и по рынкам, где суток не набралось."""
+    last = row.get("last") if row.get("last") is not None else row.get("close")
+    if last is None or row.get("quoteVolume") is None:
+        return None
+    return Ticker24h(symbol=symbol, last=float(last),
+                     quote_volume=float(row["quoteVolume"]),
+                     change_pct=_f(row, "percentage"), timestamp_ms=_ms(row))
+
+
+def _quote_from(symbol: str, row: dict[str, Any]) -> Quote:
+    return Quote(symbol=symbol, bid=_f(row, "bid"), bid_qty=_f(row, "bidVolume"),
+                 ask=_f(row, "ask"), ask_qty=_f(row, "askVolume"),
+                 last=_f(row, "last"), timestamp_ms=_ms(row))
+
+
+def _funding_from(symbol: str, row: dict[str, Any]) -> FundingRate:
+    ts = row.get("fundingTimestamp")
+    return FundingRate(symbol=symbol, rate=_f(row, "fundingRate"),
+                       next_ms=None if ts is None else int(ts),
+                       mark=_f(row, "markPrice"), index=_f(row, "indexPrice"),
+                       timestamp_ms=_ms(row))
+
+
+def _open_interest_from(symbol: str, row: dict[str, Any]) -> OpenInterest | None:
+    """`None` — в ответе нет объёма интереса, то есть строка ни о чём не говорит."""
+    amount = row.get("openInterestAmount")
+    if amount is None:
+        return None
+    return OpenInterest(symbol=symbol, amount=float(amount),
+                        value=_f(row, "openInterestValue"), timestamp_ms=_ms(row))
+
+
+def _liquidation_from(symbol: str, row: dict[str, Any]) -> Liquidation:
+    return Liquidation(symbol=symbol, price=_f(row, "price"),
+                       contracts=_f(row, "contracts"),
+                       quote_value=_f(row, "quoteValue"),
+                       side=None if row.get("side") is None else str(row["side"]),
+                       timestamp_ms=_ms(row))
+
+
+WS_SILENCE_S: dict[str, float] = {
+    "ohlcv": 300.0,
+    "ticker": 300.0,
+    "orderbook": 60.0,
+    "quotes": 60.0,
+    "markprice": 60.0,
+    "liquidations": 3600.0,
+}
+"""Порог молчания по РОДУ потока. ⚠ Числа НЕ ЗАМЕРЕНЫ, и это названо здесь, а не спрятано.
+
+Замерен только один порог — для сделок (`WS_TRADES_SILENCE_S`, тонкий символ, max 43 с).
+Остальные выведены из ПРИРОДЫ потока, а не из наблюдения:
+
+  * стакан и лучшие цены обновляются по каждому изменению книги — тишина минуту почти
+    наверняка обрыв;
+  * бары и тикер идут по таймеру биржи, но у тикера период до секунды, а бар минутный;
+  * ликвидации — событие редкое: на тонком символе их может не быть сутками, и короткий
+    порог давал бы переподключение на пустом месте.
+
+Любое из этих чисел подлежит замеру, как только соответствующий поток попадёт в боевой
+контур. Сейчас ни один из них там не используется.
+"""
 
 
 def parse_trade(raw: dict[str, Any]) -> RawTrade | NotReady:

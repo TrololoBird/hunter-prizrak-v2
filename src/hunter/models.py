@@ -235,6 +235,77 @@ class FundingRate(BaseModel):
     timestamp_ms: int | None = None
 
 
+class BookLevel(BaseModel):
+    """Одна ступень стакана."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    price: float
+    qty: float
+
+
+class OrderBook(BaseModel):
+    """Стакан целиком. Ступени идут от лучшей цены вглубь."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    timestamp_ms: int | None = None
+    nonce: int | None = None
+    """Номер обновления биржи. Нужен, чтобы склеивать снимок с потоком дельт."""
+
+
+class Quote(BaseModel):
+    """Лучшая пара цен без глубины. Публичные `ticker/bookTicker` и `ticker/price`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    bid: float | None = None
+    bid_qty: float | None = None
+    ask: float | None = None
+    ask_qty: float | None = None
+    last: float | None = None
+    timestamp_ms: int | None = None
+
+
+class MarkPrice(BaseModel):
+    """Маркировочная и индексная цена. Только контракты."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    mark: float | None = None
+    index: float | None = None
+    timestamp_ms: int | None = None
+
+
+class LongShortRatio(BaseModel):
+    """Соотношение длинных и коротких позиций за период. Только контракты."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    ratio: float
+    period: str | None = None
+    timestamp_ms: int | None = None
+
+
+class Liquidation(BaseModel):
+    """Публичная ликвидация. Только контракты и маржа."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    price: float | None = None
+    contracts: float | None = None
+    quote_value: float | None = None
+    side: str | None = None
+    timestamp_ms: int | None = None
+
+
 class Instrument(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
