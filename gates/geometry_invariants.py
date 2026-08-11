@@ -51,7 +51,15 @@ HOUR = 3_600_000
 
 
 def check_level(lv: Level) -> list[str]:
-    """Зона обязана содержать свой ПОК и не быть вывернутой."""
+    """Зона содержит ПОК, а база (ХАЙ…ЛОЙ) содержит и зону, и ПОК.
+
+    ⚠ Последнее добавлено 2026-08-11 по вопросу владельца «как ПОК может быть вне
+    базы». Ответ: не может — на стр. 30 коробка подписана ХАЙ и ЛОЙ, профиль натянут на
+    неё, зона нарисована двумя линиями ВНУТРИ неё, ПОК между ними. До правки этого не
+    проверял никто, и замер по карте из 856 уровней нашёл 21.6% с ПОК вне «границ» и
+    46.3% с зоной шире «базы» — потому что границей считались линии по свингам, а не
+    коробка. Теперь роли разведены, и гейт сторожит именно коробку.
+    """
     bad = []
     if lv.zone_lo > lv.zone_hi:
         bad.append(f"зона вывернута: lo {lv.zone_lo} > hi {lv.zone_hi}")
@@ -59,6 +67,14 @@ def check_level(lv: Level) -> list[str]:
         bad.append(f"ПОК {lv.price} вне зоны [{lv.zone_lo}, {lv.zone_hi}]")
     if lv.boundary_lo > lv.boundary_hi:
         bad.append(f"границы вывернуты: {lv.boundary_lo} > {lv.boundary_hi}")
+    if lv.range_lo > lv.range_hi:
+        bad.append(f"база вывернута: ЛОЙ {lv.range_lo} > ХАЙ {lv.range_hi}")
+    if not (lv.range_lo <= lv.price <= lv.range_hi):
+        bad.append(f"ПОК {lv.price} ВНЕ БАЗЫ [{lv.range_lo}, {lv.range_hi}] — "
+                   f"на стр. 30 ПОК всегда внутри коробки")
+    if lv.zone_lo < lv.range_lo or lv.zone_hi > lv.range_hi:
+        bad.append(f"зона [{lv.zone_lo}, {lv.zone_hi}] ШИРЕ базы "
+                   f"[{lv.range_lo}, {lv.range_hi}] — на стр. 30 зона внутри коробки")
     return bad
 
 
@@ -122,6 +138,10 @@ def level(side: LevelSide, poc: str, lo: str, hi: str, *, tf: str = "4h",
         structure_volume=1000.0,
         boundary_lo=Decimal(b_lo if b_lo is not None else lo),
         boundary_hi=Decimal(b_hi if b_hi is not None else hi),
+        # Коробка (ХАЙ…ЛОЙ структуры) не уже линий границ: тени протыкают линию, а не
+        # наоборот. Здесь она совпадает с линиями — минимальный правдоподобный случай.
+        range_lo=Decimal(b_lo if b_lo is not None else lo),
+        range_hi=Decimal(b_hi if b_hi is not None else hi),
         boundary_narrowed=0, boundary_ladder=False,
     )
 
@@ -186,6 +206,12 @@ def planted() -> list[tuple[str, list[str]]]:
     чтобы проверить сами проверки, а не расчёт.
     """
     bad_level = level(LevelSide.LONG, "105", "99", "101")  # ПОК вне своей зоны
+    poc_outside = level(LevelSide.LONG, "100", "99", "101",
+                        b_lo="99", b_hi="101").model_copy(
+        update={"range_lo": Decimal("101.5"), "range_hi": Decimal("103")})
+    zone_wider = level(LevelSide.LONG, "100", "95", "105",
+                       b_lo="95", b_hi="105").model_copy(
+        update={"range_lo": Decimal("99"), "range_hi": Decimal("101")})
     long_lv = level(LevelSide.LONG, "100", "99", "101", b_lo="98", b_hi="102")
     good = build_setup(long_lv, ())
     stop_ahead = good.model_copy(update={"stop": Decimal("103")})  # стоп ВЫШЕ входа лонга
@@ -196,6 +222,8 @@ def planted() -> list[tuple[str, list[str]]]:
     pp_stop_ahead = pp_good.model_copy(update={"stop": 95.0})  # стоп НИЖЕ входа шорта
     return [
         ("уровень: ПОК вне зоны", check_level(bad_level)),
+        ("уровень: ПОК вне БАЗЫ (стр. 30)", check_level(poc_outside)),
+        ("уровень: зона шире базы (стр. 30)", check_level(zone_wider)),
         ("сделка: стоп впереди входа", check_setup(stop_ahead)),
         ("сделка: вход вне своей зоны", check_setup(entry_out)),
         ("ПП: цель позади входа", check_pp(pp_target_back)),
