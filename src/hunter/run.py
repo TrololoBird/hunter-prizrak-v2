@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import ccxt
+import polars as pl
 
 from . import archive, card, clock, emit, engine, geometry, levels, log, store
 from .accumulation import detect as detect_accumulations
@@ -34,10 +35,12 @@ from .models import (
     BarBinnedTrades,
     Instrument,
     NotReady,
+    RawTrade,
     RunReport,
     SeriesState,
     TradeHistogram,
     TradeWindows,
+    bin_index,
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
@@ -519,7 +522,7 @@ async def _supervise(name: str, factory: Callable[[], Awaitable[None]],
 
 def needed_days(
     series: dict[str, list[Bar]], horizon_days: int
-) -> tuple[set[date], int, int]:
+) -> tuple[set[date], int, int, int]:
     """Какие сутки архива нужны — ВЫВОДИТСЯ ИЗ СТРУКТУР, а не задаётся ручкой.
 
     Стр. 26: «важно захватить все свечи структуры». Значит набор суток определяют сами
@@ -535,9 +538,14 @@ def needed_days(
     `horizon_days` отсекает старое — и это НЕ порог качества, а граница набора: структура,
     из которой цена ушла год назад, уровнем по стр. 25 уже не является. Возвращается
     вместе с числом отсечённых структур, чтобы отсечение было видно, а не молчало.
+
+    Четвёртым возвращается ПРАВЫЙ КРАЙ самого свежего окна (мс): REST-добору
+    незавершённых суток (решение владельца 2026-08-11) нужно знать, докуда качать, —
+    дальше правого края окон сделки никем не читаются.
     """
     days: set[date] = set()
     used = dropped = 0
+    max_hi = 0
     now = max((b[-1].open_ms for b in series.values() if b), default=0)
     cut = now - horizon_days * 86_400_000
     for tf, bars in series.items():
@@ -552,12 +560,13 @@ def needed_days(
                 dropped += 1
                 continue
             used += 1
+            max_hi = max(max_hi, hi)
             d = datetime.fromtimestamp(lo / 1000, UTC).date()
             end = datetime.fromtimestamp((hi - 1) / 1000, UTC).date()
             while d <= end:
                 days.add(d)
                 d += timedelta(days=1)
-    return days, used, dropped
+    return days, used, dropped, max_hi
 
 
 async def backfill_trades(
@@ -592,14 +601,176 @@ async def backfill_trades(
             log.degraded("бэкфилл пропущен: нет инструмента", символ=sym)
             continue
         insts[sym] = inst
-    await asyncio.to_thread(_backfill_impl, insts, uni, report, horizon_days,
-                            max_days_per_symbol)
+    gaps = await asyncio.to_thread(_backfill_impl, insts, uni, report, horizon_days,
+                                   max_days_per_symbol)
+    # РЕШЕНИЕ ВЛАДЕЛЬЦА 2026-08-11: живой контур не ждёт публикации архива. Сутки,
+    # которых у data.binance.vision нет (файл выходит с отставанием до двух суток),
+    # добираются REST-ом ccxt здесь же, а не остаются дыркой карты до завтра.
+    # Шаг идёт на цикле событий, а не в потоке: он ходит в сеть через `ex`.
+    for sym, (days, cover_to) in gaps.items():
+        gap_inst = insts.get(sym)
+        if gap_inst is None:
+            log.degraded("REST-добор пропущен: нет инструмента", символ=sym,
+                         суток=len(days))
+            continue
+        for day in sorted(days):
+            day_end = int(datetime(day.year, day.month, day.day,
+                                   tzinfo=UTC).timestamp() * 1000) + 86_400_000
+            age_days = (cover_to - day_end) / 86_400_000
+            if age_days > REST_BACKFILL_MAX_AGE_DAYS:
+                # Не молчание: сутки считаются и называются. Глубже замеренной глубины
+                # `startTime` пустой ответ биржи неотличим от «сделок не было».
+                log.degraded("сутки старше замеренной глубины REST — не добираются",
+                             символ=sym, дата=str(day),
+                             возраст_суток=round(age_days, 1),
+                             предел=REST_BACKFILL_MAX_AGE_DAYS)
+                report.backfill_days_missing += 1
+                report.backfill_missing_by_symbol[sym] = (
+                    report.backfill_missing_by_symbol.get(sym, 0) + 1)
+                continue
+            await _rest_fill_day(ex, sym, gap_inst, day, cover_to, report)
+
+
+REST_BACKFILL_MAX_AGE_DAYS = 30
+"""Глубже скольких суток REST-добор НЕ применяется. Число — граница ЗАМЕРА, а не воля:
+probe_rest_trade_depth_2026-08-11.py подтвердил выдачу `startTime` на глубине до 30
+суток; что биржа отвечает глубже — не замерено, а пустой ответ там неотличим от
+«сделок не было» и отравил бы кэш нулевыми сутками (см. отказ на пустом кадре в
+`_rest_fill_day`). Сутки старше границы остаются названным отказом с причиной."""
+
+REST_CHECKPOINT_TRADES = 200_000
+"""Сделок между контрольными точками REST-добора суток. ⚠ ЧИСЛО ПОДОБРАНО, не замерено:
+~200 страниц по 1000 сделок ≈ пара минут закачки — столько прогресса теряется при
+обрыве в худшем случае. Мельче — кэш дёргается записью на каждый чих; крупнее — обрыв
+дорожает. Сам механизм обязателен: без точек обрыв терял ВСЮ выкачку суток, и при
+коротких окнах исполнения добор крупного символа мог не завершиться никогда."""
+
+
+async def _rest_fill_day(
+    ex: Exchange, sym: str, inst: Instrument, day: date, cover_to_ms: int,
+    report: RunReport,
+) -> None:
+    """Добрать одни сутки REST-ом ccxt: закрытые — полным файлом кэша, текущие — частичным.
+
+    Решение владельца 2026-08-11 (и FOUNDATION §5 буквально: «Источник — Binance USD-M
+    через ccxt/ccxt.pro»): архив публикации — ускоритель истории, а не условие карты.
+
+    Частичный файл уже в кэше учитывается: качается только остаток за его границей,
+    прочитанное раньше не выкачивается заново. Бинирование — `models.bin_index`, та же
+    единственная функция, что у живого потока; согласие с архивной свёрткой держит
+    gates/binning_agrees.py.
+    """
+    day0 = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
+    day_end = day0 + 86_400_000
+    closed = day_end <= cover_to_ms
+    target = day_end if closed else cover_to_ms
+    if target <= day0:
+        return
+
+    qty: dict[tuple[int, int], float] = {}
+    cnt: dict[tuple[int, int], int] = {}
+    start = day0
+    prior = archive.find_part(archive.CACHE_DIR, inst.market_id, day, inst.tick_size)
+    if prior is not None:
+        path, prior_cover = prior
+        if prior_cover >= target:
+            # Состояние названо, а не проглочено (находка аудита 2026-08-11): сутки уже
+            # покрыты частичным файлом до нужной границы — качать нечего, это успех.
+            log.info("сутки уже покрыты частичным файлом", символ=sym, дата=str(day),
+                     покрыто_до=prior_cover, нужно_до=target)
+            return
+        for row in (await asyncio.to_thread(pl.read_parquet, path)).iter_rows(named=True):
+            key = (int(row["bucket"]), int(row["bin"]))
+            qty[key] = qty.get(key, 0.0) + float(row["qty"])
+            cnt[key] = cnt.get(key, 0) + int(row["n"])
+        start = prior_cover
+
+    since_ckpt = 0
+    max_ts = 0
+
+    def on_page(trades: list[RawTrade]) -> None:
+        nonlocal since_ckpt, max_ts
+        for t in trades:
+            bucket = t.timestamp - t.timestamp % archive.CACHE_BUCKET_MS
+            key = (bucket, bin_index(t.price, inst.tick_size))
+            qty[key] = qty.get(key, 0.0) + t.amount
+            cnt[key] = cnt.get(key, 0) + 1
+            max_ts = max(max_ts, t.timestamp)
+        since_ckpt += len(trades)
+        # КОНТРОЛЬНАЯ ТОЧКА. Сутки крупного символа качаются десятки минут; без точек
+        # обрыв процесса (таймаут, Ctrl+C) терял всю выкачку, и повтор начинал с нуля —
+        # то есть при коротких окнах исполнения добор МОГ НЕ ЗАВЕРШИТЬСЯ НИКОГДА.
+        # Частичный файл с границей по последней ПОЛНОЙ корзине делает любой рестарт
+        # продолжением. Порог подобран: ~200 страниц ≈ пара минут между точками.
+        if since_ckpt >= REST_CHECKPOINT_TRADES:
+            since_ckpt = 0
+            ckpt = max_ts - max_ts % archive.CACHE_BUCKET_MS
+            if ckpt > start:
+                frame = archive.frame_from_pairs(qty, cnt).filter(
+                    pl.col("bucket") < ckpt)
+                archive.write_part_day(inst.market_id, day, inst.tick_size, frame, ckpt)
+
+    got = await ex.fetch_agg_trades_window(sym, start, target, on_page)
+    if isinstance(got, NotReady):
+        log.degraded("сутки не добраны REST-ом", символ=sym, дата=str(day),
+                     причина=got.reason)
+        report.backfill_days_missing += 1
+        report.backfill_missing_by_symbol[sym] = (
+            report.backfill_missing_by_symbol.get(sym, 0) + 1)
+        return
+    fetched, covered = got
+    if covered <= start:
+        # Прогресса нет: писать нечего (при частичном файле это сохранило бы то же
+        # покрытие вторым файлом), сутки остаются недобранными и посчитаны.
+        log.degraded("сутки не добраны REST-ом", символ=sym, дата=str(day),
+                     причина=f"покрытие не продвинулось ({covered} ≤ {start})")
+        report.backfill_days_missing += 1
+        report.backfill_missing_by_symbol[sym] = (
+            report.backfill_missing_by_symbol.get(sym, 0) + 1)
+        return
+    frame = archive.frame_from_pairs(qty, cnt)
+    if frame.height == 0:
+        # ⚠ Пустые сутки НЕ записываются вовсе — ни полными, ни частичными. Находка
+        # аудита 2026-08-11: пустой ответ может значить не «сделок не было», а «глубже
+        # хранения биржи» — записанный по нему полный файл отравил бы кэш НАВСЕГДА
+        # (binned_day возвращает существующий файл, не перекачивая). У бессрочного
+        # контракта сутки без единой сделки — экзотика; честнее оставить их названным
+        # отказом, чем рискнуть молчаливым нулём профиля.
+        log.degraded("REST-добор дал пустые сутки — не записаны", символ=sym,
+                     дата=str(day), покрыто_до=covered)
+        report.backfill_days_missing += 1
+        report.backfill_missing_by_symbol[sym] = (
+            report.backfill_missing_by_symbol.get(sym, 0) + 1)
+        return
+    if closed and covered >= day_end:
+        await asyncio.to_thread(archive.write_full_day_from_frame,
+                                inst.market_id, day, inst.tick_size, frame)
+        report.backfill_rest_days += 1
+    else:
+        # Корзина, в которую попала ПОСЛЕДНЯЯ сделка, не заявляется покрытой: она могла
+        # оборваться на середине. В файл идут только корзины левее границы покрытия.
+        cover = min(covered, target)
+        frame = frame.filter(pl.col("bucket") < cover)
+        await asyncio.to_thread(archive.write_part_day, inst.market_id, day,
+                                inst.tick_size, frame, cover)
+        report.backfill_rest_partial += 1
+        if closed:
+            # Закрытые сутки, добранные не до конца, — деградация, и она названа:
+            # частичный файл честен (граница в имени), но сутки остаются непокрытыми.
+            log.degraded("закрытые сутки добраны частично", символ=sym, дата=str(day),
+                         покрыто_до=covered, конец_суток=day_end)
+            report.backfill_days_missing += 1
+            report.backfill_missing_by_symbol[sym] = (
+                report.backfill_missing_by_symbol.get(sym, 0) + 1)
+    report.backfill_rest_trades += fetched
+    log.info("сутки добраны REST-ом", символ=sym, дата=str(day), сделок=fetched,
+             целиком=closed and covered >= day_end)
 
 
 def _backfill_impl(
     insts: dict[str, Instrument], uni: Universe, report: RunReport, horizon_days: int,
     max_days_per_symbol: int,
-) -> None:
+) -> dict[str, tuple[list[date], int]]:
     """Тело бэкфилла. Синхронно и целиком в рабочем потоке — см. `backfill_trades`.
 
     Закачка ПОСЛЕДОВАТЕЛЬНА. Уводить её в поток — не то же самое, что качать в несколько
@@ -613,7 +784,13 @@ def _backfill_impl(
     `max_days_per_symbol` — предохранитель от многолетних структур 1Н, и он ГРОМКИЙ:
     отброшенное печатается числом, а не проглатывается. Непокрытые окна остаются
     `NotReady` с названной причиной (§4.3), а не заполняются приблизительным профилем.
+
+    Возвращает по символу СУТКИ, которых архив не дал, и правый край нужного покрытия —
+    их добирает REST-пас в `backfill_trades` (решение владельца 2026-08-11). Отказ архива
+    здесь больше не финален, поэтому и не считается в `backfill_days_missing`: финальный
+    счёт ведёт REST-пас.
     """
+    gaps: dict[str, tuple[list[date], int]] = {}
     for sym in uni.symbols:
         inst = insts.get(sym)
         if inst is None:
@@ -623,7 +800,7 @@ def _backfill_impl(
         if not series:
             log.degraded("бэкфилл пропущен: нет баров", символ=sym)
             continue
-        want, used, dropped = needed_days(series, horizon_days)
+        want, used, dropped, max_hi = needed_days(series, horizon_days)
         if len(want) > max_days_per_symbol:
             keep = sorted(want)[-max_days_per_symbol:]
             log.warn("предохранитель бэкфилла", символ=sym, нужно_суток=len(want),
@@ -642,16 +819,20 @@ def _backfill_impl(
         # `MemoryError` на 102 сутках: двадцать миллионов пар (корзина, бин) при том,
         # что каждой структуре нужно только её окно. Профиль теперь строит
         # `archive.WindowSource` по требованию.
+        left: list[date] = []
         for day in sorted(want):
             got = archive.binned_day(inst.market_id, day, inst.tick_size)
             if isinstance(got, NotReady):
-                log.degraded("сутки архива не получены", символ=sym, дата=str(day),
-                             причина=got.reason)
-                report.backfill_days_missing += 1
+                log.info("суток нет в архиве — добор REST-ом", символ=sym,
+                         дата=str(day), причина=got.reason)
+                left.append(day)
                 continue
             report.backfill_days_loaded += 1
             report.backfill_trades += int(got["n"].sum())
         log.info("сутки уложены в кэш", символ=sym, суток=report.backfill_days_loaded)
+        if left:
+            gaps[sym] = (left, max_hi)
+    return gaps
 
 
 def trade_source(ex: Exchange, sym: str, report: RunReport) -> TradeWindows | None:
@@ -778,9 +959,11 @@ def persist_archive(run_id: str, report: RunReport,
     for sym, src in sources.items():
         if not isinstance(src, archive.WindowSource):
             continue
-        for day in sorted(src.used_days):
-            store.write_archive_slice(run_id, sym,
-                                      archive.cache_path(src.market_id, day, src.tick))
+        # Кладутся ПУТИ, прочитанные источником, а не даты: сутки бывают полными и
+        # частичными файлами, и повтору нужен именно читанный файл (граница покрытия
+        # частичных стоит в имени — иначе пересборка разошлась бы на этой границе).
+        for path in sorted(src.used_paths):
+            store.write_archive_slice(run_id, sym, path)
             report.archive_slices_written += 1
 
 
@@ -1022,6 +1205,8 @@ CYCLE_FIELDS = (
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
+    "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
+    "backfill_missing_by_symbol",
 )
 """Поля отчёта, относящиеся к ОДНОМУ расчёту, а не ко всему времени работы.
 
@@ -1552,6 +1737,13 @@ def print_report(r: RunReport) -> int:
           f"старше горизонта отброшено: {r.backfill_structures_old}")
     print(f"   суток загружено: {r.backfill_days_loaded}, не получено: "
           f"{r.backfill_days_missing}, отброшено предохранителем: {r.backfill_days_capped}")
+    print(f"   добрано REST-ом ccxt (архив не отдал; решение владельца 2026-08-11): "
+          f"суток целиком {r.backfill_rest_days}, частично {r.backfill_rest_partial}, "
+          f"сделок {r.backfill_rest_trades:,}")
+    if r.backfill_missing_by_symbol:
+        by_sym = sorted(r.backfill_missing_by_symbol.items(), key=lambda x: -x[1])
+        print("   недобранные сутки по символам (сводка по измерению): "
+              + ", ".join(f"{s} {n}" for s, n in by_sym))
     print(f"   сделок влито: {r.backfill_trades}")
 
     print("\n7. ЛЕДЖЕР (§8 этап 7)")

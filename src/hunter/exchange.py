@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import zlib
 from collections import Counter
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from decimal import Decimal
 from typing import Any
 
@@ -143,6 +143,36 @@ TRADE_RECOVER_MAX_IDS = 3000
 
 TRADE_RECOVER_PAGE = 1000
 """Сделок за один запрос догона. 1000 — максимум aggTrades по документации Binance."""
+
+BACKFILL_DAY_MAX_PAGES = 10_000
+"""Предел страниц REST-добора ОДНИХ суток (до 10 млн сделок). ⚠ ЧИСЛО ПОДОБРАНО, не
+замерено: это предохранитель от бесконечного курсора, а не бюджет. Достигнутый предел
+НЕ молчит: добор останавливается, покрытие фиксируется до последней ПОЛНОЙ корзины, а
+остаток суток остаётся названным отказом (§4.3).
+
+Цена предела в весе: 10 000 страниц × 20 веса = 200 000, то есть ~83 минуты при лимите
+2400/мин — добор таких суток растянется, но не уронит остальной REST: страницы идут через
+`_quiet_gate`, и ccxt с `enableRateLimit` сам темпирует запросы.
+"""
+
+REST_TRADES_WINDOW_MS = 3_600_000
+"""Сколько рынка накрывает ОДИН вызов `fetch_trades(since=…)`. Число НЕ наше и НЕ подобрано.
+
+Его дописывает сама ccxt — `ccxt/async_support/binance.py::fetch_trades`, ccxt 4.5.71:
+
+    if since is not None:
+        request['startTime'] = since
+        request['endTime'] = self.sum(since, 3600000)
+
+Это обход правила Binance «If both startTime and endTime are sent, time between startTime
+and endTime must be less than 1 hour» (USDⓈ-M, Compressed/Aggregate Trades List).
+
+⚠ Следствие, из-за которого константа вообще названа: ПУСТОЙ ответ означает «в этот час
+сделок нет», а не «сделок больше нет». Замер 2026-08-11
+(docs/audit/probes/probe_rest_empty_page_2026-08-11.py): у ARPA страница оборвана временем
+(792 сделки при limit=1000, размах 3589 с, до отметки since+1ч остаётся 10 с), у BTC —
+лимитом (1000 сделок за 75 с). Прибор различает оба случая, то есть контроль пройден.
+"""
 
 RATE_LIMIT_BACKOFF_S = 60.0
 """НИЖНЯЯ граница паузы после ответа «лимит превышен». ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — по документации.
@@ -810,6 +840,158 @@ class Exchange:
             cursor = top + 1
         self.trades_recovered += len(out)
         return out
+
+    async def fetch_agg_trades_window(
+        self, symbol: str, from_ms: int, to_ms: int,
+        on_page: Callable[[list[RawTrade]], None],
+    ) -> tuple[int, int] | NotReady:
+        """Выкачать сделки окна `[from_ms, to_ms)` REST-ом постранично. Для бэкфилла.
+
+        Решение владельца 2026-08-11: живой контур обязан работать через ccxt REST/WS и
+        не ждать публикации суточного архива. Этот метод — тот самый REST-путь: сутки,
+        которых нет в архиве (публикуется с отставанием до двух суток, HTTP 404), больше
+        не дырка в карте, а обычная закачка.
+
+        Курсор — ПО ВРЕМЕНИ (`startTime`), а не по `fromId`. Это не вкусовщина, а замер
+        2026-08-11 (docs/audit/probes/probe_rest_trade_depth_2026-08-11.py и
+        probe_backfill_window_2026-08-11.py): у Binance USDⓈ-M `fromId` старше 24 часов
+        отклоняется кодом -1000 («Only recent trade history within the past 24 hours is
+        supported for aggTrades»), тогда как `startTime` отдаёт сделки минимум 30-суточной
+        давности. Первая редакция метода шла по `fromId` и ломалась на второй странице
+        любых суток старше одних.
+
+        У времени нет однозначной границы: следующая страница просится с миллисекунды
+        ПОСЛЕДНЕЙ принятой сделки (не +1 — на плотной миллисекунде потерялся бы хвост),
+        а повтор границы отсеивается по номерам aggTrade этой миллисекунды. Страница,
+        целиком лежащая в одной уже виденной миллисекунде, прогресса не даёт — добор
+        останавливается НАЗВАННО, с покрытием до последней полной корзины.
+
+        Страницы отдаются `on_page` по мере прихода, а не копятся: сутки крупного символа
+        — миллионы сделок, и держать их списком значило бы повторить `MemoryError`
+        бэкфилла 2026-08-04. Возвращает `(сделок_отдано, покрыто_до_мс)`:
+        `покрыто_до_мс == to_ms` — окно выкачано целиком; меньше — добор оборван (отказ
+        биржи, сеть, предел страниц) и покрытие честно обрезано до последней ПОЛНОЙ
+        корзины кэша. `NotReady` — не пришло ни одной страницы.
+        """
+        from .archive import CACHE_BUCKET_MS
+
+        def covered(last_ts: int | None) -> int:
+            """До какой миллисекунды покрытие ДОКАЗАНО, с округлением вниз до корзины.
+
+            Два основания, и берётся дальнее: последняя принятая сделка и `floor_ms` —
+            отметка, до которой биржа ответила ПУСТЫМИ часами. Пустой час — такое же
+            свидетельство покрытия, как сделка: он говорит, что сделок там нет. Без
+            второго основания добор по тонкому символу докладывал бы покрытие по
+            последней сделке, то есть занижал бы его на все пройденные пустые часы.
+            """
+            by_trade = from_ms if last_ts is None else last_ts - last_ts % CACHE_BUCKET_MS
+            # Отметка пустых часов тоже кладётся на сетку корзин ВНИЗ (находка аудита
+            # 2026-08-11): cursor_ts — миллисекунда сделки, и cursor_ts+час на сетку не
+            # ложится, а покрытие обещано «до последней ПОЛНОЙ корзины».
+            by_empty = floor_ms - floor_ms % CACHE_BUCKET_MS
+            return min(to_ms, max(by_trade, by_empty))
+
+        total = 0
+        last_ts: int | None = None
+        cursor_ts = from_ms
+        floor_ms = from_ms
+        """Докуда покрытие доказано ПУСТЫМИ часами. Растёт только на пустом ответе."""
+        boundary_ids: set[int] = set()
+        """Номера aggTrade сделок, лежащих РОВНО на миллисекунде курсора: следующая
+        страница просится с неё же и приносит их повторно — повтор отсеивается здесь."""
+        for _ in range(BACKFILL_DAY_MAX_PAGES):
+            await self._quiet_gate()
+            try:
+                raw = await self._ex.fetch_trades(
+                    symbol, since=cursor_ts, limit=TRADE_RECOVER_PAGE)
+            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+                self.rest_errors[type(e).__name__] += 1
+                self.rest_rate_limited += 1
+                self._declare_quiet(self._rate_limit_pause_s())
+                if total:
+                    return total, covered(last_ts)
+                return NotReady(
+                    reason=f"{symbol}: REST-добор окна — лимит биржи ({type(e).__name__})")
+            except ccxt.NetworkError as e:
+                self.rest_errors[type(e).__name__] += 1
+                if total:
+                    return total, covered(last_ts)
+                return NotReady(
+                    reason=f"{symbol}: REST-добор окна — сеть ({type(e).__name__})")
+            except ccxt.ExchangeError as e:
+                self.rest_errors[type(e).__name__] += 1
+                if total:
+                    return total, covered(last_ts)
+                return NotReady(
+                    reason=f"{symbol}: REST-добор окна — отказ биржи ({type(e).__name__})")
+            except ccxt.OperationFailed as e:
+                # ⚠ НЕ дубль веток выше: `OperationFailed` — прямой наследник `BaseError`,
+                # сюда падает то, что не сеть и не `ExchangeError` (замер 2026-08-11:
+                # код -1000 у fromId старше 24 ч летел именно так, мимо обоих ловцов).
+                self.rest_errors[type(e).__name__] += 1
+                if total:
+                    return total, covered(last_ts)
+                return NotReady(
+                    reason=f"{symbol}: REST-добор окна — отказ ({type(e).__name__})")
+            self._note_weight()
+            if not raw:
+                # ⚠ ЗДЕСЬ БЫЛ ВЫВОД «после since сделок нет, окно покрыто целиком», и он
+                # НЕВЕРЕН. ccxt сам дописывает верхнюю границу запроса в ОДИН ЧАС —
+                # `ccxt/async_support/binance.py::fetch_trades`, ccxt 4.5.71:
+                #     request['startTime'] = since
+                #     request['endTime'] = self.sum(since, 3600000)
+                # (обход правила Binance «time between startTime and endTime must be less
+                # than 1 hour»). Значит пустой ответ означает пустой ЧАС, а не конец
+                # сделок, и прежняя ветка на тонком символе с часовой паузой объявляла бы
+                # ПОЛНОЕ покрытие усечённого окна — молчаливое усечение, §4.3.
+                # Замер 2026-08-11 (probe_rest_empty_page_2026-08-11.py): у ARPA страница
+                # оборвана временем (792 сделки, размах 3589 с, до отметки since+1ч 10 с),
+                # у BTC — лимитом (1000 сделок за 75 с). Границу ставит час, а не биржа.
+                floor_ms = min(to_ms, cursor_ts + REST_TRADES_WINDOW_MS)
+                if floor_ms >= to_ms:
+                    return total, to_ms
+                cursor_ts = floor_ms
+                boundary_ids.clear()
+                continue
+            page: list[RawTrade] = []
+            page_max_ts: int | None = None
+            done = False
+            for r in raw:
+                t = parse_trade(r)
+                if isinstance(t, NotReady) or t.id is None:
+                    self.trades_unparsed += 1
+                    continue
+                page_max_ts = (t.timestamp if page_max_ts is None
+                               else max(page_max_ts, t.timestamp))
+                if t.timestamp >= to_ms:
+                    done = True
+                    continue
+                if t.timestamp < from_ms:
+                    continue
+                if t.timestamp == cursor_ts and int(t.id) in boundary_ids:
+                    continue  # повтор граничной миллисекунды прошлой страницы
+                page.append(t)
+                last_ts = t.timestamp if last_ts is None else max(last_ts, t.timestamp)
+            if page:
+                total += len(page)
+                on_page(page)
+            if done:
+                return total, to_ms
+            if page_max_ts is None or (page_max_ts == cursor_ts and not page):
+                # Вся страница — уже виденная миллисекунда: время не движется, значит
+                # плотнее страницы курсором по времени не пройти. Названный обрыв.
+                log.warn("REST-добор: курсор времени не продвинулся", символ=symbol,
+                         миллисекунда=cursor_ts, сделок=total)
+                return total, covered(last_ts)
+            if page_max_ts > cursor_ts:
+                boundary_ids = {int(t.id) for t in page
+                                if t.timestamp == page_max_ts and t.id is not None}
+                cursor_ts = page_max_ts
+            else:
+                boundary_ids |= {int(t.id) for t in page if t.id is not None}
+        log.warn("REST-добор упёрся в предел страниц", символ=symbol,
+                 страниц=BACKFILL_DAY_MAX_PAGES, сделок=total)
+        return total, covered(last_ts)
 
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[RawTrade]]:
         """Поток сделок УЖЕ РАЗОБРАННЫМ в тип. §10.1: словарей между слоями нет.

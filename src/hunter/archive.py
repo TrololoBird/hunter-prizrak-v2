@@ -13,8 +13,17 @@
 1440 запросов и ~36 минут против нескольких секунд на один суточный ZIP.
 
 Отсюда разделение, а не запрет:
-  * широкое окно (сутки и больше) — архив;
+  * широкое окно (сутки и больше) — архив, ГДЕ ОН ЕСТЬ;
   * узкое окно (минуты) — REST уместен и работает.
+
+⚠ Решение владельца 2026-08-11: живой контур НЕ ЖДЁТ публикации архива. Файл суток
+выходит с отставанием до двух суток (замер: 2026-08-10 и 2026-08-11 отдавали HTTP 404
+при прогоне 2026-08-11), и до этой правки карта младших ТФ систематически обрывалась
+на позавчера — свежайшие структуры не получали уровней. Теперь сутки, которых в архиве
+нет, добирает REST-ом ccxt (`Exchange.fetch_agg_trades_window`): закрытые — полным
+файлом кэша, незавершённые — частичным с границей покрытия в имени (`part_path`).
+Архив остаётся дешёвым путём для глубокой истории, но единственным источником он
+больше не является.
 
 Целостность проверяется приложенным биржей .CHECKSUM: замер 2026-08-03 на
 BTCUSDT-aggTrades-2026-08-01.zip — sha256 совпал.
@@ -238,7 +247,114 @@ def binned_day(
     return binned
 
 
-CACHE_STEM = re.compile(r"^(?P<market>.+)-(?P<day>\d{4}-\d{2}-\d{2})-(?P<rest>.+)$")
+def frame_from_pairs(
+    qty: dict[tuple[int, int], float], cnt: dict[tuple[int, int], int]
+) -> pl.DataFrame:
+    """Свернуть пары (корзина, бин) в кадр ТОЙ ЖЕ схемы, что у `binned_day`.
+
+    Нужен REST-добору: он бинит сделки поштучно через `models.bin_index` (единственную
+    функцию бинирования; согласие с `bin_expr` держит gates/binning_agrees.py), а кэш
+    хранит кадры. Строки сортируются по (корзина, бин) — порядок в файле детерминирован,
+    как того требует §10.6.
+    """
+    keys = sorted(qty)
+    return pl.DataFrame({
+        "bucket": [k[0] for k in keys],
+        "bin": [k[1] for k in keys],
+        "qty": [qty[k] for k in keys],
+        "n": [cnt[k] for k in keys],
+    }, schema={"bucket": pl.Int64, "bin": pl.Int64, "qty": pl.Float64, "n": pl.UInt32})
+
+
+def write_full_day_from_frame(
+    market_id: str, day: date, tick: Decimal, frame: pl.DataFrame
+) -> Path:
+    """Положить ЗАКРЫТЫЕ сутки, добранные REST-ом, в кэш под именем полных.
+
+    Право на имя полных даёт вызывающий: сюда пишутся только сутки, чьё покрытие
+    доведено до конца суток ВРЕМЕННЫМ курсором (`fetch_agg_trades_window`) — страница
+    просится с миллисекунды последней принятой сделки, повтор границы отсеивается по
+    номерам aggTrade, пустой ответ засчитывает покрытым ровно час (верхнюю границу
+    `endTime = since + 1 ч` дописывает сама ccxt). ⚠ Это гарантия слабее архивной:
+    sha256 у REST-пути нет, а непрерывность держится на поведении пагинации, а не на
+    номерах от первого до последнего. Сутки без ЕДИНОЙ сделки под это имя не пишутся
+    вовсе (`_rest_fill_day` отказывает): пустота глубже хранения биржи неотличима от
+    настоящей, а файл с нулём отравил бы кэш навсегда.
+
+    Частичные файлы этих суток после появления полного подчищаются: они целиком
+    входят в полный и больше никогда не будут выбраны (`_day` смотрит полный раньше).
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = cache_path(market_id, day, tick)
+    _write_atomic(frame, path)
+    for p in CACHE_DIR.glob(f"{path.stem}-part*.parquet"):
+        p.unlink(missing_ok=True)
+    return path
+
+
+def part_path(market_id: str, day: date, tick: Decimal, cover_to_ms: int) -> Path:
+    """Имя ЧАСТИЧНЫХ суток: как у полных, плюс граница покрытия в миллисекундах.
+
+    Введено 2026-08-11 решением владельца: живой контур не ждёт публикации архива —
+    сутки, которых у `data.binance.vision` ещё нет, добираются REST-ом через ccxt.
+    Незавершённые сутки нельзя класть под именем полных: следующий прогон счёл бы их
+    покрытыми целиком и построил усечённый профиль МОЛЧА. Поэтому граница покрытия
+    стоит в имени — всё, от чего зависит содержимое, обязано стоять в имени (та же
+    логика, что у шага цены и метки схемы).
+    """
+    base = cache_path(market_id, day, tick)
+    return base.with_name(f"{base.stem}-part{cover_to_ms}.parquet")
+
+
+def find_part(
+    cache_dir: Path, market_id: str, day: date, tick: Decimal
+) -> tuple[Path, int] | None:
+    """Найти частичные сутки в каталоге; при нескольких — с наибольшим покрытием.
+
+    Несколько файлов одних суток — след оборванного добора, а не ошибка: новый файл
+    пишется раньше, чем стираются старые. Побеждает наибольшее покрытие.
+    """
+    base = cache_path(market_id, day, tick)
+    best: tuple[Path, int] | None = None
+    for p in cache_dir.glob(f"{base.stem}-part*.parquet"):
+        m = re.fullmatch(r".*-part(\d+)", p.stem)
+        if not m:
+            continue
+        cover = int(m.group(1))
+        if best is None or cover > best[1]:
+            best = (p, cover)
+    return best
+
+
+def write_part_day(
+    market_id: str, day: date, tick: Decimal, frame: pl.DataFrame, cover_to_ms: int
+) -> Path:
+    """Положить частичные сутки в общий кэш; прежние частичные файлы этих суток убрать.
+
+    Убирается только то, что этим же вызовом заменено файлом с БОЛЬШИМ покрытием, —
+    это смена поколения кэша, а не потеря данных: содержимое старого файла целиком
+    входит в новый (та же пагинация по fromId с начала суток).
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = part_path(market_id, day, tick, cover_to_ms)
+    _write_atomic(frame, path)
+    base = cache_path(market_id, day, tick)
+    for p in CACHE_DIR.glob(f"{base.stem}-part*.parquet"):
+        m = re.fullmatch(r".*-part(\d+)", p.stem)
+        if m and int(m.group(1)) < cover_to_ms:
+            p.unlink(missing_ok=True)
+    return path
+
+
+CACHE_STEM = re.compile(r"^(?P<market>.+)-(?P<day>\d{4}-\d{2}-\d{2})$")
+"""Стебель имени ПОСЛЕ отрезания хвоста `-корзина-шаг-схема`: рынок и дата, больше ничего.
+
+⚠ До 2026-08-11 шаблон требовал ещё один сегмент ПОСЛЕ даты (`-(?P<rest>.+)`), который
+к моменту сопоставления уже отрезан, — и потому `cached_days` возвращала пусто ВСЕГДА,
+при любом состоянии кэша. Прибор, запертый в одном ответе (реестр CLAUDE.md): сводка
+бэкфилла честно печатала «из_кэша=0, качать=75» поверх 73 лежащих на диске суток.
+На закачку дефект не влиял (`binned_day` проверяет файл сам), врала только сводка.
+Пойман сверкой строки лога с `ls data/aggcache` на втором прогоне BEAT."""
 
 
 def cached_days(market_id: str, tick: Decimal) -> set[date]:
@@ -296,15 +412,17 @@ class WindowSource:
         в кадрах этого прогона: иначе повтор зависит от того, что успел долить бэкфилл
         соседнего прогона (А-3, Н-6 разбора)."""
 
-        self.used_days: set[date] = set()
-        """Сутки, ФАКТИЧЕСКИ прочитанные при построении окон.
+        self.used_paths: set[Path] = set()
+        """ФАЙЛЫ, ФАКТИЧЕСКИ прочитанные при построении окон, — их кладёт в кадры
+        `persist_archive`, и на этом стоит герметичность повтора.
 
-        Не «нужные по расчёту», а именно прочитанные: их и надо положить в кадры, чтобы
-        повтор был герметичен. Множество, а не список, — порядок здесь не значим, а в
-        карточку это число не попадает (карточка обязана быть детерминированной).
+        Именно пути, а не даты (до 2026-08-11 здесь был `used_days`): сутки бывают
+        двумя видами файлов — полными и частичными (`-part<мс>`), и повтору нужен
+        ровно тот файл, что читался, иначе пересборка разошлась бы на границе покрытия.
         """
 
         self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        self._open_parts: dict[date, tuple[pl.DataFrame, int] | None] = {}
 
     def _day(self, day: date) -> pl.DataFrame | None:
         """Сутки из кэша. Скачивания здесь НЕТ: это работа бэкфилла, а не расчёта."""
@@ -315,11 +433,30 @@ class WindowSource:
         if not path.exists():
             return None
         frame = pl.read_parquet(path)
-        self.used_days.add(day)
+        self.used_paths.add(path)
         self._open[day] = frame
         while len(self._open) > self.max_open:
             self._open.popitem(last=False)
         return frame
+
+    def _part(self, day: date) -> tuple[pl.DataFrame, int] | None:
+        """Частичные сутки из кэша: (кадр, покрыто_до_мс). Скачивания здесь тоже нет.
+
+        Появляются у суток, которых нет в архиве публикации: REST-добор бэкфилла пишет
+        их с границей покрытия в имени (решение владельца 2026-08-11). Остаток суток за
+        границей добирает живой поток — см. `window`.
+        """
+        if day in self._open_parts:
+            return self._open_parts[day]
+        found = find_part(self.cache_dir, self.market_id, day, self.tick)
+        if found is None:
+            self._open_parts[day] = None
+            return None
+        path, cover = found
+        frame = pl.read_parquet(path)
+        self.used_paths.add(path)
+        self._open_parts[day] = (frame, cover)
+        return self._open_parts[day]
 
     def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
         d0 = datetime.fromtimestamp(from_ms / 1000, UTC).date()
@@ -328,12 +465,31 @@ class WindowSource:
 
         qty: dict[int, float] = {}
         cnt: dict[int, int] = {}
-        missing: list[date] = []
+        # Непокрытое — СПИСКОМ ДИАПАЗОНОВ, а не суток: у частичных суток дыра начинается
+        # с границы покрытия, а не с полуночи, и просить у живого потока всю дату значило
+        # бы сложить уже сложенное дважды (тот же класс дефекта, что «живой добор на всё
+        # окно» до 2026-08-09).
+        missing: list[tuple[date, int, int]] = []
+        partial_at: dict[date, int] = {}
+        """Сутки, у которых есть частичный файл, и его граница: отказ обязан называть
+        «частично до X», а не «нет суток» (§4.3 — причина, а не ближайшая похожая)."""
         for day in span:
+            day0 = int(datetime(day.year, day.month, day.day, tzinfo=UTC)
+                       .timestamp() * 1000)
+            day_end = day0 + 86_400_000
             frame = self._day(day)
             if frame is None:
-                missing.append(day)
-                continue
+                got_part = self._part(day)
+                if got_part is None:
+                    missing.append((day, max(from_ms, day0), min(to_ms, day_end)))
+                    continue
+                frame, cover = got_part
+                rem_from = max(from_ms, cover)
+                rem_to = min(to_ms, day_end)
+                if rem_from < rem_to:
+                    missing.append((day, rem_from, rem_to))
+                    partial_at[day] = cover
+                frame = frame.filter(pl.col("bucket") < cover)
             # ⚠ `maintain_order=True` — не украшение, а условие §10.6. Без него polars
             # группирует параллельно и отдаёт группы в РАЗНОМ ПОРЯДКЕ от прогона к
             # прогону; порядок уходит в `qty_by_bin`, оттуда — в порядок сложения float,
@@ -373,14 +529,11 @@ class WindowSource:
             # transport-decision §3.3 требуют добора по суткам. Контроль:
             # docs/audit/probes/probe_live_overlap_2026-08-09.py — на подстроенном
             # пересечении прежний способ удваивает, посуточный нет.
-            still: list[date] = []
-            for day in missing:
-                day0 = int(datetime(day.year, day.month, day.day, tzinfo=UTC)
-                           .timestamp() * 1000)
-                got = self.live.window(max(from_ms, day0),
-                                       min(to_ms, day0 + 86_400_000))
+            still: list[tuple[date, int, int]] = []
+            for day, gap_from, gap_to in missing:
+                got = self.live.window(gap_from, gap_to)
                 if isinstance(got, NotReady):
-                    still.append(day)
+                    still.append((day, gap_from, gap_to))
                     continue
                 for idx, q in got.qty_by_bin.items():
                     qty[idx] = qty.get(idx, 0.0) + q
@@ -388,10 +541,13 @@ class WindowSource:
             missing = still
 
         if missing:
+            days = [d.isoformat() + (f" (частично, до {partial_at[d]})"
+                                     if d in partial_at else "")
+                    for d, _, _ in missing]
             return NotReady(
                 reason=f"{self.symbol}: окно [{from_ms},{to_ms}) не покрыто — нет суток "
-                       f"{', '.join(d.isoformat() for d in missing[:5])}"
-                       + (f" и ещё {len(missing) - 5}" if len(missing) > 5 else "")
+                       f"{', '.join(days[:5])}"
+                       + (f" и ещё {len(days) - 5}" if len(days) > 5 else "")
             )
         if not qty:
             return NotReady(reason=f"{self.symbol}: в окне [{from_ms},{to_ms}) сделок нет")
