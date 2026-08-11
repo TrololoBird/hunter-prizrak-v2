@@ -1358,7 +1358,7 @@ class Collector:
         self.seed_limit = seed_limit
         self.keep_bars = keep_bars
         self.keep_trade_days = keep_trade_days
-        self.ex = Exchange()
+        self.ex = Exchange(uni.venue)
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self.seq: dict[str, TradeSequence] = {}

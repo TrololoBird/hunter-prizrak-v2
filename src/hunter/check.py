@@ -48,7 +48,7 @@ def _verdict(lines: list[tuple[str, bool, str]]) -> int:
 async def _admission_survey(
     uni: Universe, required: int
 ) -> dict[str, dict[str, int | NotReady]]:
-    ex = Exchange()
+    ex = Exchange(uni.venue)
     await ex.open()
     try:
         out: dict[str, dict[str, int | NotReady]] = {}

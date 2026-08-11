@@ -153,7 +153,7 @@ def _profile(args: argparse.Namespace) -> int:
     end = start + 86_400_000
 
     async def day_histogram() -> tuple[Decimal, TradeHistogram] | NotReady:
-        ex = Exchange()
+        ex = Exchange(load_universe(args.universe).venue)
         await ex.open()
         try:
             symbol = next((s for s, mk in ex.markets_by_id().items()
@@ -222,7 +222,7 @@ def _admission(args: argparse.Namespace) -> int:
         как «у символа нет истории» (§4.3)."""
         from .models import NotReady
 
-        ex = Exchange()
+        ex = Exchange(uni.venue)
         await ex.open()
         try:
             out: list[tuple[str, dict[str, int], tuple[str, ...]]] = []
@@ -382,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
     prof = sub.add_parser("profile", help="профиль объёма за сутки: ПОК, VAH, VAL")
     prof.add_argument("--symbol", required=True, help="идентификатор биржи, напр. BTCUSDT")
     prof.add_argument("--day", required=True, help="дата YYYY-MM-DD")
+    # Площадка берётся из вселенной: профиль спота и профиль бессрочного — разные числа.
+    prof.add_argument("--universe", type=Path, default=DEFAULT_PATH)
 
     adm = sub.add_parser("admission", help="хватает ли истории на величины §2.9")
     adm.add_argument("--universe", type=Path, default=DEFAULT_PATH)

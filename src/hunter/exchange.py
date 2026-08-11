@@ -10,14 +10,14 @@ import zlib
 from collections import Counter
 from collections.abc import AsyncGenerator, Callable
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 import ccxt
 import ccxt.pro as ccxtpro
 from pydantic import ValidationError
 
 from . import clock, log
-from .bars import closed_only, on_grid
+from .bars import closed_only, on_grid, tf_ms
 from .models import (
     Bar,
     ClockSync,
@@ -142,7 +142,19 @@ TRADE_RECOVER_MAX_IDS = 3000
 """
 
 TRADE_RECOVER_PAGE = 1000
-"""Сделок за один запрос догона. 1000 — максимум aggTrades по документации Binance."""
+"""Сделок за один запрос догона. 1000 — максимум aggTrades по документации Binance.
+
+⚠ И здесь же названо то, что до 2026-08-11 было выбрано за нас умолчанием. У `fetch_trades`
+есть опция `fetchTradesMethod` (ccxt/binance.py), переключающая эндпоинт:
+
+    fapiPublicGetAggTrades        — умолчание для линейных контрактов, вес 20, наш выбор
+    fapiPublicGetTrades           — сырые сделки, вес 5
+    fapiPublicGetHistoricalTrades — сырые сделки по номеру, вес 20, предел limit 500
+
+Мы работаем на первом, и это ПРАВИЛЬНО по FOUNDATION.md §5: профиль строится на aggTrade.
+Но выбор был сделан умолчанием библиотеки, а не нами, и вчетверо большая цена по весу
+относительно `trades` в бюджете добора не учитывалась.
+"""
 
 BACKFILL_DAY_MAX_PAGES = 10_000
 """Предел страниц REST-добора ОДНИХ суток (до 10 млн сделок). ⚠ ЧИСЛО ПОДОБРАНО, не
@@ -156,16 +168,24 @@ BACKFILL_DAY_MAX_PAGES = 10_000
 """
 
 REST_TRADES_WINDOW_MS = 3_600_000
-"""Сколько рынка накрывает ОДИН вызов `fetch_trades(since=…)`. Число НЕ наше и НЕ подобрано.
+"""Наибольшее окно ОДНОГО вызова `fetch_trades`. Число НЕ наше и НЕ подобрано.
 
-Его дописывает сама ccxt — `ccxt/async_support/binance.py::fetch_trades`, ccxt 4.5.71:
+⚠ ФОРМУЛИРОВКА ИСПРАВЛЕНА 2026-08-11 построчным чтением. Здесь стояло «его дописывает
+сама ccxt», и это приписывало правило библиотеке. Правило — БИРЖИ: «If both startTime and
+endTime are sent, time between startTime and endTime must be less than 1 hour» (USDⓈ-M,
+Compressed/Aggregate Trades List). ccxt лишь подставляет этот потолок по умолчанию, когда
+верхнюю границу не задали:
 
     if since is not None:
         request['startTime'] = since
         request['endTime'] = self.sum(since, 3600000)
+    until = self.safe_integer(params, 'until')
+    if until is not None:
+        request['endTime'] = until
 
-Это обход правила Binance «If both startTime and endTime are sent, time between startTime
-and endTime must be less than 1 hour» (USDⓈ-M, Compressed/Aggregate Trades List).
+То есть подстановка ПЕРЕОПРЕДЕЛЯЕМА через `params['until']` — вниз, но не вверх. Разница
+существенна: она означает, что верхнюю границу страницы задаём мы, а не библиотека, и
+`fetch_agg_trades_window` этим пользуется, чтобы не тянуть сделки за пределы окна.
 
 ⚠ Следствие, из-за которого константа вообще названа: ПУСТОЙ ответ означает «в этот час
 сделок нет», а не «сделок больше нет». Замер 2026-08-11
@@ -191,6 +211,92 @@ RATE_LIMIT_BACKOFF_S = 60.0
 2026-08-11 показала, что обещан он только в СПОТОВОЙ, а на странице USDⓈ-M не упомянут
 вовсе. Разбор — в докстроке `_rate_limit_pause_s`.
 """
+
+
+REST_TIMEOUT_MS = 20_000
+"""Таймаут HTTP-запроса. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО — названо как выбор, а не как результат.
+
+Умолчание ccxt — 10 000 мс (ccxt/base/exchange.py, `timeout = 10000`), и до 2026-08-11 мы
+его просто не трогали, то есть не выбирали вовсе. За двое суток прогонов `RequestTimeout`
+приходил дважды. Цена ошибки несимметрична: короткий таймаут теряет опрос (данные придут
+следующим кругом), длинный держит задачу занятой — но у нас задача ряда всё равно спит до
+следующей границы ТФ, так что «держит» почти ничего не стоит.
+
+Проверяется счётчиком `rest_errors['RequestTimeout']` в приёмке: если он не падает, дело
+не в числе.
+"""
+
+RATE_LIMIT_ERRORS: tuple[type[Exception], ...] = (
+    ccxt.RateLimitExceeded,
+    ccxt.DDoSProtection,
+    ccxt.InvalidNonce,
+)
+"""Классы, при которых объявляется ГЛОБАЛЬНАЯ пауза REST. Список не наш — он взят из
+руководства ccxt дословно.
+
+Manual.md, «Rate Limit»: «In case your calls hit a rate limit or get nonce errors, the
+ccxt library will throw an `InvalidNonce` exception, or, in some cases, one of the
+following types: `DDoSProtection`, `ExchangeNotAvailable`, `ExchangeError`, `InvalidNonce`».
+
+До 2026-08-11 мы считали лимитом только первые два. `InvalidNonce` наследует
+`NetworkError`, то есть ловился — но как ОБЫЧНЫЙ сетевой сбой, без объявления паузы и без
+отдельного счётчика. Повтор после попадания в лимит — ровно то, за что Binance банит по
+IP (`418`) на срок до трёх суток.
+
+⚠ `ExchangeNotAvailable` и `ExchangeError` из того же списка сюда НЕ включены сознательно.
+Оба возникают и по причинам, к темпу отношения не имеющим (техобслуживание, неверный
+запрос), и глобальная минутная тишина при каждом отказе биржи заморозила бы сбор данных
+там, где нужно просто повторить позже. Цена этого выбора названа: попадание в лимит,
+пришедшее под видом `ExchangeNotAvailable`, паузы не вызовет и будет виден только в
+`rest_errors`.
+"""
+
+WS_TRADES_STREAM = "aggTrade"
+"""Имя потока сделок. FOUNDATION.md §5: профиль строится на aggTrade.
+
+⚠ ВЫНЕСЕНО В КОНСТАНТУ 2026-08-11, И ЭТО НЕ КОСМЕТИКА. Имя стояло только в опциях
+конструктора, а снятие подписки его не видело — и снимало ДРУГОЙ поток. Разбор по
+исходнику ccxt 4.5.71:
+
+  * `watch_trades` (ccxt/pro/binance.py) ставит `params['callerMethodName'] = 'watchTrades'`,
+    а `handle_option_and_params` (ccxt/base/exchange.py) этим ключом ПОДМЕНЯЕТ имя метода
+    при поиске опции. Поэтому читается `options['watchTrades']['name']` — наш `aggTrade`;
+  * `un_watch_trades` `callerMethodName` НЕ СТАВИТ. Цепочка поиска: `params['name']` →
+    `options['watchTradesForSymbols']` → глобальный `options['name']` → **умолчание
+    `'trade'`**. Ни одного из первых трёх у нас не было.
+
+То есть снятие адресовалось потоку `trade`, на который мы никогда не подписывались, а
+подписка `aggTrade` оставалась живой. Вызов при этом НЕ падал — потому счётчик «снято
+подписок» показывал успех.
+
+Теперь имя одно и передаётся обеим сторонам явно.
+"""
+
+RATE_UTILISATION = 0.75
+"""Какую ДОЛЮ опубликованного биржей лимита веса мы позволяем себе занимать.
+
+⚠ Число выбрано, а не замерено, и вот чем оно ограничено с двух сторон.
+
+СВЕРХУ. Руководство ccxt (Manual.md, «What the rateLimit number means») даёт формулу
+прямо: пауза перед запросом = `rateLimit` × стоимость запроса, а само число берётся из
+опубликованного лимита биржи делением. Оно же предупреждает, что биржи применяют ещё
+поэндпоинтные и всплесковые правила, которые одним числом не выражаются, — потому целиться
+в 100% лимита нельзя. Цена ошибки в эту сторону — бан по IP от 2 минут до 3 суток.
+
+СНИЗУ. Умолчание ccxt `rateLimit = 50` мс — НЕ выбор под нашу задачу. То же руководство
+называет его дословно «a safe default which is sub-optimal» и относит настройку к
+пользователю. При лимите USDⓈ-M в 2400 веса за минуту 50 мс означают 1200 веса, то есть
+ровно половину разрешённого; при споте в 6000 — пятую часть.
+
+0.75 — середина между «не трогать чужое умолчание» и «занять всё». Подставляется в
+величину, ПРОЧИТАННУЮ У БИРЖИ (`weight_limit`), а не в зашитую константу, поэтому число
+само едет за площадкой: 2400 -> 33 мс, 6000 -> 13 мс.
+"""
+
+WS_UNSUBSCRIBE_TIMEOUT_S = 5.0
+"""Сколько ждать подтверждения снятия подписки при остановке. Не замерено: это предел
+ожидания вежливости, а не величина рынка. Биржа вправе не ответить — тогда соединение
+всё равно закрывается, и об этом печатается строка."""
 
 
 def desync_s(key: str, base_s: float) -> float:
@@ -234,10 +340,71 @@ class CapabilityMissing(RuntimeError):
     """Биржа или версия ccxt не умеет того, без чего прогон бессмысленен."""
 
 
+class Venue(NamedTuple):
+    """Площадка Binance: класс ccxt и то, чем она отличается в ОБРАЩЕНИИ, а не в смысле."""
+
+    ccxt_class: str
+    """Имя класса в ccxt.pro."""
+    exchange_info: str
+    """Неявный метод, отдающий `rateLimits`. У каждой площадки СВОЙ путь, и это не
+    косметика: `fapiPublicGetExchangeInfo` на споте не существует, а `publicGetExchangeInfo`
+    не существует на фьючерсах — вызов чужого даёт `AttributeError` в середине `open()`."""
+    ping: str
+    """Неявный метод проверки живости ИМЕННО ЭТОЙ площадки, вес 1.
+
+    ⚠ Нужен потому, что единый `fetchStatus` у Binance спрашивает НЕ ТО. Разбор исходника
+    2026-08-11 (ccxt/binance.py, `fetch_status`): метод зовёт `sapiGetSystemStatus` —
+    эндпоинт СПОТОВОГО КОШЕЛЬКА, и отвечает про спотовую систему независимо от того, на
+    какой площадке мы работаем. Замер на трёх площадках дал три «ok», и это был один и тот
+    же спотовый эндпоинт, вызванный трижды.
+
+    Руководство ccxt само разрешает такой путь (Manual.md, «Exchange Status»): статус
+    может обновляться «using the exchange ping or fetchTime endpoint to see if its alive».
+    """
+    human: str
+
+
+VENUES: dict[str, Venue] = {
+    "binanceusdm": Venue("binanceusdm", "fapiPublicGetExchangeInfo", "fapiPublicGetPing",
+                         "Binance USDⓈ-M, бессрочные фьючерсы на USDT"),
+    "binancecoinm": Venue("binancecoinm", "dapiPublicGetExchangeInfo", "dapiPublicGetPing",
+                          "Binance COIN-M, фьючерсы с монетным обеспечением"),
+    "binance": Venue("binance", "publicGetExchangeInfo", "publicGetPing",
+                     "Binance спот"),
+}
+"""Площадки, на которых транспорт работает. Ключ идёт из `config/universe.toml`.
+
+⚠ ДО 2026-08-11 КЛАСС БЫЛ ЗАШИТ: `ccxtpro.binanceusdm()` стоял константой в конструкторе,
+и никакой другой площадки транспорт не знал. Это не выбор — это единственный вариант,
+который был написан. Владелец 2026-08-11: «полноценно подключи spot, futures, rest,
+websocket».
+
+⚠ Площадка НЕ выводится из символов и не угадывается. Символ `BTC/USDT` (спот) и
+`BTC/USDT:USDT` (бессрочный) — разные рынки с разной ценой и разным объёмом, и молчаливая
+подмена одного другим означала бы профиль объёма, построенный не по тому рынку. Ключ
+задаёт оператор в конфигурации вселенной, как того требует §5.
+
+⚠ Разными остаются ТОЛЬКО обращение и путь к лимитам. Ни одно правило методики от
+площадки не зависит: курс говорит о цене и объёме, а не о типе контракта.
+"""
+
+
 class Exchange:
-    def __init__(self) -> None:
-        self._ex = ccxtpro.binanceusdm({
+    def __init__(self, venue: str = "binanceusdm") -> None:
+        if venue not in VENUES:
+            raise ValueError(
+                f"площадка {venue!r} не поддержана; известны: {', '.join(sorted(VENUES))}"
+            )
+        self.venue = VENUES[venue]
+        self._ex = getattr(ccxtpro, self.venue.ccxt_class)({
             "enableRateLimit": True,
+            # ⚠ ЗАДАНО ЯВНО 2026-08-11. Умолчание ccxt — 10 000 мс
+            # (ccxt/base/exchange.py, `timeout = 10000`), и оно НАС УЖЕ ЛОВИЛО: за двое
+            # суток прогонов дважды пришёл `RequestTimeout`. Число здесь не замерено и
+            # названо таковым: 20 с — удвоенное умолчание, взятое в сторону «реже рвать»,
+            # потому что цена таймаута у нас — потеря опроса, а не деньги. Счётчик
+            # `rest_errors['RequestTimeout']` показывает, помогает ли оно.
+            "timeout": REST_TIMEOUT_MS,
             # ⚠ ЗАКРЕПЛЕНО ЯВНО 2026-08-11, и не из перестраховки: РУКОВОДСТВО ccxt И
             # КОД РАСХОДЯТСЯ. Руководство (wiki/ccxt.pro.manual.md, «newUpdates mode»)
             # предупреждает: «in the future `newUpdates: true` will be the default mode»,
@@ -252,7 +419,15 @@ class Exchange:
             "newUpdates": True,
             # FOUNDATION.md §5: профиль строится на aggTrade. По умолчанию ccxt.pro
             # подписан на поток 'trade' — здесь он переключён явно.
-            "options": {"watchTrades": {"name": "aggTrade"}},
+            #
+            # ⚠ Ключ `watchTradesForSymbols` — НЕ дубль. `watch_trades` подставляет
+            # `callerMethodName='watchTrades'` и потому находит первый ключ, а
+            # `un_watch_trades` этого не делает и ищет по второму. Без обоих снятие
+            # подписки адресовалось бы потоку `trade`. См. `WS_TRADES_STREAM`.
+            "options": {
+                "watchTrades": {"name": WS_TRADES_STREAM},
+                "watchTradesForSymbols": {"name": WS_TRADES_STREAM},
+            },
         })
         self._instruments: dict[str, Instrument] = {}
         self.weight_limit: int | None = None
@@ -268,6 +443,11 @@ class Exchange:
         """Наибольший `X-MBX-USED-WEIGHT-1M` за прогон. 0 — заголовок ни разу не пришёл."""
 
         self.weight_reads = 0
+        self.bars_pages_short = 0
+        """Сколько рядов добрано НЕ ЦЕЛИКОМ из-за обрыва пагинации свечей. Ноль при
+        глубине выше предела ccxt означает «все ряды пришли полностью», а не «пагинации
+        не было»: путь короткой истории этот счётчик не трогает вовсе."""
+
         self.trades_unparsed = 0
         """Сделок, которые не удалось разобрать в тип. Знаменатель — принятые."""
         """Сколько ответов принесли заголовок веса. Знаменатель к `weight_peak`: без него
@@ -305,6 +485,15 @@ class Exchange:
         """Сделок из разрывов, оставшихся НЕ добранными (разрыв шире предела или отказ
         REST). Пара к `trades_recovered`: без неё «добрано N» молчит о недобранном."""
 
+        self._watching: set[str] = set()
+        """Символы с ЖИВОЙ подпиской на сделки. Нужен, чтобы снять их явно при остановке:
+        без списка `un_watch_trades` некому адресовать."""
+
+        self.ws_unwatched = 0
+        self.ws_unwatch_failed = 0
+        """Снятых явно и не снятых подписок. Пара: «снято N» без знаменателя не отличает
+        удачное снятие от того, что снимать было нечего."""
+
         self.ws_unsubscribes: Counter[str] = Counter()
         """Пробуждения `watch_*` через `UnsubscribeError`. Это ШТАТНОЕ событие ccxt, а не
         сбой, и считается отдельно, чтобы не разбавлять счётчик отказов."""
@@ -339,6 +528,7 @@ class Exchange:
         return tuple(missing)
 
     async def open(self) -> ClockSync:
+        log.info("площадка", класс=self.venue.ccxt_class, что=self.venue.human)
         await self._ex.load_markets()
         # Проверка ПОСЛЕ load_markets: у ccxt часть `has` уточняется по ответу биржи.
         # И ДО всего остального: отказ обязан случиться в начале прогона, а не из
@@ -348,6 +538,10 @@ class Exchange:
                 f"{self._ex.id}: нет необходимых возможностей ccxt — " + "; ".join(missing)
             )
         await self._read_weight_limit()
+        # Темп настраивается СРАЗУ после чтения лимита и до всякого сбора: очередь
+        # троттлера здесь пуста, пересборка никого не бросит.
+        self._tune_rate_limiter()
+        await self.read_status()
         sync = await clock.measure(self.fetch_server_ms)
         log.info("часы сведены", сдвиг_мс=sync.offset_ms, rtt_мс=sync.rtt_ms,
                  замеров=sync.samples)
@@ -368,7 +562,18 @@ class Exchange:
             # ⚠ Имя метода — `fapiPublicGetExchangeInfo`, а НЕ snake_case: ccxt порождает
             # оба варианта, но `fapi_public_get_exchangeinfo` среди них нет, и первая
             # редакция падала на нём `AttributeError` уже в `open()`.
-            info = await self._ex.fapiPublicGetExchangeInfo()
+            #
+            # ⚠ И оно РАЗНОЕ У ПЛОЩАДОК (правка 2026-08-11): на споте этого метода нет
+            # вовсе, там `publicGetExchangeInfo`. Путь берётся из таблицы `VENUES`, а не
+            # зашит, иначе подключение спота падало бы `AttributeError` в `open()` —
+            # ровно тем отказом, который эта же функция однажды уже дала.
+            call = getattr(self._ex, self.venue.exchange_info, None)
+            if call is None:
+                log.degraded("у площадки нет метода лимитов",
+                             площадка=self.venue.ccxt_class,
+                             метод=self.venue.exchange_info)
+                return
+            info = await call()
         except ccxt.BaseError as e:
             log.degraded("лимит веса у биржи не прочитан",
                          причина=f"{type(e).__name__} {e}")
@@ -383,6 +588,88 @@ class Exchange:
                 return
         log.degraded("в exchangeInfo нет строки REQUEST_WEIGHT/MINUTE/1",
                      строк=len(info.get("rateLimits", [])))
+
+    def _tune_rate_limiter(self) -> None:
+        """Настроить темп по лимиту, ПРОЧИТАННОМУ У БИРЖИ, и включить окно вместо ведра.
+
+        До 2026-08-11 обе величины были чужими умолчаниями, которых мы не выбирали.
+
+        ЧИСЛО. Руководство ccxt (Manual.md, «What the rateLimit number means») даёт формулу
+        прямо: пауза перед запросом = `rateLimit` × стоимость запроса, а само `rateLimit`
+        берётся делением опубликованного лимита биржи. Там же умолчание 50 мс названо
+        дословно «a safe default which is sub-optimal», а настройка отнесена к пользователю.
+        Мы лимит уже читаем (`_read_weight_limit`) — значит число можно ВЫЧИСЛИТЬ, а не
+        подобрать. Доля названа в `RATE_UTILISATION`.
+
+        АЛГОРИТМ. Умолчание ccxt — «дырявое ведро» ёмкостью 1 (ccxt/base/exchange.py,
+        `init_rest_rate_limiter`): всплесков нет вовсе, каждый запрос ждёт свою задержку
+        целиком. Binance же считает вес В ОКНЕ ОДНОЙ МИНУТЫ. Оконный режим ccxt эту модель
+        воспроизводит точно: в его троттлере `maxWeight = rollingWindowSize / rateLimit`,
+        то есть при окне 60 000 мс величина `60000 / rateLimit` и есть допустимый вес за
+        минуту. Подставив наше `rateLimit`, получаем ровно `weight_limit × RATE_UTILISATION`
+        веса в минуту — с всплесками внутри бюджета и блокировкой по его исчерпании.
+
+        ⚠ Оконный ограничитель БЕЗОПАСНЕЕ ведра, а не рискованнее: он не позволяет
+        превысить бюджет ни в одном скользящем окне минуты, а значит и ни в одном
+        фиксированном. Ведро же держит средний темп, но о минутном окне биржи не знает.
+
+        ⚠ `tokenBucket` сбрасывается в `None` ПЕРЕД пересборкой. Иначе бесполезно:
+        `init_rest_rate_limiter` накладывает умолчания под уже существующее ведро
+        (`extend(defaultBucket, existingBucket)`), и старая скорость пополнения победила бы
+        новую. Зовётся сразу после чтения лимита, когда очередь троттлера пуста.
+
+        Лимит не прочитан — не трогаем ничего: угадывать бюджет опаснее, чем идти медленно.
+        """
+        if self.weight_limit is None:
+            log.degraded("темп оставлен на умолчании ccxt — лимит биржи не прочитан",
+                         rate_limit_мс=self._ex.rateLimit)
+            return
+        was = self._ex.rateLimit
+        budget = self.weight_limit * RATE_UTILISATION
+        self._ex.rateLimit = 60_000 / budget
+        self._ex.rateLimiterAlgorithm = "rollingWindow"
+        self._ex.rollingWindowSize = 60_000.0
+        self._ex.tokenBucket = None
+        self._ex.init_rest_rate_limiter()
+        log.info("темп настроен по лимиту биржи", лимит_веса_в_минуту=self.weight_limit,
+                 доля=RATE_UTILISATION, бюджет_веса_в_минуту=round(budget),
+                 rate_limit_мс=round(self._ex.rateLimit, 2), было_мс=was,
+                 алгоритм="rollingWindow")
+
+    async def read_status(self) -> bool | None:
+        """Отвечает ли ШЛЮЗ НАШЕЙ ПЛОЩАДКИ. `None` — спросить не удалось.
+
+        ⚠ ЗДЕСЬ БЫЛ `fetch_status`, И ЭТО БЫЛА ОШИБКА — ИСПРАВЛЕНО 2026-08-11 построчным
+        чтением исходника. Единый `fetchStatus` у Binance зовёт `sapiGetSystemStatus`, то
+        есть эндпоинт СПОТОВОГО КОШЕЛЬКА (ccxt/binance.py, `fetch_status`). На USDⓈ-M он
+        отвечает про спот. Мой же зонд напечатал «ok» на трёх площадках и это было прочтено
+        как три ответа — а был один спотовый эндпоинт, вызванный трижды. Прибор не мог
+        ответить иначе.
+
+        Теперь спрашивается `ping` САМОЙ площадки (вес 1) — путь, который руководство ccxt
+        прямо называет допустимым для статуса («using the exchange ping or fetchTime
+        endpoint to see if its alive»).
+
+        ⚠ Что это МЕРЯЕТ и чего НЕ меряет. `ping` отвечает «шлюз принимает запросы». Он не
+        отвечает «данные свежие» и не отвечает «техобслуживания нет»: у USDⓈ-M отдельного
+        поля статуса ccxt не даёт вовсе. Поэтому возврат булев, а не строка статуса — иначе
+        величина обещала бы больше, чем содержит.
+
+        Отказ НЕ роняет прогон: неизвестная живость хуже известной, но лучше остановки.
+        """
+        call = getattr(self._ex, self.venue.ping, None)
+        if call is None:
+            log.degraded("у площадки нет метода ping — живость шлюза не проверена",
+                         площадка=self.venue.ccxt_class, метод=self.venue.ping)
+            return None
+        got = await self._rest("проверка шлюза", self.venue.ccxt_class, call)
+        if isinstance(got, NotReady):
+            log.degraded("шлюз площадки НЕ ОТВЕТИЛ", площадка=self.venue.ccxt_class,
+                         причина=got.reason)
+            return False
+        log.info("шлюз площадки отвечает", площадка=self.venue.ccxt_class,
+                 метод=self.venue.ping)
+        return True
 
     def _rate_limit_pause_s(self) -> float:
         """Длина паузы после 429/418: `Retry-After` биржи, если он есть, но не короче минуты.
@@ -464,7 +751,45 @@ class Exchange:
         self.weight_peak = max(self.weight_peak, int(raw))
 
     async def close(self) -> None:
-        await self._ex.close()
+        """Снять подписки ЯВНО и закрыть соединение вместе с сессией HTTP.
+
+        ⚠ ДВЕ ПРАВКИ 2026-08-11 по обратной сверке, и обе про разницу «закрыли» и
+        «отпустили»:
+
+        * `un_watch_trades` не звался НИ РАЗУ. Подписки снимались обрывом сокета, то есть
+          биржа узнавала о нашем уходе по молчанию, а не по слову. Для одного процесса,
+          который завершается, разница невелика; для службы, которая переоткрывает
+          соединение, брошенная подписка — это поток, который биржа ещё какое-то время
+          считает живым;
+        * `close()` без аргумента оставляет сессию HTTP жить до сборки мусора. Аргумент
+          `True` закрывает и её.
+
+        Ни то, ни другое не имеет права уронить остановку: закрытие — последнее, что
+        делает прогон, и исключение здесь потеряло бы отчёт, который уже собран. Поэтому
+        отказы считаются и печатаются, но не поднимаются.
+        """
+        for sym in sorted(self._watching):
+            if not self._ex.has.get("unWatchTrades"):
+                break
+            try:
+                # Имя потока передаётся ЯВНО, а не берётся из опций: у снятия своя
+                # цепочка поиска, и умолчание в ней — `trade`. См. `WS_TRADES_STREAM`.
+                await asyncio.wait_for(
+                    self._ex.un_watch_trades(sym, params={"name": WS_TRADES_STREAM}),
+                    timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
+                self.ws_unwatched += 1
+            except (TimeoutError, ccxt.BaseError) as e:
+                self.ws_unwatch_failed += 1
+                log.degraded("подписка не снята явно — закроем обрывом", символ=sym,
+                             причина=f"{type(e).__name__} {e}")
+        self._watching.clear()
+        try:
+            # `True` — закрыть и сессию HTTP, а не только сокеты (ccxt: `close(True)`).
+            await self._ex.close(True)
+        except TypeError:
+            # Версия ccxt без этого аргумента: закрываем как умеем, но не молча.
+            log.degraded("ccxt не принимает close(True) — сессия HTTP закроется сборщиком")
+            await self._ex.close()
 
     async def _rest(
         self, what: str, key: str, call: Callable[[], Any]
@@ -508,7 +833,7 @@ class Exchange:
         await self._quiet_gate()
         try:
             got = await call()
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+        except RATE_LIMIT_ERRORS as e:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
             pause = self._rate_limit_pause_s()
@@ -550,7 +875,7 @@ class Exchange:
         await self._quiet_gate()
         try:
             got = int(await self._ex.fetch_time())
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+        except RATE_LIMIT_ERRORS as e:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
             self._declare_quiet(self._rate_limit_pause_s())
@@ -616,7 +941,7 @@ class Exchange:
         await self._quiet_gate()
         try:
             await self._ex.load_markets(reload=True)
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+        except RATE_LIMIT_ERRORS as e:
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
             # Тишина объявляется ГЛОБАЛЬНО, а не высыпается здесь: ждать будут все
@@ -670,7 +995,7 @@ class Exchange:
         датированы июлем, а без него доступны только последние `limit` баров — для 15м
         это 10.4 суток, то есть до дат разборов окно не достаёт.
         """
-        raw = await self._fetch_ohlcv_guarded(symbol, timeframe, since_ms, limit)
+        raw = await self._fetch_ohlcv_paged(symbol, timeframe, since_ms, limit)
         if isinstance(raw, NotReady):
             return raw
         if not raw:
@@ -705,6 +1030,79 @@ class Exchange:
             )
         return OhlcvFetch(bars=closed, rejected=rejected,
                           rejected_at_ms=rejected_at)
+
+    async def _fetch_ohlcv_paged(
+        self, symbol: str, timeframe: str, since_ms: int | None, limit: int
+    ) -> list[list[Any]] | NotReady:
+        """Свечи ГЛУБЖЕ предела ccxt в 1000 — курсором по времени.
+
+        ⚠ ЗАЧЕМ. `bars_per_timeframe = 1000` в конфигурации выглядело выбором глубины, а
+        было чужим потолком: ccxt режет выдачу свечей на 1000 жёстко (ccxt/binance.py,
+        `maxLimit = 1000`), тогда как сама Binance для фьючерсов принимает 1500. Отсюда
+        карта младших ТФ обрывалась не там, где кончается горизонт, а там, где кончается
+        предел библиотеки:
+
+            ТФ    1000 баров это     горизонт 180 суток
+            5м    3.5 суток          не достигался
+            15м   10.4 суток         не достигался
+            1ч    41.7 суток         не достигался
+            4ч    166.7 суток        почти не достигался
+            1Д    2.7 года           достигался
+
+        То есть повышение горизонта с 90 до 180 суток на четырёх младших ТФ не меняло
+        ничего, и это было НЕ ВИДНО: отказа не возникало, ряд просто был короче.
+
+        КАК. Ниже предела — ровно один запрос, как раньше: путь короткой истории не
+        трогается, и повтор карточки обязан совпасть побайтово. Выше предела — курсор по
+        `since` страницами по 1000, с дедупликацией по метке открытия (соседние страницы
+        накладываются на границе).
+
+        ⚠ Обрыв посреди пагинации НЕ МОЛЧИТ. Пустой результат — `NotReady` с причиной;
+        частичный — счётчик `bars_pages_short` и строка с числами, потому что «ряд вышел
+        короче запрошенного» неотличимо от «на бирже столько и есть», а разница между
+        ними — разница между отказом сети и возрастом инструмента.
+        """
+        if limit <= CCXT_EFFECTIVE_LIMIT:
+            return await self._fetch_ohlcv_guarded(symbol, timeframe, since_ms, limit)
+
+        step = tf_ms(timeframe)
+        # Без явного `since` глубина отсчитывается назад от СЕЙЧАС: запрос «дай N баров»
+        # означает последние N, а не первые N от сотворения рынка.
+        start = since_ms if since_ms is not None else clock.now_ms() - limit * step
+        by_open: dict[int, list[Any]] = {}
+        cursor = start
+        pages = 0
+        # Страниц заведомо хватает на `limit` баров плюс запас на пустые участки истории;
+        # предел — предохранитель от неподвижного курсора, а не бюджет.
+        max_pages = limit // CCXT_EFFECTIVE_LIMIT + 4
+        while pages < max_pages and len(by_open) < limit:
+            page = await self._fetch_ohlcv_guarded(
+                symbol, timeframe, cursor, CCXT_EFFECTIVE_LIMIT)
+            if isinstance(page, NotReady):
+                if not by_open:
+                    return page
+                self.bars_pages_short += 1
+                log.degraded("ряд добран НЕ ЦЕЛИКОМ — пагинация оборвана", символ=symbol,
+                             тф=timeframe, набрано=len(by_open), просили=limit,
+                             страниц=pages, причина=page.reason)
+                break
+            pages += 1
+            if not page:
+                break
+            before = len(by_open)
+            for row in page:
+                by_open[int(row[0])] = row
+            last = int(page[-1][0])
+            if len(by_open) == before and last <= cursor:
+                # Курсор стоит и новых баров нет: дальше история не идёт. Это НЕ отказ —
+                # это конец ряда, и он молчит законно.
+                break
+            cursor = last + step
+        ordered = [by_open[k] for k in sorted(by_open)]
+        if not ordered:
+            return NotReady(
+                reason=f"{symbol} {timeframe}: пагинация не принесла ни одного бара")
+        return ordered[-limit:]
 
     async def _fetch_ohlcv_guarded(
         self, symbol: str, timeframe: str, since_ms: int | None, limit: int
@@ -826,7 +1224,7 @@ class Exchange:
             self.ws_reconnects[key] += 1
             log.degraded(f"{what}: поток молчит дольше порога, переподключение",
                          символ=key, порог_с=silence_s)
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+        except RATE_LIMIT_ERRORS as e:
             # ВЫШЕ NetworkError: оба его наследуют, и общая ветвь дала бы быстрый повтор.
             self.rest_errors[type(e).__name__] += 1
             self.rest_rate_limited += 1
@@ -1002,10 +1400,17 @@ class Exchange:
         """Номера aggTrade сделок, лежащих РОВНО на миллисекунде курсора: следующая
         страница просится с неё же и приносит их повторно — повтор отсеивается здесь."""
         for _ in range(BACKFILL_DAY_MAX_PAGES):
+            # ⚠ Верхняя граница задаётся ЯВНО. Без неё ccxt подставляет `since + час`
+            # (ccxt/binance.py, `fetch_trades`), и последняя страница окна тянет сделки
+            # за `to_ms`, которые тут же выбрасываются проверкой `t.timestamp >= to_ms`.
+            # `until` эту подстановку переопределяет — то есть биржа не отдаёт лишнего.
+            # Шире часа ставить нельзя: правило Binance для aggTrades требует, чтобы между
+            # `startTime` и `endTime` был МЕНЕЕ часа.
+            page_until = min(to_ms, cursor_ts + REST_TRADES_WINDOW_MS)
             raw = await self._rest(
                 "REST-добор окна", symbol,
-                lambda c=cursor_ts: self._ex.fetch_trades(  # type: ignore[misc]
-                    symbol, since=c, limit=TRADE_RECOVER_PAGE),
+                lambda c=cursor_ts, u=page_until: self._ex.fetch_trades(  # type: ignore[misc]
+                    symbol, since=c, limit=TRADE_RECOVER_PAGE, params={"until": u}),
             )
             if isinstance(raw, NotReady):
                 # Покрытие, набранное до отказа, отдаётся честно обрезанным до последней
@@ -1080,6 +1485,17 @@ class Exchange:
         и потребитель читал ключи руками. Неразобранная сделка не пропускается молча:
         она считается и попадает в счётчик `trades_unparsed`, который печатает приёмка.
         """
+        if symbol not in self._watching:
+            self._watching.add(symbol)
+            # ⚠ Подписка проходит через ТОТ ЖЕ ограничитель темпа, что и REST, и стоит
+            # `options['ws']['cost']` — у binanceusdm это 5, впятеро дороже обычного
+            # запроса (ccxt/async_support/base/exchange.py, `watch_multiple`). В бюджете
+            # веса это не учитывалось: старт на всей вселенной тратит 5 × число символов
+            # прежде, чем уйдёт хоть один опрос баров.
+            cost = (self._ex.options.get("ws") or {}).get("cost", 1)
+            log.info("подписка на сделки", символ=symbol, вес=cost,
+                     подписок_всего=len(self._watching),
+                     вес_подписок_всего=cost * len(self._watching))
         while True:
             batch = await self._watch_step(
                 "сделки", symbol, lambda: self._ex.watch_trades(symbol),

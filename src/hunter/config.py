@@ -16,6 +16,14 @@ class Universe:
     symbols: tuple[str, ...]
     timeframes: tuple[str, ...]
     source: Path
+    venue: str = "binanceusdm"
+    """Площадка Binance: `binanceusdm` (бессрочные на USDT), `binancecoinm` (монетное
+    обеспечение) или `binance` (спот). Список — в `exchange.VENUES`.
+
+    ⚠ Ключ задаётся ОПЕРАТОРОМ, а не выводится из символов: `BTC/USDT` и `BTC/USDT:USDT` —
+    разные рынки с разной ценой и разным объёмом, и угадывание подменило бы источник
+    профиля молча. Умолчание сохраняет прежнее поведение для конфигураций, где ключа нет.
+    """
 
 
 def load_universe(path: Path = DEFAULT_PATH) -> Universe:
@@ -41,4 +49,8 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
     if dupes:
         raise ValueError(f"{path}: символы повторяются: {sorted(dupes)}")
 
-    return Universe(tuple(symbols), tuple(timeframes), path)
+    venue = section.get("venue", "binanceusdm")
+    if not isinstance(venue, str):
+        raise ValueError(f"{path}: venue обязан быть строкой, а не {type(venue).__name__}")
+
+    return Universe(tuple(symbols), tuple(timeframes), path, venue)
