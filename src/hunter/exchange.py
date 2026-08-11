@@ -1723,10 +1723,27 @@ class Exchange:
     def _unsupported(self, method: str) -> NotReady | None:
         """`NotReady` с названной причиной, если площадка метода не умеет.
 
-        ⚠ Проверка по карте `has` — НЕ гарантия, и это доказано: ccxt объявляет
-        `fetchOHLCVWs: True` для USDⓈ-M, где эндпоинта нет вовсе (вызов даёт `-5000`).
-        Здесь она нужна ровно затем, чтобы отсутствие метода стало НАЗВАННЫМ отказом, а не
-        `AttributeError` из середины стека. Ложное «умеет» ловится вызовом и приходит
+        ⚠ Проверка по карте `has` — НЕ гарантия, и это доказано СЕМЬЮ живыми вызовами, а
+        не рассуждением. Все семь объявлены `True`, ни один не доступен (2026-08-12):
+
+            fetchOHLCVWs            `-5000` «Method /fapi/v1/klines is invalid»
+            fetchTradesWs           `-5000` «Method /fapi/v1/trades.historical is invalid»
+            fetchOrderBookWs        требует ключей: `AuthenticationError`
+            fetchTickerWs           требует ключей: `AuthenticationError`
+            fetchLeverageTiers      требует ключей: `AuthenticationError`
+            fetchFundingHistory     требует ключей: `AuthenticationError`
+            fetchSettlementHistory  «supports option markets only»
+
+        И один случай ОБРАТНОГО направления: `unWatchBidsAsks` у площадки существует как
+        метод и бросает `NotSupported`, а `has` про него говорит `None`.
+
+        Найдено сверкой перечня методов спецификации с нашими вызовами: все семь попали в
+        «публичные, но не зовём» ИМЕННО потому, что `has` объявила их доступными. Живой
+        вызов показал, что публичны они не были — то есть корзина «не используем» была не
+        упущением, а верным ответом, полученным раньше и другим путём.
+
+        Здесь проверка нужна ровно затем, чтобы отсутствие метода стало НАЗВАННЫМ отказом,
+        а не `AttributeError` из середины стека. Ложное «умеет» ловится вызовом и приходит
         обычным отказом биржи через `_rest`.
         """
         if self._ex.has.get(method):
@@ -1888,10 +1905,22 @@ class Exchange:
             return got
         return {str(s): _funding_from(str(s), row) for s, row in got.items()}
 
-    async def fetch_funding_history(
+    async def fetch_funding_rate_history(
         self, symbol: str, since_ms: int | None = None, limit: int = 100
     ) -> list[FundingRate] | NotReady:
-        """История ставки финансирования."""
+        """История ставки финансирования.
+
+        ⚠ ПЕРЕИМЕНОВАН 2026-08-12 ИЗ `fetch_funding_history` — это была ЛОВУШКА ИМЕНИ.
+        У ccxt есть ДВА разных метода, и они про разное:
+
+            fetchFundingRateHistory  публичная история СТАВКИ по рынку — то, что здесь
+            fetchFundingHistory      приватная история УПЛАЧЕННОГО финансирования по
+                                     ПОЗИЦИЯМ, требует ключей (проверено вызовом:
+                                     `AuthenticationError`), то есть §5 её запрещает
+
+        Наш метод назывался по второму, а звал первый. Пока метода два, ошибиться нельзя
+        было только зная оба; теперь имя совпадает с тем, что вызывается.
+        """
         if (no := self._unsupported("fetchFundingRateHistory")) is not None:
             return no
         got = await self._rest(
@@ -2560,6 +2589,31 @@ class Exchange:
                 for s, row in got.items()
             }
 
+    async def watch_mark_price(
+        self, symbol: str, every_second: bool = True
+    ) -> AsyncGenerator[MarkPrice]:
+        """Маркировочная цена ОДНОГО контракта отдельной подпиской.
+
+        ⚠ Не дубль `watch_mark_prices`, а её одиночная форма — та же разница, что между
+        `fetch_ticker` и `fetch_tickers`. Пакетная подписка на один символ стоит подписки
+        на поток всех цен площадки; одиночная подписывается на один канал.
+
+        Добавлено 2026-08-12 по сверке перечня: это был ЕДИНСТВЕННЫЙ метод, который
+        площадка отдаёт публично без ключей, а мы не звали. Остальные три из «не зовём»
+        оказались недоступны при живом вызове, хотя `has` объявляет их истинными.
+        """
+        self._note_watch("markprice_one", symbol)
+        while True:
+            got = await self._watch_step(
+                "маркировочная цена", symbol,
+                lambda: self._ex.watch_mark_price(
+                    symbol, params={"use1sFreq": every_second}),
+                WS_SILENCE_S["markprice"])
+            if got is None:
+                continue
+            yield MarkPrice(symbol=symbol, mark=_f(got, "markPrice"),
+                            index=_f(got, "indexPrice"), timestamp_ms=_ms(got))
+
     async def watch_liquidations(self, symbol: str) -> AsyncGenerator[list[Liquidation]]:
         """Поток публичных ликвидаций. ⚠ Только контракты.
 
@@ -2844,6 +2898,7 @@ UNWATCH_CAP: dict[str, str] = {
     "orderbook_many": "unWatchOrderBookForSymbols",
     "ticker_many": "unWatchTickers",
     "liquidations": "unWatchLiquidations",
+    "markprice_one": "unWatchMarkPrice",
 }
 """РОД -> имя возможности в карте `has`. Нужен, потому что НАЛИЧИЕ МЕТОДА НЕ ЗНАЧИТ, ЧТО
 ОН РАБОТАЕТ: `un_watch_bids_asks` у binanceusdm существует как атрибут и бросает
@@ -2877,6 +2932,7 @@ UNWATCH: dict[str, tuple[str, dict[str, Any]]] = {
     # `check_unwatch_table` сказал об этом на СТАРТЕ. Прежде этот род в таблицах
     # отсутствовал, и о невозможности снятия узнавали в момент остановки.
     "liquidations": ("un_watch_liquidations", {}),
+    "markprice_one": ("un_watch_mark_price", {}),
 }
 UNWATCH_ARGS: dict[str, tuple[str, ...]] = {
     "ohlcv": ("symbol", "timeframe"),
