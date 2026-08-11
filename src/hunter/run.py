@@ -997,8 +997,21 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 no_bars += 1
                 continue
             if p.target is None:
+                # ⚠ ЗДЕСЬ БЫЛ `continue`, и это была молчаливая потеря ответа. Найдено
+                # 2026-08-11 на живом BEAT: сигнал #140 (лонг 4ч, вход 1.2186) числился
+                # «цена не дошла до входа», тогда как тот же `outcome.resolve` по тем же
+                # барам отвечал `open` — вход состоялся баром 4ч 00:00-04:00 (диапазон
+                # 1.217…1.813). Контроль: по шорту #141 с входом 7.1329 прибор отвечал
+                # `not_filled`, то есть различать он способен.
+                #
+                # Отсутствие цели закрывает ровно ОДИН исход из четырёх: `target`.
+                # `resolve` принимает `target=None` и корректно считает `stop`, `open` и
+                # `not_filled` — они зависят только от входа и стопа. Пропуская такой
+                # сигнал целиком, леджер не записывал даже СТОП, то есть сигнал без цели
+                # не получал ответа НИКОГДА. Это ровно тот дефект, ради которого заведён
+                # `_resolve_pending` (76 сигналов из 112 без ответа), только по другому
+                # измерению — не «уровень ушёл из карты», а «у сделки нет цели».
                 no_target += 1
-                continue
             side = (levels.LevelSide.LONG if p.direction == "long"
                     else levels.LevelSide.SHORT)
             res = outcome_resolve(
@@ -1024,9 +1037,13 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                     report.states_recorded += 1
     report.pending_no_target = no_target
     report.pending_no_bars = no_bars
-    if no_target or no_bars:
-        log.degraded("часть сигналов дорешать нельзя", без_цели=no_target,
-                     без_баров=no_bars)
+    if no_bars:
+        log.degraded("часть сигналов дорешать нельзя", без_баров=no_bars)
+    if no_target:
+        # НЕ деградация: такие сигналы дорешиваются, просто исход `цель` у них
+        # невозможен по построению. Знать их число всё равно нужно — оно знаменатель
+        # к «по цели 0%»: без него ноль целей читался бы как «цели не достигаются».
+        log.info("сигналы без цели дорешаны по стопу и состоянию", сигналов=no_target)
 
 
 def record(run_id: str, report: RunReport, uni: Universe,
@@ -1755,9 +1772,12 @@ def print_report(r: RunReport) -> int:
           f"которые прогон заново не эмитировал: {r.outcomes_resolved_late}")
     print(f"   состояний незакрытых сделок записано: {r.states_recorded} "
           f"(мимо входа / сделка идёт — §4.3, схема v4)")
-    if r.pending_no_target or r.pending_no_bars:
-        print(f"   дорешать НЕЛЬЗЯ: без сохранённой цели {r.pending_no_target} "
-              f"(записаны до схемы v5), без ряда ТФ в этом прогоне {r.pending_no_bars}")
+    if r.pending_no_target:
+        print(f"   БЕЗ ЦЕЛИ (геометрия её не дала либо запись до схемы v5): "
+              f"{r.pending_no_target} — дорешиваются по стопу и состоянию, исход «по "
+              f"цели» у них невозможен по построению; это знаменатель к «по цели 0%»")
+    if r.pending_no_bars:
+        print(f"   дорешать НЕЛЬЗЯ: без ряда ТФ в этом прогоне {r.pending_no_bars}")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())
