@@ -61,17 +61,25 @@ def closed_bars(ex: ccxt.binanceusdm, symbol: str, timeframe: str) -> list[Bar]:
 
 
 def map_zones(symbol: str) -> list[ZoneSpec]:
-    """Активные уровни символа из карты леджера — все ТФ разом."""
+    """Активные уровни символа из карты леджера — все ТФ разом, С ПРАВИЛОМ ВХОДА.
+
+    ⚠ Правило входа берётся с 2026-08-11, и это не украшение. `state='active'` НЕ
+    означает «цена уровня не касалась»: курс на стр. 25 снимает лимитки на первое же
+    касание, оставляя вход по слому младшего ТФ, — уровень при этом остаётся активным.
+    Замер на BEAT: из 21 активного уровня 8 цена уже касалась, и бот показывал их
+    владельцу наравне со свежими. Расчёт различие знал, карта его не хранила.
+    """
     conn = store.open_readonly()
     try:
         rows = conn.execute(
-            "SELECT timeframe, side, price, zone_lo, zone_hi FROM levels"
+            "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule FROM levels"
             " WHERE symbol=? AND state='active' ORDER BY price", (symbol,),
         ).fetchall()
     finally:
         conn.close()
     return [ZoneSpec(side=r[1], timeframe=r[0], price=float(r[2]),
-                     zone_lo=float(r[3]), zone_hi=float(r[4])) for r in rows]
+                     zone_lo=float(r[3]), zone_hi=float(r[4]),
+                     entry_rule=r[5] or "") for r in rows]
 
 
 def zones_for_chart(
@@ -108,6 +116,16 @@ def pp_zones(bars: list[Bar], timeframe: str) -> list[ZoneSpec]:
     return out
 
 
+ENTRY_MARK = {
+    "limit": "",
+    "confirmation": " ⏳ уже касались — лимиток нет, только по слому младшего ТФ (стр. 31)",
+    "retest_flipped": " ↩ пробит и флипнут — вход по ретесту в другую сторону (стр. 43)",
+    "": " ⚠ правило входа не записано (строка карты до схемы 6)",
+}
+"""Подпись правила входа. Пустая строка у `limit` намеренно: свежий уровень с лимитками —
+норма, и помечать надо ОТКЛОНЕНИЕ от неё, а не каждую строку."""
+
+
 def _fmt_zone(z: ZoneSpec) -> str:
     band = "🟢" if (z.timeframe in SENIOR_TFS and z.side == "long") else (
         "🔴" if (z.timeframe in SENIOR_TFS and z.side == "short") else "🟡")
@@ -115,7 +133,7 @@ def _fmt_zone(z: ZoneSpec) -> str:
         rng = f"{z.price:g}"
     else:
         rng = f"{z.zone_lo:g}–{z.zone_hi:g} (ПОК {z.price:g})"
-    return f"{band} {rng} · {z.timeframe}"
+    return f"{band} {rng} · {z.timeframe}{ENTRY_MARK.get(z.entry_rule, '')}"
 
 
 def compose_text(symbol: str, zones: list[ZoneSpec], pps: list[ZoneSpec]) -> str:

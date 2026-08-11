@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import log
 from .bars import tf_ms
-from .levels import Level, LevelState
+from .levels import EntryRule, Level, LevelState
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
 DATA_DIR = Path("data")
@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS levels (
     last_seen    INTEGER NOT NULL,
     state        TEXT    NOT NULL CHECK (state IN ('active', 'worked_off', 'flipped')),
     retired_at   INTEGER,
+    -- ЧЕМ уровень торгуется. NULL — строка записана до схемы 6, правило не сохранялось.
+    -- ⚠ Заведено 2026-08-11: `state='active'` НЕ означает «цена не касалась». Курс
+    -- (стр. 25) снимает лимитки уже на первое касание, оставляя вход по слому младшего
+    -- ТФ, — то есть у активного уровня два разных разрешения, и в карте их не было.
+    -- Замер на BEAT: из 21 активного уровня 8 цена уже касалась, а бот показывал их
+    -- владельцу наравне со свежими. Расчёт различал (`LevelStatus.entry_rule`), карта —
+    -- нет, и потому различие до владельца не доходило.
+    entry_rule   TEXT    CHECK (entry_rule IN ('limit', 'confirmation', 'retest_flipped')),
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     CHECK (to_ms > from_ms),
@@ -139,8 +147,14 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+5 → 6 (2026-08-11): у уровня карты появилось ПРАВИЛО ВХОДА (`entry_rule`). Без него
+`state='active'` читался как «уровень свежий, цена не касалась», тогда как курс
+(стр. 25) снимает лимитки на первое же касание, оставляя активным сам уровень. Замер на
+BEAT: 8 активных уровней из 21 — уже касавшиеся, и в карте они были неотличимы от
+нетронутых. Прежние строки получают NULL и переписываются первым же прогоном.
 
 4 → 5 (2026-08-10): у сигнала появилась ЦЕЛЬ (`target`). Без неё исход сделки нельзя
 досчитать ни в каком прогоне, кроме того, который её выдал, — и отсюда шло СМЕЩЕНИЕ
@@ -455,7 +469,14 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     ).fetchone()
     if not has_states:
         return "3"
-    return SCHEMA_VERSION if "target" in cols else "4"
+    if "target" not in cols:
+        return "4"
+    lvl_cols = {r[1] for r in conn.execute("PRAGMA table_info(levels)")}
+    # Пустой набор — таблицы `levels` ещё нет: её создаст `CREATE TABLE IF NOT EXISTS`
+    # сразу свежей, и мигрировать нечего.
+    if lvl_cols and "entry_rule" not in lvl_cols:
+        return "5"
+    return SCHEMA_VERSION
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -530,6 +551,13 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # 4 → 5: колонка добавляется НА МЕСТЕ. Перестройка не нужна — `UNIQUE` не
         # трогается, а `ALTER TABLE ADD COLUMN` в SQLite дёшев и не переписывает строк.
         conn.execute("ALTER TABLE signals ADD COLUMN target REAL")
+        conn.commit()
+    if _schema_version(conn) == "5":
+        # 5 → 6: та же дешёвая правка на месте. Колонка NULLABLE осознанно — у прежних
+        # строк правила входа НЕТ, и выдумать его нельзя: `active` не говорит, касалась
+        # ли цена. NULL здесь читается как «не записано», а не как «лимитки»; первый же
+        # прогон перепишет строку настоящим значением.
+        conn.execute("ALTER TABLE levels ADD COLUMN entry_rule TEXT")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -728,7 +756,7 @@ class MapSync(BaseModel):
 def sync_levels(
     conn: sqlite3.Connection,
     symbol: str,
-    seen: list[tuple[Level, LevelState]],
+    seen: list[tuple[Level, LevelState, EntryRule]],
     now_ms: int,
 ) -> MapSync:
     """Слить свежепосчитанную карту с накопленной.
@@ -760,7 +788,7 @@ def sync_levels(
     """
     added = updated = retired = 0
     rejected: list[str] = []
-    for lvl, state in seen:
+    for lvl, state, rule in seen:
         key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
         row = conn.execute(
             "SELECT state, retired_at FROM levels WHERE symbol=? AND timeframe=? AND"
@@ -772,12 +800,13 @@ def sync_levels(
                 conn.execute(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
-                    " last_seen, state, retired_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " last_seen, state, retired_at, entry_rule)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
-                     None if active else now_ms),
+                     None if active else now_ms, rule.value),
                 )
                 added += 1
                 retired += not active
@@ -788,9 +817,10 @@ def sync_levels(
             retired_at = None if active else (row[1] if row[1] is not None else now_ms)
             conn.execute(
                 "UPDATE levels SET last_seen=?, price=?, zone_lo=?, zone_hi=?, state=?,"
-                " retired_at=? WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
+                " retired_at=?, entry_rule=? WHERE symbol=? AND timeframe=? AND"
+                " from_ms=? AND to_ms=?",
                 (now_ms, float(lvl.price), float(lvl.zone_lo), float(lvl.zone_hi),
-                 state.value, retired_at, *key),
+                 state.value, retired_at, rule.value, *key),
             )
             updated += 1
             retired += was_active and not active

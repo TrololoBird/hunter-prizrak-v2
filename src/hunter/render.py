@@ -45,6 +45,10 @@ class ZoneSpec:
     zone_lo: float
     zone_hi: float
     kind: str = "level"
+    entry_rule: str = ""
+    """Чем уровень торгуется: limit | confirmation | retest_flipped. Пусто — не записано
+    (строка карты до схемы 6). Нужен, чтобы уровень, которого цена УЖЕ касалась, не
+    выглядел как свежий: курс снимает лимитки на первое касание (стр. 25)."""
 
 
 def _zone_style(z: ZoneSpec) -> tuple[str, str]:

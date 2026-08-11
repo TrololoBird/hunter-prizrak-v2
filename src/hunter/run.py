@@ -1083,7 +1083,10 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # условие `last_seen < now` и объявлялись «перенесёнными из прошлых
             # прогонов». Живой прогон на ПУСТОЙ карте напечатал «перенесено 4» — число
             # правдоподобное и целиком выдуманное.
-            seen = [(m.level, m.status.state) for m in d.mapped]
+            # Правило входа пишется вместе с состоянием (схема 6, 2026-08-11): без него
+            # `active` читался как «свежий, цена не касалась», а курс снимает лимитки уже
+            # на первое касание (стр. 25). Замер на BEAT: 8 активных из 21 — касавшиеся.
+            seen = [(m.level, m.status.state, m.status.entry_rule) for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
             report.map_added += sync.added
