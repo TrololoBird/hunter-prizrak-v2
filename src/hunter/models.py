@@ -10,10 +10,11 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def tick_scale(tick: Decimal) -> tuple[int, int]:
@@ -92,18 +93,46 @@ class NotReady(BaseModel):
         return f"не готово: {self.reason}"
 
 
-class Bar(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+@dataclass(slots=True, frozen=True)
+class Bar:
+    """Свеча. Не модель pydantic, и это РЕСУРСНОЕ решение с названной ценой.
 
-    open_ms: int = Field(ge=0)
+    ⚠ ПЕРЕВЕДЁН С `BaseModel` НА СРЕЗОВЫЙ КЛАСС 2026-08-11. Повод — этап 2: глубина ряда
+    стала выводиться из горизонта, и число баров в памяти выросло с 81 тыс. до 2.0 млн.
+    Замер стоимости типа (`tracemalloc`, 50 000 экземпляров):
+
+        pydantic BaseModel   1113 байт на бар  ->  2.10 ГБ на вселенную
+        dataclass(slots)      121 байт на бар  ->  0.23 ГБ на вселенную
+
+    Девятикратно, и это разница между «работает» и `MemoryError`, который в проекте уже
+    случался на бэкфилле (2026-08-04). Шесть чисел не имеют права стоить килобайт.
+
+    ⚠ ЧТО ПРИ ЭТОМ НЕ ПОТЕРЯНО. Проверка определения свечи осталась на месте и осталась
+    ОБЯЗАТЕЛЬНОЙ: `__post_init__` бросает `ValueError` ровно там же, где прежде бросал
+    валидатор pydantic, и перехватчик в `exchange.fetch_closed_ohlcv` его ловит —
+    `pydantic.ValidationError` сам наследует `ValueError`, так что ветвь не расширялась,
+    а сузилась до общего предка. Битый бар по-прежнему отклоняется поимённо, а не
+    проезжает молча; замер 2026-08-03 нашёл такой один на 73 828 (BCH/USDT:USDT 1w).
+
+    `frozen=True` сохранён: бар неизменяем, как и был. `slots=True` — то, ради чего всё.
+
+    ⚠ Списки баров лежат ПОЛЯМИ моделей pydantic (`OhlcvFetch.bars`, `SeriesState.bars`).
+    Проверено, что pydantic такие объекты пропускает ПО ССЫЛКЕ, не пересоздавая: накладные
+    расходы на модель поверх 50 000 баров — 0.4 МБ, и `st.bars[0] is xs[0]` истинно.
+    """
+
+    open_ms: int
     open: float
     high: float
     low: float
     close: float
-    volume: float = Field(ge=0)
+    volume: float
 
-    @model_validator(mode="after")
-    def _ohlc_consistent(self) -> Bar:
+    def __post_init__(self) -> None:
+        if self.open_ms < 0:
+            raise ValueError(f"бар {self.open_ms}: метка открытия отрицательна")
+        if self.volume < 0:
+            raise ValueError(f"бар {self.open_ms}: объём отрицателен ({self.volume})")
         # Не «разумное значение», а определение свечи: экстремумы обязаны накрывать
         # открытие и закрытие. Нарушение означает битые данные, а не редкий рынок.
         if self.high < max(self.open, self.close) or self.low > min(self.open, self.close):
@@ -113,7 +142,6 @@ class Bar(BaseModel):
             )
         if self.high < self.low:
             raise ValueError(f"бар {self.open_ms}: high < low")
-        return self
 
 
 class Instrument(BaseModel):

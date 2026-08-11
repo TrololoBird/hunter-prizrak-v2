@@ -111,9 +111,20 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                     uni.venue, market_id, tf, want_from)
                 report.bars_from_store += len(stored)
 
-            # Хвост меньше окна просится с явного `since`; полное окно — как раньше,
-            # без `since`, чтобы биржа отдала своё умолчание последних `limit` баров.
-            ask = depth if since_ms is None else CATCHUP_MAX_BARS
+            # Размер хвоста считается ПО РАЗРЫВУ, а не берётся константой.
+            #
+            # ⚠ ЗДЕСЬ СТОЯЛО `CATCHUP_MAX_BARS` (100), И ЭТО БЫЛ ДЕФЕКТ. Сто баров 5м —
+            # восемь часов; служба, простоявшая сутки, добрала бы восьмую часть пропуска,
+            # а остальное осталось бы дырой НАВСЕГДА: засев отрабатывает один раз, второй
+            # попытки нет. Дыра при этом не молчала бы (`find_gaps` её печатает), но и не
+            # закрывалась бы никогда.
+            #
+            # Верхняя граница — та же `depth`: просить больше, чем нужно ряду, незачем.
+            if since_ms is None:
+                ask = depth
+            else:
+                behind = max(0, clock.now_ms() - since_ms) // tf_ms(tf)
+                ask = min(depth, int(behind) + 2)  # +2: текущий незакрытый и запас на край
             got = await ex.fetch_closed_ohlcv(sym, tf, limit=ask, since_ms=since_ms)
             if isinstance(got, NotReady):
                 if not stored:

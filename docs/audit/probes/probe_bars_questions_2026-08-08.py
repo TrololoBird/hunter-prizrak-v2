@@ -43,6 +43,7 @@ import json
 import random
 import statistics
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import polars as pl
@@ -344,9 +345,9 @@ def main() -> int:  # noqa: C901
     step0 = tf_ms(t0)
     spoiled = list(b0)
     idx = min(5, len(spoiled) - 1)
-    spoiled[idx] = spoiled[idx].model_copy(
-        update={"open_ms": spoiled[idx].open_ms + step0 // 2}
-    )
+    # `dataclasses.replace`, а не `model_copy`: `Bar` переведён с модели pydantic на
+    # срезовый dataclass 2026-08-11 ради памяти (1113 -> 121 байт на бар).
+    spoiled[idx] = replace(spoiled[idx], open_ms=spoiled[idx].open_ms + step0 // 2)
     off_s, bad_s, _ = violations([(r0, s0, t0, spoiled)])
     off_c, bad_c, _ = violations([(r0, s0, t0, b0)])
     print(f"    чистый ряд:      вне сетки {off_c}, шаг не кратен {bad_c}")
