@@ -627,7 +627,7 @@ async def backfill_trades(
                 report.backfill_missing_by_symbol[sym] = (
                     report.backfill_missing_by_symbol.get(sym, 0) + 1)
                 continue
-            await _rest_fill_day(ex, sym, gap_inst, day, cover_to, report)
+            await _rest_fill_day(ex, sym, gap_inst, day, report)
 
 
 REST_BACKFILL_MAX_AGE_DAYS = 365
@@ -671,8 +671,7 @@ REST_CHECKPOINT_TRADES = 200_000
 
 
 async def _rest_fill_day(
-    ex: Exchange, sym: str, inst: Instrument, day: date, cover_to_ms: int,
-    report: RunReport,
+    ex: Exchange, sym: str, inst: Instrument, day: date, report: RunReport,
 ) -> None:
     """Добрать одни сутки REST-ом ccxt: закрытые — полным файлом кэша, текущие — частичным.
 
@@ -686,8 +685,24 @@ async def _rest_fill_day(
     """
     day0 = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
     day_end = day0 + 86_400_000
-    closed = day_end <= cover_to_ms
-    target = day_end if closed else cover_to_ms
+    now = clock.now_ms()
+    closed = day_end <= now
+    # ⚠ ГРАНИЦА ДОБОРА — НЕ КОНЕЦ НОВЕЙШЕЙ СТРУКТУРЫ, А «ДОКУДА ВОЗМОЖНО». Правка
+    # 2026-08-11, и она условие того, чтобы холодный старт действительно ушёл.
+    #
+    # Раньше здесь стояло `closed = day_end <= cover_to_ms; target = ... else cover_to_ms`,
+    # то есть сутки добирались ровно до правого края САМОЙ СВЕЖЕЙ структуры символа.
+    # Следствий было два, и оба вредные:
+    #   * ПРОШЕДШИЕ сутки оставались частичными посреди дня. Замер 2026-08-11: файл
+    #     BTCUSDT-2026-08-10 покрыт до 13:50 UTC, хотя сутки давно кончились;
+    #   * СЕГОДНЯШНИЕ сутки обрывались раньше начала живого потока — значит между кэшем
+    #     и потоком зияла дыра, `archive.extend_day_from_live` отказывался её заклеивать
+    #     (и правильно делал), и принятое вебсокетом в кэш не ложилось НИКОГДА. Холодный
+    #     старт при этом оставался бы на месте при снятом на словах.
+    #
+    # Теперь прошедшие сутки добираются до конца, а текущие — до «сейчас» по БИРЖЕВЫМ
+    # часам. Ровно эта граница и смыкается с первой корзиной живого потока.
+    target = day_end if closed else now
     if target <= day0:
         return
 
@@ -837,8 +852,26 @@ def _backfill_impl(
         report.backfill_structures += used
         report.backfill_structures_old += dropped
 
+        # ⚠ ТЕКУЩИЕ СУТКИ ДОБАВЛЯЮТСЯ ВСЕГДА, независимо от структур. Это второе
+        # условие снятия холодного старта (2026-08-11).
+        #
+        # `needed_days` набирает сутки ИЗ ОКОН СТРУКТУР, и сегодняшних среди них может не
+        # оказаться вовсе: у символа может не быть ни одной структуры, закрывшейся
+        # сегодня. Тогда сегодняшние сутки не покрыты ничем, живому потоку не с чем
+        # смыкаться, и принятое вебсокетом опять умирает вместе с процессом.
+        #
+        # Цена названа: при первом запуске это добор текущих суток с 00:00 UTC, до
+        # ~6 минут на плотном символе. При каждом следующем — только дельта с прошлого
+        # покрытия, то есть минуты простоя службы. Ровно этот размен и означает
+        # «холодного старта нет»: платим один раз, а не при каждом запуске.
+        today = datetime.fromtimestamp(clock.now_ms() / 1000, UTC).date()
+        want.add(today)
+
         cached = archive.cached_days(inst.market_id, inst.tick_size)
-        left = sorted(want - cached)
+        # ⚠ Текущие сутки НЕ считаются покрытыми по факту наличия файла: он частичный и
+        # отстаёт от «сейчас» на всё время простоя. Их добор решается внутри
+        # `_rest_fill_day` сравнением границы файла с целью.
+        left = sorted((want - cached) | {today})
         log.info("набор суток из структур", символ=sym, структур=used,
                  суток=len(want), уже_в_кэше=len(want & cached),
                  добирать=len(left), старых_структур=dropped)
@@ -1643,6 +1676,13 @@ def print_report(r: RunReport) -> int:
     print(f"   сделок принято всего: {r.trades_total}, "
           f"баров отрезано хвостом: {r.bars_trimmed}, "
           f"корзин сделок забыто: {r.live_buckets_dropped}")
+    # ⚠ Печатается ВСЕГДА, в том числе нулём, и вот зачем. Ноль здесь означает, что
+    # принятое вебсокетом в кэш не легло, — то есть следующий запуск выкачает те же
+    # сутки REST-ом заново, хотя данные уже были у нас в руках. Невидимый счётчик
+    # позволил бы холодному старту вернуться молча (§4.3).
+    print(f"   суток продлено живым потоком: {r.live_days_flushed}"
+          + ("   ⚠ ноль: принятое потоком в кэш НЕ ЛОЖИТСЯ"
+             if r.live_days_flushed == 0 and r.trades_total > 0 else ""))
 
     print("\n1. ЧАСЫ (§6)")
     print(f"   сдвиг биржа−локальные    : {r.sync.offset_ms:+d} мс")
