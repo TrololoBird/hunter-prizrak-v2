@@ -1244,10 +1244,8 @@ class Exchange:
             return got
         return OrderBook(
             symbol=symbol,
-            bids=tuple(BookLevel(price=float(p), qty=float(q))
-                       for p, q in (got.get("bids") or [])),
-            asks=tuple(BookLevel(price=float(p), qty=float(q))
-                       for p, q in (got.get("asks") or [])),
+            bids=_levels(got.get("bids")),
+            asks=_levels(got.get("asks")),
             timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
             nonce=None if got.get("nonce") is None else int(got["nonce"]),
         )
@@ -1319,9 +1317,18 @@ class Exchange:
         self, symbol: str, timeframe: str = "5m",
         since_ms: int | None = None, limit: int = 100,
     ) -> list[OpenInterest] | NotReady:
-        """История открытого интереса ПО ТАЙМФРЕЙМУ — ряд, соизмеримый с барами."""
+        """История открытого интереса ПО ТАЙМФРЕЙМУ — ряд, соизмеримый с барами.
+
+        ⚠ Набор периодов у статистики СВОЙ и не совпадает с §2.8: недельного здесь нет.
+        См. `STATS_TIMEFRAMES`.
+        """
         if (no := self._unsupported("fetchOpenInterestHistory")) is not None:
             return no
+        if timeframe not in STATS_TIMEFRAMES:
+            return NotReady(
+                reason=f"история интереса: период {timeframe!r} биржей не поддержан; "
+                       f"есть {', '.join(sorted(STATS_TIMEFRAMES))}")
+        limit = min(limit, STATS_MAX_LIMIT)
         got = await self._rest(
             "история интереса", f"{symbol} {timeframe}",
             lambda: self._ex.fetch_open_interest_history(symbol, timeframe,
@@ -1331,15 +1338,25 @@ class Exchange:
         return [oi for row in got if (oi := _open_interest_from(symbol, row)) is not None]
 
     async def fetch_long_short_ratio(
-        self, symbol: str, period: str = "5m",
+        self, symbol: str, timeframe: str = "5m",
         since_ms: int | None = None, limit: int = 100,
     ) -> list[LongShortRatio] | NotReady:
-        """История соотношения длинных и коротких позиций. ⚠ Только контракты."""
+        """История соотношения длинных и коротких позиций. ⚠ Только контракты.
+
+        Параметр назван `timeframe`, как в документации, а не `period`: у ccxt это второй
+        позиционный аргумент, и разные имена у одной величины путают на ровном месте.
+        Набор периодов — тот же, что у статистики интереса (`STATS_TIMEFRAMES`).
+        """
         if (no := self._unsupported("fetchLongShortRatioHistory")) is not None:
             return no
+        if timeframe not in STATS_TIMEFRAMES:
+            return NotReady(
+                reason=f"соотношение позиций: период {timeframe!r} биржей не поддержан; "
+                       f"есть {', '.join(sorted(STATS_TIMEFRAMES))}")
+        limit = min(limit, STATS_MAX_LIMIT)
         got = await self._rest(
-            "длинные против коротких", f"{symbol} {period}",
-            lambda: self._ex.fetch_long_short_ratio_history(symbol, period,
+            "длинные против коротких", f"{symbol} {timeframe}",
+            lambda: self._ex.fetch_long_short_ratio_history(symbol, timeframe,
                                                             since_ms, limit))
         if isinstance(got, NotReady):
             return got
@@ -1850,10 +1867,8 @@ class Exchange:
                 continue
             yield OrderBook(
                 symbol=symbol,
-                bids=tuple(BookLevel(price=float(p), qty=float(q))
-                           for p, q in (got.get("bids") or [])[:depth]),
-                asks=tuple(BookLevel(price=float(p), qty=float(q))
-                           for p, q in (got.get("asks") or [])[:depth]),
+                bids=_levels(got.get("bids"), depth),
+                asks=_levels(got.get("asks"), depth),
                 timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
                 nonce=None if got.get("nonce") is None else int(got["nonce"]),
             )
@@ -1963,6 +1978,19 @@ class Exchange:
 # ослабить правило ради собственного удобства.
 
 
+def _levels(rows: Any, depth: int | None = None) -> tuple[BookLevel, ...]:
+    """Ступени стакана. Берутся ПО ИНДЕКСУ, а не распаковкой пары.
+
+    ⚠ Разница не косметическая. Первая редакция писала `for p, q in rows`, и это падало бы
+    на ответе с ТРЕТЬИМ элементом, который документация прямо разрешает (Manual.md, «Notes
+    On Order Book Structure»): у книг третьего уровня там номер заявки, у сведённых —
+    счётчик заявок на ступени, у некоторых бирж — время постановки. У Binance элементов
+    два, поэтому дефект был латентным и проявился бы при смене площадки.
+    """
+    out = [BookLevel(price=float(r[0]), qty=float(r[1])) for r in (rows or [])]
+    return tuple(out if depth is None else out[:depth])
+
+
 def _f(row: dict[str, Any], key: str) -> float | None:
     v = row.get(key)
     return None if v is None else float(v)
@@ -1990,9 +2018,15 @@ def _quote_from(symbol: str, row: dict[str, Any]) -> Quote:
 
 
 def _funding_from(symbol: str, row: dict[str, Any]) -> FundingRate:
+    # ⚠ `fundingRate` у Binance это `lastFundingRate` (ставка НАЗАД), а `fundingTimestamp` —
+    # `nextFundingTime` (время ВПЕРЁД). Разбор по исходнику, а не по имени поля;
+    # подробнее — докстрока `FundingRate`.
     ts = row.get("fundingTimestamp")
-    return FundingRate(symbol=symbol, rate=_f(row, "fundingRate"),
+    return FundingRate(symbol=symbol, last_rate=_f(row, "fundingRate"),
                        next_ms=None if ts is None else int(ts),
+                       interval=None if row.get("interval") is None
+                       else str(row["interval"]),
+                       interest_rate=_f(row, "interestRate"),
                        mark=_f(row, "markPrice"), index=_f(row, "indexPrice"),
                        timestamp_ms=_ms(row))
 
@@ -2012,6 +2046,25 @@ def _liquidation_from(symbol: str, row: dict[str, Any]) -> Liquidation:
                        quote_value=_f(row, "quoteValue"),
                        side=None if row.get("side") is None else str(row["side"]),
                        timestamp_ms=_ms(row))
+
+
+STATS_TIMEFRAMES: frozenset[str] = frozenset(
+    {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+)
+"""Периоды, которые принимает СТАТИСТИКА контракта — открытый интерес и соотношение
+позиций. Список НЕ совпадает с нашими таймфреймами и взят из документации дословно
+(wiki/exchanges/binance.md, `fetchOpenInterestHistory`: «"5m","15m","30m","1h","2h","4h",
+"6h","12h", or "1d"»).
+
+⚠ Зачем это здесь. §2.8 задаёт проекту шесть ТФ, и среди них есть `1w`, которого в этом
+списке НЕТ. Без проверки вызов с недельным периодом уходил бы на биржу и возвращался
+отказом её кода — то есть причина «этот период тут не бывает» подменялась бы причиной
+«биржа отвергла запрос». Разница в том, что первую видно сразу, а вторую надо
+расследовать.
+"""
+
+STATS_MAX_LIMIT = 500
+"""Предел записей у статистики контракта. Документация: «default 30, max 500»."""
 
 
 WS_SILENCE_S: dict[str, float] = {

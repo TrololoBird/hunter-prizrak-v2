@@ -223,13 +223,30 @@ class OpenInterest(BaseModel):
 
 
 class FundingRate(BaseModel):
-    """Ставка финансирования бессрочного контракта. Публичный `premiumIndex`."""
+    """Ставка финансирования бессрочного контракта. Публичный `premiumIndex`.
+
+    ⚠ ИМЕНА ПОЛЕЙ СВЕРЕНЫ С ИСХОДНИКОМ 2026-08-11, И ДВА ИЗ НИХ ЧИТАЛИСЬ БЫ НЕВЕРНО.
+    Единая структура ccxt («Funding Rate Structure») называет их `fundingRate` и
+    `fundingTimestamp`, но у Binance они берутся так (ccxt/binance.py,
+    `parse_funding_rate`):
+
+        fundingRate      <- lastFundingRate   ПОСЛЕДНЯЯ расчётная ставка, не текущая
+        fundingTimestamp <- nextFundingTime   время СЛЕДУЮЩЕГО расчёта
+
+    То есть ставка смотрит назад, а метка времени — вперёд. Поля названы здесь так, чтобы
+    это было видно из имени: `last_rate` и `next_ms`, а не `rate` и `timestamp`.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     symbol: str
-    rate: float | None = None
+    last_rate: float | None = None
+    """ПОСЛЕДНЯЯ расчётная ставка (`lastFundingRate` у Binance), а не прогноз."""
     next_ms: int | None = None
+    """Время СЛЕДУЮЩЕГО расчёта (`nextFundingTime` у Binance)."""
+    interval: str | None = None
+    """Период расчёта, например `8h`. У Binance из `fundingIntervalHours`."""
+    interest_rate: float | None = None
     mark: float | None = None
     index: float | None = None
     timestamp_ms: int | None = None
@@ -294,7 +311,19 @@ class LongShortRatio(BaseModel):
 
 
 class Liquidation(BaseModel):
-    """Публичная ликвидация. Только контракты и маржа."""
+    """Публичная ликвидация. Только контракты и маржа.
+
+    ⚠ Две особенности, найденные сверкой с исходником 2026-08-11.
+
+    `side` в ДОКУМЕНТИРОВАННОЙ структуре ccxt («Liquidation Structure») ОТСУТСТВУЕТ, но в
+    реализации есть: `parse_ws_liquidation` кладёт туда сырое поле `S` (BUY/SELL) строчными.
+    Редкий случай, когда код шире документации; поле оставлено, потому что оно реально
+    приходит, а не потому что я его ожидал.
+
+    `quote_value` и `base_value` у Binance в потоке ВСЕГДА пусты — парсер подставляет туда
+    `None`. Поле оставлено ради других площадок, но на нашей оно ничего не скажет, и это
+    названо здесь, чтобы пустота не читалась как «объём нулевой».
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
