@@ -2110,15 +2110,26 @@ class Exchange:
             yield {str(s): _quote_from(str(s), row) for s, row in got.items()}
 
     async def watch_mark_prices(
-        self, symbols: tuple[str, ...]
+        self, symbols: tuple[str, ...], *, every_second: bool = True
     ) -> AsyncGenerator[dict[str, MarkPrice]]:
-        """Поток маркировочных цен. ⚠ Только контракты."""
+        """Поток маркировочных цен. ⚠ Только контракты.
+
+        ⚠ ЧАСТОТА — ЭТО ВЫБОР, И ДО 2026-08-12 ОН БЫЛ ЧУЖИМ УМОЛЧАНИЕМ. Документация
+        (wiki/exchanges/binance.md, `watchMarkPrices`): «params.use1sFreq — *default is
+        true* if set to true, the mark price will be updated every second, otherwise every
+        three seconds». То есть без указания поток идёт ВТРОЕ ЧАЩЕ, и на вселенной из 27
+        символов это втрое больше сообщений ни за чем.
+
+        Умолчание здесь оставлено библиотечным намеренно: поток не в боевом контуре, менять
+        поведение без нужды незачем. Но теперь это ручка с названной ценой, а не молчание.
+        """
         for s in symbols:
             self._note_watch("markprice", s)
         while True:
             got = await self._watch_step(
                 "маркировочные цены", ",".join(symbols),
-                lambda: self._ex.watch_mark_prices(list(symbols)),
+                lambda: self._ex.watch_mark_prices(
+                    list(symbols), params={"use1sFreq": every_second}),
                 WS_SILENCE_S["markprice"])
             if got is None:
                 continue
