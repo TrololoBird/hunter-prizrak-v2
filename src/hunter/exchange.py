@@ -470,18 +470,43 @@ class Venue(NamedTuple):
 
     ⚠ Путь у каждой площадки свой, как и у `exchange_info`.
     """
+    default_sub_type: str | None
+    """Подтип контракта: `linear`, `inverse` или `None` у спота.
+
+    ⚠ ЗАКРЕПЛЯЕТСЯ ЯВНО 2026-08-12, И ПОВОД НАЙДЕН ЗАМЕРОМ. Спецификация перечисляет
+    `params.subType` («linear» or «inverse») у ВОСЬМИ методов, которые мы зовём, и мы не
+    передавали его ни разу — то есть подтип выбирался за нас. У `binanceusdm` умолчание
+    совпадает с нужным (`linear`), а `binancecoinm` СВОЙ `defaultType` не ставит вовсе и
+    наследует от базового класса `binance` значение `spot` — при том, что спотовых рынков
+    на COIN-M нет. Проверено: `binancecoinm().options['defaultType'] == 'spot'`.
+
+    Пока мы работали на одной зашитой площадке, это не могло проявиться. С появлением
+    ключа `venue` — может, и молча.
+    """
+    trades_method: str
+    """Неявный эндпоинт, которым `fetch_trades` берёт сделки.
+
+    ⚠ FOUNDATION §5 требует строить профиль на aggTrade. До сих пор это обеспечивалось
+    УМОЛЧАНИЕМ ccxt: при пустом `options['fetchTradesMethod']` эндпоинт выбирается по типу
+    рынка в теле `fetch_trades` (ccxt/binance.py). Умолчание сейчас нужное, но оно чужое —
+    смена его в библиотеке перевела бы профиль на поток `trades` без единой строки в логе,
+    а сделки там не агрегированы, то есть гистограмма изменилась бы молча.
+    """
     human: str
 
 
 VENUES: dict[str, Venue] = {
     "binanceusdm": Venue("binanceusdm", "fapiPublicGetExchangeInfo", "swap",
                          "fapiPublicGetPing", "fapiPublicGetKlines",
+                         "linear", "fapiPublicGetAggTrades",
                          "Binance USDⓈ-M, бессрочные фьючерсы на USDT"),
     "binancecoinm": Venue("binancecoinm", "dapiPublicGetExchangeInfo", "swap",
                           "dapiPublicGetPing", "dapiPublicGetKlines",
+                          "inverse", "dapiPublicGetAggTrades",
                           "Binance COIN-M, фьючерсы с монетным обеспечением"),
     "binance": Venue("binance", "publicGetExchangeInfo", "spot", "publicGetPing",
-                     "publicGetKlines", "Binance спот"),
+                     "publicGetKlines", None, "publicGetAggTrades",
+                     "Binance спот"),
 }
 """Площадки, на которых транспорт работает. Ключ идёт из `config/universe.toml`.
 
@@ -582,6 +607,16 @@ class Exchange:
             "options": {
                 "watchTrades": {"name": WS_TRADES_STREAM},
                 "watchTradesForSymbols": {"name": WS_TRADES_STREAM},
+                # ⚠ ТИП РЫНКА И ЭНДПОИНТ СДЕЛОК ЗАКРЕПЛЕНЫ ЯВНО 2026-08-12. Оба до сих
+                # пор брались умолчанием — своим у каждого класса ccxt, — и оба разбора
+                # в докстроках `Venue.default_sub_type` и `Venue.trades_method`.
+                # Коротко: `binancecoinm` наследует `defaultType='spot'` от базового
+                # класса, а выбор между aggTrade и trades для профиля объёма (§5) держался
+                # на ветке внутри чужой функции.
+                "defaultType": self.venue.market_type,
+                "fetchTradesMethod": self.venue.trades_method,
+                **({"defaultSubType": self.venue.default_sub_type}
+                   if self.venue.default_sub_type else {}),
             },
         })
         self._instruments: dict[str, Instrument] = {}
