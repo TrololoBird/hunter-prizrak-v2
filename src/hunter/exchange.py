@@ -499,9 +499,13 @@ class Exchange:
         """Сделок из разрывов, оставшихся НЕ добранными (разрыв шире предела или отказ
         REST). Пара к `trades_recovered`: без неё «добрано N» молчит о недобранном."""
 
-        self._watching: set[str] = set()
-        """Символы с ЖИВОЙ подпиской на сделки. Нужен, чтобы снять их явно при остановке:
-        без списка `un_watch_trades` некому адресовать."""
+        self._watching: dict[str, set[str]] = {}
+        """Живые подписки: РОД потока -> символы. Нужен, чтобы снять их явно при остановке.
+
+        ⚠ Был множеством символов для одних лишь сделок. Стал словарём по роду 2026-08-11,
+        когда потоков стало шесть: без рода снятие адресовалось бы не тому каналу — ровно
+        тот дефект, что уже случился с `un_watch_trades` и потоком `trade`.
+        """
 
         self.ws_unwatched = 0
         self.ws_unwatch_failed = 0
@@ -771,6 +775,42 @@ class Exchange:
         self.weight_reads += 1
         self.weight_peak = max(self.weight_peak, int(raw))
 
+    def _note_watch(self, kind: str, symbol: str) -> bool:
+        """Запомнить подписку. `True` — она новая (значит, стоит напечатать её цену)."""
+        live = self._watching.setdefault(kind, set())
+        if symbol in live:
+            return False
+        live.add(symbol)
+        return True
+
+    async def unwatch_all(self) -> None:
+        """Снять ВСЕ живые подписки явно. Отказ снятия не роняет остановку.
+
+        ⚠ Снималась только одна из шести подписок, пока потоков было шесть. Брошенная
+        подписка — не пустяк для службы, которая переоткрывает соединение: биржа ещё
+        какое-то время считает её живой и продолжает слать в неё данные.
+        """
+        for kind, symbols in sorted(self._watching.items()):
+            method, params = UNWATCH.get(kind, ("", {}))
+            call = getattr(self._ex, method, None) if method else None
+            if call is None:
+                self.ws_unwatch_failed += len(symbols)
+                log.degraded("для потока нет метода снятия — закроется обрывом",
+                             род=kind, символов=len(symbols))
+                continue
+            for sym in sorted(symbols):
+                try:
+                    await asyncio.wait_for(call(sym, params=params) if params
+                                           else call(sym),
+                                           timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
+                    self.ws_unwatched += 1
+                except (TimeoutError, ccxt.BaseError) as e:
+                    self.ws_unwatch_failed += 1
+                    log.degraded("подписка не снята явно — закроем обрывом",
+                                 род=kind, символ=sym,
+                                 причина=f"{type(e).__name__} {e}")
+        self._watching.clear()
+
     async def close(self) -> None:
         """Снять подписки ЯВНО и закрыть соединение вместе с сессией HTTP.
 
@@ -789,21 +829,7 @@ class Exchange:
         делает прогон, и исключение здесь потеряло бы отчёт, который уже собран. Поэтому
         отказы считаются и печатаются, но не поднимаются.
         """
-        for sym in sorted(self._watching):
-            if not self._ex.has.get("unWatchTrades"):
-                break
-            try:
-                # Имя потока передаётся ЯВНО, а не берётся из опций: у снятия своя
-                # цепочка поиска, и умолчание в ней — `trade`. См. `WS_TRADES_STREAM`.
-                await asyncio.wait_for(
-                    self._ex.un_watch_trades(sym, params={"name": WS_TRADES_STREAM}),
-                    timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
-                self.ws_unwatched += 1
-            except (TimeoutError, ccxt.BaseError) as e:
-                self.ws_unwatch_failed += 1
-                log.degraded("подписка не снята явно — закроем обрывом", символ=sym,
-                             причина=f"{type(e).__name__} {e}")
-        self._watching.clear()
+        await self.unwatch_all()
         try:
             # `True` — закрыть и сессию HTTP, а не только сокеты (ccxt: `close(True)`).
             await self._ex.close(True)
@@ -1187,6 +1213,66 @@ class Exchange:
         if self._ex.has.get(method):
             return None
         return NotReady(reason=f"{self.venue.ccxt_class}: не умеет {method}")
+
+    async def fetch_currencies(self) -> dict[str, str] | NotReady:
+        """Код валюты -> её идентификатор у биржи. ⚠ У фьючерсных площадок обычно пусто:
+        валюты описаны спотовым кошельком, а не контрактным шлюзом."""
+        if (no := self._unsupported("fetchCurrencies")) is not None:
+            return no
+        got = await self._rest("валюты", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_currencies())
+        if isinstance(got, NotReady):
+            return got
+        return {str(code): str((row or {}).get("id") or code) for code, row in got.items()}
+
+    async def fetch_mark_price(self, symbol: str) -> MarkPrice | NotReady:
+        """Маркировочная цена ОДНОГО контракта. Вес 1 против 10 у запроса всех сразу."""
+        if (no := self._unsupported("fetchMarkPrice")) is not None:
+            return no
+        got = await self._rest("маркировочная цена", symbol,
+                               lambda: self._ex.fetch_mark_price(symbol))
+        if isinstance(got, NotReady):
+            return got
+        return MarkPrice(symbol=symbol, mark=_f(got, "markPrice"),
+                         index=_f(got, "indexPrice"), timestamp_ms=_ms(got))
+
+    async def fetch_funding_intervals(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, str] | NotReady:
+        """Символ -> период расчёта финансирования (`8h`, `4h`, …).
+
+        Отвечает на то, чего не даёт `fetch_funding`: у него поле `interval` на этой
+        площадке приходит пустым (проверено), а здесь период спрашивается прямо.
+        """
+        if (no := self._unsupported("fetchFundingIntervals")) is not None:
+            return no
+        got = await self._rest("периоды финансирования", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_funding_intervals(symbols))
+        if isinstance(got, NotReady):
+            return got
+        return {str(s): str(row["interval"]) for s, row in got.items()
+                if row.get("interval") is not None}
+
+    async def fetch_l2_order_book(
+        self, symbol: str, depth: int = 100
+    ) -> OrderBook | NotReady:
+        """СВЕДЁННЫЙ стакан: заявки сгруппированы по цене.
+
+        Руководство ccxt («Notes On Ticker Structure») прямо советует эту семью вместо
+        тикера, когда нужны бид и аск: «If you need a unified way to access bids and asks
+        you should use `fetchL[123]OrderBook` family instead».
+        """
+        if (no := self._unsupported("fetchL2OrderBook")) is not None:
+            return no
+        got = await self._rest("сведённый стакан", symbol,
+                               lambda: self._ex.fetch_l2_order_book(symbol, depth))
+        if isinstance(got, NotReady):
+            return got
+        return OrderBook(
+            symbol=symbol, bids=_levels(got.get("bids")), asks=_levels(got.get("asks")),
+            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+            nonce=None if got.get("nonce") is None else int(got["nonce"]),
+        )
 
     async def fetch_ticker(self, symbol: str) -> Ticker24h | NotReady:
         """Суточная статистика ОДНОГО рынка. Вес 1 против 40 у запроса всех сразу."""
@@ -1837,6 +1923,7 @@ class Exchange:
         """Поток свечей. ⚠ В боевой ряд НЕ ИДЁТ: правило «ОДИН РЯД — ОДИН ИСТОЧНИК»
         стоит с 2026-08-05, и склейка потока с REST-историей уже однажды дала 81 бар,
         принятый двумя источниками разом."""
+        self._note_watch("ohlcv", symbol)
         while True:
             got = await self._watch_step(
                 f"свечи {timeframe}", f"{symbol} {timeframe}",
@@ -1859,6 +1946,7 @@ class Exchange:
         self, symbol: str, depth: int = 20
     ) -> AsyncGenerator[OrderBook]:
         """Поток стакана. ccxt держит книгу инкрементально и отдаёт согласованный снимок."""
+        self._note_watch("orderbook", symbol)
         while True:
             got = await self._watch_step(
                 "стакан", symbol, lambda: self._ex.watch_order_book(symbol, depth),
@@ -1875,6 +1963,7 @@ class Exchange:
 
     async def watch_ticker(self, symbol: str) -> AsyncGenerator[Ticker24h]:
         """Поток суточной статистики."""
+        self._note_watch("ticker", symbol)
         while True:
             got = await self._watch_step(
                 "тикер", symbol, lambda: self._ex.watch_ticker(symbol),
@@ -1891,6 +1980,8 @@ class Exchange:
         self, symbols: tuple[str, ...]
     ) -> AsyncGenerator[dict[str, Quote]]:
         """Поток лучших цен по многим рынкам одной подпиской."""
+        for s in symbols:
+            self._note_watch("quotes", s)
         while True:
             got = await self._watch_step(
                 "лучшие цены", ",".join(symbols),
@@ -1904,6 +1995,8 @@ class Exchange:
         self, symbols: tuple[str, ...]
     ) -> AsyncGenerator[dict[str, MarkPrice]]:
         """Поток маркировочных цен. ⚠ Только контракты."""
+        for s in symbols:
+            self._note_watch("markprice", s)
         while True:
             got = await self._watch_step(
                 "маркировочные цены", ",".join(symbols),
@@ -1934,6 +2027,133 @@ class Exchange:
             if out:
                 yield out
 
+    async def watch_trades_many(
+        self, symbols: tuple[str, ...]
+    ) -> AsyncGenerator[list[RawTrade]]:
+        """Сделки МНОГИХ символов одной подпиской.
+
+        ⚠ Экономит не соединения, а задачи. Соединение и так одно: ccxt складывает
+        подписки в общие потоки (`subscriptionLimitByStream` = 200 на поток,
+        `streamLimits` = 50 потоков), так что 27 символов уже жили в одном сокете. Разница
+        в том, что здесь одна задача asyncio вместо двадцати семи.
+
+        ⚠ Предел ccxt — 200 символов на вызов, дальше `BadRequest`. Проверяется здесь,
+        чтобы отказ был назван нашими словами, а не пришёл из середины библиотеки.
+        """
+        if len(symbols) > 200:
+            raise ValueError(
+                f"watch_trades_many: {len(symbols)} символов, а ccxt принимает 200 за раз")
+        for s in symbols:
+            self._note_watch("trades", s)
+        while True:
+            batch = await self._watch_step(
+                "сделки пакетом", ",".join(symbols),
+                lambda: self._ex.watch_trades_for_symbols(list(symbols)),
+                WS_TRADES_SILENCE_S)
+            if batch is None:
+                continue
+            out: list[RawTrade] = []
+            for raw in batch:
+                t = parse_trade(raw)
+                if isinstance(t, NotReady):
+                    self.trades_unparsed += 1
+                    continue
+                out.append(t)
+            if out:
+                yield out
+
+    async def watch_ohlcv_many(
+        self, pairs: tuple[tuple[str, str], ...]
+    ) -> AsyncGenerator[dict[str, dict[str, list[Bar]]]]:
+        """Свечи многих пар «символ + ТФ» одной подпиской. ⚠ В боевой ряд не идут."""
+        for sym, _tf in pairs:
+            self._note_watch("ohlcv", sym)
+        while True:
+            got = await self._watch_step(
+                "свечи пакетом", ",".join(f"{s}:{t}" for s, t in pairs),
+                lambda: self._ex.watch_ohlcv_for_symbols([list(p) for p in pairs]),
+                WS_SILENCE_S["ohlcv"])
+            if got is None:
+                continue
+            out: dict[str, dict[str, list[Bar]]] = {}
+            for sym, by_tf in got.items():
+                for tf, rows in by_tf.items():
+                    bars: list[Bar] = []
+                    for r in rows:
+                        try:
+                            bars.append(Bar(open_ms=int(r[0]), open=float(r[1]),
+                                            high=float(r[2]), low=float(r[3]),
+                                            close=float(r[4]), volume=float(r[5])))
+                        except ValueError as e:
+                            log.degraded("бар потока отклонён", символ=str(sym),
+                                         тф=str(tf), причина=str(e))
+                    if bars:
+                        out.setdefault(str(sym), {})[str(tf)] = bars
+            if out:
+                yield out
+
+    async def watch_tickers(
+        self, symbols: tuple[str, ...]
+    ) -> AsyncGenerator[dict[str, Ticker24h]]:
+        """Суточная статистика многих рынков одной подпиской."""
+        for s in symbols:
+            self._note_watch("ticker", s)
+        while True:
+            got = await self._watch_step(
+                "тикеры пакетом", ",".join(symbols),
+                lambda: self._ex.watch_tickers(list(symbols)),
+                WS_SILENCE_S["ticker"])
+            if got is None:
+                continue
+            out: dict[str, Ticker24h] = {}
+            for s, row in got.items():
+                t = _ticker_from(str(s), row)
+                if t is None:
+                    self.tickers_unparsed += 1
+                    continue
+                out[str(s)] = t
+            if out:
+                yield out
+
+    async def watch_order_books_many(
+        self, symbols: tuple[str, ...], depth: int = 20
+    ) -> AsyncGenerator[OrderBook]:
+        """Стаканы многих символов одной подпиской. Отдаётся ПО ОДНОМУ на обновление:
+        ccxt будит вызов, когда изменилась книга одного из символов."""
+        for s in symbols:
+            self._note_watch("orderbook", s)
+        while True:
+            got = await self._watch_step(
+                "стаканы пакетом", ",".join(symbols),
+                lambda: self._ex.watch_order_book_for_symbols(list(symbols), depth),
+                WS_SILENCE_S["orderbook"])
+            if got is None:
+                continue
+            yield OrderBook(
+                symbol=str(got.get("symbol") or symbols[0]),
+                bids=_levels(got.get("bids"), depth),
+                asks=_levels(got.get("asks"), depth),
+                timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+                nonce=None if got.get("nonce") is None else int(got["nonce"]),
+            )
+
+    async def watch_liquidations_many(
+        self, symbols: tuple[str, ...]
+    ) -> AsyncGenerator[list[Liquidation]]:
+        """Ликвидации многих контрактов одной подпиской."""
+        for s in symbols:
+            self._note_watch("liquidations", s)
+        while True:
+            got = await self._watch_step(
+                "ликвидации пакетом", ",".join(symbols),
+                lambda: self._ex.watch_liquidations_for_symbols(list(symbols)),
+                WS_SILENCE_S["liquidations"])
+            if got is None:
+                continue
+            out = [_liquidation_from(str(r.get("symbol") or symbols[0]), r) for r in got]
+            if out:
+                yield out
+
     async def watch_agg_trades(self, symbol: str) -> AsyncGenerator[list[RawTrade]]:
         """Поток сделок УЖЕ РАЗОБРАННЫМ в тип. §10.1: словарей между слоями нет.
 
@@ -1941,8 +2161,7 @@ class Exchange:
         и потребитель читал ключи руками. Неразобранная сделка не пропускается молча:
         она считается и попадает в счётчик `trades_unparsed`, который печатает приёмка.
         """
-        if symbol not in self._watching:
-            self._watching.add(symbol)
+        if self._note_watch("trades", symbol):
             # ⚠ Подписка проходит через ТОТ ЖЕ ограничитель темпа, что и REST, и стоит
             # `options['ws']['cost']` — у binanceusdm это 5, впятеро дороже обычного
             # запроса (ccxt/async_support/base/exchange.py, `watch_multiple`). В бюджете
@@ -1950,8 +2169,8 @@ class Exchange:
             # прежде, чем уйдёт хоть один опрос баров.
             cost = (self._ex.options.get("ws") or {}).get("cost", 1)
             log.info("подписка на сделки", символ=symbol, вес=cost,
-                     подписок_всего=len(self._watching),
-                     вес_подписок_всего=cost * len(self._watching))
+                     подписок_всего=len(self._watching["trades"]),
+                     вес_подписок_всего=cost * len(self._watching["trades"]))
         while True:
             batch = await self._watch_step(
                 "сделки", symbol, lambda: self._ex.watch_trades(symbol),
@@ -2047,6 +2266,22 @@ def _liquidation_from(symbol: str, row: dict[str, Any]) -> Liquidation:
                        side=None if row.get("side") is None else str(row["side"]),
                        timestamp_ms=_ms(row))
 
+
+UNWATCH: dict[str, tuple[str, dict[str, Any]]] = {
+    "trades": ("un_watch_trades", {"name": WS_TRADES_STREAM}),
+    "ohlcv": ("un_watch_ohlcv", {}),
+    "orderbook": ("un_watch_order_book", {}),
+    "ticker": ("un_watch_ticker", {}),
+    "quotes": ("un_watch_bids_asks", {}),
+    "markprice": ("un_watch_mark_prices", {}),
+}
+"""РОД потока -> (метод снятия, обязательные параметры).
+
+⚠ Параметры не пусты у сделок, и это не украшение: `un_watch_trades` ищет имя потока по
+другой цепочке, чем подписка, и её умолчание — `trade`, а мы на `aggTrade`. Разбор — в
+`WS_TRADES_STREAM`. Остальные роды параметров не требуют, но столбец оставлен, потому что
+следующий такой случай обнаружится не раньше, чем сломается.
+"""
 
 STATS_TIMEFRAMES: frozenset[str] = frozenset(
     {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
