@@ -529,6 +529,13 @@ class Exchange:
 
     async def open(self) -> ClockSync:
         log.info("площадка", класс=self.venue.ccxt_class, что=self.venue.human)
+        # ⚠ ДО СЕТИ. Идентификаторы рынков у площадок Binance совпадают (`BTC/USDT` и
+        # `BTC/USDT:USDT` оба дают `BTCUSDT`), поэтому кэш сделок, собранный одной
+        # площадкой, дозаписанный другой, стал бы смесью двух разных рынков без единого
+        # признака. Отказ здесь дешевле испорченных данных.
+        from .archive import check_venue
+        if why := check_venue(self.venue.ccxt_class):
+            raise CapabilityMissing(why)
         await self._ex.load_markets()
         # Проверка ПОСЛЕ load_markets: у ccxt часть `has` уточняется по ответу биржи.
         # И ДО всего остального: отказ обязан случиться в начале прогона, а не из

@@ -18,7 +18,7 @@ from decimal import Decimal
 import ccxt
 import polars as pl
 
-from . import archive, card, clock, emit, engine, geometry, levels, log, store
+from . import archive, barstore, card, clock, emit, engine, geometry, levels, log, store
 from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, find_gaps, on_grid, tf_ms
 from .config import Universe
@@ -48,27 +48,96 @@ from .swings import detect as detect_swings
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int) -> None:
+    """Засев рядов: хранилище на диске плюс добор хвоста у биржи.
+
+    ⚠ ДО 2026-08-11 БАРЫ НЕ СОХРАНЯЛИСЬ ВОВСЕ, и каждый прогон качал все 162 ряда заново.
+    История глубже одного запроса не накапливалась никогда — её некуда было класть, — а
+    кэш сделок при этом копился с самого начала. Эта асимметрия и закрывается здесь.
+
+    Порядок: прочитать сохранённое → спросить у биржи ТОЛЬКО хвост за последним
+    сохранённым баром → дописать → отдать объединённый ряд. Пустое хранилище даёт ровно
+    прежнее поведение: хвоста нет, просится всё окно.
+
+    ⚠ Переписанные бары считаются отдельно (`bars_rewritten`). Закрытый бар неизменен;
+    если биржа отдала по той же метке другие числа, это её правка задним числом либо наша
+    ошибка склейки, и оба случая обязаны быть видны числом, а не расхождением карточки.
+    """
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
             log.degraded("инструмент недоступен", причина=inst.reason)
+        market_id = None if isinstance(inst, NotReady) else inst.market_id
         for tf in uni.timeframes:
             st = SeriesState(symbol=sym, timeframe=tf)
             report.series[(sym, tf)] = st
-            got = await ex.fetch_closed_ohlcv(sym, tf, limit=limit)
             report.seed_checked += 1
+
+            want_from = clock.now_ms() - limit * tf_ms(tf)
+            stored: list[Bar] = []
+            since_ms: int | None = None
+            if market_id is not None:
+                stored = barstore.load(uni.venue, market_id, tf, since_ms=want_from)
+                since_ms = barstore.missing_tail_since(
+                    uni.venue, market_id, tf, want_from)
+                report.bars_from_store += len(stored)
+
+            # Хвост меньше окна просится с явного `since`; полное окно — как раньше,
+            # без `since`, чтобы биржа отдала своё умолчание последних `limit` баров.
+            ask = limit if since_ms is None else CATCHUP_MAX_BARS
+            got = await ex.fetch_closed_ohlcv(sym, tf, limit=ask, since_ms=since_ms)
             if isinstance(got, NotReady):
-                st.not_ready = got
-                log.degraded("засев пропущен", причина=got.reason)
+                if not stored:
+                    st.not_ready = got
+                    log.degraded("засев пропущен", причина=got.reason)
+                    continue
+                # Хранилище есть, хвост не пришёл: ряд стар, но не пуст. Молчать нельзя —
+                # иначе «данные есть» неотличимо от «данные свежие».
+                report.seed_tail_failed += 1
+                log.degraded("хвост ряда не добран — ряд отдан из хранилища",
+                             символ=sym, тф=tf, из_хранилища=len(stored),
+                             причина=got.reason)
+                fresh: list[Bar] = []
+            else:
+                fresh = got.bars
+                st.rejected_bars = got.rejected
+                st.rejected_at_ms = got.rejected_at_ms
+
+            if market_id is not None and fresh:
+                added, rewritten = barstore.append(uni.venue, market_id, tf, fresh)
+                report.bars_stored += added
+                report.bars_rewritten += rewritten
+                if rewritten:
+                    log.warn("биржа отдала ИНЫЕ числа по уже сохранённым барам",
+                             символ=sym, тф=tf, переписано=rewritten)
+                merged = barstore.load(uni.venue, market_id, tf, since_ms=want_from)
+            else:
+                merged = _merge_bars(stored, fresh)
+
+            # ⚠ Отдаётся ровно `limit` ПОСЛЕДНИХ баров, а не всё окно по времени. Разница
+            # не косметическая: биржа отдавала счётом, и переход на границу по времени
+            # сдвинул бы левый край ряда на бар — то есть изменил бы расчёт УЖЕ ЗДЕСЬ,
+            # тогда как этап 1 обязан быть безразличным к нему. Глубина меняется на
+            # этапе 2, осознанно и с диффом повтора. Хранилище при этом копит ВСЁ, что
+            # пришло: обрезается только выдача.
+            merged = merged[-limit:]
+
+            if not merged:
+                st.not_ready = NotReady(reason=f"{sym} {tf}: ряд пуст и в хранилище, и у биржи")
                 continue
-            st.bars = got.bars
-            st.rejected_bars = got.rejected
-            st.rejected_at_ms = got.rejected_at_ms
-            st.gaps = find_gaps(got.bars, tf)
-            report.seeded_bars += len(got.bars)
+            st.bars = merged
+            st.gaps = find_gaps(merged, tf)
+            report.seeded_bars += len(merged)
             if st.gaps:
                 log.warn("разрыв сетки", символ=sym, тф=tf, разрывов=len(st.gaps),
                          первый_после=st.gaps[0][0])
+
+
+def _merge_bars(stored: list[Bar], fresh: list[Bar]) -> list[Bar]:
+    """Слияние по метке открытия, приходящее побеждает. Запасной путь для случая, когда
+    рынка нет в списке инструментов и писать в хранилище некуда."""
+    by_open = {b.open_ms: b for b in stored}
+    by_open.update({b.open_ms: b for b in fresh})
+    return [by_open[k] for k in sorted(by_open)]
 
 
 def _sleep_until_next_poll_s(timeframe: str, now_ms: int) -> float:
@@ -1706,6 +1775,19 @@ def print_report(r: RunReport) -> int:
     print(f"   суток продлено живым потоком: {r.live_days_flushed}"
           + ("   ⚠ ноль: принятое потоком в кэш НЕ ЛОЖИТСЯ"
              if r.live_days_flushed == 0 and r.trades_total > 0 else ""))
+
+    # ⚠ Хранилище баров печатается ВСЕГДА и тремя числами сразу. Одно «поднято из
+    # хранилища N» не отличает растущее хранилище от застывшего, а молчаливая перезапись
+    # уже сохранённого бара изменила бы ряд без названной причины.
+    print(f"   бары: из хранилища {r.bars_from_store}, дописано {r.bars_stored}, "
+          f"переписано {r.bars_rewritten}"
+          + ("   ⚠ ноль поднято: хранилище пусто или в него не пишется"
+             if r.bars_from_store == 0 and r.seeded_bars > 0 else ""))
+    if r.bars_rewritten:
+        print(f"     ⚠ биржа отдала ИНЫЕ числа по {r.bars_rewritten} уже сохранённым "
+              f"барам — закрытый бар неизменен, причина обязана быть найдена")
+    if r.seed_tail_failed:
+        print(f"     ⚠ рядов отдано из хранилища БЕЗ свежего хвоста: {r.seed_tail_failed}")
 
     print("\n1. ЧАСЫ (§6)")
     print(f"   сдвиг биржа−локальные    : {r.sync.offset_ms:+d} мс")
