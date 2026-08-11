@@ -412,6 +412,15 @@ class CapabilityMissing(RuntimeError):
     """Биржа или версия ccxt не умеет того, без чего прогон бессмысленен."""
 
 
+_WatchArg = str | tuple[str, ...] | tuple[tuple[str, ...], ...]
+"""Один аргумент подписки в памяти о ней.
+
+Три формы, и все три настоящие: символ (`watch_ticker`), кортеж символов
+(`watch_trades_for_symbols`), кортеж пар «символ + таймфрейм» (`watch_ohlcv_for_symbols`).
+Кортежи, а не списки, потому что подписки хранятся во множестве.
+"""
+
+
 class Venue(NamedTuple):
     """Площадка Binance: класс ccxt и то, чем она отличается в ОБРАЩЕНИИ, а не в смысле."""
 
@@ -644,7 +653,7 @@ class Exchange:
         """Сделок из разрывов, оставшихся НЕ добранными (разрыв шире предела или отказ
         REST). Пара к `trades_recovered`: без неё «добрано N» молчит о недобранном."""
 
-        self._watching: dict[str, set[tuple[str, ...]]] = {}
+        self._watching: dict[str, set[tuple[_WatchArg, ...]]] = {}
         """Живые подписки: РОД потока -> набор АРГУМЕНТОВ, которыми она открыта.
 
         ⚠ Три редакции за сутки, и каждая правка чинила один и тот же класс дефекта —
@@ -1111,11 +1120,17 @@ class Exchange:
                            f"только обрывом соединения")
         return tuple(bad)
 
-    def _note_watch(self, kind: str, *args: str) -> bool:
+    def _note_watch(self, kind: str, *args: _WatchArg) -> bool:
         """Запомнить подписку по её АРГУМЕНТАМ. `True` — она новая.
 
         Аргументы, а не символ: снятие обязано повторить их в точности, иначе адресуется
-        другому каналу. У свечей это (символ, таймфрейм), у остальных — (символ,).
+        другому каналу. У свечей это (символ, таймфрейм), у одиночных — (символ,).
+
+        ⚠ У ПАКЕТНЫХ РОДОВ АРГУМЕНТ ОДИН И ОН СОСТАВНОЙ — кортеж символов или кортеж пар.
+        Так и запоминается, целиком. Прежде пакетная подписка записывалась ПО СИМВОЛУ, как
+        будто их было столько же, сколько символов, и снятие потом шло одиночным методом
+        по каждому. Кортеж, а не список, потому что запоминаем во множество: список
+        нехешируем, и попытка положить его туда упала бы `TypeError` на первом же вызове.
         """
         live = self._watching.setdefault(kind, set())
         if args in live:
@@ -1139,13 +1154,22 @@ class Exchange:
                              род=kind, подписок=len(subs))
                 continue
             want = UNWATCH_ARGS.get(kind, ("symbol",))
-            for args in sorted(subs):
+            for args in sorted(subs, key=_watch_key):
                 # Аргументы повторяются В ТОЧНОСТИ: у свечей это ещё и таймфрейм (без него
-                # снялась бы подписка на умолчание `1m`), а у пакетных родов первый
-                # аргумент — СПИСОК, и одиночная строка разошлась бы по символам.
-                call_args: list[Any] = list(args)
-                if want and want[0] == "symbols":
-                    call_args[0] = [args[0]]
+                # снялась бы подписка на умолчание `1m`), у одиночных родов с пакетным
+                # снятием символ оборачивается в список, а у пакетных родов аргумент уже
+                # составной и разворачивается в список (или в список пар) целиком.
+                call_args: list[Any] = []
+                for i, a in enumerate(args):
+                    plural = want[i] in ("symbols", "symbolsAndTimeframes") \
+                        if i < len(want) else False
+                    if isinstance(a, tuple):
+                        call_args.append([list(x) if isinstance(x, tuple) else x
+                                          for x in a])
+                    elif plural:
+                        call_args.append([a])
+                    else:
+                        call_args.append(a)
                 try:
                     await asyncio.wait_for(
                         call(*call_args, params=params) if params else call(*call_args),
@@ -1156,7 +1180,7 @@ class Exchange:
                     # наша ошибка таблицы, и она не должна ронять остановку прогона.
                     self.ws_unwatch_failed += 1
                     log.degraded("подписка не снята явно — закроем обрывом",
-                                 род=kind, аргументы=",".join(args),
+                                 род=kind, аргументы=_watch_key(args),
                                  причина=f"{type(e).__name__} {e}")
         self._watching.clear()
 
@@ -2497,8 +2521,7 @@ class Exchange:
         self, symbols: tuple[str, ...]
     ) -> AsyncGenerator[dict[str, Quote]]:
         """Поток лучших цен по многим рынкам одной подпиской."""
-        for s in symbols:
-            self._note_watch("quotes", s)
+        self._note_watch("quotes", tuple(symbols))
         while True:
             got = await self._watch_step(
                 "лучшие цены", ",".join(symbols),
@@ -2522,8 +2545,7 @@ class Exchange:
         Умолчание здесь оставлено библиотечным намеренно: поток не в боевом контуре, менять
         поведение без нужды незачем. Но теперь это ручка с названной ценой, а не молчание.
         """
-        for s in symbols:
-            self._note_watch("markprice", s)
+        self._note_watch("markprice", tuple(symbols))
         while True:
             got = await self._watch_step(
                 "маркировочные цены", ",".join(symbols),
@@ -2571,8 +2593,7 @@ class Exchange:
         if len(symbols) > 200:
             raise ValueError(
                 f"watch_trades_many: {len(symbols)} символов, а ccxt принимает 200 за раз")
-        for s in symbols:
-            self._note_watch("trades", s)
+        self._note_watch("trades_many", tuple(symbols))
         while True:
             batch = await self._watch_step(
                 "сделки пакетом", ",".join(symbols),
@@ -2594,8 +2615,7 @@ class Exchange:
         self, pairs: tuple[tuple[str, str], ...]
     ) -> AsyncGenerator[dict[str, dict[str, list[Bar]]]]:
         """Свечи многих пар «символ + ТФ» одной подпиской. ⚠ В боевой ряд не идут."""
-        for sym, tf in pairs:
-            self._note_watch("ohlcv", sym, tf)
+        self._note_watch("ohlcv_many", tuple(tuple(p) for p in pairs))
         while True:
             got = await self._watch_step(
                 "свечи пакетом", ",".join(f"{s}:{t}" for s, t in pairs),
@@ -2624,8 +2644,7 @@ class Exchange:
         self, symbols: tuple[str, ...]
     ) -> AsyncGenerator[dict[str, Ticker24h]]:
         """Суточная статистика многих рынков одной подпиской."""
-        for s in symbols:
-            self._note_watch("ticker", s)
+        self._note_watch("ticker_many", tuple(symbols))
         while True:
             got = await self._watch_step(
                 "тикеры пакетом", ",".join(symbols),
@@ -2648,8 +2667,7 @@ class Exchange:
     ) -> AsyncGenerator[OrderBook]:
         """Стаканы многих символов одной подпиской. Отдаётся ПО ОДНОМУ на обновление:
         ccxt будит вызов, когда изменилась книга одного из символов."""
-        for s in symbols:
-            self._note_watch("orderbook", s)
+        self._note_watch("orderbook_many", tuple(symbols))
         while True:
             got = await self._watch_step(
                 "стаканы пакетом", ",".join(symbols),
@@ -2669,8 +2687,7 @@ class Exchange:
         self, symbols: tuple[str, ...]
     ) -> AsyncGenerator[list[Liquidation]]:
         """Ликвидации многих контрактов одной подпиской."""
-        for s in symbols:
-            self._note_watch("liquidations", s)
+        self._note_watch("liquidations", tuple(symbols))
         while True:
             got = await self._watch_step(
                 "ликвидации пакетом", ",".join(symbols),
@@ -2753,6 +2770,21 @@ def _day(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, UTC).date().isoformat()
 
 
+def _watch_key(args: tuple[_WatchArg, ...]) -> str:
+    """Аргументы подписки одной строкой: для сортировки и для лога.
+
+    ⚠ Понадобилась потому, что аргументы перестали быть плоскими строками:
+    `",".join(args)` падал бы `TypeError` на кортеже символов, а сортировка множества
+    со смешанными типами — `TypeError` при сравнении. Детерминированный порядок здесь
+    обязателен: остановка попадает в отчёт, а отчёт обязан повторяться (§10.6).
+    """
+    def one(a: _WatchArg) -> str:
+        if isinstance(a, tuple):
+            return "+".join(one(x) for x in a)
+        return a
+    return ",".join(one(a) for a in args)
+
+
 def _ticker_from(symbol: str, row: dict[str, Any]) -> Ticker24h | None:
     """`None` — тикер неполон. Биржа отдаёт их и по рынкам, где суток не набралось."""
     last = row.get("last") if row.get("last") is not None else row.get("close")
@@ -2807,6 +2839,11 @@ UNWATCH_CAP: dict[str, str] = {
     "ticker": "unWatchTicker",
     "quotes": "unWatchBidsAsks",
     "markprice": "unWatchMarkPrices",
+    "trades_many": "unWatchTradesForSymbols",
+    "ohlcv_many": "unWatchOHLCVForSymbols",
+    "orderbook_many": "unWatchOrderBookForSymbols",
+    "ticker_many": "unWatchTickers",
+    "liquidations": "unWatchLiquidations",
 }
 """РОД -> имя возможности в карте `has`. Нужен, потому что НАЛИЧИЕ МЕТОДА НЕ ЗНАЧИТ, ЧТО
 ОН РАБОТАЕТ: `un_watch_bids_asks` у binanceusdm существует как атрибут и бросает
@@ -2825,23 +2862,49 @@ UNWATCH: dict[str, tuple[str, dict[str, Any]]] = {
     "ticker": ("un_watch_ticker", {}),
     "quotes": ("un_watch_bids_asks", {}),
     "markprice": ("un_watch_mark_prices", {}),
+    # ⚠ ПАКЕТНЫЕ РОДА ДОБАВЛЕНЫ 2026-08-12, И ЭТО ЧЕТВЁРТАЯ ПРАВКА ОДНОГО ДЕФЕКТА.
+    # Сверка перечня методов спецификации binance с нашими вызовами показала пять
+    # незваных `unWatch*ForSymbols` — ровно столько, сколько у нас пакетных подписок.
+    # Пакетные потоки регистрировались под теми же родами, что одиночные, и снимались
+    # ОДИНОЧНЫМ методом: `watch_ohlcv_for_symbols` открывает канал с одним хешем
+    # сообщения, `un_watch_ohlcv` адресуется другому. Вызов при этом НЕ ПАДАЕТ.
+    "trades_many": ("un_watch_trades_for_symbols", {"name": WS_TRADES_STREAM}),
+    "ohlcv_many": ("un_watch_ohlcv_for_symbols", {}),
+    "orderbook_many": ("un_watch_order_book_for_symbols", {}),
+    "ticker_many": ("un_watch_tickers", {}),
+    # ⚠ Ликвидации сняты быть НЕ МОГУТ: метода `un_watch_liquidations` у площадки нет
+    # вовсе, и `has` про него говорит `None`. Род внесён В ТАБЛИЦУ НАМЕРЕННО — чтобы
+    # `check_unwatch_table` сказал об этом на СТАРТЕ. Прежде этот род в таблицах
+    # отсутствовал, и о невозможности снятия узнавали в момент остановки.
+    "liquidations": ("un_watch_liquidations", {}),
 }
 UNWATCH_ARGS: dict[str, tuple[str, ...]] = {
     "ohlcv": ("symbol", "timeframe"),
     "markprice": ("symbols",),
     "quotes": ("symbols",),
+    "trades_many": ("symbols",),
+    "ohlcv_many": ("symbolsAndTimeframes",),
+    "orderbook_many": ("symbols",),
+    "ticker_many": ("symbols",),
+    # ⚠ Ликвидаций здесь НЕТ НАМЕРЕННО. Метода снятия у площадки не существует, значит
+    # и сигнатуры, с которой можно было бы сверяться, тоже нет. Записать сюда имя
+    # параметра значило бы объявить непроверяемое: развернуть аргумент правильно код
+    # умеет и без строки в таблице (составной аргумент разворачивается по типу).
 }
 """Чем ИМЕННО зовётся снятие у каждого рода. Умолчание — `("symbol",)`.
 
-⚠ У ДВУХ РОДОВ ПАРАМЕТР ВО МНОЖЕСТВЕННОМ ЧИСЛЕ, и это не мелочь: `un_watch_mark_prices`
-и `un_watch_bids_asks` принимают СПИСОК символов, потому что подписка на них тоже
-пакетная. Вызов с одной строкой вместо списка не падает — ccxt пройдёт по СИМВОЛАМ СТРОКИ
-как по списку рынков. Найдено проверкой `check_unwatch_table` на живой таблице, а не
-рассуждением: до неё оба стояли как одиночные.
+⚠ У РОДОВ С МНОЖЕСТВЕННЫМ ПАРАМЕТРОМ подписка ПАКЕТНАЯ, и снятие принимает СПИСОК.
+Вызов с одной строкой вместо списка не падает — ccxt пройдёт по СИМВОЛАМ СТРОКИ как по
+списку рынков. Найдено проверкой `check_unwatch_table` на живой таблице, а не
+рассуждением: до неё `markprice` и `quotes` стояли как одиночные.
+
+⚠ `symbolsAndTimeframes` — третья форма, и её нельзя свести к предыдущим:
+`un_watch_ohlcv_for_symbols` принимает СПИСОК ПАР `[[символ, тф], …]`. Плоский список
+символов туда не годится, и подстановка одиночной пары сняла бы одну из подписок пакета.
 
 Держится отдельно от `UNWATCH`, потому что читается двумя сторонами: `check_unwatch_table`
-сверяет эти имена с настоящей сигнатурой ccxt, `unwatch_all` по ним же решает, обернуть ли
-символ в список. Разойтись они не могут — таблица одна.
+сверяет эти имена с настоящей сигнатурой ccxt, `unwatch_all` по ним же решает, во что
+разворачивать запомненные аргументы. Разойтись они не могут — таблица одна.
 """
 
 """РОД потока -> (метод снятия, обязательные параметры).
