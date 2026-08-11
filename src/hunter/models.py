@@ -144,6 +144,73 @@ class Bar:
             raise ValueError(f"бар {self.open_ms}: high < low")
 
 
+class Ticker24h(BaseModel):
+    """Суточная статистика рынка. Публичный `ticker/24hr`.
+
+    ⚠ Ни одна из этих величин НЕ ВХОДИТ в сигнал и входить не может: признака, которого
+    нет в курсе, в методике не появляется (§0). Транспорт их отдаёт, потому что вселенная
+    отбиралась ПО ОБОРОТУ (`config/universe.toml`), а проверить оборот было нечем — число
+    в конфигурации снято руками 2026-08-03 и с тех пор не пересматривалось.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    last: float
+    quote_volume: float
+    """Оборот за сутки в валюте котировки. Именно по нему отбиралась вселенная."""
+    change_pct: float | None = None
+    timestamp_ms: int | None = None
+
+
+class BookTop(BaseModel):
+    """Вершина стакана: лучший бид и аск. Публичный `depth`.
+
+    Отдаётся ВЕРШИНА, а не весь стакан, и это решение: полная книга — сотни уровней на
+    символ, типизировать которые незачем, пока ни одно правило курса на них не ссылается.
+    Понадобится глубина — расширится здесь, а не появится словарём у потребителя.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    bid: float
+    bid_qty: float
+    ask: float
+    ask_qty: float
+    timestamp_ms: int | None = None
+
+    @property
+    def spread(self) -> float:
+        return self.ask - self.bid
+
+
+class OpenInterest(BaseModel):
+    """Открытый интерес по контракту. Публичный `openInterest`, только контракты."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    amount: float
+    """В контрактах (базовой валюте)."""
+    value: float | None = None
+    """В валюте котировки, если биржа его посчитала."""
+    timestamp_ms: int | None = None
+
+
+class FundingRate(BaseModel):
+    """Ставка финансирования бессрочного контракта. Публичный `premiumIndex`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    rate: float | None = None
+    next_ms: int | None = None
+    mark: float | None = None
+    index: float | None = None
+    timestamp_ms: int | None = None
+
+
 class Instrument(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

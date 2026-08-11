@@ -20,13 +20,17 @@ from . import clock, log
 from .bars import closed_only, on_grid, tf_ms
 from .models import (
     Bar,
+    BookTop,
     ClockSync,
+    FundingRate,
     Instrument,
     MarketsReload,
     NotReady,
     OhlcvFetch,
+    OpenInterest,
     RawTrade,
     TickChange,
+    Ticker24h,
 )
 
 # Замер 2026-08-03: /fapi/v1/klines принимает limit=1500, на 1501 отвечает
@@ -447,6 +451,10 @@ class Exchange:
         """Сколько рядов добрано НЕ ЦЕЛИКОМ из-за обрыва пагинации свечей. Ноль при
         глубине выше предела ccxt означает «все ряды пришли полностью», а не «пагинации
         не было»: путь короткой истории этот счётчик не трогает вовсе."""
+
+        self.tickers_unparsed = 0
+        """Тикеров, отброшенных как неполные. Знаменатель — принятые: биржа отдаёт
+        суточную статистику и по рынкам, где суток ещё не набралось."""
 
         self.trades_unparsed = 0
         """Сделок, которые не удалось разобрать в тип. Знаменатель — принятые."""
@@ -1149,6 +1157,142 @@ class Exchange:
         # ccxt не типизирован: `fetch_ohlcv` объявлен как Any. Приведение здесь, а не
         # у вызывающего, — граница типизированной части проекта проходит по этому классу.
         return list(raw)
+
+    # --- рыночный контекст ------------------------------------------------
+    #
+    # ⚠ ГРАНИЦА, КОТОРУЮ ЭТОТ РАЗДЕЛ НЕ ПЕРЕСЕКАЕТ. Всё ниже — ВОЗМОЖНОСТИ ТРАНСПОРТА,
+    # а не элементы методики. Ни открытого интереса, ни ставки финансирования, ни стакана
+    # в мини-курсе нет; по §0 признак, которого нет в курсе, — выдумка, даже если он
+    # полезен. Поэтому эти методы существуют, типизированы и проверяемы, но ни один из них
+    # НЕ ЗОВЁТСЯ из расчёта сигнала. Появится референт в курсе или корпусе — путь готов.
+    #
+    # Добавлено 2026-08-11 по обратной сверке: из 30 публичных эндпоинтов площадки мы
+    # звали 4. Остальные не были «не нужны» — они не были рассмотрены.
+
+    async def fetch_tickers(
+        self, symbols: tuple[str, ...] | None = None
+    ) -> dict[str, Ticker24h] | NotReady:
+        """Суточная статистика по рынкам. Вес 1 за символ, 40 за все сразу.
+
+        ⚠ Зачем это нужно ИМЕННО НАМ: вселенная отбиралась по обороту (топ-12 плюс символы
+        корпуса), а число оборота снято руками 2026-08-03 и с тех пор ничем не проверялось.
+        Здесь появляется прибор, которым его можно пересчитать, не открывая браузер.
+        """
+        got = await self._rest("суточная статистика", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_tickers(symbols))
+        if isinstance(got, NotReady):
+            return got
+        out: dict[str, Ticker24h] = {}
+        for sym, row in got.items():
+            last = row.get("last") if row.get("last") is not None else row.get("close")
+            if last is None or row.get("quoteVolume") is None:
+                # Неполный тикер пропускается ПОИМЁННО: биржа отдаёт их и для рынков,
+                # где суток ещё не набралось.
+                self.tickers_unparsed += 1
+                continue
+            out[str(sym)] = Ticker24h(
+                symbol=str(sym), last=float(last),
+                quote_volume=float(row["quoteVolume"]),
+                change_pct=(None if row.get("percentage") is None
+                            else float(row["percentage"])),
+                timestamp_ms=(None if row.get("timestamp") is None
+                              else int(row["timestamp"])),
+            )
+        return out
+
+    async def fetch_alt_price_series(
+        self, symbol: str, timeframe: str, kind: str, limit: int = 500
+    ) -> list[Bar] | NotReady:
+        """Ряд МАРКИРОВОЧНОЙ или ИНДЕКСНОЙ цены. `kind` — `mark`, `index`, `premiumIndex`.
+
+        Это те же свечи, но не по сделкам: маркировочная цена — та, по которой биржа
+        считает ликвидации, индексная — сводная по нескольким площадкам. Из ccxt берутся
+        тем же `fetch_ohlcv` с `params['price']` (ccxt/binance.py: `markPriceKlines`,
+        `indexPriceKlines`, `premiumIndexKlines`).
+
+        ⚠ РЯД ЗДЕСЬ НЕ СМЕШИВАЕТСЯ С ОСНОВНЫМ. Правило «ОДИН РЯД — ОДИН ИСТОЧНИК» стоит
+        в проекте с 2026-08-05 и стоило удаления вебсокетного потока баров: склейка двух
+        источников — это место, где живут дубликаты и невидимые разрывы. Маркировочная
+        цена отдаётся ОТДЕЛЬНЫМ списком и в хранилище баров не пишется.
+
+        ⚠ Только контракты: на споте маркировочной и индексной цены не существует.
+        """
+        if kind not in ("mark", "index", "premiumIndex"):
+            raise ValueError(f"неизвестный ряд {kind!r}; есть mark, index, premiumIndex")
+        raw = await self._rest(
+            f"ряд {kind}", f"{symbol} {timeframe}",
+            lambda: self._ex.fetch_ohlcv(symbol, timeframe, limit=limit,
+                                         params={"price": kind}),
+        )
+        if isinstance(raw, NotReady):
+            return raw
+        out: list[Bar] = []
+        for r in raw:
+            try:
+                out.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
+                               low=float(r[3]), close=float(r[4]), volume=float(r[5])))
+            except ValueError as e:
+                # ⚠ У премии объём нулевой, а цены могут быть отрицательными — это не
+                # битый бар, а свойство величины. Отказ называется, а не глотается.
+                log.degraded(f"бар ряда {kind} отклонён", символ=symbol, тф=timeframe,
+                             причина=str(e))
+        if not out:
+            return NotReady(reason=f"{symbol} {timeframe}: ряд {kind} пуст после разбора")
+        return closed_only(out, timeframe, clock.now_ms())
+
+    async def fetch_book_top(self, symbol: str) -> BookTop | NotReady:
+        """Лучший бид и аск. Запрашивается limit=5 — по таблице весов ccxt это ступень 2,
+        самая дешёвая: `depth` стоит 2 до 50 уровней, 5 до сотни, 20 до тысячи."""
+        got = await self._rest("стакан", symbol,
+                               lambda: self._ex.fetch_order_book(symbol, 5))
+        if isinstance(got, NotReady):
+            return got
+        bids, asks = got.get("bids") or [], got.get("asks") or []
+        if not bids or not asks:
+            return NotReady(reason=f"{symbol}: стакан пуст с одной из сторон")
+        return BookTop(
+            symbol=symbol, bid=float(bids[0][0]), bid_qty=float(bids[0][1]),
+            ask=float(asks[0][0]), ask_qty=float(asks[0][1]),
+            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+        )
+
+    async def fetch_open_interest(self, symbol: str) -> OpenInterest | NotReady:
+        """Открытый интерес. ⚠ Только контракты: на споте эндпоинта нет вовсе."""
+        if not self._ex.has.get("fetchOpenInterest"):
+            return NotReady(
+                reason=f"{self.venue.ccxt_class}: площадка не умеет fetchOpenInterest")
+        got = await self._rest("открытый интерес", symbol,
+                               lambda: self._ex.fetch_open_interest(symbol))
+        if isinstance(got, NotReady):
+            return got
+        amount = got.get("openInterestAmount")
+        if amount is None:
+            return NotReady(reason=f"{symbol}: в ответе нет openInterestAmount")
+        return OpenInterest(
+            symbol=symbol, amount=float(amount),
+            value=(None if got.get("openInterestValue") is None
+                   else float(got["openInterestValue"])),
+            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+        )
+
+    async def fetch_funding(self, symbol: str) -> FundingRate | NotReady:
+        """Ставка финансирования и маркировочная цена. ⚠ Только бессрочные контракты."""
+        if not self._ex.has.get("fetchFundingRate"):
+            return NotReady(
+                reason=f"{self.venue.ccxt_class}: площадка не умеет fetchFundingRate")
+        got = await self._rest("ставка финансирования", symbol,
+                               lambda: self._ex.fetch_funding_rate(symbol))
+        if isinstance(got, NotReady):
+            return got
+        return FundingRate(
+            symbol=symbol,
+            rate=None if got.get("fundingRate") is None else float(got["fundingRate"]),
+            next_ms=(None if got.get("fundingTimestamp") is None
+                     else int(got["fundingTimestamp"])),
+            mark=None if got.get("markPrice") is None else float(got["markPrice"]),
+            index=None if got.get("indexPrice") is None else float(got["indexPrice"]),
+            timestamp_ms=None if got.get("timestamp") is None else int(got["timestamp"]),
+        )
 
     async def count_history(
         self, symbol: str, timeframe: str, *, cap: int
