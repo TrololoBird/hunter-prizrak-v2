@@ -77,36 +77,66 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _profile(args: argparse.Namespace) -> int:
-    """Профиль объёма за сутки из архива: ПОК, VAH, VAL (§2.2, §5)."""
+    """Профиль объёма за сутки: ПОК, VAH, VAL (§2.2, §5).
+
+    ⚠ Переписано 2026-08-11 вместе с удалением `data.binance.vision`. Раньше команда
+    качала суточный ZIP архива; теперь сутки берутся тем же путём, что и в бою, — REST-ом
+    ccxt. Диагностика обязана ходить туда же, куда боевой расчёт, иначе она проверяет
+    не то, что работает.
+    """
     import datetime as dt
 
-    from .archive import fetch_agg_trades_day, histogram_from_day
     from .exchange import Exchange
-    from .models import NotReady
+    from .models import NotReady, RawTrade, TradeHistogram, bin_index
     from .volume_profile import Expansion, build
 
-    async def tick_of(market_id: str) -> Decimal | NotReady:
+    day = dt.date.fromisoformat(args.day)
+    start = int(dt.datetime.combine(day, dt.time(), dt.UTC).timestamp() * 1000)
+    end = start + 86_400_000
+
+    async def day_histogram() -> tuple[Decimal, TradeHistogram] | NotReady:
         ex = Exchange()
         await ex.open()
         try:
-            for sym, mk in ex.markets_by_id().items():
-                if mk == market_id:
-                    inst = ex.instrument(sym)
-                    return inst if isinstance(inst, NotReady) else inst.tick_size
-            return NotReady(reason=f"{market_id}: нет такого рынка")
+            symbol = next((s for s, mk in ex.markets_by_id().items()
+                           if mk == args.symbol), None)
+            if symbol is None:
+                return NotReady(reason=f"{args.symbol}: нет такого рынка")
+            inst = ex.instrument(symbol)
+            if isinstance(inst, NotReady):
+                return inst
+            qty: dict[int, float] = {}
+            cnt: dict[int, int] = {}
+            seen = 0
+
+            def on_page(page: list[RawTrade]) -> None:
+                nonlocal seen
+                for t in page:
+                    b = bin_index(t.price, inst.tick_size)
+                    qty[b] = qty.get(b, 0.0) + t.amount
+                    cnt[b] = cnt.get(b, 0) + 1
+                    seen += 1
+
+            got = await ex.fetch_agg_trades_window(symbol, start, end, on_page)
+            if isinstance(got, NotReady):
+                return got
+            _, covered = got
+            if covered < end:
+                pct = (covered - start) / (end - start) * 100
+                return NotReady(reason=f"{args.symbol} {day}: покрыто {pct:.1f}% суток")
+            return inst.tick_size, TradeHistogram(
+                symbol=symbol, tick_size=inst.tick_size,
+                qty_by_bin=qty, count_by_bin=cnt,
+                trades_seen=seen, qty_seen=sum(qty.values()),
+                first_ms=start, last_ms=end - 1)
         finally:
             await ex.close()
 
-    tick = asyncio.run(tick_of(args.symbol))
-    if isinstance(tick, NotReady):
-        print(f"НЕ ГОТОВО: {tick.reason}")
+    res = asyncio.run(day_histogram())
+    if isinstance(res, NotReady):
+        print(f"НЕ ГОТОВО: {res.reason}")
         return 1
-    day = dt.date.fromisoformat(args.day)
-    data = fetch_agg_trades_day(args.symbol, day)
-    if isinstance(data, NotReady):
-        print(f"НЕ ГОТОВО: {data.reason}")
-        return 1
-    h = histogram_from_day(data, args.symbol, tick)
+    tick, h = res
     print(f"{args.symbol} {day}: сделок {h.trades_seen:,}, бинов {len(h.qty_by_bin):,}, "
           f"объём {h.qty_seen:,.3f}, tickSize {tick}")
     for e in (Expansion.PAIRS, Expansion.SINGLE):

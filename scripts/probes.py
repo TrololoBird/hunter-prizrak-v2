@@ -14,13 +14,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import io
 import statistics
 import sys
 import time
-import urllib.request
-import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
@@ -47,7 +43,6 @@ from hunter.exchange import Exchange
 from hunter.models import Bar, NotReady, TradeHistogram
 from hunter.swings import SwingKind
 
-ARCHIVE = "https://data.binance.vision/data/futures/um/daily"
 SYMS = ("BTC/USDT:USDT", "ETH/USDT:USDT")
 TFS = ("5m", "15m", "1h", "4h", "1d")
 
@@ -88,50 +83,24 @@ def _series(bars: list[Bar], expr: pl.Expr) -> list[float | None]:
     return list(df.select(expr.alias("v"))["v"])
 
 
-def _fetch_day(market_id: str, day: date, tick: Decimal, bucket_ms: int) -> pl.DataFrame | None:
-    """Сутки сделок из архива, сразу свёрнутые в (корзина, бин) → объём.
-
-    ⚠ Бинирует ТОЛЬКО через `archive.bin_expr`. Здесь была третья в проекте копия
-    выражения `(price / float(tick)).floor()` — после `models` и `archive`, — и зонд
-    `bar-vs-tick` из-за неё сравнивал «тики против баров» не с боевым бинированием, а
-    со своим двойником: часть разницы была разницей СХЕМ, а не источников данных. На BTC
-    (tick 0.1) примесь оказалась нулевой по замеру, но конструкция была неверна.
-    """
-    url = f"{ARCHIVE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
-    try:
-        with urllib.request.urlopen(url, timeout=900) as r:
-            blob = bytes(r.read())
-        with urllib.request.urlopen(url + ".CHECKSUM", timeout=300) as r:
-            expected = r.read().decode().split()[0]
-    except OSError as e:
-        print(f"    {day}: не получено — {type(e).__name__}")
-        return None
-    if hashlib.sha256(blob).hexdigest() != expected:
-        print(f"    {day}: sha256 НЕ СОШЁЛСЯ — отброшено")
-        return None
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        csv = z.read(z.namelist()[0])
-    return pl.read_csv(io.BytesIO(csv), columns=["price", "quantity", "transact_time"]) \
-        .with_columns(
-            (pl.col("transact_time") // bucket_ms * bucket_ms).alias("bucket"),
-            archive.bin_expr(pl.col("price"), tick).alias("bin"),
-        ).group_by("bucket", "bin").agg(pl.col("quantity").sum().alias("qty"))
-
-
 def _cached_day(market_id: str, day: date, tick: Decimal) -> pl.DataFrame | None:
     """Сутки сделок из ОБЩЕГО кэша — того же, которым пользуется боевой бэкфилл.
 
-    ⚠ Здесь была вторая, СОБСТВЕННАЯ реализация кэша с гранулярностью 900 000 мс. Пока
-    боевой путь качал архив заново каждый прогон, зонды и продакшн жили на разных
-    хранилищах и разной сетке — то есть проверялось не то, что работает. После переноса
-    кэша в `archive.binned_day` (сетка 300 000 мс, самый младший ТФ проекта) реализация
-    ровно одна, и зонд подтверждает боевой код, а не свой двойник.
+    ⚠ Здесь была вторая, СОБСТВЕННАЯ реализация кэша с гранулярностью 900 000 мс — то
+    есть зонды и боевой путь жили на разных хранилищах и разной сетке, и проверялось не
+    то, что работает. Теперь читается ТОТ ЖЕ кэш (сетка 300 000 мс, самый младший ТФ
+    проекта), и зонд подтверждает боевой код, а не свой двойник.
+
+    ⚠ 2026-08-11 зонд БОЛЬШЕ НЕ КАЧАЕТ. Раньше отсюда звался `archive.binned_day`, и он
+    при промахе кэша тянул суточный ZIP архива; архив из проекта удалён, а тянуть сутки
+    REST-ом из зонда значило бы менять состояние боевого кэша замером. Чего нет в кэше —
+    честно отсутствует.
     """
-    got = archive.binned_day(market_id, day, tick)
-    if isinstance(got, NotReady):
-        print(f"    {market_id} {day}: не получено — {got.reason}")
+    path = archive.CACHE_DIR / archive.cache_path(market_id, day, tick).name
+    if not path.exists():
+        print(f"    {market_id} {day}: нет в кэше")
         return None
-    return got
+    return pl.read_parquet(path)
 
 
 def _histogram_over(
@@ -699,8 +668,8 @@ async def map_drift() -> None:
                     have = archive.cached_days(inst.market_id, inst.tick_size)
                     frames = {}
                     for d in sorted(days & have):
-                        got = archive.binned_day(inst.market_id, d, inst.tick_size)
-                        if not isinstance(got, NotReady):
+                        got = _cached_day(inst.market_id, d, inst.tick_size)
+                        if got is not None:
                             frames[d] = got
                     built, _st, sk = _levels_over(
                         s, inst.tick_size, todo, frames, {tf: bars})
@@ -818,48 +787,6 @@ async def rest_history() -> None:
         print("    те же сутки одним ZIP: 15.5 МБ за 5.3 с")
     finally:
         await ex.close()
-
-
-async def bar_vs_tick() -> None:
-    """map-depth: ПОК из тиков против ПОК из 1м-баров на структуре BTC 17.07."""
-    tick = Decimal("0.1")
-    lo = int(datetime(2026, 7, 17, 6, 15, tzinfo=UTC).timestamp() * 1000)
-    hi = int(datetime(2026, 7, 17, 16, 0, tzinfo=UTC).timestamp() * 1000)
-    key = 62837.3
-
-    fr = _fetch_day("BTCUSDT", date(2026, 7, 17), tick, 300_000)
-    if fr is None:
-        return
-    w = fr.filter((pl.col("bucket") >= lo) & (pl.col("bucket") < hi)) \
-          .group_by("bin").agg(pl.col("qty").sum())
-    tick_poc = float(Decimal(int(w.filter(pl.col("qty") == w["qty"].max())["bin"][0])) * tick)
-    print(f"тики: ПОК {tick_poc:.1f}, к уровню автора {(tick_poc-key)/key*100:+.3f}% "
-          f"[{'в шуме' if abs((tick_poc-key)/key*100) < NOISE else 'вне шума'}]")
-
-    url = f"{ARCHIVE}/klines/BTCUSDT/1m/BTCUSDT-1m-2026-07-17.zip"
-    with urllib.request.urlopen(url, timeout=300) as r:
-        blob = bytes(r.read())
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        kl = pl.read_csv(io.BytesIO(z.read(z.namelist()[0])))
-    kw = kl.filter((pl.col("open_time") >= lo) & (pl.col("open_time") < hi))
-    print(f"баров 1м в окне {kw.height}, размер суток klines {len(blob)/1e6:.3f} МБ")
-    for how in ("close", "spread"):
-        bins: dict[int, float] = {}
-        for r2 in kw.iter_rows(named=True):
-            v = float(r2["volume"])
-            if how == "close":
-                b = int(Decimal(str(r2["close"])) // tick)
-                bins[b] = bins.get(b, 0.0) + v
-            else:
-                a = int(Decimal(str(r2["low"])) // tick)
-                b2 = int(Decimal(str(r2["high"])) // tick)
-                for k in range(a, b2 + 1):
-                    bins[k] = bins.get(k, 0.0) + v / (b2 - a + 1)
-        peak = max(bins.values())
-        p = float(Decimal(min(b for b, v in bins.items() if v == peak)) * tick)
-        dev = (p - key) / key * 100
-        print(f"бары ({how}): ПОК {p:.1f}, к автору {dev:+.3f}% "
-              f"[{'в шуме' if abs(dev) < NOISE else 'вне шума'}]")
 
 
 def _pool_without_time(pool: tuple[levels.MappedLevel, ...]) -> tuple[levels.MappedLevel, ...]:
@@ -1030,7 +957,6 @@ PROBES = {
     "backfill-window": backfill_window,
     "archive-need": archive_need,
     "rest-history": rest_history,
-    "bar-vs-tick": bar_vs_tick,
     "emit-quality": emit_quality,
 }
 

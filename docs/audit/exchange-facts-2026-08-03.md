@@ -74,7 +74,7 @@ print('байт', len(blob), '| sha256 совпал:', hashlib.sha256(blob).hexd
 Колонки CSV (из заголовка файла): `agg_trade_id, price, quantity, first_trade_id,
 last_trade_id, transact_time, is_buyer_maker`.
 
-Целостность проверяется в коде: `archive.py::fetch_agg_trades_day` возвращает `NotReady`,
+Целостность проверяется в коде: `archive.py` функция fetch_agg_trades_day ⟨механизм удалён 2026-08-11, см. archive-removed-2026-08-11.md⟩ возвращает `NotReady`,
 если суммы нет или она не сошлась, — а не молча отдаёт непроверенный файл (§4.3).
 
 ## 5. Часы

@@ -1,46 +1,45 @@
-"""Исторические сделки и бары из публичного архива Binance. FOUNDATION.md §8 этап 3.
+"""Кэш сделок для профиля объёма. Источник — ТОЛЬКО ccxt: REST и вебсокет.
 
-Зачем архив, а не REST — ЗАМЕР, а не цитата.
+⚠ 2026-08-11 из проекта УДАЛЁН `data.binance.vision`. Это решение владельца, и вот его
+основание: суточный архив публикуется с отставанием до двух суток, и живой контур,
+который его ждёт, систематически теряет самые свежие структуры. Дефект был не в редком
+отказе, а в ПЕРЕКОСЕ ПО СВЕЖЕСТИ — обрывались ровно те уровни, которые и торгуются.
 
-⚠ Прежняя редакция этой строки утверждала, что `/fapi/v1/aggTrades` отдаёт сделки «не
-старше 24 часов». **Это неверно, и проверено 2026-08-04:** запрос с `since` от 17.07
-(восемнадцать суток назад) вернул 1000 сделок за 0.45 с. Утверждение было взято из
-документации по памяти и ни разу не измерялось — тот самый класс дефектов, ради которого
-проект переписывался.
+Возражение, которым архив держался, ЗАМЕРЕНО И СНЯТО. Прежняя докстрока говорила, что
+REST отдаёт сделки не глубже 24 часов, потом — что глубже 30 суток не пробовали. Оба
+утверждения были недомерены. Замер 2026-08-11 двоичным поиском по BTC:
 
-Настоящая причина другая — ПРОПУСКНАЯ СПОСОБНОСТЬ. Замер на BTC: 1000 сделок в ответе
-покрывают 51-110 секунд рынка, запрос идёт 0.45-1.69 с. Значит сутки сделок это около
-1440 запросов и ~36 минут против нескольких секунд на один суточный ZIP.
+    отступ    ответ
+    365 сут   сделки есть
+    370 сут   сделки есть
+    373 сут   сделки есть
+    376 сут   ПУСТО
+    547 сут   ПУСТО
+    730 сут   ПУСТО
 
-Отсюда разделение, а не запрет:
-  * широкое окно (сутки и больше) — архив, ГДЕ ОН ЕСТЬ;
-  * узкое окно (минуты) — REST уместен и работает.
+То есть глубина `fapiPublicGetAggTrades` по `startTime` — около ГОДА, а не суток и не
+месяца. Этого хватает на любой горизонт, который система использует.
 
-⚠ Решение владельца 2026-08-11: живой контур НЕ ЖДЁТ публикации архива. Файл суток
-выходит с отставанием до двух суток (замер: 2026-08-10 и 2026-08-11 отдавали HTTP 404
-при прогоне 2026-08-11), и до этой правки карта младших ТФ систематически обрывалась
-на позавчера — свежайшие структуры не получали уровней. Теперь сутки, которых в архиве
-нет, добирает REST-ом ccxt (`Exchange.fetch_agg_trades_window`): закрытые — полным
-файлом кэша, незавершённые — частичным с границей покрытия в имени (`part_path`).
-Архив остаётся дешёвым путём для глубокой истории, но единственным источником он
-больше не является.
+Второе возражение — пропускная способность — тоже пересчитано. Замер: одна страница
+покрывает ~314 с рынка, сутки BTC это ~275 страниц. При умолчании ccxt `rateLimit = 50`
+мс и весе `aggTrades` 20 пауза перед запросом ровно секунда, то есть сутки идут ~6 минут.
+Дорого для холодного старта — и потому холодного старта больше нет (см. ниже).
 
-Целостность проверяется приложенным биржей .CHECKSUM: замер 2026-08-03 на
-BTCUSDT-aggTrades-2026-08-01.zip — sha256 совпал.
+ЧТО ОСТАЛОСЬ В ЭТОМ МОДУЛЕ: только КЭШ. Сделки, пришедшие потоком или добранные REST-ом,
+сворачиваются в пары (корзина, бин) и кладутся в parquet посуточно. Закрытые сутки —
+полным файлом, незавершённые — частичным с границей покрытия в имени (`part_path`).
+`WindowSource` собирает из них окно любой структуры по требованию.
+
+ЧТО В КЭШЕ НЕ ХРАНИТСЯ: сами сделки. Хранятся только суммы объёма и числа сделок по
+(корзина, бин) — этого достаточно профилю и на порядки дешевле по месту.
 """
+
 
 from __future__ import annotations
 
-import hashlib
-import http.client
-import io
 import os
 import re
-import urllib.error
-import urllib.request
-import zipfile
 from collections import OrderedDict
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -48,91 +47,6 @@ from pathlib import Path
 import polars as pl
 
 from .models import BarBinnedTrades, NotReady, TradeHistogram, tick_scale
-
-BASE = "https://data.binance.vision/data/futures/um/daily"
-
-# Колонки CSV архива, замер 2026-08-03 по заголовку файла.
-AGG_COLUMNS = [
-    "agg_trade_id", "price", "quantity",
-    "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker",
-]
-
-
-@dataclass(frozen=True, slots=True)
-class ArchiveDay:
-    market_id: str
-    day: date
-    zip_bytes: int
-    csv_bytes: int
-    rows: int
-    frame: pl.DataFrame
-
-
-def agg_trades_url(market_id: str, day: date) -> str:
-    return f"{BASE}/aggTrades/{market_id}/{market_id}-aggTrades-{day.isoformat()}.zip"
-
-
-FETCH_TRIES = 3
-"""Попыток на файл. Обрыв закачки — не отказ сервера, а транзиентная помеха.
-
-⚠ Число подобрано, а не замерено: обрывов на выборке было слишком мало, чтобы считать
-частоту. Здесь оно названо тем, чем является, и не выдаётся за измеренное.
-"""
-
-
-def _fetch(url: str, timeout: int, tries: int = FETCH_TRIES) -> bytes | NotReady:
-    """Скачать файл. Любой сетевой сбой — НАЗВАННЫЙ отказ, а не исключение наружу.
-
-    ⚠ Прежняя редакция ловила только `HTTPError` и `OSError`. `http.client.IncompleteRead`
-    (оборванная закачка) не относится ни к тому, ни к другому — это `HTTPException`, —
-    и потому пролетала наружу и роняла ВЕСЬ прогон из-за одних суток. Замер 2026-08-04:
-    прогон упал на `IncompleteRead(5711811 bytes read, 7057424 more expected)`, успев
-    уложить в кэш большую часть горизонта.
-
-    Класс дефекта тот же, что и всё остальное здесь, только вывернутый: не молчаливое
-    проглатывание, а падение там, где деградация допустима и должна быть названа (§4.3).
-    """
-    last = ""
-    for attempt in range(1, tries + 1):
-        try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return bytes(r.read())
-        except urllib.error.HTTPError as e:
-            # HTTP-код сервера повтором не лечится: 404 останется 404.
-            return NotReady(reason=f"{url}: HTTP {e.code}")
-        except (OSError, http.client.HTTPException) as e:
-            last = f"{type(e).__name__} {e}"
-            if attempt < tries:
-                continue
-    return NotReady(reason=f"{url}: {last} (попыток {tries})")
-
-
-def fetch_agg_trades_day(
-    market_id: str, day: date, timeout: int = 180
-) -> ArchiveDay | NotReady:
-    """Скачать сутки сделок и проверить контрольную сумму биржи."""
-    url = agg_trades_url(market_id, day)
-    blob = _fetch(url, timeout)
-    if isinstance(blob, NotReady):
-        return blob
-
-    checksum = _fetch(url + ".CHECKSUM", timeout)
-    if isinstance(checksum, NotReady):
-        return NotReady(reason=f"{market_id} {day}: нет .CHECKSUM — целостность не проверяема")
-    expected = checksum.decode().split()[0]
-    actual = hashlib.sha256(blob).hexdigest()
-    if actual != expected:
-        return NotReady(reason=f"{market_id} {day}: sha256 не сошёлся ({actual} против {expected})")
-
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        name = z.namelist()[0]
-        csv = z.read(name)
-
-    frame = pl.read_csv(io.BytesIO(csv), columns=["price", "quantity", "transact_time"])
-    return ArchiveDay(
-        market_id=market_id, day=day, zip_bytes=len(blob), csv_bytes=len(csv),
-        rows=frame.height, frame=frame,
-    )
 
 
 def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
@@ -202,8 +116,8 @@ def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
 
     ⚠ Прежняя редакция писала прямо по целевому пути. Обрыв процесса (а качается до
     сотен файлов по ~15 МБ, с таймаутом 900 с и тремя попытками) оставлял обрезанный
-    parquet, и дальше `binned_day` видел `path.exists()` и возвращал его НАВСЕГДА, не
-    перекачивая, а `cached_days` считал эти сутки загруженными. Причина потом выглядела
+    parquet, и дальше читатель видел `path.exists()` и брал его НАВСЕГДА, не переспрашивая,
+    а `cached_days` считал эти сутки собранными. Причина потом выглядела
     бы как «битый файл», а не как «недокачано».
 
     `os.replace` атомарна в пределах одной файловой системы — отсюда требование класть
@@ -217,40 +131,10 @@ def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def binned_day(
-    market_id: str, day: date, tick: Decimal, timeout: int = 900
-) -> pl.DataFrame | NotReady:
-    """Сутки сделок, свёрнутые в (корзина, бин) → объём и число, С КЭШЕМ на диске.
-
-    Кэш обязателен, а не удобен: боевой бэкфилл без него качал 15 МБ на символ-сутки
-    ЗАНОВО каждый прогон, и потому был вынужден ограничиваться тремя сутками — а трёх
-    суток хватает на 15% структур и на НОЛЬ структур 4ч и 1Д (замер 2026-08-04,
-    docs/audit/backfill-window-2026-08-04.md).
-
-    sha256 сверяется ДО свёртки и только при скачивании: в кэш кладётся уже проверенное.
-    """
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = cache_path(market_id, day, tick)
-    if path.exists():
-        return pl.read_parquet(path)
-
-    got = fetch_agg_trades_day(market_id, day, timeout)
-    if isinstance(got, NotReady):
-        return got
-    binned = got.frame.with_columns(
-        (pl.col("transact_time") // CACHE_BUCKET_MS * CACHE_BUCKET_MS).alias("bucket"),
-        bin_expr(pl.col("price"), tick).alias("bin"),
-    ).group_by("bucket", "bin").agg(
-        pl.col("quantity").sum().alias("qty"), pl.len().alias("n")
-    )
-    _write_atomic(binned, path)
-    return binned
-
-
 def frame_from_pairs(
     qty: dict[tuple[int, int], float], cnt: dict[tuple[int, int], int]
 ) -> pl.DataFrame:
-    """Свернуть пары (корзина, бин) в кадр ТОЙ ЖЕ схемы, что у `binned_day`.
+    """Свернуть пары (корзина, бин) в кадр схемы кэша: (корзина, бин) → объём и число.
 
     Нужен REST-добору: он бинит сделки поштучно через `models.bin_index` (единственную
     функцию бинирования; согласие с `bin_expr` держит gates/binning_agrees.py), а кэш
@@ -296,7 +180,7 @@ def part_path(market_id: str, day: date, tick: Decimal, cover_to_ms: int) -> Pat
     """Имя ЧАСТИЧНЫХ суток: как у полных, плюс граница покрытия в миллисекундах.
 
     Введено 2026-08-11 решением владельца: живой контур не ждёт публикации архива —
-    сутки, которых у `data.binance.vision` ещё нет, добираются REST-ом через ccxt.
+    сутки собираются REST-ом и живым потоком ccxt, других источников нет.
     Незавершённые сутки нельзя класть под именем полных: следующий прогон счёл бы их
     покрытыми целиком и построил усечённый профиль МОЛЧА. Поэтому граница покрытия
     стоит в имени — всё, от чего зависит содержимое, обязано стоять в имени (та же
@@ -327,19 +211,27 @@ def find_part(
 
 
 def write_part_day(
-    market_id: str, day: date, tick: Decimal, frame: pl.DataFrame, cover_to_ms: int
+    market_id: str, day: date, tick: Decimal, frame: pl.DataFrame, cover_to_ms: int,
+    cache_dir: Path | None = None,
 ) -> Path:
-    """Положить частичные сутки в общий кэш; прежние частичные файлы этих суток убрать.
+    """Положить частичные сутки в кэш; прежние частичные файлы этих суток убрать.
 
     Убирается только то, что этим же вызовом заменено файлом с БОЛЬШИМ покрытием, —
     это смена поколения кэша, а не потеря данных: содержимое старого файла целиком
-    входит в новый (та же пагинация по fromId с начала суток).
+    входит в новый (та же пагинация с начала суток).
+
+    ⚠ `cache_dir` заведён 2026-08-11 и закрывает дефект, а не удобство. Функция писала
+    в глобальный `CACHE_DIR` ВСЕГДА, и потому зонд `probe_live_flush_2026-08-11.py`,
+    просивший временный каталог, писал в БОЕВОЙ кэш — то есть замер менял те самые
+    данные, по которым потом строится профиль. Поймал это контроль самого зонда:
+    покрытие во временном каталоге не сдвигалось, потому что запись уходила мимо него.
     """
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = part_path(market_id, day, tick, cover_to_ms)
+    root = CACHE_DIR if cache_dir is None else cache_dir
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / part_path(market_id, day, tick, cover_to_ms).name
     _write_atomic(frame, path)
     base = cache_path(market_id, day, tick)
-    for p in CACHE_DIR.glob(f"{base.stem}-part*.parquet"):
+    for p in root.glob(f"{base.stem}-part*.parquet"):
         m = re.fullmatch(r".*-part(\d+)", p.stem)
         if m and int(m.group(1)) < cover_to_ms:
             p.unlink(missing_ok=True)
@@ -353,7 +245,7 @@ CACHE_STEM = re.compile(r"^(?P<market>.+)-(?P<day>\d{4}-\d{2}-\d{2})$")
 к моменту сопоставления уже отрезан, — и потому `cached_days` возвращала пусто ВСЕГДА,
 при любом состоянии кэша. Прибор, запертый в одном ответе (реестр CLAUDE.md): сводка
 бэкфилла честно печатала «из_кэша=0, качать=75» поверх 73 лежащих на диске суток.
-На закачку дефект не влиял (`binned_day` проверяет файл сам), врала только сводка.
+На сбор дефект не влиял (наличие файла проверяется отдельно), врала только сводка.
 Пойман сверкой строки лога с `ls data/aggcache` на втором прогоне BEAT."""
 
 
@@ -567,11 +459,6 @@ class WindowSource:
 # (docs/audit/backfill-window-2026-08-04.md, MemoryError на 102 сутках).
 
 
-def histogram_from_day(day_data: ArchiveDay, symbol: str, tick: Decimal) -> TradeHistogram:
-    """Свернуть сутки сделок в гистограмму цена→объём с шагом tickSize (§5)."""
-    return _histogram(day_data.frame, symbol, tick, day_data.rows)
-
-
 def _histogram(
     frame: pl.DataFrame, symbol: str, tick: Decimal, rows: int
 ) -> TradeHistogram:
@@ -590,3 +477,88 @@ def _histogram(
     h.first_ms = int(frame["transact_time"].min())  # type: ignore[arg-type]
     h.last_ms = int(frame["transact_time"].max())  # type: ignore[arg-type]
     return h
+
+
+def coverage_to_ms(
+    market_id: str, day: date, tick: Decimal, cache_dir: Path | None = None
+) -> int | None:
+    """Докуда сутки покрыты кэшем: конец суток у полного файла, граница у частичного.
+
+    `None` — суток нет вовсе. Нужна тому, кто решает, можно ли ПРОДЛИТЬ покрытие живым
+    потоком: продлевать разрешено только СМЕЖНОЕ покрытие, иначе в файле образуется дыра,
+    о которой имя файла молчать не имеет права (§4.3).
+    """
+    root = CACHE_DIR if cache_dir is None else cache_dir
+    start = int(datetime.combine(day, datetime.min.time(), tzinfo=UTC).timestamp() * 1000)
+    if (root / cache_path(market_id, day, tick).name).exists():
+        return start + 86_400_000
+    found = find_part(root, market_id, day, tick)
+    return None if found is None else found[1]
+
+
+def extend_day_from_live(
+    market_id: str, day: date, tick: Decimal,
+    live: dict[int, dict[int, float]], live_cnt: dict[int, dict[int, int]],
+    upto_ms: int, cache_dir: Path | None = None,
+) -> int | None:
+    """Продлить покрытие суток ЖИВЫМ ПОТОКОМ. Возвращает новую границу или `None`.
+
+    ⚠ ЭТО И ЕСТЬ СНЯТИЕ ХОЛОДНОГО СТАРТА (решение владельца 2026-08-11). До этой правки
+    поток жил ТОЛЬКО в памяти прогона: всё, что служба приняла вебсокетом, умирало вместе
+    с процессом, и следующий запуск заново выкачивал те же сутки REST-ом. Стоило это
+    ~6 минут на символ-сутки при том, что данные уже были получены и выброшены.
+
+    Теперь принятое потоком ложится в тот же суточный кэш, что и добранное REST-ом:
+    схема у них одна — (корзина, бин) → объём и число сделок.
+
+    ⚠ ПРОДЛЕВАЕТСЯ ТОЛЬКО СМЕЖНОЕ ПОКРЫТИЕ. Если кэш кончается раньше, чем начинается
+    поток, между ними дыра, и записать это одним частичным файлом нельзя: имя файла
+    объявляет покрытие ОТ НАЧАЛА СУТОК, и такая запись солгала бы о дыре. В этом случае
+    возвращается `None`, а дыру закрывает REST-добор — он для того и остался.
+
+    Полные сутки не трогаются: у них покрытие уже доведено до конца.
+    """
+    root = CACHE_DIR if cache_dir is None else cache_dir
+    day_start = int(
+        datetime.combine(day, datetime.min.time(), tzinfo=UTC).timestamp() * 1000)
+    day_end = day_start + 86_400_000
+    upto = min(upto_ms, day_end)
+
+    have = coverage_to_ms(market_id, day, tick, root)
+    if have is not None and have >= day_end:
+        return None                      # сутки закрыты, продлевать нечего
+    known_from = day_start if have is None else have
+    if upto <= known_from:
+        return None                      # нового покрытия нет
+
+    fresh_buckets = [b for b in live if known_from <= b < upto]
+    if not fresh_buckets:
+        return None
+    if min(fresh_buckets) > known_from:
+        # ⚠ ДЫРА между концом покрытия и началом потока. Продлевать нельзя: имя
+        # частичного файла объявляет покрытие ОТ НАЧАЛА СУТОК, и запись поверх дыры
+        # солгала бы о ней (§4.3). Дыру закрывает REST-добор.
+        #
+        # ⚠ Проверка стояла только для случая «суток нет вовсе» (`have is None`), а при
+        # уже существующем частичном файле не выполнялась — то есть дыра посреди суток
+        # заклеивалась молча. Нашёл контроль зонда `probe_live_flush_2026-08-11.py`:
+        # случаи «смежно» и «дыра» отличались ровно смежностью и давали ОДИН ответ.
+        return None
+
+    pairs: dict[tuple[int, int], float] = {}
+    counts: dict[tuple[int, int], int] = {}
+    prior = find_part(root, market_id, day, tick)
+    if prior is not None:
+        for row in pl.read_parquet(prior[0]).iter_rows(named=True):
+            key = (int(row["bucket"]), int(row["bin"]))
+            pairs[key] = pairs.get(key, 0.0) + float(row["qty"])
+            counts[key] = counts.get(key, 0) + int(row["n"])
+    for bucket in fresh_buckets:
+        for idx, amount in live[bucket].items():
+            key = (bucket, idx)
+            pairs[key] = pairs.get(key, 0.0) + amount
+            counts[key] = counts.get(key, 0) + live_cnt.get(bucket, {}).get(idx, 0)
+    if not pairs:
+        return None
+    write_part_day(market_id, day, tick, frame_from_pairs(pairs, counts), upto, root)
+    return upto
