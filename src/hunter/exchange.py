@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import zlib
 from collections import Counter
 from collections.abc import AsyncGenerator, Callable
@@ -571,6 +572,12 @@ class Exchange:
             raise CapabilityMissing(
                 f"{self._ex.id}: нет необходимых возможностей ccxt — " + "; ".join(missing)
             )
+        # ⚠ Снятие подписок идёт через `getattr` и потому невидимо статическим проверкам.
+        # Расхождение таблицы с сигнатурой проявилось бы только при остановке прогона —
+        # то есть после сбора, когда сообщать уже поздно. Здесь оно проявляется на старте.
+        if bad := self.check_unwatch_table():
+            log.degraded("таблица снятия подписок расходится с ccxt",
+                         расхождений=len(bad), причины="; ".join(bad))
         await self._read_weight_limit()
         # Темп настраивается СРАЗУ после чтения лимита и до всякого сбора: очередь
         # троттлера здесь пуста, пересборка никого не бросит.
@@ -821,6 +828,58 @@ class Exchange:
         self.weight_reads += 1
         self.weight_peak = max(self.weight_peak, int(raw))
 
+    def check_unwatch_table(self) -> tuple[str, ...]:
+        """Сверить таблицу `UNWATCH` с НАСТОЯЩИМИ сигнатурами ccxt. Пусто — всё сходится.
+
+        ⚠ ЗАЧЕМ ЭТО ВООБЩЕ ПОНАДОБИЛОСЬ. Снятие подписок идёт через `getattr`, то есть
+        мимо любой статической проверки: ни ruff, ни mypy, ни сверка вызовов с
+        документацией по разбору AST этих вызовов НЕ ВИДЯТ — они видят только
+        `self._ex.<имя>`. Именно поэтому дефект «`un_watch_ohlcv` принимает таймфрейм, а
+        зовём одним символом» пережил и линтер, и типизацию, и машинную сверку сигнатур.
+
+        Здесь та же проверка делается в РАНТАЙМЕ и один раз, при открытии: у каждого метода
+        из таблицы спрашивается его сигнатура и проверяется, что он существует, принимает
+        ожидаемое число позиционных аргументов и знает наши именованные.
+
+        Возвращается СПИСОК расхождений, а не булево: причина обязана быть названа поимённо.
+        """
+        bad: list[str] = []
+        for kind, (method, params) in sorted(UNWATCH.items()):
+            call = getattr(self._ex, method, None)
+            if call is None:
+                bad.append(f"{kind}: у площадки нет метода {method}")
+                continue
+            try:
+                sig = inspect.signature(call)
+            except (TypeError, ValueError) as e:
+                # ⚠ Молчать нельзя: непрочитанная сигнатура — это НЕПРОВЕДЁННАЯ проверка,
+                # и без этой строки таблица объявлялась бы чистой по несуществующему
+                # основанию. Поймано гейтом `no_silent_failure`.
+                bad.append(f"{kind}: сигнатуру {method} прочитать не удалось "
+                           f"({type(e).__name__}) — проверка НЕ ПРОВЕДЕНА")
+                continue
+            positional = [p for p, v in sig.parameters.items()
+                          if v.kind in (v.POSITIONAL_ONLY, v.POSITIONAL_OR_KEYWORD)]
+            want = UNWATCH_ARGS.get(kind, ("symbol",))
+            # ⚠ Сверяются ИМЕНА в порядке, а не их число. Первая редакция сравнивала
+            # количества — и КОНТРОЛЬ ЕЁ ОПРОВЕРГ: подмена `un_watch_ohlcv` на
+            # `un_watch_trades` проходила молча, потому что у обоих по два позиционных
+            # параметра. Только у второго второй — это `params`, и таймфрейм уехал бы
+            # туда как словарь настроек.
+            if positional[: len(want)] != list(want):
+                bad.append(f"{kind}: {method} принимает {positional[:len(want)] or positional}, "
+                           f"а мы зовём как {list(want)}")
+            if params and "params" not in sig.parameters:
+                bad.append(f"{kind}: {method} не принимает params, а мы шлём {list(params)}")
+            # ⚠ Сигнатура сходится, а метод всё равно может не работать: у binanceusdm
+            # `un_watch_bids_asks` существует и бросает `NotSupported`. Карта `has`
+            # об этом знает (`None`), поэтому спрашивается и она.
+            cap = UNWATCH_CAP.get(kind)
+            if cap and not self._ex.has.get(cap):
+                bad.append(f"{kind}: площадка не объявляет {cap} — подписка снимется "
+                           f"только обрывом соединения")
+        return tuple(bad)
+
     def _note_watch(self, kind: str, *args: str) -> bool:
         """Запомнить подписку по её АРГУМЕНТАМ. `True` — она новая.
 
@@ -848,12 +907,17 @@ class Exchange:
                 log.degraded("для потока нет метода снятия — закроется обрывом",
                              род=kind, подписок=len(subs))
                 continue
+            want = UNWATCH_ARGS.get(kind, ("symbol",))
             for args in sorted(subs):
+                # Аргументы повторяются В ТОЧНОСТИ: у свечей это ещё и таймфрейм (без него
+                # снялась бы подписка на умолчание `1m`), а у пакетных родов первый
+                # аргумент — СПИСОК, и одиночная строка разошлась бы по символам.
+                call_args: list[Any] = list(args)
+                if want and want[0] == "symbols":
+                    call_args[0] = [args[0]]
                 try:
-                    # Аргументы повторяются В ТОЧНОСТИ: у свечей это ещё и таймфрейм,
-                    # и без него снялась бы подписка на умолчание `1m`.
                     await asyncio.wait_for(
-                        call(*args, params=params) if params else call(*args),
+                        call(*call_args, params=params) if params else call(*call_args),
                         timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
                     self.ws_unwatched += 1
                 except (TimeoutError, TypeError, ccxt.BaseError) as e:
@@ -2321,6 +2385,24 @@ def _liquidation_from(symbol: str, row: dict[str, Any]) -> Liquidation:
                        timestamp_ms=_ms(row))
 
 
+UNWATCH_CAP: dict[str, str] = {
+    "trades": "unWatchTrades",
+    "ohlcv": "unWatchOHLCV",
+    "orderbook": "unWatchOrderBook",
+    "ticker": "unWatchTicker",
+    "quotes": "unWatchBidsAsks",
+    "markprice": "unWatchMarkPrices",
+}
+"""РОД -> имя возможности в карте `has`. Нужен, потому что НАЛИЧИЕ МЕТОДА НЕ ЗНАЧИТ, ЧТО
+ОН РАБОТАЕТ: `un_watch_bids_asks` у binanceusdm существует как атрибут и бросает
+`NotSupported binanceusdm unWatchBidsAsks() is not supported yet`, а `has` про него
+говорит `None`. Проверка по сигнатуре такое пропускает — метод-то есть.
+
+Найдено живым вызовом: снятие пакетной подписки на лучшие цены отказало на остановке.
+Отказ был назван, но узнавать о нём в момент закрытия поздно — теперь он известен на
+старте.
+"""
+
 UNWATCH: dict[str, tuple[str, dict[str, Any]]] = {
     "trades": ("un_watch_trades", {"name": WS_TRADES_STREAM}),
     "ohlcv": ("un_watch_ohlcv", {}),
@@ -2329,6 +2411,24 @@ UNWATCH: dict[str, tuple[str, dict[str, Any]]] = {
     "quotes": ("un_watch_bids_asks", {}),
     "markprice": ("un_watch_mark_prices", {}),
 }
+UNWATCH_ARGS: dict[str, tuple[str, ...]] = {
+    "ohlcv": ("symbol", "timeframe"),
+    "markprice": ("symbols",),
+    "quotes": ("symbols",),
+}
+"""Чем ИМЕННО зовётся снятие у каждого рода. Умолчание — `("symbol",)`.
+
+⚠ У ДВУХ РОДОВ ПАРАМЕТР ВО МНОЖЕСТВЕННОМ ЧИСЛЕ, и это не мелочь: `un_watch_mark_prices`
+и `un_watch_bids_asks` принимают СПИСОК символов, потому что подписка на них тоже
+пакетная. Вызов с одной строкой вместо списка не падает — ccxt пройдёт по СИМВОЛАМ СТРОКИ
+как по списку рынков. Найдено проверкой `check_unwatch_table` на живой таблице, а не
+рассуждением: до неё оба стояли как одиночные.
+
+Держится отдельно от `UNWATCH`, потому что читается двумя сторонами: `check_unwatch_table`
+сверяет эти имена с настоящей сигнатурой ccxt, `unwatch_all` по ним же решает, обернуть ли
+символ в список. Разойтись они не могут — таблица одна.
+"""
+
 """РОД потока -> (метод снятия, обязательные параметры).
 
 ⚠ Параметры не пусты у сделок, и это не украшение: `un_watch_trades` ищет имя потока по
