@@ -499,12 +499,21 @@ class Exchange:
         """Сделок из разрывов, оставшихся НЕ добранными (разрыв шире предела или отказ
         REST). Пара к `trades_recovered`: без неё «добрано N» молчит о недобранном."""
 
-        self._watching: dict[str, set[str]] = {}
-        """Живые подписки: РОД потока -> символы. Нужен, чтобы снять их явно при остановке.
+        self._watching: dict[str, set[tuple[str, ...]]] = {}
+        """Живые подписки: РОД потока -> набор АРГУМЕНТОВ, которыми она открыта.
 
-        ⚠ Был множеством символов для одних лишь сделок. Стал словарём по роду 2026-08-11,
-        когда потоков стало шесть: без рода снятие адресовалось бы не тому каналу — ровно
-        тот дефект, что уже случился с `un_watch_trades` и потоком `trade`.
+        ⚠ Три редакции за сутки, и каждая правка чинила один и тот же класс дефекта —
+        снятие адресуется не тому, что открыто.
+
+        1. Было множеством символов для одних лишь сделок, и снятие шло в поток `trade`
+           вместо `aggTrade` (умолчание чужой цепочки поиска опций);
+        2. Стало словарём по роду, когда потоков стало шесть, — но хранило один символ;
+        3. Стало хранить КОРТЕЖ АРГУМЕНТОВ, потому что `un_watch_ohlcv(symbol, timeframe)`
+           принимает ТАЙМФРЕЙМ, а вызов с одним символом брал бы умолчание `1m`. Подписка
+           на 5м осталась бы живой, и вызов при этом НЕ ПАДАЛ БЫ.
+
+        Общее у всех трёх: снятие не падает, когда снимает не то. Поэтому проверять его
+        можно только тем, перестали ли приходить данные, а не кодом возврата.
         """
 
         self.ws_unwatched = 0
@@ -566,7 +575,10 @@ class Exchange:
         # Темп настраивается СРАЗУ после чтения лимита и до всякого сбора: очередь
         # троттлера здесь пуста, пересборка никого не бросит.
         self._tune_rate_limiter()
+        # Два вопроса, два прибора: доступен ли НАШ шлюз и не на обслуживании ли Binance.
+        # Ни один не отвечает за другого — см. докстроки обоих.
         await self.read_status()
+        await self.read_maintenance()
         sync = await clock.measure(self.fetch_server_ms)
         log.info("часы сведены", сдвиг_мс=sync.offset_ms, rtt_мс=sync.rtt_ms,
                  замеров=sync.samples)
@@ -696,6 +708,40 @@ class Exchange:
                  метод=self.venue.ping)
         return True
 
+    async def read_maintenance(self) -> str | None:
+        """Состояние СПОТОВОЙ системы Binance: `ok`, `maintenance`, `shutdown`, `error`.
+
+        ⚠ ВЕЛИЧИНА НЕ ПРО НАШУ ПЛОЩАДКУ, И ЭТО НАЗВАНО В ИМЕНИ ВОЗВРАТА. `fetchStatus` у
+        Binance зовёт `sapiGetSystemStatus` — эндпоинт спотового кошелька (ccxt/binance.py),
+        и на USDⓈ-M отвечает про спот.
+
+        ⚠ ПОЧЕМУ ОНА ВСЁ-ТАКИ ВЕРНУЛАСЬ. 2026-08-11 я заменил `fetchStatus` на `ping`
+        площадки и назвал замену улучшением. Это было неверно наполовину: `ping` отвечает
+        «шлюз принимает запросы» и НИЧЕГО не говорит про техобслуживание, а `fetchStatus` —
+        единственный признак обслуживания, который ccxt для Binance вообще отдаёт (со
+        значениями и полем `eta`). Убрав его, я не улучшил прибор, а снял единственный
+        источник одного из двух сигналов. Теперь их два, и каждый отвечает на свой вопрос:
+        `read_status` — «доступен ли наш шлюз», `read_maintenance` — «не на обслуживании
+        ли Binance в целом».
+
+        Отказ не роняет прогон и не считается нарушением: величина справочная.
+        """
+        if not self._ex.has.get("fetchStatus"):
+            return None
+        got = await self._rest("состояние Binance", self.venue.ccxt_class,
+                               lambda: self._ex.fetch_status())
+        if isinstance(got, NotReady):
+            log.degraded("состояние Binance не прочитано", причина=got.reason)
+            return None
+        status = None if got.get("status") is None else str(got["status"])
+        if status == "ok":
+            log.info("Binance (спотовая система) в рабочем состоянии", статус=status)
+        else:
+            log.degraded("BINANCE СООБЩАЕТ О НЕРАБОЧЕМ СОСТОЯНИИ — величина СПОТОВАЯ, "
+                         "но других признаков обслуживания ccxt не даёт",
+                         статус=str(status), до=str(got.get("eta")))
+        return status
+
     def _rate_limit_pause_s(self) -> float:
         """Длина паузы после 429/418: `Retry-After` биржи, если он есть, но не короче минуты.
 
@@ -775,12 +821,16 @@ class Exchange:
         self.weight_reads += 1
         self.weight_peak = max(self.weight_peak, int(raw))
 
-    def _note_watch(self, kind: str, symbol: str) -> bool:
-        """Запомнить подписку. `True` — она новая (значит, стоит напечатать её цену)."""
+    def _note_watch(self, kind: str, *args: str) -> bool:
+        """Запомнить подписку по её АРГУМЕНТАМ. `True` — она новая.
+
+        Аргументы, а не символ: снятие обязано повторить их в точности, иначе адресуется
+        другому каналу. У свечей это (символ, таймфрейм), у остальных — (символ,).
+        """
         live = self._watching.setdefault(kind, set())
-        if symbol in live:
+        if args in live:
             return False
-        live.add(symbol)
+        live.add(args)
         return True
 
     async def unwatch_all(self) -> None:
@@ -790,24 +840,28 @@ class Exchange:
         подписка — не пустяк для службы, которая переоткрывает соединение: биржа ещё
         какое-то время считает её живой и продолжает слать в неё данные.
         """
-        for kind, symbols in sorted(self._watching.items()):
+        for kind, subs in sorted(self._watching.items()):
             method, params = UNWATCH.get(kind, ("", {}))
             call = getattr(self._ex, method, None) if method else None
             if call is None:
-                self.ws_unwatch_failed += len(symbols)
+                self.ws_unwatch_failed += len(subs)
                 log.degraded("для потока нет метода снятия — закроется обрывом",
-                             род=kind, символов=len(symbols))
+                             род=kind, подписок=len(subs))
                 continue
-            for sym in sorted(symbols):
+            for args in sorted(subs):
                 try:
-                    await asyncio.wait_for(call(sym, params=params) if params
-                                           else call(sym),
-                                           timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
+                    # Аргументы повторяются В ТОЧНОСТИ: у свечей это ещё и таймфрейм,
+                    # и без него снялась бы подписка на умолчание `1m`.
+                    await asyncio.wait_for(
+                        call(*args, params=params) if params else call(*args),
+                        timeout=WS_UNSUBSCRIBE_TIMEOUT_S)
                     self.ws_unwatched += 1
-                except (TimeoutError, ccxt.BaseError) as e:
+                except (TimeoutError, TypeError, ccxt.BaseError) as e:
+                    # `TypeError` тоже ловится: расхождение в числе аргументов — это
+                    # наша ошибка таблицы, и она не должна ронять остановку прогона.
                     self.ws_unwatch_failed += 1
                     log.degraded("подписка не снята явно — закроем обрывом",
-                                 род=kind, символ=sym,
+                                 род=kind, аргументы=",".join(args),
                                  причина=f"{type(e).__name__} {e}")
         self._watching.clear()
 
@@ -1923,7 +1977,7 @@ class Exchange:
         """Поток свечей. ⚠ В боевой ряд НЕ ИДЁТ: правило «ОДИН РЯД — ОДИН ИСТОЧНИК»
         стоит с 2026-08-05, и склейка потока с REST-историей уже однажды дала 81 бар,
         принятый двумя источниками разом."""
-        self._note_watch("ohlcv", symbol)
+        self._note_watch("ohlcv", symbol, timeframe)
         while True:
             got = await self._watch_step(
                 f"свечи {timeframe}", f"{symbol} {timeframe}",
@@ -2066,8 +2120,8 @@ class Exchange:
         self, pairs: tuple[tuple[str, str], ...]
     ) -> AsyncGenerator[dict[str, dict[str, list[Bar]]]]:
         """Свечи многих пар «символ + ТФ» одной подпиской. ⚠ В боевой ряд не идут."""
-        for sym, _tf in pairs:
-            self._note_watch("ohlcv", sym)
+        for sym, tf in pairs:
+            self._note_watch("ohlcv", sym, tf)
         while True:
             got = await self._watch_step(
                 "свечи пакетом", ",".join(f"{s}:{t}" for s, t in pairs),
