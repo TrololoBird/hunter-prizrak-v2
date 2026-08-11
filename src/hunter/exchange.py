@@ -11,6 +11,7 @@ import os
 import zlib
 from collections import Counter
 from collections.abc import AsyncGenerator, Callable
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
 
@@ -22,6 +23,7 @@ from . import clock, log
 from .bars import closed_only, on_grid, tf_ms
 from .models import (
     Bar,
+    BarDetail,
     BookLevel,
     BookTop,
     ClockSync,
@@ -46,6 +48,47 @@ from .models import (
 # Протокол: docs/audit/exchange-limits-2026-08-03.md
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
+
+OHLCV_PAGE = 499
+"""Размер СТРАНИЦЫ при добре ряда глубже предела ccxt. Не 1000, и это расчёт, а не вкус.
+
+⚠ ПОВОД. Страница в 1000 баров выглядела очевидным выбором — «бери максимум, который
+отдаёт библиотека». Но платим мы не за бары, а за ВЕС, и цена веса ступенчатая. Обе
+модели цены сняты приборно, обе дают один и тот же ответ.
+
+Ступени, снятые с ЗАГОЛОВКА биржи `x-mbx-used-weight-1m` (замер 2026-08-06, тот же, что
+обосновывает `CATCHUP_MAX_BARS`):
+
+    limit     3   50  100 | 101  200  499  500 | 1000
+    вес       1    1    1 |   2    2    2    2 |    5
+
+Ступени, по которым РЕЗЕРВИРУЕТ вес сам throttler ccxt (`byLimit` из `describe()`,
+снято перехватом `throttle` до отправки запроса):
+
+    limit      99  100  499 | 500  1000  1500
+    вес         1    2    2 |   5     5     5
+
+Модели расходятся ровно на limit=500: биржа берёт 2, ccxt резервирует 5. Значит 499 —
+наибольшая страница, дешёвая ПО ОБЕИМ, и она же максимум ступени «2» у биржи минус один
+бар. Отсюда бар на единицу веса:
+
+    страница 1000  ->  200.0 бар/вес
+    страница  499  ->  249.5 бар/вес
+
+На глубоком засеве это −20.4% веса (105 120 баров, то есть год на 5м: 530 -> 422).
+На КОРОТКОМ ряде наоборот дороже (1000 баров одним запросом — 5, тремя страницами — 6),
+поэтому порог одиночного запроса остаётся `CCXT_EFFECTIVE_LIMIT`, а страница применяется
+только за ним. Выше порога 499 выигрывает всегда: 1001 бар это 6 против 10.
+
+⚠ Число запросов при этом удваивается, и это ПРОВЕРЕНО безопасным, а не предположено:
+`exchangeInfo` фьючерсной площадки объявляет только `REQUEST_WEIGHT` 2400/мин и лимиты
+ордеров — строки `RAW_REQUESTS` там нет вовсе (она есть у спота: 300 000 за 5 минут).
+
+⚠ `features['swap']['linear']['fetchOHLCV']['limit']` объявляет 500, и следовать ему
+буквально было бы ХУЖЕ всего: один лишний бар переводит запрос на ступень 5 у ccxt,
+то есть в 2.5 раза дороже. Карта `features` — такое же объявление, как `has`, и здесь
+она проиграла таблице веса.
+"""
 
 # ⚠ `WS_SILENCE_S` (порог молчания потока БАРОВ) удалён 2026-08-05 вместе с самим
 # потоком: бары больше не приходят вебсокетом, и порог его молчания нечему сторожить.
@@ -403,18 +446,33 @@ class Venue(NamedTuple):
     Руководство ccxt само разрешает такой путь (Manual.md, «Exchange Status»): статус
     может обновляться «using the exchange ping or fetchTime endpoint to see if its alive».
     """
+    klines: str
+    """Неявный метод сырых свечей. Нужен ради ЧЕТЫРЁХ ПОЛЕЙ, которые ccxt выбрасывает.
+
+    Единый `fetch_ohlcv` отдаёт шесть чисел, а Binance присылает двенадцать
+    (`parse_ohlcv` в ccxt/binance.py перечисляет их все в комментарии и берёт индексы
+    0–5). Выброшенное — не мелочь: индекс 9 это ОБЪЁМ ПОКУПОК ПО РЫНКУ за бар, то есть
+    разделение объёма свечи на покупки и продажи БЕЗ единой сделки.
+
+    Цена вопроса в весе: тот же бар через `aggTrades` стоит 20 за запрос, а через свечи —
+    2 за 499 баров. Разбор корпуса (`prizrak_btc_eth_keyzone.txt`) показывает, что автор
+    смотрит именно на разделение объёма: «по дельте ордербука крупных продаж нету, крупняк
+    не появлялся, при том, что откупы больш[ие]».
+
+    ⚠ Путь у каждой площадки свой, как и у `exchange_info`.
+    """
     human: str
 
 
 VENUES: dict[str, Venue] = {
     "binanceusdm": Venue("binanceusdm", "fapiPublicGetExchangeInfo", "swap",
-                         "fapiPublicGetPing",
+                         "fapiPublicGetPing", "fapiPublicGetKlines",
                          "Binance USDⓈ-M, бессрочные фьючерсы на USDT"),
     "binancecoinm": Venue("binancecoinm", "dapiPublicGetExchangeInfo", "swap",
-                          "dapiPublicGetPing",
+                          "dapiPublicGetPing", "dapiPublicGetKlines",
                           "Binance COIN-M, фьючерсы с монетным обеспечением"),
     "binance": Venue("binance", "publicGetExchangeInfo", "spot", "publicGetPing",
-                     "Binance спот"),
+                     "publicGetKlines", "Binance спот"),
 }
 """Площадки, на которых транспорт работает. Ключ идёт из `config/universe.toml`.
 
@@ -450,6 +508,14 @@ VERBOSE_ENV = "HUNTER_CCXT_VERBOSE"
 
 ⚠ Вывод идёт в поток ccxt и содержит ПОЛНЫЕ ответы биржи — на бэкфилле это мегабайты.
 Постоянно держать включённым нельзя, и это сказано здесь, а не обнаруживается диском.
+"""
+
+FETCH_HISTORY_CACHE = 64
+"""Сколько последних обменов ccxt держит в СВОЁМ кольцевом журнале (`fetchHistoryCache`).
+
+Включается только вместе с подробным выводом. Число не замерено и названо таковым: 64 —
+столько запросов укладывается в один круг опроса вселенной, то есть при разборе отказа
+виден весь круг, а не его хвост. Умолчание ccxt — 0, журнал выключен.
 """
 
 
@@ -527,6 +593,15 @@ class Exchange:
         """Сколько рядов добрано НЕ ЦЕЛИКОМ из-за обрыва пагинации свечей. Ноль при
         глубине выше предела ccxt означает «все ряды пришли полностью», а не «пагинации
         не было»: путь короткой истории этот счётчик не трогает вовсе."""
+
+        self.bars_short_unexplained = 0
+        """Рядов короче запрошенного, чью краткость НЕ объясняет дата листинга.
+
+        Пара к `bars_pages_short`, и закрывает другой случай: там пагинация ОБОРВАЛАСЬ
+        отказом, здесь она завершилась нормально, но история кончилась раньше окна. До
+        2026-08-12 этот случай не считался вовсе — ряд молча выходил короче. Отделять
+        его от молодого инструмента стало чем: `Instrument.created_ms`.
+        """
 
         self.tickers_unparsed = 0
         """Тикеров, отброшенных как неполные. Знаменатель — принятые: биржа отдаёт
@@ -626,7 +701,43 @@ class Exchange:
         if emulated:
             log.degraded("возможность ЭМУЛИРУЕТСЯ ccxt, а не даётся биржей напрямую",
                          методы=", ".join(sorted(emulated)))
+        self._check_features()
         return tuple(missing)
+
+    def _check_features(self) -> None:
+        """Вторая карта возможностей ccxt — `features` — против первой, `has`.
+
+        ⚠ ЗАЧЕМ СРАВНИВАТЬ ДВЕ КАРТЫ ОДНОЙ БИБЛИОТЕКИ. Руководство (Manual.md, «Features»)
+        описывает `features` как более подробную карту с разбивкой по ТИПУ РЫНКА и прямо
+        говорит: «if any method is set to null/undefined it means method is "not
+        supported"». Там же честно сказано, что она «currently a work in progress and
+        might be incomplete».
+
+        Замер на нашей площадке показывает, что карты РАСХОДЯТСЯ: `has['fetchTrades']`
+        истинно, а `features['swap']['linear']['fetchTrades']` равно `None`, то есть по
+        букве руководства метод «не поддерживается» — при том, что мы им пользуемся и он
+        отвечает. Значит `features` — такое же ОБЪЯВЛЕНИЕ, как `has`, и веры ему ровно
+        столько же.
+
+        Отсюда роль этой проверки: не запрещать и не разрешать, а НАЗВАТЬ расхождение на
+        старте. Молчаливое согласие двух карт ничего не доказывает; молчаливое расхождение
+        ушло бы незамеченным. Прогон не роняется — обе карты лгали в обе стороны.
+        """
+        node = self._ex.features.get(self.venue.market_type)
+        if isinstance(node, dict) and ("linear" in node or "inverse" in node):
+            node = node.get("linear") or node.get("inverse")
+        if not isinstance(node, dict):
+            log.degraded("карта features молчит о типе рынка площадки",
+                         тип=self.venue.market_type)
+            return
+        clash = [name for name in REQUIRED_CAPABILITIES
+                 if bool(self._ex.has.get(name)) and node.get(name) is None]
+        log.info("карта features СПРОШЕНА (вторая карта, тоже объявление)",
+                 тип=self.venue.market_type, спрошено=len(REQUIRED_CAPABILITIES),
+                 расхождений_с_has=len(clash))
+        if clash:
+            log.degraded("has и features РАСХОДЯТСЯ — обе карты объявления, не проверки",
+                         методы=", ".join(sorted(clash)))
 
     async def open(self) -> ClockSync:
         log.info("площадка", класс=self.venue.ccxt_class, что=self.venue.human)
@@ -634,8 +745,15 @@ class Exchange:
         # ответов биржи в потоке выглядели бы поломкой, а не запрошенной диагностикой.
         if os.environ.get(VERBOSE_ENV):
             self._ex.verbose = True
+            # ⚠ Кольцевой журнал САМОЙ ccxt, а не наш. Разница принципиальна: наши строки
+            # лога — утверждения кода о себе, а `fetchHistoryCache` хранит пары
+            # запрос/ответ/исключение так, как их видел транспорт. Проекту без второго
+            # читателя это единственное свидетельство об отказе, не написанное нами.
+            # Включается вместе с подробным выводом: держит ответы целиком, то есть стоит
+            # памяти, и в обычном прогоне не нужен (умолчание ccxt — 0, то есть выключен).
+            self._ex.fetchHistoryCacheSize = FETCH_HISTORY_CACHE
             log.warn("ПОДРОБНЫЙ ВЫВОД ccxt ВКЛЮЧЁН — печатаются запросы и ответы целиком",
-                     переменная=VERBOSE_ENV)
+                     переменная=VERBOSE_ENV, журнал_обменов=FETCH_HISTORY_CACHE)
         # ⚠ ДО СЕТИ. Идентификаторы рынков у площадок Binance совпадают (`BTC/USDT` и
         # `BTC/USDT:USDT` оба дают `BTCUSDT`), поэтому кэш сделок, собранный одной
         # площадкой, дозаписанный другой, стал бы смесью двух разных рынков без единого
@@ -1197,7 +1315,9 @@ class Exchange:
         market_id = market.get("id")
         if not market_id:
             return NotReady(reason=f"{symbol}: у рынка нет id для архива")
-        inst = Instrument(symbol=symbol, market_id=str(market_id), tick_size=tick)
+        created = market.get("created")
+        inst = Instrument(symbol=symbol, market_id=str(market_id), tick_size=tick,
+                          created_ms=None if created is None else int(created))
         self._instruments[symbol] = inst
         return inst
 
@@ -1332,8 +1452,11 @@ class Exchange:
 
         КАК. Ниже предела — ровно один запрос, как раньше: путь короткой истории не
         трогается, и повтор карточки обязан совпасть побайтово. Выше предела — курсор по
-        `since` страницами по 1000, с дедупликацией по метке открытия (соседние страницы
-        накладываются на границе).
+        `since` страницами по `OHLCV_PAGE`, с дедупликацией по метке открытия (соседние
+        страницы накладываются на границе).
+
+        ⚠ Страница НЕ равна пределу библиотеки, и почему — целиком в `OHLCV_PAGE`:
+        платим за вес, а не за бары, и ступень веса делает 499 на четверть выгоднее 1000.
 
         ⚠ Обрыв посреди пагинации НЕ МОЛЧИТ. Пустой результат — `NotReady` с причиной;
         частичный — счётчик `bars_pages_short` и строка с числами, потому что «ряд вышел
@@ -1352,10 +1475,10 @@ class Exchange:
         pages = 0
         # Страниц заведомо хватает на `limit` баров плюс запас на пустые участки истории;
         # предел — предохранитель от неподвижного курсора, а не бюджет.
-        max_pages = limit // CCXT_EFFECTIVE_LIMIT + 4
+        max_pages = limit // OHLCV_PAGE + 4
         while pages < max_pages and len(by_open) < limit:
             page = await self._fetch_ohlcv_guarded(
-                symbol, timeframe, cursor, CCXT_EFFECTIVE_LIMIT)
+                symbol, timeframe, cursor, OHLCV_PAGE)
             if isinstance(page, NotReady):
                 if not by_open:
                     return page
@@ -1380,7 +1503,43 @@ class Exchange:
         if not ordered:
             return NotReady(
                 reason=f"{symbol} {timeframe}: пагинация не принесла ни одного бара")
+        if len(ordered) < limit:
+            self._explain_short(symbol, timeframe, len(ordered), limit, start, step)
         return ordered[-limit:]
+
+    def _explain_short(self, symbol: str, timeframe: str, got: int, want: int,
+                       start_ms: int, step_ms: int) -> None:
+        """Назвать ПРИЧИНУ короткого ряда: молодой инструмент или недобор.
+
+        ⚠ ЭТОТ СЛУЧАЙ МОЛЧАЛ. Обрыв пагинации считался (`bars_pages_short`), а нормальное
+        завершение с недобором — нет: цикл выходил по «истории дальше нет», и ряд просто
+        оказывался короче запрошенного, без единой строки. Ровно та форма дефекта, что
+        описана в CLAUDE.md: сто честных отказов подряд читаются как «рынок такой».
+
+        Различить помогает дата появления рынка, которую биржа отдаёт вместе с рынками.
+        Если запрошенное окно начинается раньше листинга — ряд короче ЗАКОННО, и сказать
+        это надо один раз и спокойно. Если позже — недобор настоящий и идёт в `degraded`.
+        """
+        inst = self.instrument(symbol)
+        created = None if isinstance(inst, NotReady) else inst.created_ms
+        if created is not None and created > start_ms:
+            # Сколько баров вообще МОГЛО быть: от листинга до конца окна включительно.
+            #
+            # ⚠ `+ 1` и `min` — не украшение, обе поправки нашёл контроль. Первая
+            # редакция делила разность нацело и печатала «возможно_всего 0» рядом с
+            # «набрано 1»: бар, внутри которого рынок открылся, не считался. Конец окна
+            # тоже не `start + want*step`: при явном `since` окно может уходить в
+            # будущее, и оценка тогда обгоняла бы реальность.
+            window_end = min(clock.now_ms(), start_ms + want * step_ms)
+            possible = max(0, (window_end - created) // step_ms + 1)
+            log.info("ряд короче запрошенного — инструмент моложе окна",
+                     символ=symbol, тф=timeframe, набрано=got, просили=want,
+                     возможно_всего=possible, листинг=_day(created))
+            return
+        self.bars_short_unexplained += 1
+        log.degraded("ряд короче запрошенного, и листингом это НЕ объясняется",
+                     символ=symbol, тф=timeframe, набрано=got, просили=want,
+                     листинг="неизвестен" if created is None else _day(created))
 
     async def _fetch_ohlcv_guarded(
         self, symbol: str, timeframe: str, since_ms: int | None, limit: int
@@ -1420,6 +1579,111 @@ class Exchange:
         # ccxt не типизирован: `fetch_ohlcv` объявлен как Any. Приведение здесь, а не
         # у вызывающего, — граница типизированной части проекта проходит по этому классу.
         return list(raw)
+
+    async def fetch_klines_detailed(
+        self, symbol: str, timeframe: str, limit: int = OHLCV_PAGE,
+        since_ms: int | None = None,
+    ) -> list[BarDetail] | NotReady:
+        """Свечи СО ВСЕМИ полями ответа биржи, включая разделение объёма на стороны.
+
+        ⚠ ИДЁТ МИМО ЕДИНОГО МЕТОДА, И ЭТО ВЫНУЖДЕННО. `fetch_ohlcv` отдаёт шесть чисел —
+        так устроен контракт ccxt. Ответ Binance содержит двенадцать, и `parse_ohlcv`
+        (ccxt/binance.py) перечисляет их все в комментарии, а берёт индексы 0–5.
+
+        ⚠ ПОЧЕМУ НЕ ПОДМЕНОЙ `parse_ohlcv`. Руководство ccxt («Get raw OHLCV response»)
+        прямо предлагает такой путь — переопределить разбор и дописать сырую строку. Здесь
+        он НЕ ГОДИТСЯ, и причина видна в том же исходнике: ТОТ ЖЕ `parse_ohlcv` разбирает
+        mark-, index- и premium-свечи, а у них поля 5, 7, 9, 10 равны нулю с пометкой
+        «Ignore». Глобальная подмена молча выдавала бы нули за объём покупок на трёх рядах
+        из четырёх. Поэтому отдельный вызов сырого эндпоинта, а разбор единых свечей
+        остаётся ccxt.
+
+        Вес тот же, что у обычных свечей (`byLimit` считается по пути, а не по методу),
+        поэтому умолчание лимита — `OHLCV_PAGE`, дешёвая ступень.
+        """
+        call = getattr(self._ex, self.venue.klines, None)
+        if call is None:
+            return NotReady(
+                reason=f"{self.venue.ccxt_class}: нет метода {self.venue.klines}")
+        market = self._ex.market(symbol)
+        request: dict[str, Any] = {
+            "symbol": market["id"],
+            "interval": self._ex.timeframes[timeframe],
+            "limit": min(limit, KLINES_MAX_LIMIT),
+        }
+        if since_ms is not None:
+            request["startTime"] = since_ms
+        raw = await self._rest("подробные свечи", f"{symbol} {timeframe}",
+                               lambda: call(request))
+        if isinstance(raw, NotReady):
+            return raw
+        out: list[BarDetail] = []
+        for row in raw:
+            try:
+                out.append(BarDetail(
+                    open_ms=int(row[0]), close_ms=int(row[6]),
+                    open=float(row[1]), high=float(row[2]), low=float(row[3]),
+                    close=float(row[4]), volume=float(row[5]),
+                    quote_volume=float(row[7]), trades=int(row[8]),
+                    taker_buy_base=float(row[9]), taker_buy_quote=float(row[10]),
+                ))
+            except (ValueError, IndexError, TypeError) as e:
+                # Молчать нельзя: отброшенный бар обязан быть назван, иначе короткий ряд
+                # неотличим от короткой истории рынка — тот же класс дефекта, что и в
+                # `bars_pages_short`.
+                log.degraded("подробный бар отклонён", символ=symbol, тф=timeframe,
+                             причина=f"{type(e).__name__} {e}")
+        if not out:
+            return NotReady(
+                reason=f"{symbol} {timeframe}: подробных баров не осталось "
+                       f"(пришло {len(raw)})")
+        return out
+
+    async def fetch_derived_ohlcv(
+        self, symbol: str, timeframe: str, kind: str, limit: int = OHLCV_PAGE,
+    ) -> list[Bar] | NotReady:
+        """Свечи ПРОИЗВОДНЫХ цен: маркировочной, индексной, премии индекса.
+
+        `kind` — `mark`, `index` или `premium`. Руководство (Manual.md, «Mark, Index and
+        PremiumIndex Candlestick Charts») даёт два пути: параметр `price` в `fetch_ohlcv`
+        и три отдельных метода. Здесь второй — у него `has`-имя, то есть отсутствие
+        превращается в названный отказ, а не в ответ биржи «нет такого интервала».
+
+        ⚠ ОБЪЁМ У ЭТИХ РЯДОВ ВСЕГДА НОЛЬ, и это не пустой рынок: в ответе на его месте
+        стоит «Ignore» (комментарий `parse_ohlcv` в ccxt/binance.py). Ноль объёма здесь
+        законен, поэтому ряд отдаётся `Bar`, а не `BarDetail`.
+
+        Зачем вообще: маркировочная цена — то, по чему биржа считает ликвидации, и она
+        расходится с последней сделкой. Ни одно правило курса на неё не ссылается — раздел
+        остаётся возможностью транспорта, как и весь рыночный контекст ниже.
+        """
+        method = {"mark": "fetchMarkOHLCV", "index": "fetchIndexOHLCV",
+                  "premium": "fetchPremiumIndexOHLCV"}.get(kind)
+        if method is None:
+            return NotReady(reason=f"неизвестный род свечей {kind!r}: "
+                                   "ожидались mark, index или premium")
+        if (no := self._unsupported(method)) is not None:
+            return no
+        snake = {"mark": "fetch_mark_ohlcv", "index": "fetch_index_ohlcv",
+                 "premium": "fetch_premium_index_ohlcv"}[kind]
+        raw = await self._rest(
+            f"свечи {kind}", f"{symbol} {timeframe}",
+            lambda: getattr(self._ex, snake)(symbol, timeframe, None, limit))
+        if isinstance(raw, NotReady):
+            return raw
+        out: list[Bar] = []
+        for r in raw:
+            try:
+                out.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
+                               low=float(r[3]), close=float(r[4]), volume=float(r[5])))
+            except ValueError as e:
+                log.degraded(f"бар {kind} отклонён", символ=symbol, тф=timeframe,
+                             причина=str(e))
+        if not out:
+            return NotReady(
+                reason=f"{symbol} {timeframe}: рядов {kind} не осталось "
+                       f"(пришло {len(raw)})")
+        return out
 
     # --- рыночный контекст ------------------------------------------------
     #
@@ -2189,7 +2453,16 @@ class Exchange:
     async def watch_order_book(
         self, symbol: str, depth: int = 20
     ) -> AsyncGenerator[OrderBook]:
-        """Поток стакана. ccxt держит книгу инкрементально и отдаёт согласованный снимок."""
+        """Поток стакана. ccxt держит книгу инкрементально и отдаёт согласованный снимок.
+
+        ⚠ `timestamp` В ЭТОМ ПОТОКЕ ВСЕГДА ПУСТ, и это признано САМОЙ ccxt, а не наша
+        догадка: `skip-tests.json` в её репозитории отключает проверку метки времени для
+        `binanceusdm` / `watchOrderBook` и `watchOrderBookForSymbols` с пометкой «not
+        present». То же для `orderBook` спотовой площадки.
+
+        Значит `OrderBook.timestamp_ms` из потока — `None` не иногда, а всегда, и возраст
+        книги по нему определять нельзя. Порядок обновлений даёт `nonce`.
+        """
         self._note_watch("orderbook", symbol)
         while True:
             got = await self._watch_step(
@@ -2473,6 +2746,11 @@ def _f(row: dict[str, Any], key: str) -> float | None:
 def _ms(row: dict[str, Any]) -> int | None:
     v = row.get("timestamp")
     return None if v is None else int(v)
+
+
+def _day(ms: int) -> str:
+    """Дата UTC из метки в миллисекундах. Для строк лога: `1567965300000` не читается."""
+    return datetime.fromtimestamp(ms / 1000, UTC).date().isoformat()
 
 
 def _ticker_from(symbol: str, row: dict[str, Any]) -> Ticker24h | None:
