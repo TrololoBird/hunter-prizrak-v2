@@ -1672,9 +1672,16 @@ def parse_trade(raw: dict[str, Any]) -> RawTrade | NotReady:
     единственной границей с ccxt, и разбор словаря обязан быть внутри неё, а не рядом.
     """
     try:
+        # ⚠ `side` читается с 2026-08-11 и до этого ВЫБРАСЫВАЛСЯ. ccxt выводит его из
+        # сырого `isBuyerMaker` и отдаёт у каждой сделки aggTrade; мы теряли сторону
+        # прямо на границе. Референт — не курс (он молчит), а корпус: автор обосновывает
+        # вывод «не пик» тем, что «крупных продаж нету, крупняк не появлялся, откупы
+        # большие». Подробнее — докстрока поля `RawTrade.side`.
+        side = raw.get("side")
         return RawTrade(price=float(raw["price"]), amount=float(raw["amount"]),
                         timestamp=int(raw["timestamp"]),
-                        id=None if raw.get("id") is None else str(raw["id"]))
+                        id=None if raw.get("id") is None else str(raw["id"]),
+                        side=None if side is None else str(side))
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         return NotReady(reason=f"сделка не разобрана: {type(exc).__name__} {exc}")
 
