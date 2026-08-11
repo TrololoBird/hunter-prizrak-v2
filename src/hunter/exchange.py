@@ -235,6 +235,18 @@ class Exchange:
     def __init__(self) -> None:
         self._ex = ccxtpro.binanceusdm({
             "enableRateLimit": True,
+            # ⚠ ЗАКРЕПЛЕНО ЯВНО 2026-08-11, и не из перестраховки: РУКОВОДСТВО ccxt И
+            # КОД РАСХОДЯТСЯ. Руководство (wiki/ccxt.pro.manual.md, «newUpdates mode»)
+            # предупреждает: «in the future `newUpdates: true` will be the default mode»,
+            # то есть описывает умолчание как ЛОЖЬ. Установленная ccxt 4.5.71 отдаёт
+            # `binanceusdm().newUpdates == True` — проверено вызовом.
+            #
+            # Разница не косметическая. При `False` `watch_trades` возвращает ВЕСЬ
+            # скользящий кэш (до `tradesLimit` записей) на каждом вызове, и потребитель,
+            # кладущий сделки в гистограмму, посчитал бы один объём десятки раз. При
+            # `True` приходит только пришедшее с прошлого вызова. Профиль объёма —
+            # ровно тот расчёт, который такая подмена испортила бы молча.
+            "newUpdates": True,
             # FOUNDATION.md §5: профиль строится на aggTrade. По умолчанию ccxt.pro
             # подписан на поток 'trade' — здесь он переключён явно.
             "options": {"watchTrades": {"name": "aggTrade"}},
