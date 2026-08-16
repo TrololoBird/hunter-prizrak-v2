@@ -118,12 +118,12 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
 
     # Долив архива — до сборки карточки: без него окна исторических структур не покрыты
     # и уровней не бывает вовсе. Внутри — свой `to_thread` (Д-8 и его дополнение).
-    await run.backfill_trades(c.ex, uni, report, horizon_days)
+    await run.backfill_profile_bars(c.ex, uni, report, horizon_days)
     # Источники строятся на цикле: им нужен `market_id` инструмента, а рынки живут на
     # объекте биржи, который задача перечитывания меняет именно здесь.
     sources: dict[str, TradeWindows] = {
         sym: src for sym in uni.symbols
-        if (src := run.trade_source(c.ex, sym, report)) is not None
+        if (src := run.trade_source(c.ex, sym, report, uni)) is not None
     }
 
     await asyncio.to_thread(run.persist_frames, run_id, report)

@@ -23,6 +23,7 @@ PURE_MODULES = [
     "src/hunter/models.py",
     "src/hunter/admission.py",
     "src/hunter/volume_profile.py",
+    "src/hunter/profile_source.py",
     "src/hunter/swings.py",
     "src/hunter/accumulation.py",
     "src/hunter/levels.py",

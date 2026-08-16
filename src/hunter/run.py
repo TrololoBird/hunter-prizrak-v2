@@ -32,6 +32,7 @@ from .config import Universe
 from .exchange import (
     CATCHUP_MAX_BARS,
     CATCHUP_RETRY_S,
+    OHLCV_PAGE,
     POLL_LIMIT,
     POLL_OFFSET_S,
     REQUIRED_CAPABILITIES,
@@ -52,6 +53,7 @@ from .models import (
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
+from .profile_source import CandleWindows
 from .swings import detect as detect_swings
 
 
@@ -680,6 +682,124 @@ def needed_days(
     return days, used, dropped, max_hi
 
 
+def profile_windows(series: dict[str, list[Bar]],
+                    horizon_days: int) -> tuple[list[tuple[int, int]], int, int]:
+    """Окна структур, под которые нужен профиль. Возвращает (окна, взято, отброшено).
+
+    ⚠ ОКНА, А НЕ СУТКИ. Прежний источник профиля (сделки) хранился суточными файлами,
+    поэтому `find_gaps` отвечал множеством ДАТ. Свечи хранятся рядом по таймфрейму, и
+    просить у биржи сутки целиком там, где структуре нужен час, — платить за то, что
+    никто не прочитает.
+
+    Горизонт отсекает старые структуры так же, как в `find_gaps`: правее правого края
+    окна профиль никем не читается.
+    """
+    out: list[tuple[int, int]] = []
+    used = dropped = 0
+    now = max((b[-1].open_ms for b in series.values() if b), default=0)
+    cut = now - horizon_days * 86_400_000
+    for tf, bars in series.items():
+        if not bars:
+            continue
+        sw = detect_swings(bars)
+        if isinstance(sw, NotReady):
+            continue
+        for acc in detect_accumulations(bars, sw, tf).closed:
+            lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
+            if hi < cut:
+                dropped += 1
+                continue
+            used += 1
+            out.append((lo, hi))
+    return out, used, dropped
+
+
+def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, int]]:
+    """Слить пересекающиеся и близкие окна.
+
+    ⚠ Порог слияния — НЕ вкус: это длительность одной страницы запроса. Пока разрыв между
+    окнами короче страницы, отдельный запрос за вторым окном стоит столько же, сколько
+    добор промежутка внутри первого, — значит сливать дешевле. Разрыв шире страницы
+    сливать уже невыгодно: платили бы за бары, которых никто не спросит.
+    """
+    out: list[tuple[int, int]] = []
+    for lo, hi in sorted(spans):
+        if out and lo - out[-1][1] <= gap_ms:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
+                                horizon_days: int) -> None:
+    """Долить СВЕЧИ ПРОФИЛЯ под окна исторических структур.
+
+    ⚠ ЗАМЕНА `backfill_trades` С 2026-08-12 (решение владельца: «меняй транспорт на
+    свечной»). Прежде под те же окна качались отдельные сделки `aggTrade`; основание
+    этого выбора — одна фраза в скобках из первого коммита проекта, без референта.
+    Разбор и замер: `docs/audit/poc-candles-vs-ticks-2026-08-12.md`, обоснование
+    источника — докстрока модуля `profile_source`.
+
+    Цена перехода замерена: сутки BTC через `aggTrades` — 3500 единиц веса, через
+    минутные свечи — 6.
+
+    ⚠ Отказ здесь НЕ роняет прогон и НЕ молчит: непокрытое окно позже отдаст
+    `CandleWindows.window` как `NotReady` с числом недостающих свечей (§4.3), а сводка
+    добора печатается в приёмке.
+
+    ⚠ `horizon_days` — ПАРАМЕТР, а не ноль. Первая редакция передавала ноль в
+    `profile_windows`, и это отбрасывало ВСЕ структуры: порог отсечки считается как
+    «сейчас минус горизонт», значит при нуле он равен «сейчас», а окно закрытой
+    структуры кончается раньше. Дымовой прогон напечатал «окон 0, отброшено 45» —
+    прибор молчал бы, если бы отброшенные не считались отдельно.
+    """
+    tf = uni.profile_timeframe
+    step = tf_ms(tf)
+    page_ms = step * OHLCV_PAGE
+    for sym in uni.symbols:
+        inst = ex.instrument(sym)
+        if isinstance(inst, NotReady):
+            report.profile_symbols_skipped += 1
+            log.degraded("профиль: инструмент недоступен", символ=sym,
+                         причина=inst.reason)
+            continue
+        wins, used, dropped = profile_windows(bars_of(report, sym), horizon_days)
+        if not wins:
+            continue
+        merged = merge_windows(wins, page_ms)
+        report.profile_windows += used
+        report.profile_windows_dropped += dropped
+        for lo, hi in merged:
+            # ⚠ `None` У `missing_tail_since` ЗНАЧИТ «ПРОСИТЬ ВСЁ», А НЕ «УЖЕ ЕСТЬ».
+            # Первая редакция читала его как «покрыто» и на ПУСТОМ хранилище объявляла
+            # все участки кэшированными: дымовой прогон напечатал «окон 49, добрано 0,
+            # из хранилища 4» при нуле файлов профиля на диске. Инверсия смысла —
+            # ровно тот дефект, который не виден по коду возврата и виден по числам.
+            since = barstore.missing_tail_since(uni.venue, inst.market_id, tf, lo)
+            if since is not None and since >= hi:
+                report.profile_spans_cached += 1
+                continue
+            start = lo if since is None else since
+            ask = (hi - start) // step + 2
+            got = await ex.fetch_closed_ohlcv(sym, tf, limit=int(ask), since_ms=start)
+            if isinstance(got, NotReady):
+                report.profile_spans_failed += 1
+                log.degraded("профиль: свечи окна не добраны", символ=sym, тф=tf,
+                             от=start, до=hi, причина=got.reason)
+                continue
+            added, rewritten = barstore.append(uni.venue, inst.market_id, tf, got.bars)
+            report.profile_bars_stored += added
+            report.profile_bars_rewritten += rewritten
+            report.profile_spans_filled += 1
+    log.info("профиль: свечи под окна структур", тф=tf,
+             окон=report.profile_windows, отброшено_по_горизонту=report.profile_windows_dropped,
+             участков_добрано=report.profile_spans_filled,
+             участков_из_хранилища=report.profile_spans_cached,
+             участков_с_отказом=report.profile_spans_failed,
+             баров_записано=report.profile_bars_stored)
+
+
 async def backfill_trades(
     ex: Exchange, uni: Universe, report: RunReport, horizon_days: int,
     max_days_per_symbol: int = 400,
@@ -1035,17 +1155,31 @@ def _backfill_impl(
     return gaps
 
 
-def trade_source(ex: Exchange, sym: str, report: RunReport) -> TradeWindows | None:
-    """Источник профиля для символа: кэш архива плюс живой поток прогона.
+def trade_source(ex: Exchange, sym: str, report: RunReport,
+                 uni: Universe) -> TradeWindows | None:
+    """Источник профиля для символа — СВЕЧИ ПРОФИЛЯ из хранилища баров.
 
-    Один на оба пути — печать карточки и запись в леджер. Раньше туда передавался
-    материализованный `BarBinnedTrades`, и он же был причиной `MemoryError`.
+    ⚠ ПЕРЕВЕДЁН СО СДЕЛОК НА СВЕЧИ 2026-08-12 по решению владельца. Прежде здесь
+    строился `archive.WindowSource` — суточный кэш `aggTrade` плюс живой поток сделок.
+    Основанием того выбора была одна фраза в скобках из первого коммита проекта, и оно
+    не выдержало проверки: ни один сигнальный бот жанра отдельных сделок не берёт, а
+    инструмент автора курса строит профиль по свечам младшего разрешения. Разбор,
+    замер и цена — в докстроке модуля `profile_source` и в
+    `docs/audit/poc-candles-vs-ticks-2026-08-12.md`.
+
+    ⚠ Бары читаются НА ВЫЗОВ и не удерживаются: минутный ряд за девяносто суток — это
+    около 130 тысяч баров на символ, и держать их для всех двадцати семи разом значило бы
+    вернуть ту самую `MemoryError`, ради которой источник когда-то и стал ленивым.
+
+    Один на оба пути — печать карточки и запись в леджер.
     """
     inst = ex.instrument(sym)
     if isinstance(inst, NotReady):
-        return report.binned.get(sym)
-    return archive.WindowSource(sym, inst.market_id, inst.tick_size,
-                                live=report.binned.get(sym))
+        return None
+    bars = barstore.load(uni.venue, inst.market_id, uni.profile_timeframe)
+    if not bars:
+        return None
+    return CandleWindows(sym, inst.tick_size, bars, uni.profile_timeframe)
 
 
 def bars_of(report: RunReport, sym: str) -> dict[str, list[Bar]]:
@@ -1427,6 +1561,9 @@ CYCLE_FIELDS = (
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
     "backfill_missing_by_symbol",
+    "profile_windows", "profile_windows_dropped", "profile_spans_filled",
+    "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
+    "profile_bars_rewritten", "profile_symbols_skipped",
 )
 """Поля отчёта, относящиеся к ОДНОМУ расчёту, а не ко всему времени работы.
 
@@ -1767,11 +1904,11 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         report = c.snapshot()
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
-        await backfill_trades(c.ex, uni, report, horizon_days)
+        await backfill_profile_bars(c.ex, uni, report, horizon_days)
         # Источники строятся ДО закрытия соединения: им нужен `market_id` инструмента.
-        # Сеть после этого не трогается — читается только кэш на диске.
+        # Сеть после этого не трогается — читается только хранилище баров на диске.
         sources = {sym: src for sym in uni.symbols
-                   if (src := trade_source(c.ex, sym, report)) is not None}
+                   if (src := trade_source(c.ex, sym, report, uni)) is not None}
     finally:
         await c.shutdown()
     # Смерти, разобранные при ОСТАНОВКЕ, обязаны попасть в возвращаемый отчёт: снимок
@@ -2029,7 +2166,19 @@ def print_report(r: RunReport) -> int:
     print(f"   файлов parquet записано: {r.frames_written}")
     print(f"   карточек сохранено: {r.cards_written}")
 
-    print("\n5б. АРХИВ СДЕЛОК ПОД ОКНА СТРУКТУР (стр. 26)")
+    print("\n5б. СВЕЧИ ПРОФИЛЯ ПОД ОКНА СТРУКТУР")
+    print(f"   окон структур: {r.profile_windows}, "
+          f"старше горизонта отброшено: {r.profile_windows_dropped}, "
+          f"символов пропущено: {r.profile_symbols_skipped}")
+    print(f"   участков: добрано у биржи {r.profile_spans_filled}, "
+          f"взято из хранилища {r.profile_spans_cached}, "
+          f"с отказом {r.profile_spans_failed}")
+    print(f"   свечей записано: {r.profile_bars_stored}, "
+          f"ПЕРЕЗАПИСАНО: {r.profile_bars_rewritten}")
+    if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
+        print("   ⚠ окна есть, а участков профиля НЕТ — уровней не будет ни одного")
+
+    print("\n5в. АРХИВ СДЕЛОК (источником профиля НЕ является с 2026-08-12)")
     print(f"   структур в горизонте: {r.backfill_structures}, "
           f"старше горизонта отброшено: {r.backfill_structures_old}")
     print(f"   суток загружено: {r.backfill_days_loaded}, не получено: "

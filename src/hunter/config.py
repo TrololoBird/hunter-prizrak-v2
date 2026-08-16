@@ -6,7 +6,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bars import TIMEFRAME_MS
+from .bars import PROFILE_MS, TIMEFRAME_MS
 
 DEFAULT_PATH = Path("config/universe.toml")
 
@@ -23,6 +23,20 @@ class Universe:
     ⚠ Ключ задаётся ОПЕРАТОРОМ, а не выводится из символов: `BTC/USDT` и `BTC/USDT:USDT` —
     разные рынки с разной ценой и разным объёмом, и угадывание подменило бы источник
     профиля молча. Умолчание сохраняет прежнее поведение для конфигураций, где ключа нет.
+    """
+
+    profile_timeframe: str = "1m"
+    """Разрешение свечей, ИЗ КОТОРЫХ строится профиль объёма. Не таймфрейм анализа.
+
+    ⚠ Появился 2026-08-12 вместе с переводом профиля со сделок на свечи (решение
+    владельца). Разрешение вынесено в конфигурацию, а не зашито, потому что оно —
+    ЦЕНА ПРИБЛИЖЕНИЯ: объём свечи раскладывается по её диапазону равномерно, и чем
+    младше свеча, тем меньше ошибка этого допущения. Умолчание `1m` — самое младшее,
+    что отдаёт биржа, и то же, которым строит профиль TradingView.
+
+    Допустимые значения — `bars.PROFILE_MS`. Список ТФ анализа (`timeframes`) сюда НЕ
+    входит и входить не должен: профиль по дневным свечам размазал бы объём суток по
+    всему их диапазону.
     """
 
 
@@ -53,4 +67,13 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
     if not isinstance(venue, str):
         raise ValueError(f"{path}: venue обязан быть строкой, а не {type(venue).__name__}")
 
-    return Universe(tuple(symbols), tuple(timeframes), path, venue)
+    # ⚠ Разрешение профиля проверяется по СВОЕЙ таблице, а не по §2.8: значение вроде
+    # `1d` здесь синтаксически верно и содержательно разрушительно — объём суток лёг бы
+    # ровным слоем по всему суточному диапазону.
+    profile_tf = section.get("profile_timeframe", "1m")
+    if profile_tf not in PROFILE_MS:
+        raise ValueError(
+            f"{path}: profile_timeframe={profile_tf!r} вне {sorted(PROFILE_MS)}; "
+            f"профиль строится из МЛАДШИХ свечей, а не из таймфреймов анализа")
+
+    return Universe(tuple(symbols), tuple(timeframes), path, venue, profile_tf)
