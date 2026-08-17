@@ -77,6 +77,58 @@ cryptofeed README/high_level.md, hummingbot Architecture p.1-2, OctoBot Develope
 хранилище нет части минуток, не сверялись; (б) это исторические бары — поведение живой
 границы (незакрытая свеча) отдельный вопрос; (в) точность равна точности самих 1m.
 
+## 3а. РАСШИРЕННАЯ ВЫБОРКА по требованию владельца: 20 ccxt-проектов, транспорт по коду
+
+Владелец забраковал первую выборку («минимум 20, самых популярных, на ccxt, без AI/ML»).
+Отбор машинный: GitHub-поиск по topics (trading-bot, cryptocurrency+trading) с
+сортировкой по звёздам плюс адресные кандидаты; **верификация и чтение транспорта — по
+НЕГЛУБОКИМ КЛОНАМ и локальному грепу**, потому что прибор `gh search code` провалил
+контроль (на заведомо существующее `fetch_ohlcv` в freqtrade вернул пусто; для
+opentrader вернул 0 при ccxt-файлах, видимых в клоне) — его нулям верить нельзя.
+Клоны — в scratchpad смены, в git не идут; локаторы файлов приведены.
+
+| # | проект | ★ | как получает свечи (по коду) |
+|---|---|---|---|
+| 1 | freqtrade | 53k | страницы истории вычисляются наперёд (`range(since, until, one_call)`) и летят `asyncio.gather` ПАЧКАМИ ПО 100 «to avoid overwhelming ccxt Throttling»; тот же gather по парам; кэш `_klines` (exchange/exchange.py:2627-2657, 2896) |
+| 2 | jesse | 8.3k | качает ТОЛЬКО 1m, последовательно со `sleep(driver.sleep_time)`, в БД (Peewee, on_conflict_ignore); старшие ТФ генерирует сам (import_candles_mode) |
+| 3 | passivbot | ~3k | «lightweight **1m OHLCV manager**»: кэш посуточными шардами `{exchange}/{tf}/{symbol}/YYYY-MM-DD.npy`, глобальный `asyncio.Semaphore` на сеть, ДЫРЫ синтезируются нулевыми свечами и «not persisted» (candlestick_manager.py:1-40, 1086, 735) |
+| 4 | OctoBot / OctoBot-Trading | 6.4k | ОТДЕЛЬНАЯ asyncio-задача на каждую пару×ТФ (`_candle_update_loop`), пересчёт будится приходом свечи через каналы (ohlcv_updater.py:80) |
+| 5 | Crypto-Signal | 5.6k | последовательный REST по парам×периодам, кэш словарём на прогон (app/behaviour.py:143-283) |
+| 6 | Haehnchen/crypto-trading-bot | 3.5k | ГИБРИД: `ccxt_candle_watch_service` — WS-вотчеры на пару×период + `ccxt_candle_prefill_service` — REST-досев с троттлом; sqlite |
+| 7 | opentrader | 2.8k | последовательный курсор `since = lastCandle + 60000` (база 1m), до endDate (ccxt-candles.provider.ts:89-121) |
+| 8 | vectorbt | 8.7k | последовательная пагинация `while True` + `sleep(delay=500мс)` + tqdm (data/custom.py:439-505) — самый медленный из увиденных паттернов, ровно наш вчерашний |
+| 9 | peregrine | 1.2k | свечи не качает вовсе: массовый async-сбор стаканов/тикеров по десяткам бирж (арбитраж) |
+| 10 | bt-ccxt-store | ~800 | поллинг `fetch_ohlcv` в фиде backtrader от fromdate (ccxtbt/ccxtfeed.py:96) |
+| 11 | WolfBot | ~700 | ccxt как адаптер части бирж (BinanceCcxt.ts); свечи — собственные потоки/импортёры, fetchOHLCV в src не найден |
+| 12 | catalyst (Enigma) | 2.6k | `fetch_ohlcv` с ретраями и `retry_sleeptime=5`, хранение бандлами (exchange/ccxt/ccxt_exchange.py:423-462, 929) |
+| 13 | magic8bot | ~1k | бары строит ИЗ СДЕЛОК: «Trade sync … backfill for N days» + пакет `@magic8bot/timebucket` (engine/trade.ts:72) — nautilus-модель на ccxt |
+| 14 | Roibal (учебный) | ~2.5k | разовые прямые `fetch_ohlcv` в скриптах, без хранения |
+| 15 | tradingview-webhooks-bot | ~800 | свечи НЕ КАЧАЕТ: сигнал приходит вебхуком из TradingView, ccxt — только исполнение |
+| 16 | investing-algorithm-framework | 1.7k | последовательная пагинация `while from < to` + `sleep(exchange.rateLimit/1000)` (data_providers/ccxt.py:674-702) |
+| 17 | pyjuque | ~500 | `getOHLCVHistory`: последовательные страницы limit=1000 (Exchanges/CcxtExchange.py:38-43) |
+| 18 | ccxt (сам, examples) | 43k | официальные образцы: async-пагинация, `fetch-ohlcv-multiple-symbols-continuously`, работа от closing time (examples/py) |
+| 19 | supertrend-crypto-bot | 413 | канонический минимум: опрос `fetch_ohlcv('1m', limit=100)` по расписанию, без истории (supertrend.py:91) |
+| 20 | kupi-terminal | ~2k | on-demand: `fetchOHLCV(symbol, tf, undefined, optimalLimit)` по запросу интерфейса (dataActions.ts:529) |
+
+**Исключены с названной причиной:** Superalgos (клон не собрался, а поиску кода GitHub
+верить нельзя — НЕ ВЕРИФИЦИРОВАН, не «не использует»), lumibot / zvt-ядро / OpenBB /
+manu354 (ccxt в коде не найден). Не-ccxt лидеры (hummingbot, gocryptotrader,
+nautilus_trader, cryptofeed, gekko, tribeca) — в таблице §2 как контекст.
+
+**Синтез по 20 (что встречается и сколько раз):**
+* **последовательная пагинация со sleep — 7 из 20** (vectorbt, jesse, opentrader,
+  Crypto-Signal, catalyst, investing-algo, pyjuque): наш вчерашний паттерн — норма
+  жанра, а не наш личный дефект; и именно поэтому freqtrade с gather×100 выделяется;
+* **параллельные заранее вычисленные страницы — 1 из 20** (freqtrade, самый крупный) —
+  ровно сегодняшняя наша правка, чужим кодом подтверждена;
+* **база 1m с локальной сборкой старших ТФ — 3 из 20** (jesse полностью, passivbot
+  «1m manager», opentrader курсор 1m): jesse-модель — не экзотика;
+* **бары из сделок — 1 из 20** (magic8bot) плюс nautilus вне выборки;
+* **WS-вотчеры свечей — 2 из 20** (Haehnchen гибрид, OctoBot задача-на-ряд);
+* **пустые минуты — известная жанру проблема:** passivbot синтезирует нулевые свечи
+  для дыр и НЕ хранит их — независимое подтверждение нашей находки о фантомной цене
+  (§3): пустой минуте нельзя доверять цену.
+
 ## 4. Варианты архитектуры и их цена
 
 **I. Остаться как есть (уже ускорено).** Параллельные страницы + кэши движка влиты.
