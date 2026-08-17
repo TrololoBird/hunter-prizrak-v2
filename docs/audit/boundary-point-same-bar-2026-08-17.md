@@ -231,15 +231,71 @@ last_other.index`. Значит противоположный свинг, ст�
 
 ---
 
-## 7. ЧТО ОСТАЛОСЬ НЕПРОВЕРЕННЫМ
+## 6а. КНИГИ: автор определения говорит ПРЯМО — два фрактала
 
-* **Книжная ветка закрыта частично.** Дословных цитат из Bill Williams «Trading Chaos»,
-  Мёрфи, Эдвардса-Маги, Шабакера, du Plessis НЕТ: archive.org из этого окружения
-  недоступен, Google Books отдаёт пустые ответы, пиратские PDF сознательно не качались.
-  Самая перспективная цель — du Plessis, «The Definitive Guide to Point and Figure»:
-  правило приоритета для этого бара должно быть там сформулировано книжно.
+Ветка закрыта. archive.org из этого окружения недоступен (`curl` даёт код 000, HathiTrust
+403, Google Books API 429), пиратские PDF сознательно не качались. Рабочим оказался
+недокументированный эндпоинт `books.google.ru/books?id=<ID>&jscmd=SearchWithinVolume`,
+отдающий номера страниц и сниппеты.
+
+**Bill Williams, "New Trading Dimensions", Wiley 1998, page 68 — прямой ответ:**
+
+> «Up and down fractals may share bars. The same bar can be part of both an up and a down
+> fractal.»
+
+Там же, **page 70** — почему так выходит:
+
+> «Bar LOWs have no significance on UP-FRACTALS and bar HIGHS have no significance on
+> DOWN-FRACTALS.»
+
+**Williams & Gregory-Williams, "Trading Chaos" 2-е изд., Wiley 2004, page 137:**
+
+> «Fractals can share bars.» … «middle finger is an up and down Fractal.»
+
+**Это первоисточник ТОГО САМОГО определения, на котором стоит наш `swings.detect`.**
+Считается двумя фракталами, не одним. Цитаты внесены в докстроку `swings.py`.
+
+**Обратный полюс — единственный, кто запрещает прямо: Jeremy du Plessis, "The Definitive
+Guide to Point and Figure", page 2-46:**
+
+> «As with close only charts, it is impossible to plot both an X and an O on the same day.»
+
+И причина, page 2-46 — **тот же довод, которым обосновано строгое неравенство в
+`pereprior`** (§6):
+
+> «it is insurmountable if you are using end-of-day data, for the simple reason that you do
+> not know whether the high or low occurred first.»
+
+Правило приоритета, page 2-47: «the low takes precedence, so you must look at the low to
+see if it generates a new O. If it does, you plot that O and ignore the high» — причём
+приоритет сильнее разворота на три клетки.
+
+**Остальные книги вопроса не ставят:** Kaufman запрещает на уровне алгоритма свинг-графика
+(page 169: "only the swing high and swing low points in alternating columns"), но сам же
+отделяет пивот от свинга (page 174) и про совпадение не говорит; Al Brooks даёт разрешение
+ПО ПОСТРОЕНИЮ (определение через один экстремум плюс «at or above»), но такого предложения
+не пишет — это вывод, а не цитата; Edwards & Magee подтверждают точку правилом "entirely
+outside the range" (page 363, 369, 371), которое перекрывающийся день исключает; Bulkowski,
+Nison, Sperandeo, Murphy — не касаются.
+
+---
+
+## 7. ЧТО ОСТАЛОСЬ НЕПРОВЕРЕННЫМ
 * **Исходник стандартного `ZigZag.mq5` / `Fractals.mq5` не получен** — поиск по GitHub дал
   0, справка MetaTrader алгоритма не описывает.
+* **Из книг НЕ открылись** (Google Books `noview`, archive.org недоступен): Bulkowski
+  «Encyclopedia of Chart Patterns» и «Visual Guide to Chart Patterns» (сайт автора
+  указывает точное место определения — гл. 2, page 13), Schabacker, Frost & Prechter,
+  Nison «Japanese Candlestick Charting Techniques», Rhea, Raschke & Connors.
+* ⚠ **Market Profile (Dalton, Steidlmayer) — НЕ ПРОВЕРЕН, и это важнее, чем выглядит.**
+  Поиск дал нули по «swing high», «swing low», «pivot», но КОНТРОЛЬ ПРОВАЛИЛСЯ: в том же
+  томе «auction» даёт 8 попаданий, а «value area» и «Market Profile» — 0. Прибор отвечает
+  непоследовательно, значит его нули НЕ являются свидетельством отсутствия. Гипотеза
+  «Market Profile барными пивотами не оперирует» остаётся правдоподобной и недоказанной.
+  Это существенно: наш профиль объёма — из той же школы.
+* **Murphy проверен только в месте определения тренда** (page 49, по неофициальному
+  сканированному PDF без текстового слоя); что он говорит про key reversal day и внешний
+  бар — не проверено.
 * **Park & Irwin (2007)** за платным доступом, ничем не подтверждён.
 * **Поведение Lean не исполнено** — `dotnet` в системе нет; вывод по исходнику и тесту.
 * Часть цитат в разделах документации снята через модель-читателя WebFetch, а не прочитана
