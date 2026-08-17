@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from .bars import PROFILE_MS, TIMEFRAME_MS
@@ -48,13 +48,49 @@ class Universe:
     """
 
 
+def _reject_unknown(section: Mapping[str, object], known: frozenset[str], path: Path) -> None:
+    """Неизвестный ключ — названный отказ, а не молчаливое умолчание.
+
+    Дефект, от которого это защищает, случался ДВАЖДЫ: `bars_per_timeframe` (удалён
+    2026-08-11) и `admission_required_bars` (удалён 2026-08-17) лежали в файле мёртвыми —
+    их не читала ни одна строка, а докстроки ссылались на них как на действующие.
+    Зеркальная половина того же дефекта — опечатка в имени ключа: загрузчик, молча
+    пропускающий неизвестное, подставил бы умолчание вместо значения оператора.
+    То же правило, что `extra="forbid"` у моделей (§10.1, гейт models_forbid_extra),
+    перенесённое на TOML. Разбор: docs/audit/frozen-rules-2026-08-17.md §4."""
+    unknown = sorted(set(section) - known)
+    if unknown:
+        raise ValueError(
+            f"{path}: неизвестные ключи {unknown}; известны {sorted(known)}. "
+            f"Мёртвый или опечатанный ключ не читается никем — это молчаливая деградация")
+
+
+def _known_keys(cls: type) -> frozenset[str]:
+    """Ключи TOML = поля датакласса минус служебный `source` (его пишет загрузчик).
+
+    Выводится из полей, а не переписывается руками: рукописный список разошёлся бы с
+    датаклассом молча — тот же дефект, от которого защищает `_reject_unknown`."""
+    return frozenset(f.name for f in fields(cls)) - {"source"}
+
+
+def _reject_unknown_sections(data: Mapping[str, object], known: str, path: Path) -> None:
+    """Лишняя ТАБЛИЦА — тот же дефект, что лишний ключ: `[universo]` или вернувшийся
+    `[bars]` молча пролежал бы мёртвым (найдено rules-auditor 2026-08-17)."""
+    unknown = sorted(set(data) - {known})
+    if unknown:
+        raise ValueError(
+            f"{path}: неизвестные секции {unknown}; здесь живёт только [{known}]")
+
+
 def load_universe(path: Path = DEFAULT_PATH) -> Universe:
     if not path.exists():
         raise FileNotFoundError(f"нет файла вселенной {path} — §5 требует закреплённый набор")
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    _reject_unknown_sections(data, "universe", path)
     section = data.get("universe")
     if not isinstance(section, dict):
         raise ValueError(f"{path}: нет секции [universe]")
+    _reject_unknown(section, _known_keys(Universe), path)
 
     symbols = section.get("symbols")
     if not symbols:
@@ -169,9 +205,11 @@ def load_bot_config(path: Path = BOT_PATH) -> BotConfig:
     if not path.exists():
         return BotConfig()
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    _reject_unknown_sections(data, "bot", path)
     section = data.get("bot")
     if not isinstance(section, dict):
         raise ValueError(f"{path}: нет секции [bot]")
+    _reject_unknown(section, _known_keys(BotConfig), path)
 
     pinned = section.get("pinned", [])
     if not isinstance(pinned, list) or any(not isinstance(s, str) for s in pinned):
