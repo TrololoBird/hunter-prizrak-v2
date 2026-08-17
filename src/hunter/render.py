@@ -15,6 +15,7 @@ docs/audit/author-review-2026-08-09-vs-bot.md): светлый фон, зелё�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import matplotlib
@@ -123,6 +124,13 @@ def chart_png(
     ax.set_facecolor("#f0f2ef")
     ax.axvspan(len(bars) - 0.5, right, facecolor="#e9ecea", zorder=0)
 
+    tags: list[tuple[float, str, str]] = []
+    """Отложенные ценовые плашки (y, текст, цвет): рисуются после цикла зон с
+    раздвижкой по вертикали — до 2026-08-17 плашки близких уровней наезжали друг
+    на друга и читались как одна (session-2026-08-17 §5)."""
+    used_marks: set[str] = set()
+    """Какие значки реально встретились — легенда рисуется только по ним."""
+
     def bar_index(ms: int) -> int | None:
         """Номер бара по метке времени. None — метка вне окна графика."""
         if ms <= 0 or not bars:
@@ -166,6 +174,7 @@ def chart_png(
                     zorder=6,
                 ))
                 drawn_box = True
+                used_marks.add("box")
 
         # 2. ЛИНИЯ УРОВНЯ — от структуры вправо, а не через весь экран.
         start = (i0 if drawn_box and i0 is not None else 0)
@@ -176,18 +185,15 @@ def chart_png(
         i_ev = bar_index(z.retired_at_ms) if z.state != "active" else None
         line_end = i_ev if i_ev is not None else right
         if lo <= z.price <= hi:
-            ax.plot([start, line_end], [z.price, z.price], color="#2b2b2b",
-                    linewidth=1.0, zorder=3)
+            # Линия уровня — тоньше и серее свечей: раньше чёрные линии всех уровней
+            # сливались в «лес» (разбор session-2026-08-17 §5); иерархию задают
+            # цветные плашки и зоны, а не толщина чёрного.
+            ax.plot([start, line_end], [z.price, z.price], color="#6b6b6b",
+                    linewidth=0.9, zorder=3)
             if i_ev is None:
-                ax.annotate(
-                    f"{z.price:g}", xy=(right, z.price),
-                    xytext=(3, 0), textcoords="offset points",
-                    va="center", ha="left", fontsize=8.5, fontweight="bold",
-                    color="white",
-                    bbox={"boxstyle": "square,pad=0.22", "facecolor": edge,
-                          "edgecolor": "none"},
-                    zorder=6, annotation_clip=False,
-                )
+                # Плашка кладётся ОТЛОЖЕННО: сначала собираются все, потом раздвигаются
+                # по вертикали, чтобы не наезжать друг на друга (см. ниже).
+                tags.append((z.price, f"{z.price:g}", edge))
 
         # 3. ЗОНА ВХОДА — прямоугольник В БУДУЩЕМ, подписанный стороной сделки.
         if z.kind == "level" and z.entry_rule in ("limit", "retest_flipped"):
@@ -202,6 +208,7 @@ def chart_png(
                 va="center", ha="center", fontsize=8, fontweight="bold",
                 color="#1b3a1b" if z.side == "long" else "#4a1414", zorder=6,
             )
+            used_marks.add("entry")
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
@@ -224,6 +231,7 @@ def chart_png(
                                     "linewidth": 2.4, "mutation_scale": 16},
                         zorder=8, annotation_clip=False,
                     )
+                    used_marks.add("arrow")
                 else:
                     # ⚠ КРЕСТИКА В КУРСЕ НЕТ. Проверено по всем 69 страницам: значков X
                     # нет ни на одной, слова «крестик» нет в тексте. Курс велит уровень
@@ -233,6 +241,7 @@ def chart_png(
                     # выдано за курс.
                     ax.plot([i_ev], [z.price], marker="x", color="#2f6fd0",
                             markersize=11, markeredgewidth=2.4, zorder=8)
+                    used_marks.add("flip")
 
         if z.kind == "pp":
             # Зона переприора — узкая полоса у правого края: это зона тени свечи слома,
@@ -242,6 +251,7 @@ def chart_png(
                 max(z_hi - z_lo, (hi - lo) * 0.003),
                 facecolor=fill, edgecolor=edge, linewidth=1.0, alpha=0.8, zorder=4,
             ))
+            used_marks.add("pp")
 
     w = 0.62
     for i, b in enumerate(bars):
@@ -281,10 +291,81 @@ def chart_png(
                 facecolor=colr, edgecolor="none", alpha=0.55, zorder=1,
             ))
 
+    # ТЕКУЩАЯ ЦЕНА — пунктир через весь график и контрастная плашка справа.
+    # Без неё читатель не видел, ГДЕ рынок относительно зон (session-2026-08-17 §5).
+    last_close = bars[-1].close
+    if lo <= last_close <= hi:
+        ax.plot([-1, right], [last_close, last_close], color="#1a1a1a",
+                linewidth=0.9, linestyle=(0, (4, 3)), zorder=7)
+        tags.append((last_close, f"{last_close:g}", "#1a1a1a"))
+
+    # ПЛАШКИ ЦЕН — с раздвижкой: близкие сдвигаются по вертикали, чтобы каждая
+    # читалась; линия остаётся на своей цене, сдвигается только подпись.
+    min_gap = (hi - lo) * 0.024
+    placed: list[float] = []
+    for y, txt, colr in sorted(tags, key=lambda t: t[0]):
+        y_lab = y
+        while any(abs(y_lab - q) < min_gap for q in placed):
+            y_lab += min_gap * 0.6
+        placed.append(y_lab)
+        ax.annotate(
+            txt, xy=(right, y), xytext=(6, (y_lab - y) / (hi - lo) * 720),
+            textcoords="offset points",
+            va="center", ha="left", fontsize=8.5, fontweight="bold", color="white",
+            bbox={"boxstyle": "square,pad=0.22", "facecolor": colr, "edgecolor": "none"},
+            zorder=9, annotation_clip=False,
+        )
+
+    # ОСЬ ВРЕМЕНИ — даты по нижнему краю (6 меток), формат от длительности бара:
+    # внутридневные ТФ несут время, дневные и старше — только дату.
+    step_ms = bars[1].open_ms - bars[0].open_ms if len(bars) > 1 else 0
+    fmt = "%d.%m %H:%M" if 0 < step_ms < 86_400_000 else "%d.%m.%y"
+    n_ticks = 6
+    idxs = [round(k * (len(bars) - 1) / (n_ticks - 1)) for k in range(n_ticks)]
+    ax.set_xticks(idxs)
+    ax.set_xticklabels(
+        [datetime.fromtimestamp(bars[i].open_ms / 1000, UTC).strftime(fmt)
+         for i in idxs], fontsize=7.5, color="#555")
+    ax.tick_params(axis="x", length=2, color="#999")
+
+    # ШКАЛА ЦЕНЫ — редкие деления справа, как на платформе автора.
+    ax.yaxis.tick_right()
+    span = hi - lo
+    raw = span / 6
+    mag = 10 ** int(f"{raw:e}".split("e")[1])
+    step_y = max(raw // mag, 1) * mag
+    y0 = (int(lo / step_y) + 1) * step_y
+    yticks = []
+    yv = y0
+    while yv < hi:
+        yticks.append(yv)
+        yv += step_y
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{v:g}" for v in yticks], fontsize=7.5, color="#555")
+    ax.tick_params(axis="y", length=2, color="#999")
+
+    # ЛЕГЕНДА — только по значкам, реально попавшим на график: пустая легенда или
+    # легенда «про запас» была бы шумом. Словарь значков — авторский (стр. 19-47 + канал).
+    legend_words = {
+        "box": "рамка — структура (накопление)",
+        "entry": "полоса справа — зона входа",
+        "arrow": "стрелка — уровень отработан",
+        "flip": "× — пробит, сменил сторону",
+        "pp": "фиолетовая полоса — зона ПП",
+    }
+    lines = [legend_words[k] for k in ("box", "entry", "arrow", "flip", "pp")
+             if k in used_marks]
+    if lines:
+        ax.annotate(
+            chr(10).join(lines), xy=(0.01, 0.985), xycoords="axes fraction",
+            va="top", ha="left", fontsize=7.2, color="#444",
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white",
+                  "edgecolor": "#cccccc", "alpha": 0.85},
+            zorder=10,
+        )
+
     ax.set_xlim(-1, right)
     ax.set_ylim(lo, hi)
-    ax.set_yticks([])
-    ax.set_xticks([])
     for side in ("top", "right", "left", "bottom"):
         ax.spines[side].set_visible(False)
     title = f"{symbol} · {timeframe} · карта уровней hunter"
