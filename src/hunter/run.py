@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import statistics
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -1965,17 +1966,16 @@ OUTCOME_LABEL = {
 """
 
 
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    mid = len(s) // 2
-    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+# Самописная `_median` удалена 2026-08-17 (правило библиотеки): она дословно
+# дублировала `statistics.median` (та же семантика чётного n — среднее двух средних,
+# проверено на [1,2,3,4] → 2.5 обоими). Дубль без строки-обоснования — дефект.
 
 
 def _spread(xs: list[float]) -> str:
     """Медиана и края. Одно среднее по такой выборке скрывает ровно то, что важно."""
     if not xs:
         return "нечего считать (0 значений)"
-    return (f"значений {len(xs)}, медиана {_median(xs):.3f}, "
+    return (f"значений {len(xs)}, медиана {statistics.median(xs):.3f}, "
             f"от {min(xs):.3f} до {max(xs):.3f}")
 
 
@@ -2255,7 +2255,7 @@ def print_report(r: RunReport) -> int:
     print(f"   дистанция стопа, % цены: {_spread(r.emitted_stop_pct)}")
     print("   КОМИССИИ, ФАНДИНГ И ПРОСКАЛЬЗЫВАНИЕ НЕ МОДЕЛИРУЮТСЯ НИГДЕ.")
     if r.emitted_stop_pct:
-        med = _median(r.emitted_stop_pct)
+        med = statistics.median(r.emitted_stop_pct)
         print(f"     ориентир: круговая комиссия тейкера ~0.1% цены при медианном стопе "
               f"{med:.3f}% — это около {0.1 / med * 100:.0f}% риска на сделку")
 
