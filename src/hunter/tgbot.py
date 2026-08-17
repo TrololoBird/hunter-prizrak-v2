@@ -83,7 +83,14 @@ CHART_TFS = ("4h", "1h", "15m")
 BARS_ON_CHART = 180
 
 MESSAGES_PER_ANSWER = len(CHART_TFS) + 1
-"""Три картинки и текст. Число используется в арифметике лимитов, поэтому выводится."""
+"""Три картинки и текст. Выводится из состава ответа, а не пишется числом.
+
+⚠ 2026-08-17 эта константа была объявлена и НЕ ИСПОЛЬЗОВАНА НИГДЕ — то есть ровно тот
+дефект («ключ без потребителя»), который в тот же день был найден в `universe.toml` у
+`admission_required_bars` и годом раньше у `bars_per_timeframe`. Нашёл её механический
+обход объявлений, а не чтение. Теперь она работает: `publish_pinned` считает ею, сколько
+сообщений уйдёт в канал, и сравнивает с лимитом Telegram.
+"""
 
 PUBLISH_DELAY_S = float(service.CYCLE_SECONDS)
 """Через сколько после закрытия бара публиковать закреплённые. Выведено из такта службы.
@@ -953,6 +960,16 @@ class Delivery:
             log.degraded("публикация закреплённых пуста: список pinned не задан",
                          файл=str(self.cfg.source) if self.cfg.source else "нет файла")
             return 1
+        # Объём публикации считается ДО неё и сравнивается с лимитом: 20 сообщений в
+        # минуту в один чат — предел Telegram, и очередь `Pacer` его соблюдает растягивая
+        # отправку. Значит длинный список закреплённых не теряется, а РАСТЯГИВАЕТСЯ, и
+        # владелец обязан знать, на сколько.
+        planned = len(self.cfg.pinned) * MESSAGES_PER_ANSWER
+        if planned > Pacer.PER_MINUTE:
+            log.warn("публикация длиннее минуты: сообщений больше лимита Telegram",
+                     сообщений=planned, лимит_в_минуту=Pacer.PER_MINUTE,
+                     монет=len(self.cfg.pinned),
+                     примерно_минут=round(planned / Pacer.PER_MINUTE, 1))
         sent = failed = 0
         for raw in self.cfg.pinned:
             symbol = self.index.resolve(raw)
