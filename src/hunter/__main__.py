@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import sqlite3
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -82,7 +83,13 @@ HORIZON_DAYS = 180
 def _run(args: argparse.Namespace) -> int:
     uni = load_universe(args.universe)
     if args.symbols:
-        uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
+        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
+        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
+        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
+        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
+        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
+        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
+        uni = replace(uni, symbols=uni.symbols[: args.symbols])
     from . import log
     from .run import (
         collect,
@@ -125,7 +132,13 @@ def _serve(args: argparse.Namespace) -> int:
 
     uni = load_universe(args.universe)
     if args.symbols:
-        uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
+        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
+        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
+        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
+        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
+        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
+        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
+        uni = replace(uni, symbols=uni.symbols[: args.symbols])
     bad = asyncio.run(serve(uni, args.seed_limit, args.horizon_days, args.run_id,
                             cycle_seconds=args.cycle_seconds, max_cycles=args.cycles))
     return 1 if bad else 0
@@ -137,7 +150,13 @@ def _check(args: argparse.Namespace) -> int:
 
     uni = load_universe(args.universe)
     if args.symbols:
-        uni = Universe(uni.symbols[: args.symbols], uni.timeframes, uni.source)
+        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
+        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
+        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
+        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
+        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
+        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
+        uni = replace(uni, symbols=uni.symbols[: args.symbols])
     return 1 if run_check(uni, args.seconds, args.seed_limit) else 0
 
 
@@ -325,9 +344,51 @@ def _ledger(args: argparse.Namespace) -> int:
             return 1
         except sqlite3.OperationalError as e:
             print(f"    попытка записи отклонена СУБД: {e}")
+        mixed = _journal_vs_universe(conn, load_universe(args.universe))
     finally:
         conn.close()
-    return 0
+    return 1 if mixed else 0
+
+
+def _journal_vs_universe(conn: sqlite3.Connection, uni: Universe) -> int:
+    """ИЗ ЧЕГО СОСТОИТ ЖУРНАЛ: символы вселенной против всех прочих. Возвращает лишние.
+
+    ⚠ ЗАЧЕМ ЭТО ЗДЕСЬ. Запрос «результат в R» считает по ВСЕЙ таблице исходов, и до
+    2026-08-17 никто не спрашивал, из чего эта таблица состоит. Замер: 49 сигналов из 192
+    (26%) записаны по символам ВНЕ закреплённой вселенной — `BTW`, `BEAT` и `XAU`, причём
+    XAU это золото, которое FOUNDATION §5 называет дословно в списке исключённых. То есть
+    владельцу печатался средний R, посчитанный в том числе по золоту, и узнать об этом по
+    выдаче было нельзя.
+
+    Это ровно тот класс, который CLAUDE.md называет главным: «всякая накопленная
+    статистика обязана называть, по какой ПОДВЫБОРКЕ она посчитана».
+
+    Строки НЕ удаляются и удалены здесь не будут: журнал боевой, удаление необратимо, и
+    решение о нём принимает владелец. Задача этой функции — сделать смесь видимой числом.
+    """
+    known = set(uni.symbols)
+    rows = conn.execute(
+        "SELECT symbol, COUNT(*) FROM signals GROUP BY symbol ORDER BY 2 DESC").fetchall()
+    total = sum(int(n) for _, n in rows)
+    outside = [(str(s), int(n)) for s, n in rows if s not in known]
+    extra = sum(n for _, n in outside)
+    print(f"\n### из чего состоит журнал (вселенная {uni.source})")
+    print(f"    символов в журнале: {len(rows)}, из них вне вселенной: {len(outside)}")
+    print(f"    сигналов: {total}, из них вне вселенной: {extra}"
+          f" ({extra / total * 100:.1f}%)" if total else "    сигналов: 0")
+    if not outside:
+        print("    ⚠ ноль лишних символов — это ЗАМЕР, а не отсутствие проверки:"
+              f" сверено {len(rows)} символов со списком из {len(known)}")
+        return 0
+    for sym, n in outside:
+        named = " — §5 называет его в списке ИСКЛЮЧЁННЫХ" if sym.split("/")[0] in {
+            "XAU", "XAG", "PAXG"} else ""
+        print(f"    ⚠ {sym}: {n} сигналов, во вселенной НЕ значится{named}")
+    print("    СЛЕДСТВИЕ: «средний R» и «сколько сделок» выше посчитаны ВМЕСТЕ с этими")
+    print("    символами. Число выше — не результат системы на её вселенной.")
+    print("    Решение владельца: либо эти символы войдут во вселенную (§5), либо их")
+    print("    строки уйдут из журнала. Ни того, ни другого код сам не делает.")
+    return extra
 
 
 def _replay(args: argparse.Namespace) -> int:
@@ -401,8 +462,17 @@ def main(argv: list[str] | None = None) -> int:
 
     led = sub.add_parser("ledger", help="три проверочных запроса к леджеру (§10.6)")
     led.add_argument("--init", action="store_true", help="создать базу со схемой")
+    led.add_argument("--universe", type=Path, default=DEFAULT_PATH,
+                     help="с чем сверять состав журнала: сигналы по символам вне "
+                          "вселенной делают «средний R» числом по другой выборке")
 
-    sub.add_parser("bot", help="ТЕЛЕГРАМ-БОТ доставки: тикер → скриншоты карты + сводка")
+    tg = sub.add_parser("bot", help="ТЕЛЕГРАМ-БОТ доставки: тикер → скриншоты карты + сводка")
+    tg.add_argument("--universe", type=Path, default=DEFAULT_PATH)
+    tg.add_argument("--horizon-days", type=int, default=HORIZON_DAYS,
+                    help="глубина структур при сборке монеты ВНЕ вселенной по запросу")
+    tg.add_argument("--publish-now", action="store_true",
+                    help="разово опубликовать закреплённые монеты в канал и выйти — "
+                         "проверка канала одной командой, без ожидания закрытия бара")
 
     rep = sub.add_parser("replay",
                          help="ПОВТОР: пересобрать карточку из кадров и показать разницу")
@@ -427,7 +497,9 @@ def main(argv: list[str] | None = None) -> int:
         return _replay(args)
     if args.cmd == "bot":
         from .tgbot import main as bot_main
-        return asyncio.run(bot_main())
+        return asyncio.run(bot_main(horizon_days=args.horizon_days,
+                                    publish_now=args.publish_now,
+                                    universe=args.universe))
     return 2
 
 
