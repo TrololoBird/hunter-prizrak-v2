@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import bisect
 from decimal import Decimal
 from enum import StrEnum
 
@@ -484,11 +485,22 @@ def _with_vrvp(built: list[Level], trades: TradeWindows | None) -> list[Level]:
         # вытесненный кэш — причина называется, а не глотается.
         note = f"композит (окно структуры {widest.timeframe}) не прочитан: {comp.reason}"
         return [lv.model_copy(update={"vrvp_note": note}) for lv in built]
+    # ⚠ СРЕЗ ПО BISECT, А НЕ ПРОВЕРКА КАЖДОГО БИНА — правка 2026-08-17 по живому стеку
+    # (py-spy на serve: рабочий поток стоял в `bin_price`, профиль насчитал 11.7 млн
+    # вызовов). Композит держит сотни тысяч бинов, и прежний генератор обходил ВСЕ на
+    # КАЖДЫЙ уровень. Бины возрастают (гистограмма собрана prefix-проходом по k), цены
+    # `b*tick` монотонны — значит зона это НЕПРЕРЫВНЫЙ срез, его края находит bisect по
+    # ТЕМ ЖЕ значениям float, что сравнивал старый код, а сумма идёт по тем же
+    # элементам в том же порядке возрастания бина: числа байт-в-байт прежние
+    # (подтверждено диффом повтора).
+    keys = sorted(comp.qty_by_bin)
+    prices = [float(comp.bin_price(b)) for b in keys]
     out: list[Level] = []
     for lv in built:
         lo, hi = float(lv.zone_lo), float(lv.zone_hi)
-        zone = sum(q for b, q in comp.qty_by_bin.items()
-                   if lo <= float(comp.bin_price(b)) <= hi)
+        i = bisect.bisect_left(prices, lo)
+        j = bisect.bisect_right(prices, hi)
+        zone = sum(comp.qty_by_bin[b] for b in keys[i:j])
         out.append(lv.model_copy(update={
             "vrvp_zone_qty": zone, "vrvp_total_qty": comp.qty_seen,
             "vrvp_note": f"окно композита — структура {widest.timeframe}"}))

@@ -125,6 +125,7 @@ def first_breach(
     timeframe: str,
     *,
     from_index: int = 0,
+    to_index: int | None = None,
     confirm_bodies: int = CONFIRM_BODIES,
     return_bars: int = RETURN_BARS,
 ) -> Breach | None:
@@ -159,7 +160,12 @@ def first_breach(
         return Breach(kind=kind, direction=direction, level=level, start_index=start,
                       resolved_index=at, extreme=extreme, bodies=best_run)
 
-    for i in range(from_index, len(bars)):
+    # ⚠ `to_index` добавлен 2026-08-17 по живому стеку: pereprior ограничивал окно
+    # поиска СРЕЗОМ `bars[:end]` — копией до 51 тыс. объектов на каждого кандидата
+    # (кандидатов сотни, ряд один). Верхняя граница итерации даёт ту же семантику без
+    # копии: индексы абсолютные, обход тот же, дифф повтора пуст.
+    stop = len(bars) if to_index is None else min(to_index, len(bars))
+    for i in range(from_index, stop):
         bar = bars[i]
         if i > from_index and steps_between(bars[i - 1], bar, timeframe) != 1:
             run = 0  # дыра в ряду разрывает серию подряд идущих тел (стр. 55)

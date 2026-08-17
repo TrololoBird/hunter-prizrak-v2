@@ -122,9 +122,22 @@ def _detect_side(
     if len(others) < 2:
         return None
 
+    # ⚠ ДВА УКАЗАТЕЛЯ ВМЕСТО ФИЛЬТРА НА КАЖДОМ ШАГЕ — правка 2026-08-17 по живому
+    # стеку (py-spy: decide жил здесь минутами на 5м-ряде в 51 тыс. баров). Прежний
+    # код на КАЖДОМ `last_other` собирал `[s for s in ordered if s.kind is broken_kind
+    # and s.index < last_other.index]` — O(свингов²), сотни миллионов итераций на
+    # символ. `ordered` отсортирован по index, поэтому «последний broken строго до
+    # last_other» ищется одним проходом: указатель `bi` только движется вперёд.
+    # Семантика тождественна (тот же candidates[-1]); дифф повтора пуст.
+    brokens = [s for s in ordered if s.kind is broken_kind]
+
     found: Pereprior | None = None
+    bi = 0
     for i in range(1, len(others)):
         prev_other, last_other = others[i - 1], others[i]
+        while bi < len(brokens) and brokens[bi].index < last_other.index:
+            bi += 1
+        last_broken = brokens[bi - 1] if bi > 0 else None
 
         # Стр. 50 против стр. 51: обновился ли хай (для шорта) / лой (для лонга).
         # ⚠ Считается по состоянию НА ТОТ МОМЕНТ, а не по последним двум экстремумам
@@ -182,11 +195,9 @@ def _detect_side(
         # ⚠ ЦЕНА ВЫБОРА НАЗВАНА, а не спрятана: у 5.37% хаёв зона ПП строится по соседней
         # свече, и в 24 случаях из 55 это больше процента цены. Лечится только данными
         # мельче бара (тиками либо минутками внутри бара), которых у этого расчёта нет.
-        candidates = [s for s in ordered
-                      if s.kind is broken_kind and s.index < last_other.index]
-        if not candidates:
+        if last_broken is None:
             continue
-        broken: Swing = candidates[-1]
+        broken: Swing = last_broken
 
         # Конфигурация «последний хай + его лой» действует, пока не появился следующий
         # хай: после него «последним» становится уже он, и слом относился бы к другой
@@ -208,8 +219,8 @@ def _detect_side(
         # зоны) дал 844 и изменил число у 18 рядов из 18 — зависимость от положения края
         # монотонна, разница реальна, а не артефакт.
         edge = hi if side is PPSide.SHORT else lo
-        ev = first_breach(bars[:end], edge, direction, timeframe, from_index=start,
-                          confirm_bodies=confirm_bodies)
+        ev = first_breach(bars, edge, direction, timeframe, from_index=start,
+                          to_index=end, confirm_bodies=confirm_bodies)
         if ev is None or ev.kind is not BreachKind.BREAKOUT or ev.resolved_index is None:
             # Прокол подтверждением не является (стр. 55) — переприора нет.
             continue

@@ -98,6 +98,10 @@ class StopVolumeSet(BaseModel):
         return sum(1 for x in self.densities if x <= d) / len(self.densities) * 100
 
 
+_VOL_MEMO: dict[tuple[int, int, int, int, int], float] = {}
+"""Суммы объёма спанов младших накоплений: см. комментарий при использовании."""
+
+
 def _placement(small: Accumulation, host: Accumulation,
                small_bars: list[Bar], host_bars: list[Bar]) -> Placement:
     if small_bars[small.last_index].open_ms < host_bars[host.first_index].open_ms:
@@ -128,7 +132,21 @@ def classify(
         rng = a.upper.edge - a.lower.edge
         if rng <= 0:
             continue
-        vol = sum(b.volume for b in small_bars[a.first_index:a.last_index + 1])
+        # ⚠ МЕМО ПО СПАНУ — правка 2026-08-17 по живому стеку (py-spy): одни и те же
+        # накопления младшего ТФ пересуммировались для КАЖДОЙ структуры-хозяина заново —
+        # сотни хостов × сотни спанов × сотни баров за цикл. Значение в кэше — та же
+        # последовательность сложений float, выполненная один раз: байт-в-байт то же
+        # число (дифф повтора пуст). Ключ несёт отпечаток ряда (края и длина), id не
+        # используется — переиспользование id после сборки мусора дало бы ложное
+        # попадание.
+        memo_key = (small_bars[0].open_ms, small_bars[-1].open_ms, len(small_bars),
+                    a.first_index, a.last_index)
+        vol = _VOL_MEMO.get(memo_key)
+        if vol is None:
+            vol = sum(b.volume for b in small_bars[a.first_index:a.last_index + 1])
+            if len(_VOL_MEMO) > 100_000:
+                _VOL_MEMO.clear()
+            _VOL_MEMO[memo_key] = vol
         items.append(
             StopVolume(
                 accumulation=a,
