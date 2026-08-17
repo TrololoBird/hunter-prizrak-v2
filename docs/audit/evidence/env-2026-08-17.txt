@@ -1,0 +1,7 @@
+8276d1f Строгое неравенство в pereprior обосновано: порядок внутри бара из OHLC не следует
+?? docs/audit/evidence/env-2026-08-17.txt
+main
+Python uv 0.12.0 (b88d7c5c4 2026-07-28 x86_64-pc-windows-msvc)
+ccxt 4.5.71 | polars 1.43.2
+7298b533e18e15ed2f6c09d3835bd8b65ae7edb4333c0b843cbead2e59bbf958 *uv.lock
+python (uv run): 3.12.13 (main, Jul 23 2026, 14:44:57) [MSC v.1944 64 bit (AMD64)]
