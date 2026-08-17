@@ -54,9 +54,8 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(git commit*)",
             "command": "uv run python ${CLAUDE_PROJECT_DIR}/.claude/hooks/commit_gate.py",
-            "timeout": 300
+            "timeout": 600
           },
           {
             "type": "command",
