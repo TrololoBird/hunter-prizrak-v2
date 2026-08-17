@@ -67,6 +67,13 @@ def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
 
 
 CACHE_DIR = Path("data/aggcache")
+
+GROUPED_MAX = 1024
+"""Ёмкость кэша сгруппированных суток `TradeWindows._grouped`. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО, а
+ВЫВЕДЕНО из размера: сгруппированные сутки — тысячи строк по три колонки (~десятки КБ),
+1024 суток ≈ единицы-десятки МБ; окна структур достают до ~525 суток назад
+(evidence/serve-2026-08-17.log, просили=756422 минуток), значит ёмкость накрывает всё
+окно с запасом и вытеснения в норме не происходит вовсе."""
 CACHE_LAYOUT = "b2"
 """Метка СХЕМЫ БИНИРОВАНИЯ в имени файла кэша.
 
@@ -407,6 +414,40 @@ class WindowSource:
 
         self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
         self._open_parts: dict[date, tuple[pl.DataFrame, int] | None] = {}
+        self._part_idx: dict[str, tuple[Path, int]] | None = None
+        """Индекс частичных суток каталога, построенный ОДНИМ обходом при первом
+        обращении. До 2026-08-17 каждые непокрытые сутки каждого окна глобили каталог
+        заново: профиль повтора насчитал 4429 обходов на 33 секунды
+        (`evidence/profile-replay-after-2026-08-17.txt`). Экземпляр живёт один цикл, а
+        частичные файлы пишет только бэкфилл ДО построения источников — устаревание
+        индекса внутри цикла невозможно по порядку шагов `service.cycle`."""
+        self._grouped: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        """Гистограммы ЦЕЛЫХ суток, сгруппированные один раз. Окна структур перекрываются
+        по суткам (профиль повтора 2026-08-17: 329 вызовов `window` на 3 символа), и без
+        кэша одни и те же сутки группировались заново под каждым окном — 76% времени
+        расчёта жило здесь (`evidence/profile-replay-2026-08-17.txt`)."""
+
+    def _grouped_day(self, day: date, frame: pl.DataFrame) -> pl.DataFrame:
+        """Пер-биновая гистограмма ЦЕЛЫХ суток, считаная один раз на экземпляр.
+
+        Эквивалентность старому пути точная, а не приблизительная: для суток, целиком
+        лежащих в окне, фильтр `[from_ms, to_ms)` не отбрасывает ни строки (все `bucket`
+        суточного файла лежат внутри суток по построению файла), значит группируется ТОТ
+        ЖЕ кадр с тем же `maintain_order=True` — те же группы в том же порядке, те же
+        суммы в том же порядке сложения. Дифф повтора обязан быть пустым и проверен.
+
+        Ёмкость — своя (`GROUPED_MAX`), не `max_open`: сгруппированные сутки в сотни раз
+        меньше сырых (~тысяча бинов против сотен тысяч сделок), держать их можно годами
+        окон."""
+        if day in self._grouped:
+            self._grouped.move_to_end(day)
+            return self._grouped[day]
+        g = frame.group_by("bin", maintain_order=True).agg(pl.col("qty").sum(),
+                                                           pl.col("n").sum())
+        self._grouped[day] = g
+        while len(self._grouped) > GROUPED_MAX:
+            self._grouped.popitem(last=False)
+        return g
 
     def _day(self, day: date) -> pl.DataFrame | None:
         """Сутки из кэша. Скачивания здесь НЕТ: это работа бэкфилла, а не расчёта."""
@@ -432,7 +473,18 @@ class WindowSource:
         """
         if day in self._open_parts:
             return self._open_parts[day]
-        found = find_part(self.cache_dir, self.market_id, day, self.tick)
+        if self._part_idx is None:
+            idx: dict[str, tuple[Path, int]] = {}
+            for p in self.cache_dir.glob("*-part*.parquet"):
+                m = re.fullmatch(r"(.+)-part(\d+)", p.stem)
+                if not m:
+                    continue
+                stem, cover = m.group(1), int(m.group(2))
+                cur = idx.get(stem)
+                if cur is None or cover > cur[1]:
+                    idx[stem] = (p, cover)
+            self._part_idx = idx
+        found = self._part_idx.get(cache_path(self.market_id, day, self.tick).stem)
         if found is None:
             self._open_parts[day] = None
             return None
@@ -462,6 +514,7 @@ class WindowSource:
                        .timestamp() * 1000)
             day_end = day0 + 86_400_000
             frame = self._day(day)
+            full_day = frame is not None
             if frame is None:
                 got_part = self._part(day)
                 if got_part is None:
@@ -488,14 +541,26 @@ class WindowSource:
             # единственной проверкой, не требующей чтения кода. Шумящий на ровном месте
             # дифф эту проверку обесценивает — владелец не может отличить правку от
             # порядка сложения.
-            part = frame.filter(
-                (pl.col("bucket") >= from_ms) & (pl.col("bucket") < to_ms)
-            ).group_by("bin", maintain_order=True).agg(pl.col("qty").sum(),
-                                                       pl.col("n").sum())
-            for row in part.iter_rows(named=True):
-                idx = int(row["bin"])
-                qty[idx] = qty.get(idx, 0.0) + float(row["qty"])
-                cnt[idx] = cnt.get(idx, 0) + int(row["n"])
+            # ⚠ ДВА ПУТИ К ОДНОМУ ОТВЕТУ, и это оптимизация 2026-08-17, а не логика:
+            # профиль повтора показал 76% времени расчёта в этой функции — одни и те же
+            # целые сутки группировались заново под каждым перекрывающим окном, а строки
+            # конвертировались в Python по одной (8.7 млн вызовов iter_rows). Целые
+            # сутки внутри окна берутся из кэша `_grouped_day` (эквивалентность — в его
+            # докстроке), края и частичные сутки — прежним фильтром. Накопление идёт
+            # колонками в ТОМ ЖЕ порядке строк: значения и порядок сложения float не
+            # изменились, дифф повтора пуст (проверено, evidence в протоколе смены).
+            if full_day and day0 >= from_ms and day_end <= to_ms:
+                part = self._grouped_day(day, frame)
+            else:
+                part = frame.filter(
+                    (pl.col("bucket") >= from_ms) & (pl.col("bucket") < to_ms)
+                ).group_by("bin", maintain_order=True).agg(pl.col("qty").sum(),
+                                                           pl.col("n").sum())
+            for idx_raw, q, n in zip(part["bin"].to_list(), part["qty"].to_list(),
+                                     part["n"].to_list(), strict=True):
+                idx = int(idx_raw)
+                qty[idx] = qty.get(idx, 0.0) + float(q)
+                cnt[idx] = cnt.get(idx, 0) + int(n)
 
         if missing and self.live is not None:
             # Сутки без архива добираются из живого потока — РОВНО недостающие, а не всё
