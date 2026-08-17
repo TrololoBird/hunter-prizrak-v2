@@ -109,22 +109,26 @@ opentrader вернул 0 при ccxt-файлах, видимых в клоне
 | 18 | ccxt (сам, examples) | 43k | официальные образцы: async-пагинация, `fetch-ohlcv-multiple-symbols-continuously`, работа от closing time (examples/py) |
 | 19 | supertrend-crypto-bot | 413 | канонический минимум: опрос `fetch_ohlcv('1m', limit=100)` по расписанию, без истории (supertrend.py:91) |
 | 20 | kupi-terminal | ~2k | on-demand: `fetchOHLCV(symbol, tf, undefined, optimalLimit)` по запросу интерфейса (dataActions.ts:529) |
+| 21 | Superalgos | 5.6k | последовательный сенсор-бот: ccxt `fetchOHLCV` limit=1000, rateLimit=500; биржи без OHLCV — эмуляция через fetchTrades; сырые файлы по датам (Sensor-Bot/Exchange-Raw-Data/HistoricOHLCVs.js:41-81; `"ccxt": "^2.7.62"` в package.json) |
 
-**Исключены с названной причиной:** Superalgos (клон не собрался, а поиску кода GitHub
-верить нельзя — НЕ ВЕРИФИЦИРОВАН, не «не использует»), lumibot / zvt-ядро / OpenBB /
+⚠ Поправка того же дня: в первой редакции Superalgos стоял в исключённых
+(«не верифицирован» — клон не материализовался, а поиску кода GitHub верить нельзя).
+Дочитан напрямую из git-объектов клона и package.json — использует ccxt, строка 21.
+
+**Исключены с названной причиной:** lumibot / zvt-ядро / OpenBB /
 manu354 (ccxt в коде не найден). Не-ccxt лидеры (hummingbot, gocryptotrader,
 nautilus_trader, cryptofeed, gekko, tribeca) — в таблице §2 как контекст.
 
-**Синтез по 20 (что встречается и сколько раз):**
-* **последовательная пагинация со sleep — 7 из 20** (vectorbt, jesse, opentrader,
-  Crypto-Signal, catalyst, investing-algo, pyjuque): наш вчерашний паттерн — норма
+**Синтез по 21 (что встречается и сколько раз):**
+* **последовательная пагинация со sleep — 8 из 21** (vectorbt, jesse, opentrader,
+  Crypto-Signal, catalyst, investing-algo, pyjuque, Superalgos): наш вчерашний паттерн — норма
   жанра, а не наш личный дефект; и именно поэтому freqtrade с gather×100 выделяется;
-* **параллельные заранее вычисленные страницы — 1 из 20** (freqtrade, самый крупный) —
+* **параллельные заранее вычисленные страницы — 1 из 21** (freqtrade, самый крупный) —
   ровно сегодняшняя наша правка, чужим кодом подтверждена;
-* **база 1m с локальной сборкой старших ТФ — 3 из 20** (jesse полностью, passivbot
+* **база 1m с локальной сборкой старших ТФ — 3 из 21** (jesse полностью, passivbot
   «1m manager», opentrader курсор 1m): jesse-модель — не экзотика;
-* **бары из сделок — 1 из 20** (magic8bot) плюс nautilus вне выборки;
-* **WS-вотчеры свечей — 2 из 20** (Haehnchen гибрид, OctoBot задача-на-ряд);
+* **бары из сделок — 1 из 21 полностью** (magic8bot; у Superalgos — как эмуляция для бирж без OHLCV) плюс nautilus вне выборки;
+* **WS-вотчеры свечей — 2 из 21** (Haehnchen гибрид, OctoBot задача-на-ряд);
 * **пустые минуты — известная жанру проблема:** passivbot синтезирует нулевые свечи
   для дыр и НЕ хранит их — независимое подтверждение нашей находки о фантомной цене
   (§3): пустой минуте нельзя доверять цену.
