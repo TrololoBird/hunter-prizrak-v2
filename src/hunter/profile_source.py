@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import bisect
+from collections import OrderedDict
 from decimal import Decimal
 
 from .bars import tf_ms
@@ -56,6 +57,28 @@ MAX_BINS_PER_BAR = 200_000
 рынка: при шаге цены 0.1 это диапазон в 20 000 единиц котировки внутри одной минуты.
 Такой бар в профиль НЕ идёт и СЧИТАЕТСЯ (`bars_too_wide`), потому что молчаливый пропуск
 читался бы как «разложили всё»."""
+
+
+_WindowKey = tuple[str, str, str, int, int, int, int]
+_WINDOW_CACHE: OrderedDict[_WindowKey, TradeHistogram] = OrderedDict()
+_WINDOW_CACHE_MAX = 40
+_CACHE_MIN_BARS = 43_200
+"""Кэш ДОРОГИХ окон профиля, переживающий циклы службы (2026-08-17).
+
+Диагноз замером (evidence/profile-live-pipeline и зонд одного вызова): окно во весь
+минутный ряд BTC стоит 9.2 с, 30-суточное — 0.9 с, и КАЖДЫЙ цикл службы строил их
+заново — экземпляр `CandleWindows` живёт один цикл, а окна закрытых структур между
+циклами НЕ МЕНЯЮТСЯ. Отсюда расчётная фаза в часы на 27 символах.
+
+Устройство честности: ключ несёт ОТПЕЧАТОК ДАННЫХ (длина ряда и метка последнего бара
+в окне) — дорос ряд, изменилось окно → ключ другой, пересчёт; никакой инвалидации по
+времени. Кэшируются только окна от `_CACHE_MIN_BARS` минуток (30 суток): дешёвые
+(63 мс на двух сутках) выгоднее пересчитать, чем держать. Ёмкость 40 — это композиты
+VRVP всех символов вселенной плюс годовые окна старших ТФ.
+
+⚠ Возвращается ОБЩИЙ объект: контракт потребителей — только чтение (build_level и
+_with_vrvp гистограмму не мутируют). Значения при попадании в кэш БАЙТ-В-БАЙТ те же,
+что при пересчёте, — это тот же объект, порядок сложений не менялся вовсе."""
 
 
 class CandleWindows:
@@ -86,6 +109,15 @@ class CandleWindows:
     def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
         i = bisect.bisect_left(self._keys, from_ms)
         j = bisect.bisect_left(self._keys, to_ms)
+        cache_key = None
+        if j - i >= _CACHE_MIN_BARS:
+            cache_key = (self.symbol, self.timeframe, str(self.tick), from_ms, to_ms,
+                         j - i, self._keys[j - 1] if j > i else 0)
+            hit = _WINDOW_CACHE.get(cache_key)
+            if hit is not None:
+                _WINDOW_CACHE.move_to_end(cache_key)
+                self.windows_built += 1
+                return hit
         chunk = self.bars[i:j]
         if not chunk:
             self.windows_refused += 1
@@ -143,4 +175,8 @@ class CandleWindows:
             self.windows_refused += 1
             return NotReady(reason=f"{self.symbol}: в окне {from_ms}..{to_ms} нет объёма")
         self.windows_built += 1
+        if cache_key is not None:
+            _WINDOW_CACHE[cache_key] = h
+            while len(_WINDOW_CACHE) > _WINDOW_CACHE_MAX:
+                _WINDOW_CACHE.popitem(last=False)
         return h
