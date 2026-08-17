@@ -235,11 +235,14 @@ def _profile(args: argparse.Namespace) -> int:
 
 def _admission(args: argparse.Namespace) -> int:
     """Хватает ли истории, чтобы величины §2.9 вообще существовали."""
-    from .admission import REQUIRED_BARS, admits, unavailable_quantities
+    from .admission import REQUIRED_BARS, admits, seed_floor, unavailable_quantities
     from .exchange import Exchange
 
     uni = load_universe(args.universe)
-    required = args.required or max(REQUIRED_BARS.values())
+    # ⚠ До 2026-08-17 умолчанием стоял max(REQUIRED_BARS.values()) = 304 — порог от
+    # adx14, который система не считает; сборщик при этом гарантирует seed_floor().
+    # Отчёт судил бы владельцу «не проходит» по планке, которой не требует ничто.
+    required = args.required or seed_floor()
 
     async def survey() -> list[tuple[str, dict[str, int], tuple[str, ...]]]:
         """⚠ Третий элемент — ТФ, на которых счёт НЕ СОСТОЯЛСЯ (обратная сверка с ccxt,
@@ -269,7 +272,11 @@ def _admission(args: argparse.Namespace) -> int:
     rows = asyncio.run(survey())
     tfs = list(uni.timeframes)
     print(f"ДОПУСК: порог {required} баров на каждом ТФ")
-    print(f"Требования замерены: {REQUIRED_BARS} (docs/audit/wilder-reference-2026-08-03.md)")
+    # ⚠ Указатель уточнён 2026-08-17: wilder-reference покрывает только ATR/RSI (и сам
+    # говорит об этом строкой 79); точки каноничности ВСЕХ величин держит гейт
+    # gates/formula_reference.py на каждом прогоне CI.
+    print(f"Требования замерены: {REQUIRED_BARS} (ATR/RSI — "
+          f"docs/audit/wilder-reference-2026-08-03.md; все — gates/formula_reference.py)")
     print()
     print(f"(счёт с отсечкой на {required}: большее значение означает «не меньше»)")
     print()

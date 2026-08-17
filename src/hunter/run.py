@@ -65,12 +65,21 @@ def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
     (`bars.bars_needed`), и ряды становятся сопоставимыми: 180 суток на 5м это 51 840
     баров, на 1Д — 180, и оба накрывают одно и то же календарное окно.
 
-    Нижняя граница — самое длинное требование величин §2.9, и это `adx14` с 304 барами,
-    а не ema200 с 200: ряд короче не даёт доп-факторов независимо от горизонта.
-    """
-    from .admission import REQUIRED_BARS
+    Нижняя граница — `admission.seed_floor()`: строжайшее требование среди величин,
+    которые система СЧИТАЕТ (§2.9 плюс atr14), сейчас это ema200 с 200 барами. Ряд
+    короче не даёт доп-факторов независимо от горизонта.
 
-    floor = max(REQUIRED_BARS.values())
+    ⚠ До 2026-08-17 здесь стояло `max(REQUIRED_BARS.values())` = 304 бара от `adx14`
+    с подписью «требование §2.9» — ложной дважды: §2.9 ADX не называет, и adx14 не
+    считается нигде в `src`. Разбор: docs/audit/session-2026-08-17-auto.md.
+    """
+    from .admission import seed_floor
+
+    # +1: просимая глубина включает ФОРМИНГ-БАР, который `fetch_closed_ohlcv` снимет.
+    # Без единицы ряд из ровно floor баров давал floor-1 закрытых, и ema200 честно
+    # уходила в NotReady на всех ТФ, где глубину задаёт floor, а не горизонт (1Д, 1Н
+    # при горизонте 180 суток) — перекос вдоль ТФ, найден rules-auditor 2026-08-17.
+    floor = seed_floor() + 1
     if seed_limit > 0:
         return max(floor, seed_limit)
     return bars_needed(timeframe, horizon_days, floor)

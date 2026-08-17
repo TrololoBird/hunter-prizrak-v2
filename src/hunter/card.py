@@ -384,7 +384,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"{sw_tail.reason}")
             continue
         sw = sw_tail
-        # RSI за уровнем 70/30 — доп-фактор со скриншота стр. 64 (реестр, строка 8).
+        # RSI за уровнем 70/30 — доп-фактор; числа из классики (Уайлдер), НЕ из курса:
+        # на скриншоте стр. 64 пунктир не подписан (indicators-course-2026-08-17.md).
         # Тот же явный допуск, что у дивергенций ниже.
         if admission.check("rsi14", len(bars), d.symbol, tf) is None:
             rz = factors.rsi_zone(_series(bars, indicators.rsi())[-1])
