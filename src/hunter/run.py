@@ -764,8 +764,21 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             log.degraded("профиль: инструмент недоступен", символ=sym,
                          причина=inst.reason)
             continue
-        wins, used, dropped = profile_windows(bars_of(report, sym), horizon_days)
+        series = bars_of(report, sym)
+        wins, used, dropped = profile_windows(series, horizon_days)
         if not wins:
+            # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
+            # свечей, а без свечей — ни одного уровня; при этом в отчёте не оставалось
+            # ни счётчика, ни строки. Полный проход вселенной 2026-08-17: карту получили
+            # 9 символов из 27, сводка напечатала «новых уровней 14711», и назвать
+            # пропущенных было нечем. Причина у пустых окон ровно две, и они РАЗНЫЕ —
+            # рядов нет вовсе против «структуры есть, но все старше горизонта», — поэтому
+            # печатаются обе.
+            report.profile_symbols_no_windows += 1
+            log.degraded("профиль: окон структур нет — уровней у символа не будет",
+                         символ=sym, рядов=len(series),
+                         баров=sum(len(b) for b in series.values()),
+                         отброшено_горизонтом=dropped, горизонт_суток=horizon_days)
             continue
         merged = merge_windows(wins, page_ms)
         report.profile_windows += used
@@ -792,7 +805,13 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             report.profile_bars_stored += added
             report.profile_bars_rewritten += rewritten
             report.profile_spans_filled += 1
+    # ⚠ ЗНАМЕНАТЕЛЬ В ЭТОЙ ЖЕ СТРОКЕ. Прежде она печатала только то, что УДАЛОСЬ, и
+    # «окон 1970, добрано 1» читалось как успех при девяти обслуженных символах из
+    # двадцати семи. Теперь видно, скольких символов сводка касается вообще.
     log.info("профиль: свечи под окна структур", тф=tf,
+             символов=len(uni.symbols),
+             символов_без_окон=report.profile_symbols_no_windows,
+             символов_без_инструмента=report.profile_symbols_skipped,
              окон=report.profile_windows, отброшено_по_горизонту=report.profile_windows_dropped,
              участков_добрано=report.profile_spans_filled,
              участков_из_хранилища=report.profile_spans_cached,
