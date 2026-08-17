@@ -287,3 +287,57 @@ def find_gaps(bars: list[Bar], timeframe: str) -> list[tuple[int, int]]:
         if cur.open_ms - prev.open_ms != step:
             out.append((prev.open_ms, cur.open_ms))
     return out
+
+
+def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
+    """Собрать бары ТФ из минуток — jesse-модель, принятая владельцем 2026-08-17.
+
+    Правило, без которого совпадения с биржей НЕТ: минуты с volume == 0 не участвуют
+    в OHLC. Пустая минута несёт фантомную цену — перенесённый close предыдущей, за
+    которым не стоит ни одной сделки; нативный бар биржи строится по сделкам и фантома
+    не видит (механизм найден на ASTR 2026-02-18 09:40). С правилом совпадение ТОЧНОЕ:
+    0 расхождений OHLC на 2 127 895 полных корзинах шести ТФ по 30 рынкам
+    (`docs/audit/probes/probe_resample_2026-08-17.py`,
+    `evidence/probe-resample2-2026-08-17.txt`); объём — сумма всех минут, сходится с
+    нативным в пределах 1e-9 относительных (порядок сложения float).
+
+    Корзина, где НИ ОДНА минута не торговала, ПРОПУСКАЕТСЯ, и это названное
+    ограничение, а не забывчивость: нативная свеча такого периода — сплошной фантом
+    (o=h=l=c=перенесённый close), сверка зонда такие корзины не покрывала, а
+    сочинять цену без сделок запрещает §4.3. Дыра в ряду честнее выдуманного бара;
+    вызывающий видит её `gaps()`-ом.
+
+    Неполные КРАЙНИЕ корзины (начало ряда, форминг-хвост) возвращаются как есть —
+    отрезать их обязан вызывающий по своим часам (`is_closed`), как и для нативных
+    рядов; функция времени не знает (§10.3)."""
+    if not m1:
+        return []
+    step = tf_ms(timeframe)
+    anchor = grid_anchor_ms(timeframe)
+    out: list[Bar] = []
+    cur_bucket: int | None = None
+    traded = False
+    o = h = lo_ = c = 0.0
+    vol = 0.0
+    for b in sorted(m1, key=lambda x: x.open_ms):
+        bucket = (b.open_ms - anchor) // step * step + anchor
+        if bucket != cur_bucket:
+            if cur_bucket is not None and traded:
+                out.append(Bar(open_ms=cur_bucket, open=o, high=h, low=lo_,
+                               close=c, volume=vol))
+            cur_bucket = bucket
+            traded = False
+            vol = 0.0
+        vol += b.volume
+        if b.volume > 0:
+            if not traded:
+                o, h, lo_, c = b.open, b.high, b.low, b.close
+                traded = True
+            else:
+                h = max(h, b.high)
+                lo_ = min(lo_, b.low)
+                c = b.close
+    if cur_bucket is not None and traded:
+        out.append(Bar(open_ms=cur_bucket, open=o, high=h, low=lo_,
+                       close=c, volume=vol))
+    return out
