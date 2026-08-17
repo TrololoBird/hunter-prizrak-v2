@@ -49,6 +49,17 @@ from .models import (
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
 
+PAGE_CONCURRENCY = 8
+"""Сколько страниц пагинации свечей летит одновременно (2026-08-17).
+
+Восемь — потолок ОЧЕРЕДИ, а не темпа: темп держит троттлер ccxt по весу (rollingWindow,
+75% бюджета биржи), и уже при небольшой одновременности узкое место переезжает с
+сетевого круга (~200 мс/страница последовательно) на вес — где страница 499 и была
+оптимальна (249.5 бар/вес). Больше восьми не ускоряет заметно, но копит в памяти
+неразобранные ответы и укрупняет всплеск после паузы троттлера. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО
+ТОЧНО — выведено из отношения RTT к шагу троттлера (66 мс на вес 2); замер до/после
+всей правки — в протоколе сессии 2026-08-17."""
+
 OHLCV_PAGE = 499
 """Размер СТРАНИЦЫ при добре ряда глубже предела ccxt. Не 1000, и это расчёт, а не вкус.
 
@@ -1560,35 +1571,49 @@ class Exchange:
         # Без явного `since` глубина отсчитывается назад от СЕЙЧАС: запрос «дай N баров»
         # означает последние N, а не первые N от сотворения рынка.
         start = since_ms if since_ms is not None else clock.now_ms() - limit * step
+        # ⚠ ПАРАЛЛЕЛЬНО, а не курсором — переписано 2026-08-17 по вопросу владельца
+        # «почему бэкфилл такой долгий». Прежний цикл ждал каждую страницу по очереди и
+        # был ограничен временем СЕТЕВОГО КРУГА (~200 мс/страница по mtime файлов
+        # бэкфилла), расходуя 4-8% бюджета веса: узким местом была не биржа, а ожидание.
+        # Ключевое: результат предыдущей страницы для следующей НЕ НУЖЕН — окно известно
+        # заранее, все `startTime` вычислимы наперёд. Бары лежат на сетке ТФ (плотность
+        # ≤1 бара на шаг), поэтому страница `since=s, limit=OHLCV_PAGE` накрывает свой
+        # номинальный срез всегда; при дырах она заезжает в срез соседа — это снимает
+        # дедупликация по метке открытия. Троттлер ccxt (rollingWindow) сам держит вес.
+        # Заодно ушла хрупкость: раньше ОДИН таймаут обрывал весь остаток пагинации
+        # (2026-08-17, ETH 1m: добрано 137 225 из 756 422); теперь падает страница,
+        # она повторяется, а невосполненная — считается и называется.
+        page_ms = OHLCV_PAGE * step
+        starts = list(range(start, start + limit * step, page_ms))
+        sem = asyncio.Semaphore(PAGE_CONCURRENCY)
+
+        async def one(s: int) -> list[list[Any]] | NotReady:
+            async with sem:
+                return await self._fetch_ohlcv_guarded(symbol, timeframe, s, OHLCV_PAGE)
+
+        results = await asyncio.gather(*(one(s) for s in starts))
+        retry = [s for s, r in zip(starts, results, strict=True) if isinstance(r, NotReady)]
+        failed: list[NotReady] = []
         by_open: dict[int, list[Any]] = {}
-        cursor = start
-        pages = 0
-        # Страниц заведомо хватает на `limit` баров плюс запас на пустые участки истории;
-        # предел — предохранитель от неподвижного курсора, а не бюджет.
-        max_pages = limit // OHLCV_PAGE + 4
-        while pages < max_pages and len(by_open) < limit:
-            page = await self._fetch_ohlcv_guarded(
-                symbol, timeframe, cursor, OHLCV_PAGE)
-            if isinstance(page, NotReady):
-                if not by_open:
-                    return page
-                self.bars_pages_short += 1
-                log.degraded("ряд добран НЕ ЦЕЛИКОМ — пагинация оборвана", символ=symbol,
-                             тф=timeframe, набрано=len(by_open), просили=limit,
-                             страниц=pages, причина=page.reason)
-                break
-            pages += 1
-            if not page:
-                break
-            before = len(by_open)
-            for row in page:
+        for r in results:
+            if not isinstance(r, NotReady):
+                for row in r:
+                    by_open[int(row[0])] = row
+        for s in retry:
+            r = await self._fetch_ohlcv_guarded(symbol, timeframe, s, OHLCV_PAGE)
+            if isinstance(r, NotReady):
+                failed.append(r)
+                continue
+            for row in r:
                 by_open[int(row[0])] = row
-            last = int(page[-1][0])
-            if len(by_open) == before and last <= cursor:
-                # Курсор стоит и новых баров нет: дальше история не идёт. Это НЕ отказ —
-                # это конец ряда, и он молчит законно.
-                break
-            cursor = last + step
+        if failed:
+            if not by_open:
+                return failed[0]
+            self.bars_pages_short += 1
+            log.degraded("ряд добран НЕ ЦЕЛИКОМ — потеряны страницы", символ=symbol,
+                         тф=timeframe, набрано=len(by_open), просили=limit,
+                         страниц_всего=len(starts), страниц_потеряно=len(failed),
+                         причина=failed[0].reason)
         ordered = [by_open[k] for k in sorted(by_open)]
         if not ordered:
             return NotReady(
