@@ -1489,9 +1489,15 @@ class Exchange:
             try:
                 bars.append(Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
                                 low=float(r[3]), close=float(r[4]), volume=float(r[5])))
-            except ValidationError as e:
+            # ⚠ ValueError, а НЕ ValidationError: `Bar` с 2026-08-12 датакласс, его
+            # __post_init__ бросает голый ValueError, и ловец потомка (ValidationError
+            # наследует ValueError) его ПРОПУСКАЛ — битый бар ронял весь прогон
+            # трейсбеком. Найдено 2026-08-17 живым `hunter check` на том самом баре
+            # BCH 1w 2020-01-13 из docs/audit/broken-bar-bch-2026-08-03.md. Докстрока
+            # models.Bar обещала «ветвь сузилась до общего предка» — теперь это правда.
+            except ValueError as e:
                 why = (f"{symbol} {timeframe} бар {int(r[0])}: o={r[1]} h={r[2]} "
-                       f"l={r[3]} c={r[4]} — {e.errors()[0]['msg']}")
+                       f"l={r[3]} c={r[4]} — {e}")
                 rejected.append(why)
                 rejected_at.append(int(r[0]))
                 log.error("бар отклонён как битый", причина=why)
