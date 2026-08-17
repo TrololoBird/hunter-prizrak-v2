@@ -1420,7 +1420,11 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # Правило входа пишется вместе с состоянием (схема 6, 2026-08-11): без него
             # `active` читался как «свежий, цена не касалась», а курс снимает лимитки уже
             # на первое касание (стр. 25). Замер на BEAT: 8 активных из 21 — касавшиеся.
-            seen = [(m.level, m.status.state, m.status.entry_rule) for m in d.mapped]
+            # Четвёртым идёт МОМЕНТ СОБЫТИЯ (схема 7): `retired_at` хранит время прогона
+            # и у всех снятых уровней одинаков, а разметке нужен бар, на котором прокол
+            # или пробой действительно случился.
+            seen = [(m.level, m.status.state, m.status.entry_rule,
+                     m.status.resolved_at_ms) for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
             report.map_added += sync.added

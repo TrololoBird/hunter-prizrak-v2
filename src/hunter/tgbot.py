@@ -53,6 +53,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 import tempfile
@@ -68,6 +69,7 @@ from aiogram.types import FSInputFile, Message
 
 from . import clock, engine, log, pereprior, run, service, store, swings
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, tf_ms
+from .card import TF_LABEL
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
 from .exchange import CapabilityMissing, Exchange
 from .levels import LevelState
@@ -316,13 +318,51 @@ def parse_request(text: str, *, is_private: bool, bot_name: str) -> Request | No
 # --- карта уровней ----------------------------------------------------------------
 
 ENTRY_MARK = {
-    "limit": "",
-    "confirmation": " ⏳ уже касались — лимиток нет, только по слому младшего ТФ (стр. 31)",
-    "retest_flipped": " ↩ пробит и флипнут — вход по ретесту в другую сторону (стр. 43)",
-    "": " ⚠ правило входа не записано (строка карты до схемы 6)",
+    "limit": "лимитки",
+    "confirmation": "по факту",
+    "retest_flipped": "ретест",
+    "": "",
 }
-"""Подпись правила входа. Пустая строка у `limit` намеренно: свежий уровень с лимитками —
-норма, и помечать надо ОТКЛОНЕНИЕ от неё, а не каждую строку."""
+"""Роль зоны СЛОВАМИ ЧИТАТЕЛЯ, а не ссылкой на страницу курса и не версией схемы БД.
+
+⚠ ПЕРЕПИСАНО 2026-08-17 по разбору `docs/audit/bot-review-2026-08-17.md`. Прежние подписи
+уходили в публичный канал в таком виде: «⚠ правило входа не записано (строка карты до
+схемы 6)» — версия схемы SQLite, напечатанная ТРИДЦАТЬ РАЗ в одном сообщении. Пометка
+нужна, но владельцу в логе, а читателю нужна роль зоны.
+
+Слова взяты у автора: пост 2026-08-03 называет зоны «лимитки» и «работать по факту»
+(`research/author_markup/2026-08-03_overcarder.md`), а не «entry_rule=confirmation».
+Пустая строка у неизвестного правила намеренна: молчание честнее выдумки, а СЧЁТ таких
+строк уходит в лог (`log.degraded`), где его видит владелец.
+"""
+
+
+def _fmt_price(x: float) -> str:
+    """Цена так, как её читает человек: 63 460, 3.691, 0.00385.
+
+    Знаков после запятой — по величине самой цены, а не константой: у BTC дробная часть
+    шум, у ANKR она и есть вся цена. Разряды разделяются узким пробелом — в Telegram он
+    не переносит строку.
+    """
+    if x >= 1000:
+        return f"{x:,.0f}".replace(",", " ")
+    if x >= 1:
+        return f"{x:.4g}"
+    return f"{x:.6f}".rstrip("0")
+
+
+RETIRED_WINDOW_MS = BARS_ON_CHART * tf_ms(CHART_TFS[0])
+"""Насколько давно снятый уровень ещё показывается значком. ВЫВЕДЕНО ИЗ ШИРИНЫ ГРАФИКА.
+
+⚠ ЭТА ГРАНИЦА БЫЛА ОБЪЯВЛЕНА КОММЕНТАРИЕМ И НЕ СУЩЕСТВОВАЛА В КОДЕ. Запрос отбирал
+`retired_at IS NOT NULL`, то есть ВСЕ снятые уровни за всю историю символа, а рядом стояла
+строка «отбор по `retired_at` держит выборку свежей». Замер по BTC 2026-08-17: активных 69,
+снятых **179**; на график 4ч попадало 53 зоны, из них 31 снятая, на 15м — 61, из них 38.
+Разбор: `docs/audit/bot-review-2026-08-17.md`.
+
+Ширина старшего графика (180 баров 4ч ≈ 30 суток) — естественная граница: событие, не
+попадающее даже на самый длинный из трёх кадров, показать всё равно негде.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,16 +395,31 @@ def read_map(symbol: str) -> MapRead | NotReady:
         return NotReady(reason=f"{e} — создать: uv run python -m hunter ledger --init")
     try:
         rows = conn.execute(
-            "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen"
-            " FROM levels WHERE symbol=? AND state='active' ORDER BY price", (symbol,),
+            # ⚠ Берутся НЕ ТОЛЬКО активные. Снятые уровни нужны разметке: отработанный
+            # получает красную стрелку (стр. 25), пробитый — крестик отмены (стр. 43).
+            # Без них график молчит о том, что с уровнем случилось, — а это половина
+            # разметки автора. Отбор по `retired_at` держит выборку свежей: снятое
+            # месяц назад на график сегодняшних баров всё равно не попадёт.
+            "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen,"
+            " boundary_lo, boundary_hi, from_ms, to_ms, state,"
+            " COALESCE(resolved_at, 0)"
+            " FROM levels WHERE symbol=? AND (state='active' OR retired_at >= ?)"
+            " ORDER BY price", (symbol, clock.now_ms() - RETIRED_WINDOW_MS),
         ).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
     finally:
         conn.close()
+    # Границы структуры идут на график пунктиром рядом с зоной (запрос владельца
+    # 2026-08-17): зона — Value Area 70%, структура — боковик, её породивший, и
+    # сливать их в одну полосу значит прятать различие.
     zones = tuple(ZoneSpec(side=r[1], timeframe=r[0], price=float(r[2]),
                            zone_lo=float(r[3]), zone_hi=float(r[4]),
-                           entry_rule=r[5] or "") for r in rows)
+                           entry_rule=r[5] or "",
+                           boundary_lo=float(r[7]), boundary_hi=float(r[8]),
+                           from_ms=int(r[9]), to_ms=int(r[10]),
+                           state=r[11], retired_at_ms=int(r[12]))
+                  for r in rows)
     return MapRead(zones=zones, last_seen_ms=max((int(r[6]) for r in rows), default=0))
 
 
@@ -378,7 +433,10 @@ def zones_of(decision: engine.SymbolDecision) -> tuple[ZoneSpec, ...]:
     return tuple(sorted(
         (ZoneSpec(side=m.level.side.value, timeframe=m.level.timeframe,
                   price=float(m.level.price), zone_lo=float(m.level.zone_lo),
-                  zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value)
+                  zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
+                  boundary_lo=float(m.level.boundary_lo),
+                  boundary_hi=float(m.level.boundary_hi),
+                  from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms)
          for m in decision.mapped if m.status.state is LevelState.ACTIVE),
         key=lambda z: z.price))
 
@@ -531,14 +589,42 @@ def pp_zones(bars: list[Bar], timeframe: str) -> list[ZoneSpec]:
             for pp in pereprior.detect(bars, sw, timeframe)]
 
 
-def _fmt_zone(z: ZoneSpec) -> str:
-    band = "🟢" if (z.timeframe in SENIOR_TFS and z.side == "long") else (
-        "🔴" if (z.timeframe in SENIOR_TFS and z.side == "short") else "🟡")
-    if abs(z.zone_hi - z.zone_lo) / max(z.price, 1e-12) < 0.0005:
-        rng = f"{z.price:g}"
-    else:
-        rng = f"{z.zone_lo:g}–{z.zone_hi:g} (ПОК {z.price:g})"
-    return f"{band} {rng} · {z.timeframe}{ENTRY_MARK.get(z.entry_rule, '')}"
+ZONES_PER_SIDE = 5
+"""Сколько зон показывать на сторону. Число взято У АВТОРА, а не выбрано.
+
+Пост 2026-08-03 (`research/author_markup/2026-08-03_overcarder.md`) называет по BTC четыре
+зоны словами и по ETH — шесть. Пять — середина замеренного, и именно столько человек
+удерживает глазами. Прежняя редакция печатала ВСЕ активные: замер по BTC 2026-08-17 —
+69 уровней, 44 строки, 3282 знака в одном сообщении канала.
+"""
+
+FRESH_MAP_MAX_MIN = 60
+"""Старше скольких минут карта называется УСТАРЕВШЕЙ первой строкой, а не последней.
+
+Выведено из такта службы (`service.CYCLE_SECONDS` = 5 мин): карта, не обновлявшаяся
+двенадцать тактов, означает, что служба стоит. Первая публикация 2026-08-17 ушла с картой
+возрастом 1035 минут, и сказано об этом было последней строкой мелким шрифтом.
+"""
+
+
+def _fmt_zone(z: ZoneSpec, price: float) -> str:
+    """Одна строка зоны глазами читателя: цена, ТФ, расстояние, границы, роль.
+
+    ⚠ Расстояние до цены — главное, чего в прежней редакции не было вовсе. Уровень в
+    процентах от текущей цены отвечает на вопрос «мне это сейчас важно?», а номер
+    таймфрейма — нет.
+    """
+    band = "🟢" if z.side == "long" else "🔴"
+    senior = " ★" if z.timeframe in SENIOR_TFS else ""
+    away = (z.price - price) / price * 100 if price > 0 else 0.0
+    parts = [f"{band} {_fmt_price(z.price)}", f"{TF_LABEL.get(z.timeframe, z.timeframe)}{senior}",
+             f"{away:+.1f}%"]
+    if abs(z.zone_hi - z.zone_lo) / max(z.price, 1e-12) >= 0.0005:
+        parts.append(f"зона {_fmt_price(z.zone_lo)}–{_fmt_price(z.zone_hi)}")
+    role = ENTRY_MARK.get(z.entry_rule, "")
+    if role:
+        parts.append(role)
+    return " · ".join(parts)
 
 
 TEXT_LIMIT = 4096
@@ -574,57 +660,138 @@ def _fit(lines: list[str], keep_tail: int) -> str:
 
 
 def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
-                 origin: str, charts_missing: tuple[str, ...] = ()) -> str:
-    """Сводка в формате, близком к каналу автора: Лонги / Шорты по старшинству ТФ.
+                 origin: str, charts_missing: tuple[str, ...] = (), *,
+                 price: float = 0.0, stale_min: int = 0) -> str:
+    """Сводка ДЛЯ ЧИТАТЕЛЯ КАНАЛА. Устройство взято у автора, а не придумано.
 
-    ⚠ Строка `origin` обязательна и стоит в конце: она отвечает на вопрос, которого у
-    прежней редакции не было вовсе, — ОТКУДА эта карта и когда посчитана. Ответ по монете
-    вселенной и ответ по монете, собранной на лету, выглядят одинаково, а стоят разного.
+    ⚠ ПЕРЕПИСАНО 2026-08-17 по разбору `docs/audit/bot-review-2026-08-17.md`. Прежняя
+    редакция печатала все активные уровни подряд: замер по BTC — 69 уровней, 44 строки,
+    3282 знака, из них «правило входа не записано (строка карты до схемы 6)» — тридцать
+    раз. Ни текущей цены, ни расстояния до уровня в сообщении не было вовсе.
 
-    ⚠ Непостроенные графики называются здесь же: молча отдать две картинки вместо трёх —
-    ровно тот тихий пропуск, который запрещает §4.3.
+    Что взято из поста автора (`research/author_markup/2026-08-03_overcarder.md`):
+      * ЦЕНА названа первой строкой — у автора она есть в каждом посте;
+      * зон немного и у каждой РОЛЬ словами («лимитки», «работать по факту»);
+      * порядок — от цены наружу, а не по таймфрейму: читателю важно, что близко.
+
+    `price` — последняя цена закрытого бара младшего графика. Ноль означает «бары не
+    пришли»: тогда расстояния не печатаются, а не подставляются нулём (§4.3).
+
+    `stale_min` — возраст карты в минутах. Старше `FRESH_MAP_MAX_MIN` он выносится ПЕРВОЙ
+    строкой: карта суточной давности выглядит как сегодняшняя, и молчать об этом нельзя.
     """
     base = symbol.split("/")[0]
+    # ⚠ ТЕКСТ считает только ЖИВЫЕ уровни. С 2026-08-17 `read_map` отдаёт и снятые —
+    # они нужны графику для стрелок отработки и крестиков отмены, — но в сводке
+    # «активных уровней N» снятые сделали бы это число ложью.
+    live = [z for z in zones if z.state == "active"]
+
+    # СОРТИРОВКА ПО РАССТОЯНИЮ ДО ЦЕНЫ, а не по таймфрейму. Прежний порядок (ТФ, потом
+    # цена) ставил первым уровень в 5% от цены, а ближайший — пятой строкой.
+    def away(z: ZoneSpec) -> float:
+        return abs(z.price - price) / price if price > 0 else 0.0
+
+    # ⚠ ДЕДУБЛИКАЦИЯ ПО ЦЕНЕ. Один и тот же уровень строится на нескольких ТФ, и первая
+    # редакция этого формата напечатала «63 800 · 15м» и «63 800 · 5м» подряд, а «62 600»
+    # дважды с почти совпадающими зонами. Для читателя это ОДИН уровень; остаётся строка
+    # старшего ТФ — курс на стр. 48 говорит, что старший сильнее.
     order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
-    longs = sorted((z for z in zones if z.side == "long"),
-                   key=lambda z: (-order.get(z.timeframe, 0), -z.price))
-    shorts = sorted((z for z in zones if z.side == "short"),
-                    key=lambda z: (-order.get(z.timeframe, 0), z.price))
+    best: dict[tuple[str, str], ZoneSpec] = {}
+    for z in live:
+        key = (z.side, _fmt_price(z.price))
+        kept = best.get(key)
+        if kept is None or order.get(z.timeframe, 0) > order.get(kept.timeframe, 0):
+            best[key] = z
+    unique = sorted(best.values(), key=away)
+    hidden_dupes = len(live) - len(unique)
 
-    def pick(rows: list[ZoneSpec]) -> tuple[list[str], int]:
-        senior = [z for z in rows if z.timeframe in SENIOR_TFS]
-        local = [z for z in rows if z.timeframe not in SENIOR_TFS][:6]
-        dropped = len(rows) - len(senior) - len(local)
-        return [f"  {_fmt_zone(z)}" for z in senior + local], max(dropped, 0)
+    head = f"👑 {base} · {_fmt_price(price)}" if price > 0 else f"👑 {base}"
+    lines = [head, ""]
+    if stale_min > FRESH_MAP_MAX_MIN:
+        # Устаревшая карта — ПЕРВОЙ строкой. Внизу мелким шрифтом её не читают, а
+        # уровни суточной давности выглядят как сегодняшние.
+        lines.append(f"⚠ карта не обновлялась {_fmt_age(stale_min)} — уровни могли уже"
+                     f" отработать")
+        lines.append("")
 
-    ready = len([z for z in zones if z.entry_rule == "limit"])
-    lines = [f"👑 {base} — карта уровней hunter",
-             f"активных уровней {len(zones)}, из них лимитками торгуются {ready}; "
-             f"остальные цена уже трогала (стр. 25)", ""]
-    lines.append("Лонги:")
-    ls, dl = pick(longs)
-    lines += ls or ["  активных нет"]
-    if dl:
-        lines.append(f"  … и ещё {dl} локальных")
-    lines.append("")
-    lines.append("Шорты:")
-    ss, ds = pick(shorts)
-    lines += ss or ["  активных нет"]
-    if ds:
-        lines.append(f"  … и ещё {ds} локальных")
+    def tradable_first(z: ZoneSpec) -> tuple[int, float]:
+        """Сначала зоны с ТОРГУЕМОЙ стороны цены, потом пройденные. Не новое правило.
+
+        Лимитка на покупку ставится НИЖЕ цены, на продажу — ВЫШЕ (стр. 30: «вход от
+        уровня»). Значит лонг-зона над ценой и шорт-зона под ней — это то, что цена уже
+        прошла; показывать их первыми значит предлагать читателю неисполнимое.
+
+        ⚠ Замер 2026-08-17, BTC, карта возрастом 17 часов: из 69 активных зон **12 стоят
+        по неторгуемую сторону** (10 лонгов над ценой, 2 шорта под), и первая редакция
+        этого формата вывела в «Покупки» пять зон, все выше цены. Сортировка по одному
+        лишь расстоянию скрывала различие.
+        """
+        passed = (z.side == "long" and z.price >= price) or (
+            z.side == "short" and z.price < price)
+        return (1 if passed else 0, away(z))
+
+    # Ближайшая — среди ТОРГУЕМЫХ, а не вообще. Первая редакция считала её по всем, и
+    # метка «◀ ближайшая» доставалась зоне, которую цена уже прошла, то есть исчезала
+    # из показанного списка совсем.
+    tradable = [z for z in unique if tradable_first(z)[0] == 0]
+    nearest = min(tradable, key=away, default=None)
+
+    def block(side: str, title: str) -> list[str]:
+        """Зоны ОДНОЙ стороны от ближней к дальней. Группировка по стороне, а не по
+        «выше/ниже цены»: у автора зоны покупок и продаж — разные списки, и зелёная
+        строка в красном блоке (так вышло в первой редакции) читается как ошибка."""
+        rows = sorted((z for z in unique if z.side == side), key=tradable_first)
+        if not rows:
+            return [f"{title}: нет", ""]
+        passed = [z for z in rows if tradable_first(z)[0] == 1]
+        live_side = [z for z in rows if tradable_first(z)[0] == 0]
+        shown = live_side[:ZONES_PER_SIDE]
+        out = [f"{title} — {len(shown)} из {len(live_side)}:"]
+        for z in shown:
+            mark = " ◀ ближайшая" if z is nearest else ""
+            out.append(f"   {_fmt_zone(z, price)}{mark}")
+        rest = live_side[len(shown):]
+        if rest:
+            lo = abs(rest[0].price - price) / price * 100
+            hi = abs(rest[-1].price - price) / price * 100
+            out.append(f"   … ещё {len(rest)} — от {lo:.1f}% до {hi:.0f}% от цены")
+        if passed:
+            # Пройденные НАЗЫВАЮТСЯ, но не подаются как торгуемые: по карте цена их уже
+            # прошла, а карта может быть старой — читатель имеет право знать оба факта.
+            out.append(f"   ({len(passed)} цена уже прошла — на графике они есть)")
+        return [*out, ""]
+
+    lines += block("long", "🟢 Покупки")
+    lines += block("short", "🔴 Продажи")
+
     if pps:
+        lines.append("🟣 Переприор по свежим барам: " + ", ".join(
+            f"{'лонг' if p.side == 'long' else 'шорт'} {_fmt_price(p.zone_lo)}–"
+            f"{_fmt_price(p.zone_hi)} ({TF_LABEL.get(p.timeframe, p.timeframe)})"
+            for p in pps))
         lines.append("")
-        lines.append("Переприоры (по свежим барам):")
-        lines += [f"  🟣 {p.side} зона {p.zone_lo:g}–{p.zone_hi:g} · {p.timeframe}"
-                  for p in pps]
     if charts_missing:
+        lines.append(f"⚠ график {', '.join(charts_missing)} не построен — биржа не отдала"
+                     f" бары; зоны выше от этого не зависят")
         lines.append("")
-        lines.append(f"⚠ графики не построены: {', '.join(charts_missing)} — биржа не"
-                     f" отдала бары; уровни выше от этого не зависят")
-    tail = ["", origin,
-            "Уровни — из карты системы (§2.2, зоны VAL–VAH, ПОК линией). "
-            "Это карта, не торговая рекомендация."]
+
+    # Свёрнутые дубликаты НАЗЫВАЮТСЯ числом: молчаливое сокращение списка неотличимо от
+    # того, что этих уровней в карте не было (§4.3).
+    dupes = f" · {hidden_dupes} совпали по цене на разных ТФ" if hidden_dupes else ""
+    tail = ["★ — старший таймфрейм · «лимитки» — цена ещё не касалась зоны,"
+            " «по факту» — уже касалась" + dupes,
+            origin,
+            "Это карта уровней, а не торговая рекомендация."]
     return _fit(lines + tail, len(tail))
+
+
+def _fmt_age(minutes: int) -> str:
+    """Возраст человеческими словами: «17 ч», «3 сут», а не «1035 мин»."""
+    if minutes < 90:
+        return f"{minutes} мин"
+    if minutes < 60 * 36:
+        return f"{minutes // 60} ч"
+    return f"{minutes // 1440} сут"
 
 
 # --- отправка ---------------------------------------------------------------------
@@ -751,6 +918,14 @@ class Analysis:
     zones: tuple[ZoneSpec, ...]
     origin: str
 
+    stale_min: int = 0
+    """Возраст карты в минутах — ОТДЕЛЬНЫМ числом, а не только словами в `origin`.
+
+    Строкой возраст уже был, и первая же публикация показала, чего это стоит: карта
+    возрастом 1035 минут ушла в канал, а сказано об этом было последней строкой. Числом
+    его можно СРАВНИТЬ с порогом и вынести наверх (`FRESH_MAP_MAX_MIN`).
+    """
+
 
 class Delivery:
     """Всё состояние бота в одном месте: рынки, карта, темп, очередь сборки."""
@@ -768,6 +943,7 @@ class Delivery:
         self.cooldown = Cooldown(float(cfg.answer_cooldown_s))
         self.answers = 0
         self.unknown = 0
+        self.requests = 0
 
     # --- карта -------------------------------------------------------------
 
@@ -784,18 +960,16 @@ class Delivery:
                            f" служба — а она либо не запускалась, либо ещё не досчитала"
                            f" (uv run python -m hunter serve)")
             age_min = max(0, (now - got.last_seen_ms) // 60_000)
-            return Analysis(symbol=symbol, zones=got.zones,
-                            origin=f"Источник: карта прогонов системы, обновлена"
-                                   f" {age_min} мин назад.")
+            return Analysis(symbol=symbol, zones=got.zones, stale_min=age_min,
+                            origin=f"Карта системы, обновлена {_fmt_age(age_min)} назад.")
         built = await self.on_demand.map_of(symbol, now)
         if isinstance(built, NotReady):
             return built
         age_min = max(0, (now - built.built_at_ms) // 60_000)
         return Analysis(
-            symbol=symbol, zones=built.zones,
-            origin=f"Источник: карта построена ПО ЗАПРОСУ ({built.seconds:.0f} с работы,"
-                   f" {age_min} мин назад). Символ вне вселенной §5: система за ним не"
-                   f" следит постоянно, и в журнал эта карта не записана.")
+            symbol=symbol, zones=built.zones, stale_min=age_min,
+            origin=f"Карта собрана по запросу {_fmt_age(age_min)} назад: за этой монетой"
+                   f" система постоянно не следит.")
 
     # --- ответ -------------------------------------------------------------
 
@@ -820,6 +994,14 @@ class Delivery:
 
         missing: list[str] = []
         pps: list[ZoneSpec] = []
+        price = 0.0
+        """Цена берётся ИЗ ТЕХ ЖЕ БАРОВ, что ушли на график, а не отдельным запросом.
+
+        Иначе сообщение и картинка говорили бы о разных моментах: между двумя запросами
+        проходит время, и подпись «цена 63 460» под графиком, нарисованным по другой
+        свече, — расхождение, которое никто не заметит. Порядок `CHART_TFS` от старшего к
+        младшему, поэтому последнее присвоение — самый свежий бар.
+        """
         with tempfile.TemporaryDirectory(prefix="hunter-tg-") as tmp:
             for tf in CHART_TFS:
                 bars = await self.ex.fetch_closed_ohlcv(symbol, tf, limit=BARS_ON_CHART)
@@ -833,13 +1015,15 @@ class Delivery:
                     log.degraded("бот: бары для графика не пришли", символ=symbol, тф=tf,
                                  причина=reason)
                     continue
+                price = bars.bars[-1].close
                 png, tf_pps = await self._chart(got, tf, bars.bars, Path(tmp))
                 pps += tf_pps
                 await self.pacer.send(chat, f"график {tf}", lambda p=png: bot.send_photo(  # type: ignore[misc]
                     chat_id=chat, photo=FSInputFile(p)))
             await self.pacer.send(chat, "сводка", lambda: bot.send_message(
                 chat_id=chat,
-                text=compose_text(symbol, got.zones, pps, got.origin, tuple(missing)),
+                text=compose_text(symbol, got.zones, pps, got.origin, tuple(missing),
+                                  price=price, stale_min=got.stale_min),
                 reply_to_message_id=reply_to))
         self.answers += 1
         return True
@@ -868,7 +1052,13 @@ class Delivery:
     # --- сообщения ---------------------------------------------------------
 
     async def on_message(self, bot: Bot, message: Message) -> None:
-        """Единственная точка входа сообщений. Молчание — законный исход (см. `parse_request`)."""
+        """Единственная точка входа сообщений. Молчание — законный исход (см. `parse_request`).
+
+        ⚠ КАЖДЫЙ разобранный запрос оставляет СЛЕД (`_trace`). До 2026-08-17 следа не было
+        вовсе: живой запрос по BTW виден в журнале только потому, что у него была побочная
+        сборка на 175 с, а ответ по монете вселенной не оставлял ни строки — доставлено или
+        нет, узнать было нельзя. Разбор: `docs/audit/bot-review-2026-08-17.md`.
+        """
         # ⚠ Сообщения ботов не обрабатываются вовсе, и это защита от петли: собственная
         # публикация в канале приходит обратно как `channel_post`, а бот, отвечающий на
         # свой ответ, — классическая форма отказа, которую не ловит ни один гейт.
@@ -880,6 +1070,7 @@ class Delivery:
         if req is None:
             return
         chat = message.chat.id
+        started_ns = clock.monotonic_ns()
 
         # Пауза считается ДО разбора запроса и одинаково для всех его видов: иначе
         # `/help` остаётся бесплатным каналом спама, а он такое же сообщение бота.
@@ -892,15 +1083,18 @@ class Delivery:
                     chat_id=chat, text=f"Подождите {left:.0f} с — я отвечаю не чаще"
                                        f" раза в {self.cooldown.seconds:.0f} с на человека.",
                     reply_to_message_id=message.message_id))
+            self._trace(message, req, "отказ по паузе", started_ns, ждать_с=round(left))
             return
 
         if req.kind == "help":
             await self.pacer.send(chat, "справка", lambda: bot.send_message(
                 chat_id=chat, text=HELP_TEXT))
+            self._trace(message, req, "справка", started_ns)
             return
         if req.kind == "pinned":
             await self.pacer.send(chat, "закреплённые", lambda: bot.send_message(
                 chat_id=chat, text=self._pinned_text()))
+            self._trace(message, req, "список закреплённых", started_ns)
             return
 
         symbol = self.index.resolve(req.query)
@@ -912,12 +1106,14 @@ class Delivery:
                     text=f"Не узнаю монету «{req.query.strip()[:32]}». На площадке"
                          f" {self.uni.venue} таких рынков нет. Пример: BTC или btcusdt.",
                     reply_to_message_id=message.message_id))
+            self._trace(message, req, "тикер не опознан", started_ns)
             return
         inst = self.ex.instrument(symbol)
         if isinstance(inst, NotReady):
             await self.pacer.send(chat, "инструмент недоступен", lambda: bot.send_message(
                 chat_id=chat, text=f"НЕ ГОТОВО: {inst.reason}",
                 reply_to_message_id=message.message_id))
+            self._trace(message, req, "инструмент недоступен", started_ns, символ=symbol)
             return
         if (symbol not in self.uni.symbols
                 and self.on_demand.fresh(symbol, clock.now_ms()) is None
@@ -931,7 +1127,29 @@ class Delivery:
                 text=f"{symbol}: карты нет — собираю данные. Это минуты (в очереди"
                      f" {self.on_demand.waiting()}). Пришлю сюда, как посчитаю.",
                 reply_to_message_id=message.message_id))
-        await self.answer(bot, chat, symbol, message.message_id)
+        ok = await self.answer(bot, chat, symbol, message.message_id)
+        self._trace(message, req, "ответ доставлен" if ok else "ответа нет",
+                    started_ns, символ=symbol)
+
+    def _trace(self, message: Message, req: Request, исход: str, started_ns: int,
+               **kw: object) -> None:
+        """СЛЕД ЗАПРОСА: одна строка на каждый разобранный запрос, чем бы он ни кончился.
+
+        ⚠ Это не «логирование для полноты». До 2026-08-17 бот не писал о запросах НИЧЕГО:
+        единственный живой запрос за первый час (`BTW`) виден в журнале только по побочной
+        строке сборки, а был бы он по монете вселенной — не осталось бы и её. Отказ
+        отправки при этом выглядел бы точно так же, как успех, то есть §4.3 нарушался
+        самой формой наблюдения.
+
+        Текст пользователя обрезается до 32 знаков: он нужен, чтобы понять РАЗБОР
+        («почему это стало BTC»), а не чтобы хранить переписку.
+        """
+        self.requests += 1
+        log.info("запрос", исход=исход,
+                 чат=message.chat.id, тип_чата=message.chat.type,
+                 пользователь=message.from_user.id if message.from_user else 0,
+                 текст=req.query.strip()[:32], явный=req.explicit,
+                 мс=int((clock.monotonic_ns() - started_ns) / 1e6), **kw)
 
     def _pinned_text(self) -> str:
         if not self.cfg.pinned:
@@ -998,6 +1216,65 @@ def seconds_until_publish(timeframe: str, now_ms: int) -> float:
     return max(60.0, (next_close_ms - now_ms) / 1000.0 + PUBLISH_DELAY_S)
 
 
+class NetworkWatch(logging.Handler):
+    """Считает отказы связи, о которых aiogram сообщает СВОИМ логгером, а не нашим.
+
+    ⚠ ЗАЧЕМ ЭТО ЕСТЬ. Живой запуск 2026-08-17: за первый час журнал бота содержал
+    **18 строк** `Failed to fetch updates — TelegramNetworkError … Cannot connect to host
+    api.telegram.org:443`. Пока идёт такой отказ, бот ГЛУХ: обновления не забираются. Наши
+    приборы об этом не знали ничего — строки пишет `logging` самой aiogram, а
+    `log.degraded_count()` считает только наши вызовы. Сводка напечатала бы «потеряно 0»
+    при восемнадцати обрывах, то есть показывала бы здоровье там, где его нет.
+
+    Обработчик НЕ дублирует текст в наш лог целиком: он считает и называет ПЕРВЫЙ отказ
+    подряд, иначе один сетевой провал на сутки залил бы журнал сотнями одинаковых строк.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.failures = 0
+        self.reported = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        text = record.getMessage()
+        if "fetch updates" not in text and "TelegramNetworkError" not in text:
+            return
+        self.failures += 1
+        if not self.reported:
+            self.reported = True
+            log.degraded("связь с Telegram оборвана — бот не забирает сообщения",
+                         причина=text[:120])
+
+    def note_recovery(self) -> None:
+        """Связь восстановилась: следующий обрыв снова назовём. Зовётся из сводки."""
+        self.reported = False
+
+
+ALIVE_EVERY_S = 900.0
+"""Как часто печатать сводку РАБОТАЮЩЕГО бота. Выведено, а не выбрано.
+
+Прежде счётчики печатались только в `finally` при остановке polling — то есть у бота 24/7
+не печатались никогда. Пятнадцать минут — та частота, при которой сутки работы дают 96
+строк (читаемо), а молчание дольше четверти часа уже означает, что процесс мёртв, и это
+видно по отсутствию строки, а не по её содержанию.
+"""
+
+
+async def alive_loop(delivery: Delivery, watch: NetworkWatch) -> None:
+    """Периодическая сводка: бот жив, и вот чем он занимался."""
+    while True:
+        await asyncio.sleep(ALIVE_EVERY_S)
+        log.info("бот жив", запросов=delivery.requests, ответов=delivery.answers,
+                 неопознано=delivery.unknown,
+                 отказов_по_паузе=delivery.cooldown.refused,
+                 сборок=delivery.on_demand.built, сборок_с_отказом=delivery.on_demand.failed,
+                 в_очереди_сборки=delivery.on_demand.waiting(),
+                 сообщений_потеряно=delivery.pacer.lost,
+                 ожиданий_по_лимиту=delivery.pacer.flood_waits,
+                 обрывов_связи=watch.failures)
+        watch.note_recovery()
+
+
 async def publish_loop(delivery: Delivery, bot: Bot) -> None:
     """Вечная публикация закреплённых. Сбой одной итерации не убивает следующие.
 
@@ -1061,20 +1338,30 @@ async def main(*, horizon_days: int, publish_now: bool = False,
         async def _on_post(message: Message) -> None:
             await delivery.on_message(bot, message)
 
+        # Наблюдатель за связью ставится на логгер aiogram ДО опроса: обрывы начинаются
+        # с первого же запроса к api.telegram.org, и поставленный позже он их пропустит.
+        watch = NetworkWatch()
+        logging.getLogger("aiogram").addHandler(watch)
+        logging.getLogger("aiogram.dispatcher").addHandler(watch)
+
         publisher = asyncio.create_task(publish_loop(delivery, bot),
                                         name="публикация закреплённых")
+        alive = asyncio.create_task(alive_loop(delivery, watch), name="сводка бота")
         try:
             await dp.start_polling(bot, handle_as_tasks=True,
                                    tasks_concurrency_limit=HANDLERS_MAX)
         finally:
             publisher.cancel()
-            log.info("бот остановлен", ответов=delivery.answers,
+            alive.cancel()
+            log.info("бот остановлен", запросов=delivery.requests,
+                     ответов=delivery.answers,
                      неопознанных=delivery.unknown,
                      отказов_по_паузе=delivery.cooldown.refused,
                      сборок=delivery.on_demand.built,
                      сборок_с_отказом=delivery.on_demand.failed,
                      сообщений_потеряно=delivery.pacer.lost,
                      ожиданий_по_лимиту=delivery.pacer.flood_waits,
+                     обрывов_связи=watch.failures,
                      отложено_с=round(delivery.pacer.delayed_s, 1))
     finally:
         await bot.session.close()

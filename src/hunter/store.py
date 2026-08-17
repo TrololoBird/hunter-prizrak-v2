@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS levels (
     -- владельцу наравне со свежими. Расчёт различал (`LevelStatus.entry_rule`), карта —
     -- нет, и потому различие до владельца не доходило.
     entry_rule   TEXT    CHECK (entry_rule IN ('limit', 'confirmation', 'retest_flipped')),
+    -- Закрытие бара, на котором СОБЫТИЕ разрешилось (прокол/пробой). NULL — события нет
+    -- либо строка до схемы 7.
+    -- ⚠ Это НЕ `retired_at`. Тот хранит момент ПРОГОНА, в котором уровень сняли с карты,
+    -- и у всех снятых он одинаков. Разница вскрылась 2026-08-17 при попытке нарисовать
+    -- значки отработки: 663 значка встали бы в одну точку графика — время записи вместо
+    -- времени события. Расчёт момент знает (`LevelStatus.resolved_at_ms`), карта его
+    -- теряла.
+    resolved_at  INTEGER,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     CHECK (to_ms > from_ms),
@@ -147,8 +155,13 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+6 → 7 (2026-08-17): у уровня появился `resolved_at` — момент СОБЫТИЯ (прокола либо
+пробоя), отличный от `retired_at` (момента ПРОГОНА, в котором уровень сняли). Без него
+разметка отработки ставила бы все значки в одну точку: 663 снятых уровня BTW имели один
+и тот же `retired_at`. Прежние строки получают NULL и переписываются первым прогоном.
 
 5 → 6 (2026-08-11): у уровня карты появилось ПРАВИЛО ВХОДА (`entry_rule`). Без него
 `state='active'` читался как "уровень свежий, цена не касалась", тогда как курс
@@ -476,6 +489,8 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # сразу свежей, и мигрировать нечего.
     if lvl_cols and "entry_rule" not in lvl_cols:
         return "5"
+    if lvl_cols and "resolved_at" not in lvl_cols:
+        return "6"
     return SCHEMA_VERSION
 
 
@@ -558,6 +573,12 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # ли цена. NULL здесь читается как «не записано», а не как «лимитки»; первый же
         # прогон перепишет строку настоящим значением.
         conn.execute("ALTER TABLE levels ADD COLUMN entry_rule TEXT")
+        conn.commit()
+    if _schema_version(conn) == "6":
+        # 6 → 7: колонка на месте, NULLABLE. Момент события у прежних строк неизвестен,
+        # и подставить `retired_at` вместо него нельзя — это разные величины, ровно из-за
+        # смешения которых колонка и заводится.
+        conn.execute("ALTER TABLE levels ADD COLUMN resolved_at INTEGER")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -756,7 +777,7 @@ class MapSync(BaseModel):
 def sync_levels(
     conn: sqlite3.Connection,
     symbol: str,
-    seen: list[tuple[Level, LevelState, EntryRule]],
+    seen: list[tuple[Level, LevelState, EntryRule, int | None]],
     now_ms: int,
 ) -> MapSync:
     """Слить свежепосчитанную карту с накопленной.
@@ -788,7 +809,7 @@ def sync_levels(
     """
     added = updated = retired = 0
     rejected: list[str] = []
-    for lvl, state, rule in seen:
+    for lvl, state, rule, resolved in seen:
         key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
         row = conn.execute(
             "SELECT state, retired_at FROM levels WHERE symbol=? AND timeframe=? AND"
@@ -800,13 +821,13 @@ def sync_levels(
                 conn.execute(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
-                    " last_seen, state, retired_at, entry_rule)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " last_seen, state, retired_at, entry_rule, resolved_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
-                     None if active else now_ms, rule.value),
+                     None if active else now_ms, rule.value, resolved),
                 )
                 added += 1
                 retired += not active
@@ -817,10 +838,10 @@ def sync_levels(
             retired_at = None if active else (row[1] if row[1] is not None else now_ms)
             conn.execute(
                 "UPDATE levels SET last_seen=?, price=?, zone_lo=?, zone_hi=?, state=?,"
-                " retired_at=?, entry_rule=? WHERE symbol=? AND timeframe=? AND"
+                " retired_at=?, entry_rule=?, resolved_at=? WHERE symbol=? AND timeframe=? AND"
                 " from_ms=? AND to_ms=?",
                 (now_ms, float(lvl.price), float(lvl.zone_lo), float(lvl.zone_hi),
-                 state.value, retired_at, rule.value, *key),
+                 state.value, retired_at, rule.value, resolved, *key),
             )
             updated += 1
             retired += was_active and not active
