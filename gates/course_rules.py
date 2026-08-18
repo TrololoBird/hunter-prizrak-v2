@@ -29,12 +29,12 @@ import sys
 from collections.abc import Callable
 from decimal import Decimal
 
-from hunter.accumulation import MIN_BOUNDARY_POINTS
+from hunter.accumulation import MIN_BOUNDARY_POINTS, BoundaryZone
 from hunter.accumulation import detect as detect_accumulations
 from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
-from hunter.geometry import build_targets
+from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_targets
 from hunter.levels import (
     Level,
     LevelSide,
@@ -42,6 +42,7 @@ from hunter.levels import (
     LevelStatus,
     MappedLevel,
     status,
+    stop_anchor,
 )
 from hunter.models import Bar
 from hunter.outcome import OutcomeKind, resolve
@@ -365,6 +366,52 @@ def c_target_retired_later_still_counts() -> tuple[object, object]:
     return tuple(float(t.price) for t in got), (118.0,)
 
 
+def c_target_structure_in_frame() -> tuple[object, object]:
+    """Чистка пула целей (решение владельца «делай 1+2» 2026-08-18, развилка 2
+    раздела 6 протокола signals-trader-audit-2026-08-18): цель со структурой старше
+    кадра 180 баров СВОЕГО ТФ на момент рождения сделки отсеивается; моложе — живёт.
+
+    Оба плеча обязательны: прибор, отвечающий одинаково на свежую и протухшую
+    структуру, не проверяет ничего. Третье плечо — исключение §4.3: уровень без
+    записанного окна структуры (`to_ms == 0`, строки карты до появления поля) НЕ
+    выбрасывается молча.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    as_of = src.created_at_ms
+    frame = TARGET_STRUCTURE_FRAME_BARS * STEP
+    stale = level(115.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
+        update={"structure_to_ms": as_of - frame - STEP})
+    fresh = level(118.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
+        update={"structure_to_ms": as_of - STEP})
+    no_window = level(121.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
+        update={"structure_to_ms": 0})
+    got = build_targets(src, (mapped(stale), mapped(fresh), mapped(no_window)))
+    return tuple(float(t.price) for t in got), (118.0, 121.0)
+
+
+def c_stop_anchor_capped_by_base() -> tuple[object, object]:
+    """Полоса якоря не дальше высоты базы (решение владельца «делай 1+2» 2026-08-18,
+    развилка 1 раздела 6 протокола signals-trader-audit-2026-08-18).
+
+    Три плеча, чтобы прибор не был заперт в одном ответе:
+      * без `base_height` свинг на 4% от границы — якорь (прежнее поведение);
+      * при базе высотой 1% цены та же полоса схлопывается (ближний край 2% ближе
+        не двигается) — якоря НЕТ, стоп уходит на запас/прокол;
+      * при базе высотой 10% цены свинг на 4% остаётся в полосе — якорь есть.
+    """
+    boundary = 100.0
+    zone = BoundaryZone(edge=boundary, lo=99.5, hi=100.5, point_indices=(0, 1))
+    swing = (96.0,)  # 4% ниже границы — внутри полосы 2-5%
+    free = stop_anchor(LevelSide.LONG, boundary, zone, (), swing)
+    narrow = stop_anchor(LevelSide.LONG, boundary, zone, (), swing, base_height=1.0)
+    wide = stop_anchor(LevelSide.LONG, boundary, zone, (), swing, base_height=10.0)
+    return (
+        (None if free is None else float(free.price), narrow,
+         None if wide is None else float(wide.price)),
+        (96.0, None, 96.0),
+    )
+
+
 def c_outcome_only_future_bars() -> tuple[object, object]:
     """Б-3: исход считается только по барам, ЗАКРЫВШИМСЯ после записи сигнала.
 
@@ -415,6 +462,10 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("снятый уровень целью не является (стр. 25, 43)", c_target_not_retired),
     ("снятый ПОЗЖЕ сигнала — целью являлся (стр. 25)", c_target_retired_later_still_counts),
     ("исход только по будущим барам (§8 этап 7)", c_outcome_only_future_bars),
+    ("цель со структурой старше кадра 180 баров — не цель (решение 2026-08-18)",
+     c_target_structure_in_frame),
+    ("якорь стопа не дальше высоты базы (решение 2026-08-18)",
+     c_stop_anchor_capped_by_base),
     ("«следующая свеча» — это время, а не индекс (стр. 55)", c_two_candles_are_time_not_index),
 ]
 

@@ -129,7 +129,7 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
     await asyncio.to_thread(run.persist_frames, run_id, report)
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources)
     await asyncio.to_thread(run.produce_cards, run_id, report, uni, decided)
-    await asyncio.to_thread(run.persist_archive, run_id, report, sources)
+    await asyncio.to_thread(run.persist_source, run_id, report, sources)
     await asyncio.to_thread(run.record, run_id, report, uni, decided)
 
     spent = (clock.monotonic_ns() - started) / 1e9

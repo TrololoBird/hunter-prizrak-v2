@@ -19,8 +19,9 @@ import difflib
 
 from pydantic import BaseModel, ConfigDict
 
-from . import archive, card, engine, store
-from .models import NotReady
+from . import card, engine, store
+from .models import Bar, NotReady
+from .profile_source import TVWindows
 
 
 class SymbolDiff(BaseModel):
@@ -53,7 +54,7 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
     meta = store.read_meta(run_id, dir_name)
     if isinstance(meta, NotReady):
         return meta
-    symbol, tick, bucket = meta
+    symbol, tick, _bucket = meta
 
     saved = store.read_card(run_id, dir_name)
     if isinstance(saved, NotReady):
@@ -64,26 +65,27 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
         return NotReady(reason=f"{symbol}: кадров баров в прогоне нет")
     series = {tf: store.read_bars(run_id, dir_name, tf) for tf in tfs}
 
-    # Имя символа берётся из meta, а не из имени каталога: иначе искажённое
-    # `BTC_USDT_USDT` попадает в тексты причин и уезжает в карточку владельца.
-    trades = store.read_binned_trades(run_id, dir_name, tick, bucket, symbol)
-    binned = None if isinstance(trades, NotReady) else trades
-
-    # Источник — СРЕЗ АРХИВА, сохранённый этим прогоном, плюс его же живой поток.
+    # Источник профиля — ТОТ ЖЕ КЛАСС и ТЕ ЖЕ СВЕЧИ, что у прогона: `TVWindows` над
+    # аналитическими рядами из кадров плюс сохранённый профильный ряд (минутки,
+    # `profile_bars_*.parquet`). Сначала МАНИФЕСТ (`source.json`): кадры, снятые кодом
+    # без сохранения источника (до 2026-08-18), дают честный отказ, а не осмысленно
+    # выглядящий дифф из неполных данных — аудит правки показал это на 45 прогонах
+    # диска. Пустой манифест — другое, законное состояние: минуток у прогона не было,
+    # повтор воспроизведёт те же отказы профиля.
     #
-    # ⚠ Прежняя редакция читала общий `data/aggcache` и доказывала это тем, что архив
-    # неизменяем. Довод верен про СОДЕРЖИМОЕ суток и неверен про их НАЛИЧИЕ: бэкфилл
-    # доливает сутки между прогонами, а профиль зависит и от того, и от другого. Прогон-
-    # пробник: кадры не тронуты, из общего кэша убраны одни сутки — карточка ETH
-    # изменилась на 483 строки, и `--diff` напечатал бы «расчёт изменился» при
-    # неизменном расчёте. §10.6 условие 2 называет этот дифф единственной проверкой, не
-    # требующей чтения кода, — то есть ломалась ровно она.
-    #
-    # `market_id` восстанавливается из имени символа: сети здесь нет и быть не должно
-    # (§10.3 — повтор чистый), а правило Binance «BTC/USDT:USDT → BTCUSDT» механическое.
-    market_id = symbol.split(":")[0].replace("/", "")
-    source = archive.WindowSource(symbol, market_id, tick, live=binned,
-                                  cache_dir=store.archive_dir(run_id, dir_name))
+    # ⚠ До 2026-08-18 здесь строился `archive.WindowSource` по срезу СДЕЛОК — а прогон
+    # с 2026-08-17 строит профиль из СВЕЧЕЙ (решение владельца от 2026-08-12), и срез
+    # сделок с той же правки никто не писал (`persist_archive` молча пропускал свечные
+    # источники). Повтор сравнивал расчёт с другим транспортом и печатал «ИЗМЕНИЛОСЬ
+    # 5 из 5» при неизменённом коде: дифф §10.6 — единственная проверка, не требующая
+    # чтения кода, — был слеп ко всем правкам расчёта с 2026-08-17. Поймано контролем
+    # «неизменённый код обязан дать построчное совпадение».
+    manifest = store.read_source_meta(run_id, dir_name)
+    if isinstance(manifest, NotReady):
+        return manifest
+    profile_series: dict[str, list[Bar]] = dict(series)
+    profile_series.update(store.read_profile_bars(run_id, dir_name))
+    source = TVWindows(symbol, tick, profile_series)
 
     # Решение строится ЗАНОВО из кадров, а не берётся готовым: §10.6 условие 2 требует
     # независимого пересчёта, иначе повтор сверял бы результат сам с собой.

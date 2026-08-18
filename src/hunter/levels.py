@@ -482,7 +482,8 @@ def build_all(
                 if sw is not None:
                     sw_prices.extend(s.price for s in sw.swings if s.kind is kind)
             anchor = stop_anchor(lvl.side, float(lvl.boundary_lo if down else lvl.boundary_hi),
-                                 acc.lower if down else acc.upper, svs, tuple(sw_prices))
+                                 acc.lower if down else acc.upper, svs, tuple(sw_prices),
+                                 base_height=float(lvl.boundary_hi - lvl.boundary_lo))
             built.append(lvl.model_copy(update={
                 "stop_anchor": None if anchor is None else anchor.price,
                 "stop_anchor_source": None if anchor is None else anchor.source,
@@ -662,6 +663,7 @@ def stop_anchor(
     zone: BoundaryZone,
     stop_volumes: tuple[StopVolume, ...],
     swing_prices: tuple[float, ...] = (),
+    base_height: float | None = None,
 ) -> StopAnchor | None:
     """Якорь стопа по стр. 18. `None` — якоря нет.
 
@@ -671,6 +673,25 @@ def stop_anchor(
     `swing_prices` — лои своего ТФ и ТФ−1 для лонга, хаи для шорта. Пустой кортеж означает
     «свинги не поданы», а не «свингов нет»: умолчание оставлено, чтобы зонды могли звать
     функцию, не собирая ряды.
+
+    ⚠ `base_height` — высота базы уровня; полоса поиска НЕ дальше её. РЕШЕНИЕ ПО СМЫСЛУ,
+    зафиксировано владельцем 2026-08-18 («делай 1+2» к развилке 1 раздела 6 протокола
+    docs/audit/signals-trader-audit-2026-08-18.md). Курс задаёт полосу «2-5% от границы»
+    (стр. 18) в процентах и без привязки к ТФ; на масштабе его иллюстраций это соразмерно
+    (1Д: медиана риска 0.91 высоты структуры), а на 5м даёт стоп в ПЯТИ высотах базы
+    (медиана риск/высота 4.95, риск > 2 высот у 83% сигналов — парный замер ctl1/ctl2
+    того же протокола).
+
+    ⚠ Это НЕ непрерывный потолок, как у запаса (`geometry.with_margin`, `min(raw,
+    height)`), а условие на полосу, и оно умеет её ОПУСТОШИТЬ: двигается только дальний
+    край, ближний остаётся на 2% от цены, и при высоте базы меньше 2% цены интервал
+    схлопывается — стоповые объёмы и свинги на таком уровне не ищутся ВООБЩЕ, стопом
+    остаётся прокол либо запас (сам ограничен высотой). По медианам протокола (высота
+    базы 0.98% цены на 5м, 1.45% на 15м) на младших ТФ якорная полоса выключена у
+    большинства уровней — дифф повтора правки это и показал: из 161 якорного стопа 103
+    ушли на запас. Прокол потолку НЕ подчинён: «стоп всегда ставится за этот прокол»
+    (стр. 18) — безусловный императив, и прокол по построению принадлежит своей же
+    структуре. `None` — высота не подана (зонды), поведение прежнее.
     """
     down = side is LevelSide.LONG          # лонг: якоря НИЖЕ границы, шорт — выше
     lo_pct, hi_pct = STOP_ANCHOR_BAND_MIN_PCT, STOP_ANCHOR_BAND_MAX_PCT
@@ -678,6 +699,13 @@ def stop_anchor(
         band_lo, band_hi = boundary * (1 - hi_pct / 100), boundary * (1 - lo_pct / 100)
     else:
         band_lo, band_hi = boundary * (1 + lo_pct / 100), boundary * (1 + hi_pct / 100)
+    if base_height is not None and base_height > 0:
+        if down:
+            band_lo = max(band_lo, boundary - base_height)
+        else:
+            band_hi = min(band_hi, boundary + base_height)
+        # Полоса могла опустеть (база уже 2% от цены): стоповые объёмы и свинги тогда
+        # не ищутся вовсе, остаётся прокол либо запас — он сам ограничен высотой.
 
     found: list[tuple[float, StopAnchorSource, bool]] = []
     if zone.puncture is not None:

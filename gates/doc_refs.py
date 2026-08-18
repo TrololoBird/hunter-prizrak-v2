@@ -42,6 +42,9 @@ KNOWN_ABSENT = {
     "scripts/ingest_manipulation_video.py",  # старый проект: чем собирался корпус
     "docs/PRIZRAK_METHODOLOGY.md",           # старый проект: не переносился
     ".razbor.md",                            # это маска имени, а не путь
+    "source.json",                           # манифест источника В КАДРАХ ПРОГОНА
+                                             # (data/frames/<прогон>/<символ>/), в git
+                                             # не идёт — имя файла, а не путь в дереве
 }
 
 

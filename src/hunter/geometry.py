@@ -27,6 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
+from .bars import TIMEFRAME_MS
 from .levels import Level, LevelSide, MappedLevel
 from .levels import nested as nested_levels
 from .pereprior import Pereprior, PPSide
@@ -180,6 +181,22 @@ def _tf_step(a: str, b: str) -> int | None:
     return TF_ORDER.index(a) - TF_ORDER.index(b)
 
 
+TARGET_STRUCTURE_FRAME_BARS = 180
+"""Чистка пула целей: цель годится, только если конец её структуры не старше этого числа
+баров СВОЕГО ТФ на момент рождения сделки. РЕШЕНИЕ ПО СМЫСЛУ, зафиксировано владельцем
+2026-08-18 («делай 1+2» к развилке 2 раздела 6 протокола
+docs/audit/signals-trader-audit-2026-08-18.md). Опора — корпус: автор не размечает
+уровень без видимой структуры («мне нужна структурка, без неё шорты не рассматриваю» —
+docs/audit/video-2026-08-17-btc-review.md, находка №2; сказано про УРОВЕНЬ входа,
+перенос на ЦЕЛИ — часть того же решения по смыслу), а 95% активных строк карты несли
+структуру старше кадра и вставали целями вплотную ко входу. Число 180 взято у кадра
+ответа бота (`tgbot.BARS_ON_CHART`) — ДЛИНА рамки та же, но точка отсчёта другая:
+показ (`tgbot.near_structure`) меряет от момента ответа, пул — от момента рождения
+сделки, поэтому наборы совпадают только у свежих сделок. ⚠ Выигрыш в R:R этой чисткой
+НЕ обещан: контроль случайным отсевом той же мощности показал не меньший сдвиг (ctl3
+того же протокола); мотив — честность пула, а не замеренный рост качества."""
+
+
 def build_targets(level: Level, pool: tuple[MappedLevel, ...]) -> tuple[Target, ...]:
     """Цели по стр. 24: свой ТФ и старшие — основные, ТФ-1 — промежуточные, ТФ-2 — нет.
 
@@ -213,6 +230,15 @@ def build_targets(level: Level, pool: tuple[MappedLevel, ...]) -> tuple[Target, 
             continue
         if not mapped.alive_at(as_of):
             continue
+        # Чистка пула целей (см. TARGET_STRUCTURE_FRAME_BARS). Исключения — те же, что
+        # у `tgbot.near_structure`, и по той же причине (§4.3): уровень без записанного
+        # окна структуры (строки карты до появления поля) и уровень неизвестного ТФ НЕ
+        # выбрасываются молча — их нечем судить.
+        if other.structure_to_ms > 0 and other.timeframe in TIMEFRAME_MS:
+            if (other.structure_to_ms
+                    < as_of - TARGET_STRUCTURE_FRAME_BARS
+                    * TIMEFRAME_MS[other.timeframe]):
+                continue
         if (other.price > entry) is not up or other.price == entry:
             continue
         step = _tf_step(level.timeframe, other.timeframe)

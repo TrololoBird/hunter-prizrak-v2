@@ -148,6 +148,12 @@ class TVWindows:
         """Отказы «ряда нужного ТФ не собрано» ПО ТФ — измерение, вдоль которого
         возможен перекос (правило сводки отказов); читает `run.decide_once`."""
 
+    def series_by_tf(self) -> dict[str, list[Bar]]:
+        """Ряды, которыми РЕАЛЬНО строятся профили, по ТФ. Читает `run.persist_source`:
+        повтор (§10.6) обязан получить те же свечи, а не перечитать хранилище, которое
+        к моменту повтора доросло, — иначе дифф объявит «расчёт изменился» на доливке."""
+        return {tf: src.bars for tf, src in self._sources.items()}
+
     def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
         tf = intrabar_timeframe(to_ms - from_ms)
         src = self._sources.get(tf)

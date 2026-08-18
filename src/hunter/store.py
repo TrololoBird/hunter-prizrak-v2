@@ -352,13 +352,82 @@ def read_meta(run_id: str, symbol: str) -> tuple[str, Decimal, int] | NotReady:
     return str(d["symbol"]), Decimal(d["tick_size"]), int(d["bucket_ms"])
 
 
+def profile_bars_path(run_id: str, symbol: str, timeframe: str) -> Path:
+    return FRAMES_DIR / run_id / _safe(symbol) / f"profile_bars_{timeframe}.parquet"
+
+
+def write_profile_bars(run_id: str, symbol: str, timeframe: str,
+                       bars: list[Bar]) -> Path:
+    """Профильный ряд (интрабар-свечи `TVWindows`), которого нет среди аналитических
+    кадров, — на боевом конфиге это минутки. Основа герметичности повтора после
+    перевода профиля на свечи (решение владельца 2026-08-12, код переведён
+    2026-08-17): аналитические ряды в кадрах и так лежат, а минутный до 2026-08-18
+    не сохранял никто — повтор строил профиль из ДРУГОГО источника (среза сделок,
+    который с 2026-08-17 перестал писаться) и печатал «ИЗМЕНИЛОСЬ 5 из 5» при
+    неизменённом коде."""
+    path = profile_bars_path(run_id, symbol, timeframe)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bars_to_frame(bars).write_parquet(path, compression="zstd")
+    return path
+
+
+def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str]) -> Path:
+    """Манифест источника профиля: КАКИЕ профильные ряды прогон положил в кадры.
+
+    Пустой список — честное «минуток в хранилище не было»: повтор тогда строит
+    источник без них и воспроизводит те же отказы. ОТСУТСТВИЕ манифеста — другое
+    состояние: кадры сняты кодом без сохранения источника (до 2026-08-18), и повтор
+    обязан отказаться, а не молча собрать источник из неполных данных — иначе он
+    печатает осмысленно выглядящий, но бессмысленный дифф (найдено аудитом правки:
+    45 из 46 прогонов на диске без профильных рядов давали «расчёт изменился» при
+    неизменном коде). Манифест же закрывает и обратный отказ: если запись рядов
+    когда-нибудь снова потеряется молча, повтор таких кадров скажет об этом кодом
+    возврата, а не диффом."""
+    path = FRAMES_DIR / run_id / _safe(symbol) / "source.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"transport": "tv_candles",
+                                "profile_tfs": sorted(profile_tfs)},
+                               ensure_ascii=False), encoding="utf-8", newline="\n")
+    return path
+
+
+def read_source_meta(run_id: str, dir_name: str) -> list[str] | NotReady:
+    """Список профильных ТФ из манифеста источника. `NotReady` — манифеста нет."""
+    path = FRAMES_DIR / run_id / _safe(dir_name) / "source.json"
+    if not path.exists():
+        return NotReady(
+            reason=f"{dir_name}: манифеста источника нет ({path}) — кадры сняты до "
+                   f"2026-08-18, профильный ряд не сохранялся; сравнение свечного "
+                   f"профиля из таких кадров не строится")
+    d = json.loads(path.read_text(encoding="utf-8"))
+    return [str(tf) for tf in d.get("profile_tfs", [])]
+
+
+def read_profile_bars(run_id: str, dir_name: str) -> dict[str, list[Bar]]:
+    """Сохранённые профильные ряды прогона, по ТФ. Пуст ли словарь ЗАКОННО — отвечает
+    манифест (`read_source_meta`), не этот вызов: без манифеста пустоту не отличить
+    от кадров, снятых до появления записи рядов."""
+    d = FRAMES_DIR / run_id / _safe(dir_name)
+    if not d.is_dir():
+        return {}
+    return {p.stem.removeprefix("profile_bars_"): frame_to_bars(pl.read_parquet(p))
+            for p in sorted(d.glob("profile_bars_*.parquet"))}
+
+
 def archive_dir(run_id: str, symbol: str) -> Path:
-    """Срез архива сделок, принадлежащий ЭТОМУ прогону. Основа герметичности повтора."""
+    """Срез архива сделок, принадлежащий ЭТОМУ прогону.
+
+    ⚠ ТИКОВЫЙ транспорт: с 2026-08-17 боевой прогон строит профиль из свечей и повтор
+    этот каталог не читает; путь жив для `archive.WindowSource` (зонды)."""
     return FRAMES_DIR / run_id / _safe(symbol) / "aggcache"
 
 
 def write_archive_slice(run_id: str, symbol: str, source: Path) -> Path:
     """Положить сутки архива в кадры прогона. ЖЁСТКОЙ ССЫЛКОЙ, копией — только если нельзя.
+
+    ⚠ ТИКОВЫЙ транспорт: боевой прогон с 2026-08-17 свечной, здесь пишут только
+    `WindowSource`-источники (зонды); герметичность боевого повтора теперь держит
+    `write_profile_bars` + манифест `write_source_meta`.
 
     ⚠ Без этого повтор НЕ герметичен, и это показано прогоном: кадры (parquet) не
     трогались, из общего `data/aggcache` убраны одни сутки — карточка ETH поехала с 3244
@@ -438,7 +507,9 @@ def saved_timeframes(run_id: str, symbol: str) -> tuple[str, ...]:
     if not d.is_dir():
         return ()
     skip = {"profile", "trades_by_bar"}
-    return tuple(sorted(p.stem for p in d.glob("*.parquet") if p.stem not in skip))
+    return tuple(sorted(p.stem for p in d.glob("*.parquet")
+                        if p.stem not in skip
+                        and not p.stem.startswith("profile_bars_")))
 
 
 # --- леджер (§10.2) -----------------------------------------------------------

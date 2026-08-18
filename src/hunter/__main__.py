@@ -94,8 +94,8 @@ def _run(args: argparse.Namespace) -> int:
     from .run import (
         collect,
         decide_once,
-        persist_archive,
         persist_frames,
+        persist_source,
         print_report,
         produce_cards,
         record,
@@ -114,11 +114,13 @@ def _run(args: argparse.Namespace) -> int:
     # геометрию для 94 уровней, леджер эмитировал 33 (замер на кадрах прогона `a1`).
     decided = decide_once(report, uni, sources)
     produce_cards(args.run_id, report, uni, decided)
-    # Срез архива кладётся ПОСЛЕ карточек: до них неизвестно, какие сутки понадобились.
-    # Без него повтор читает общий кэш и объявляет «расчёт изменился» на доливке (Н-6).
-    persist_archive(args.run_id, report, sources)
+    # Данные источника профиля кладутся ПОСЛЕ карточек. Без них повтор читает общее
+    # хранилище и объявляет «расчёт изменился» на доливке (Н-6, рецидив 2026-08-18).
+    persist_source(args.run_id, report, sources)
     record(args.run_id, report, uni, decided)
-    log.info("кадры сохранены", файлов=report.frames_written, карточек=report.cards_written)
+    log.info("кадры сохранены", файлов=report.frames_written,
+             карточек=report.cards_written,
+             рядов_профиля=report.profile_series_written)
     return 1 if print_report(report) else 0
 
 

@@ -1371,27 +1371,53 @@ def produce_cards(run_id: str, report: RunReport, uni: Universe,
         report.cards_written += 1
 
 
-def persist_archive(run_id: str, report: RunReport,
-                    sources: dict[str, TradeWindows]) -> None:
-    """ШАГ 3б: положить в кадры ТЕ САМЫЕ сутки архива, из которых построена карточка.
+def persist_source(run_id: str, report: RunReport,
+                   sources: dict[str, TradeWindows]) -> None:
+    """ШАГ 3б: положить в кадры ТО, из чего строился профиль карточки.
 
-    Зовётся ПОСЛЕ карточек, а не до: до них неизвестно, какие сутки понадобились. Набор
-    берётся у самого источника (`WindowSource.used_days`), а не пересчитывается «какие
-    должны были быть» — второй расчёт разошёлся бы с первым ровно там, где это важно.
+    До перевода профиля на свечи (решение владельца 2026-08-12, код — 2026-08-17;
+    переименована из `persist_archive` 2026-08-18) — «те самые сутки архива сделок».
+    Переводом этот шаг был потерян МОЛЧА: функция фильтровала по
+    `isinstance(WindowSource)` и на свечных источниках не писала ничего, а повтор
+    продолжал читать срез сделок, которого больше не было. Поймано контролем
+    2026-08-18: `replay` с НЕИЗМЕНЁННЫМ кодом печатал «ИЗМЕНИЛОСЬ 5 из 5» — дифф
+    §10.6, единственная проверка без чтения кода, был слеп ко всем правкам расчёта
+    с 2026-08-17.
 
-    Без этого шага повтор читает ОБЩИЙ кэш, который между прогонами меняется: бэкфилл
-    доливает сутки, а очистка их убирает. Прогон-пробник: кадры не тронуты, из кэша
-    убраны одни сутки — карточка ETH изменилась на 483 строки (Н-6 разбора).
+    Для `TVWindows` кладутся ряды, которых нет среди аналитических кадров (шаг 2), —
+    на боевом конфиге это минутки из хранилища. Набор берётся у САМОГО источника
+    (`series_by_tf`), а не пересчитывается «какие должны были быть»: второй расчёт
+    разошёлся бы с первым ровно там, где это важно. Рядом пишется МАНИФЕСТ
+    (`source.json`): повтор кадров без манифеста отказывается кодом возврата, так
+    что повторение потери этого шага больше не может остаться молчаливым.
+
+    Отказ «минуток у символа нет» НАЗЫВАЕТСЯ по символу (§4.3 и правило сводки
+    отказов): сто честных пропусков подряд читались бы как «так и надо».
+
+    Без этого шага повтор читает ОБЩЕЕ хранилище, которое между прогонами меняется.
+    Прогон-пробник ещё архивной эпохи: кадры не тронуты, из кэша убраны одни сутки —
+    карточка ETH изменилась на 483 строки (Н-6 разбора).
     """
     for sym, src in sources.items():
-        if not isinstance(src, archive.WindowSource):
-            continue
-        # Кладутся ПУТИ, прочитанные источником, а не даты: сутки бывают полными и
-        # частичными файлами, и повтору нужен именно читанный файл (граница покрытия
-        # частичных стоит в имени — иначе пересборка разошлась бы на этой границе).
-        for path in sorted(src.used_paths):
-            store.write_archive_slice(run_id, sym, path)
-            report.archive_slices_written += 1
+        if isinstance(src, TVWindows):
+            saved = set(bars_of(report, sym))
+            extra = {tf: bars for tf, bars in src.series_by_tf().items()
+                     if tf not in saved and bars}
+            for tf, bars in extra.items():
+                store.write_profile_bars(run_id, sym, tf, bars)
+                report.profile_series_written += 1
+            store.write_source_meta(run_id, sym, list(extra))
+            if not extra:
+                log.degraded("профильный ряд в кадры не положен — минуток в "
+                             "хранилище нет, повтор воспроизведёт те же отказы",
+                             символ=sym)
+        elif isinstance(src, archive.WindowSource):
+            # Кладутся ПУТИ, прочитанные источником, а не даты: сутки бывают полными и
+            # частичными файлами, и повтору нужен именно читанный файл (граница покрытия
+            # частичных стоит в имени — иначе пересборка разошлась бы на этой границе).
+            for path in sorted(src.used_paths):
+                store.write_archive_slice(run_id, sym, path)
+                report.archive_slices_written += 1
 
 
 def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
@@ -1649,6 +1675,7 @@ LIVE_TRADES_KEEP_DAYS = 3
 
 CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
+    "profile_series_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
     "pending_no_target", "pending_no_bars", "emitted_outcomes",
