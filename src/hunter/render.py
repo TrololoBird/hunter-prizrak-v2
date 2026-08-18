@@ -225,7 +225,9 @@ def chart_png(
                          else z.price >= ref_price)
         if (z.kind == "level" and z.entry_rule in ("limit", "retest_flipped")
                 and z.state == "active" and tradable_side):
-            entry_boxes.append((z.side, z_lo, z_hi))
+            # НАСТОЯЩИЕ границы, не обрезанные кадром: обрезка — при рисовании.
+            # Иначе ценник границы печатал бы край кадра вместо цены зоны.
+            entry_boxes.append((z.side, z.zone_lo, z.zone_hi))
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
@@ -285,17 +287,28 @@ def chart_png(
         fill, edge = ((_LONG_FILL, _LONG_EDGE) if side == "long"
                       else (_SHORT_FILL, _SHORT_EDGE))
         for b_lo, b_hi in merged:
+            d_lo, d_hi = max(b_lo, lo), min(b_hi, hi)
             ax.add_patch(patches.Rectangle(
-                (len(bars) + future * 0.06, b_lo), future * 0.5,
-                max(b_hi - b_lo, (hi - lo) * 0.004),
+                (len(bars) + future * 0.06, d_lo), future * 0.5,
+                max(d_hi - d_lo, (hi - lo) * 0.004),
                 facecolor=fill, edgecolor=edge, linewidth=1.2, alpha=0.55, zorder=4,
             ))
             ax.annotate(
                 "BUY" if side == "long" else "SELL",
-                xy=(len(bars) + future * 0.31, (b_lo + b_hi) / 2),
+                xy=(len(bars) + future * 0.31, (d_lo + d_hi) / 2),
                 va="center", ha="center", fontsize=8, fontweight="bold",
                 color="white", zorder=6,
             )
+            # ОБЕ ГРАНИЦЫ ЗОНЫ — ценниками на шкалу. Так у автора на скриншотах
+            # разметки (корпус docs/audit/tg-prizrak-2026-08.md раздел 8: зона EIGEN
+            # подписана парой 0,1593/0,1621, уровни ARB/DOT идут парами линий с
+            # обеими ценами на шкале). Ценник получает только граница, попавшая в
+            # кадр, и это НАСТОЯЩАЯ цена зоны, а не край обрезки: первый же пробный
+            # рендер напечатал границе-за-кадром цену кадра, что было бы ложью
+            # прибора. Плашки идут в общую раздвижку с дедупликацией.
+            for y in (b_lo, b_hi):
+                if lo <= y <= hi:
+                    tags.append((y, f"{y:g}", edge))
 
     w = 0.62
     for i, b in enumerate(bars):
