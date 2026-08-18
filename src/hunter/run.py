@@ -54,7 +54,7 @@ from .models import (
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
-from .profile_source import CandleWindows
+from .profile_source import TVWindows, intrabar_timeframe
 from .swings import detect as detect_swings
 
 
@@ -692,9 +692,12 @@ def needed_days(
     return days, used, dropped, max_hi
 
 
-def profile_windows(series: dict[str, list[Bar]],
-                    horizon_days: int) -> tuple[list[tuple[int, int]], int, int]:
-    """Окна структур, под которые нужен профиль. Возвращает (окна, взято, отброшено).
+def profile_windows(
+    series: dict[str, list[Bar]], horizon_days: int,
+    intrabar_tf: str | None = None, frame_bars: int | None = None,
+) -> tuple[list[tuple[int, int]], int, int, int, int]:
+    """Окна структур, под которые нужен профиль.
+    Возвращает (окна, взято, отброшено, окон_старшего_ТФ, окон_вне_кадра).
 
     ⚠ ОКНА, А НЕ СУТКИ. Прежний источник профиля (сделки) хранился суточными файлами,
     поэтому `find_gaps` отвечал множеством ДАТ. Свечи хранятся рядом по таймфрейму, и
@@ -703,9 +706,18 @@ def profile_windows(series: dict[str, list[Bar]],
 
     Горизонт отсекает старые структуры так же, как в `find_gaps`: правее правого края
     окна профиль никем не читается.
+
+    ⚠ `intrabar_tf` (2026-08-18, правило TV): если задан, остаются только окна, которым
+    по `profile_source.intrabar_timeframe` нужны свечи ИМЕННО этого ТФ. Окна старших
+    ступеней лестницы читают ряды, уже собранные засевом, — качать под них минутки
+    значило платить за то, что профиль не прочитает; они СЧИТАЮТСЯ отдельно, а не молчат.
+
+    ⚠ `frame_bars` (там же, сборка по запросу): окно, чей конец старше `frame_bars`
+    баров своего ТФ, принадлежит структуре, чей уровень скрыл бы фильтр «у структуры», —
+    его профиль не прочитает никто. Тоже считается, а не молчит.
     """
     out: list[tuple[int, int]] = []
-    used = dropped = 0
+    used = dropped = senior = out_of_frame = 0
     now = max((b[-1].open_ms for b in series.values() if b), default=0)
     cut = now - horizon_days * 86_400_000
     for tf, bars in series.items():
@@ -714,14 +726,22 @@ def profile_windows(series: dict[str, list[Bar]],
         sw = detect_swings(bars)
         if isinstance(sw, NotReady):
             continue
+        frame_lo = (bars[-1].open_ms - frame_bars * TIMEFRAME_MS[tf]
+                    if frame_bars is not None else None)
         for acc in detect_accumulations(bars, sw, tf).closed:
             lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
             if hi < cut:
                 dropped += 1
                 continue
+            if frame_lo is not None and hi < frame_lo:
+                out_of_frame += 1
+                continue
+            if intrabar_tf is not None and intrabar_timeframe(hi - lo) != intrabar_tf:
+                senior += 1
+                continue
             used += 1
             out.append((lo, hi))
-    return out, used, dropped
+    return out, used, dropped, senior, out_of_frame
 
 
 def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, int]]:
@@ -742,7 +762,8 @@ def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, 
 
 
 async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
-                                horizon_days: int) -> None:
+                                horizon_days: int,
+                                frame_bars: int | None = None) -> None:
     """Долить СВЕЧИ ПРОФИЛЯ под окна исторических структур.
 
     ⚠ ЗАМЕНА `backfill_trades` С 2026-08-12 (решение владельца: «меняй транспорт на
@@ -775,7 +796,12 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                          причина=inst.reason)
             continue
         series = bars_of(report, sym)
-        wins, used, dropped = profile_windows(series, horizon_days)
+        # ⚠ С 2026-08-18 качаются ТОЛЬКО окна, которым правило TV назначило минутки
+        # (короткие); длинные окна читают ряды старших ТФ, уже собранные засевом.
+        wins, used, dropped, senior, out_of_frame = profile_windows(
+            series, horizon_days, intrabar_tf=tf, frame_bars=frame_bars)
+        report.profile_windows_senior_tf += senior
+        report.profile_windows_out_of_frame += out_of_frame
         if not wins:
             # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
             # свечей, а без свечей — ни одного уровня; при этом в отчёте не оставалось
@@ -784,6 +810,15 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             # пропущенных было нечем. Причина у пустых окон ровно две, и они РАЗНЫЕ —
             # рядов нет вовсе против «структуры есть, но все старше горизонта», — поэтому
             # печатаются обе.
+            #
+            # ⚠ С 2026-08-18 есть ТРЕТЬЯ причина, и она НЕ отказ: все окна символа по
+            # правилу TV читают старшие ТФ (или вне кадра ответа) — минутки им не нужны,
+            # уровни строятся из уже собранных рядов. Прежняя строка «уровней у символа
+            # не будет» здесь была бы ложью.
+            if senior or out_of_frame:
+                log.info("профиль: минутки символу не нужны — окна читают старшие ТФ",
+                         символ=sym, окон_старших_тф=senior, окон_вне_кадра=out_of_frame)
+                continue
             report.profile_symbols_no_windows += 1
             log.degraded("профиль: окон структур нет — уровней у символа не будет",
                          символ=sym, рядов=len(series),
@@ -823,6 +858,8 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
              символов_без_окон=report.profile_symbols_no_windows,
              символов_без_инструмента=report.profile_symbols_skipped,
              окон=report.profile_windows, отброшено_по_горизонту=report.profile_windows_dropped,
+             окон_старших_тф=report.profile_windows_senior_tf,
+             окон_вне_кадра=report.profile_windows_out_of_frame,
              участков_добрано=report.profile_spans_filled,
              участков_из_хранилища=report.profile_spans_cached,
              участков_с_отказом=report.profile_spans_failed,
@@ -1201,14 +1238,25 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
     вернуть ту самую `MemoryError`, ради которой источник когда-то и стал ленивым.
 
     Один на оба пути — печать карточки и запись в леджер.
+
+    ⚠ С 2026-08-18 источник — `TVWindows` (п. 3 приказа владельца): intrabar-ТФ окна
+    выбирает лестница по образцу TV (первый из 1м…1Д с < 5000 баров; число и лестница
+    ПОДОБРАНЫ нами, TV публикует только принцип — см. `TV_INTRABAR_MAX_BARS`), а не
+    всегда `1m`. Минутки
+    по-прежнему читаются из хранилища (короткие окна), аналитические ТФ — из уже
+    собранных рядов прогона: под длинные окна отдельной закачки больше нет вовсе.
+    Точность размена замерена до принятия — докстрока `TV_INTRABAR_MAX_BARS`.
     """
     inst = ex.instrument(sym)
     if isinstance(inst, NotReady):
         return None
-    bars = barstore.load(uni.venue, inst.market_id, uni.profile_timeframe)
-    if not bars:
+    series: dict[str, list[Bar]] = dict(bars_of(report, sym))
+    minutes = barstore.load(uni.venue, inst.market_id, uni.profile_timeframe)
+    if minutes:
+        series[uni.profile_timeframe] = minutes
+    if not series:
         return None
-    return CandleWindows(sym, inst.tick_size, bars, uni.profile_timeframe)
+    return TVWindows(sym, inst.tick_size, series)
 
 
 def bars_of(report: RunReport, sym: str) -> dict[str, list[Bar]]:
@@ -1268,7 +1316,8 @@ def explained_gaps(st: SeriesState) -> tuple[tuple[int, int], ...]:
 
 
 def decide_once(report: RunReport, uni: Universe,
-                sources: dict[str, TradeWindows]) -> dict[str, engine.SymbolDecision]:
+                sources: dict[str, TradeWindows],
+                frame_bars: int | None = None) -> dict[str, engine.SymbolDecision]:
     """ШАГ 2 из четырёх: посчитать сигнал. ОДИН раз на символ, для обоих потребителей.
 
     ⚠ Заменил `build_levels_once` 2026-08-06. Тот считал один раз только УРОВНИ (находка
@@ -1288,7 +1337,22 @@ def decide_once(report: RunReport, uni: Universe,
         series = bars_of(report, sym)
         if not series:
             continue
-        out[sym] = engine.decide(sym, series, sources.get(sym), tfs)
+        out[sym] = engine.decide(sym, series, sources.get(sym), tfs,
+                                 frame_bars=frame_bars)
+    # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
+    # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
+    # такой», пока их не сложили). До 2026-08-18 счётчик `windows_refused` у `TVWindows`
+    # не читал никто — находка аудита.
+    refused = {sym: r for sym, src in sources.items()
+               if (r := getattr(src, "refused_by_tf", None))}
+    if refused:
+        by_tf: dict[str, int] = {}
+        for per_tf in refused.values():
+            for tf, n in per_tf.items():
+                by_tf[tf] = by_tf.get(tf, 0) + n
+        log.degraded("профиль: окнам не хватило ряда intrabar-ТФ",
+                     всего=sum(by_tf.values()), по_тф=by_tf,
+                     символов=len(refused))
     return out
 
 
@@ -1594,7 +1658,8 @@ CYCLE_FIELDS = (
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
     "backfill_missing_by_symbol",
-    "profile_windows", "profile_windows_dropped", "profile_spans_filled",
+    "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
+    "profile_windows_out_of_frame", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
 )
@@ -1900,7 +1965,9 @@ class Collector:
 
 
 async def collect(uni: Universe, seconds: int, seed_limit: int,
-                  horizon_days: int = 90) -> tuple[RunReport, dict[str, TradeWindows]]:
+                  horizon_days: int = 90,
+                  frame_bars: int | None = None,
+                  ) -> tuple[RunReport, dict[str, TradeWindows]]:
     """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
 
     Возвращает отчёт и источники профиля. Сеть трогается только здесь — дальше три шага
@@ -1937,7 +2004,10 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         report = c.snapshot()
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
-        await backfill_profile_bars(c.ex, uni, report, horizon_days)
+        # `frame_bars` — кадр ответа сборки по запросу (2026-08-18): окна структур вне
+        # кадра не качаются, их уровни не строятся — фильтр «у структуры» их скрыл бы.
+        await backfill_profile_bars(c.ex, uni, report, horizon_days,
+                                    frame_bars=frame_bars)
         # Источники строятся ДО закрытия соединения: им нужен `market_id` инструмента.
         # Сеть после этого не трогается — читается только хранилище баров на диске.
         sources = {sym: src for sym in uni.symbols
@@ -2202,6 +2272,9 @@ def print_report(r: RunReport) -> int:
     print(f"   окон структур: {r.profile_windows}, "
           f"старше горизонта отброшено: {r.profile_windows_dropped}, "
           f"символов пропущено: {r.profile_symbols_skipped}")
+    print(f"   окон на старших ТФ (минутки не нужны, лестница intrabar-ТФ): "
+          f"{r.profile_windows_senior_tf}, вне кадра ответа: "
+          f"{r.profile_windows_out_of_frame}")
     print(f"   участков: добрано у биржи {r.profile_spans_filled}, "
           f"взято из хранилища {r.profile_spans_cached}, "
           f"с отказом {r.profile_spans_failed}")

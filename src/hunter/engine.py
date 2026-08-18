@@ -234,6 +234,7 @@ def decide(
     series: dict[str, list[Bar]],
     trades: TradeWindows | None,
     timeframes: tuple[str, ...],
+    frame_bars: int | None = None,
 ) -> SymbolDecision:
     """Кадры → решение. Единственная точка, где считается сигнал.
 
@@ -250,8 +251,11 @@ def decide(
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
     reads, unreadable = read_series(series, tfs)
     scans = {tf: r.scan for tf, r in reads.items()}
+    # `frame_bars` — рамка кадра ответа для сборки по запросу (2026-08-18, п. 3 приказа
+    # владельца); боевой прогон передаёт None и строит всё — смысл в `levels.build_all`.
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans,
-                                       {tf: r.swings for tf, r in reads.items()})
+                                       {tf: r.swings for tf, r in reads.items()},
+                                       frame_bars=frame_bars)
     mapped = levels.map_levels(frozen, series)
     trends = {tf: r.trend for tf, r in reads.items()}
 

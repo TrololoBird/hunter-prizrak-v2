@@ -1,0 +1,20 @@
+Пробник замка записи barstore.append — живой вывод 2026-08-18 ~04:03.
+Команды:
+  uv run python docs/audit/evidence/barstore-lock-probe-2026-08-18.py
+  uv run python docs/audit/evidence/barstore-lock-probe-2026-08-18.py --no-lock
+
+режим lock: баров в файле 600 из 600 (ПОЛНОСТЬЮ)
+
+режим no-lock (контроль, что прибор может ответить иначе):
+2026-08-18 04:03:02 [error] файл хранилища баров не прочитан причина='ComputeError parquet: File out of specification: Invalid thrift: protocol error' файл=data\bars\probe-venue\PROBEUSDT-1m-b1.parquet
+2026-08-18 04:03:03 [error] файл хранилища баров не прочитан причина='ComputeError parquet: File out of specification: The page header reported the wrong page size' файл=data\bars\probe-venue\PROBEUSDT-1m-b1.parquet
+режим no-lock: баров в файле 150 из 600 (ПОТЕРЯНО 450)
+
+Вывод: без замка конкурирующая запись теряет бары И даёт читателям битый parquet
+(Windows: os.replace поверх открытого файла). Оба дефекта закрыты парой
+_append_lock + повтор os.replace при PermissionError.
+
+До первой правки пробник поймал ещё два дефекта самого замка:
+  * clock.now_ms() в возрасте замка падал ClockNotSynced в путях без сведения часов —
+    возраст убран, достаточно тайм-аута ожидания;
+  * os.replace без повтора падал PermissionError при одновременном чтении.

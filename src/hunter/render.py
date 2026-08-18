@@ -4,12 +4,14 @@
 живёт в `engine.decide`, карта — в леджере). Введён 2026-08-10 решением владельца:
 бот доставки отвечает на тикер скриншотом графика + текстом в формате канала.
 
-Стилистика снята с 4 скриншотов обзора 09.08.2026 и видео (протокол
-docs/audit/author-review-2026-08-09-vs-bot.md): светлый фон, зелёные/красные свечи,
-цветные ГОРИЗОНТАЛЬНЫЕ ПОЛОСЫ зон с ценовыми плашками справа; у автора жёлтые —
-локальные/промежуточные зоны, зелёные — глобальные лонговые, красные — глобальные
-шортовые. Здесь то же правило: старшие ТФ (4ч/1Д/1Н) красятся по стороне, младшие —
-жёлтым с цветной кромкой по стороне.
+Стилистика — по прямому решению владельца 2026-08-17 «приведи наш формат ответа и
+графики к виду как у призрака», эталон — скриншот и видео-обзор автора того же дня
+(docs/audit/video-2026-08-17-btc-review.md): ТЁМНАЯ тема терминала, зелёные/красные
+свечи TradingView, торговая зона — компактный бокс в поле будущего, ЗЕЛЁНЫЙ у покупки
+и КРАСНЫЙ у продажи НА ЛЮБОМ ТФ, с подписью BUY/SELL внутри; уровни — тонкий пунктир
+с ценовой плашкой на шкале. Прежняя редакция (светлый фон, жёлтые младшие ТФ — по
+обзору 09.08, протокол author-review-2026-08-09-vs-bot.md) ЗАМЕЩЕНА: на свежих кадрах
+сторона сделки кодируется цветом на всех ТФ, и владелец выбрал именно этот вид.
 """
 
 from __future__ import annotations
@@ -27,14 +29,18 @@ from matplotlib import patches
 from .models import Bar
 
 SENIOR_TFS = ("4h", "1d", "1w")
-"""Старшие ТФ красятся по стороне (зелёный/красный), младшие — жёлтым: так у автора."""
+"""Старшие ТФ: в тексте сводки помечаются ★, на графике идут без капа локальных."""
 
-_UP, _DN = "#2f9e6e", "#d24a43"
-_LONG_FILL, _LONG_EDGE = "#c8ecc9", "#3f9e46"
-_SHORT_FILL, _SHORT_EDGE = "#f6c6c4", "#c94f47"
-_LOCAL_FILL, _LOCAL_EDGE = "#f7f0a8", "#c9b616"
-_PP_FILL, _PP_EDGE = "#ddd2f2", "#8a6fc9"
-_STRUCT_FILL, _STRUCT_EDGE = "#bfdde6", "#6fa8bd"
+_BG, _BG_FUTURE = "#131722", "#171b26"
+_TEXT, _TICK = "#d1d4dc", "#787b86"
+"""Палитра тёмной темы — снята с кадров терминала автора (видео 17.08.2026):
+фон #131722 и серый текст шкал — штатные цвета тёмной темы TradingView."""
+
+_UP, _DN = "#26a69a", "#ef5350"
+_LONG_FILL, _LONG_EDGE = "#1b5e20", "#4caf50"
+_SHORT_FILL, _SHORT_EDGE = "#7f1d1d", "#ef5350"
+_PP_FILL, _PP_EDGE = "#4a3b6b", "#9575cd"
+_STRUCT_FILL, _STRUCT_EDGE = "none", "#4dd0e1"
 """Бокс СТРУКТУРЫ — голубой, как на разметке автора курса (скриншот владельца
 2026-08-17). Цвет один на обе стороны: структура это факт истории, а не намерение."""
 
@@ -87,11 +93,12 @@ class ZoneSpec:
 
 
 def _zone_style(z: ZoneSpec) -> tuple[str, str]:
+    """Цвет — по СТОРОНЕ сделки на любом ТФ (решение владельца 2026-08-17: «как у
+    призрака»; на его кадрах BUY всегда зелёный, SHORT всегда красный, и жёлтый
+    младших ТФ читателю ничего не говорил)."""
     if z.kind == "pp":
         return _PP_FILL, _PP_EDGE
-    if z.timeframe in SENIOR_TFS:
-        return (_LONG_FILL, _LONG_EDGE) if z.side == "long" else (_SHORT_FILL, _SHORT_EDGE)
-    return _LOCAL_FILL, _LOCAL_EDGE
+    return (_LONG_FILL, _LONG_EDGE) if z.side == "long" else (_SHORT_FILL, _SHORT_EDGE)
 
 
 def chart_png(
@@ -101,6 +108,7 @@ def chart_png(
     zones: list[ZoneSpec],
     out_path: Path,
     caption: str = "",
+    price: float = 0.0,
 ) -> Path:
     """Нарисовать свечи с полосами зон и ценовыми плашками. Возвращает путь PNG.
 
@@ -108,7 +116,15 @@ def chart_png(
     (урок разбора собственной визуализации 2026-08-10 — растяжка в 4.5× сплющивала
     свечи), полосы клипуются, невидимые зоны просто не рисуются — их называет ТЕКСТ
     сообщения бота.
+
+    `price` — ЕДИНАЯ цена ответа (закрытие младшего графика), та же, по которой
+    считают `compose_text` и `tradable_counts`. Ноль — не передана, берётся закрытие
+    последней свечи ЭТОГО графика. Заведена 2026-08-18 по находке аудита: торгуемость
+    стороны решалась закрытием 4ч-свечи, и уровень между 4ч-закрытием и текущей ценой
+    получал бокс на одном графике, не получал на другом, а текст звал его третьим
+    именем — тот же класс дефекта «две цены в одном ответе», что уже чинился в tgbot.
     """
+    ref_price = price if price > 0 else (bars[-1].close if bars else 0.0)
     lo = min(b.low for b in bars)
     hi = max(b.high for b in bars)
     pad = (hi - lo) * 0.05
@@ -120,16 +136,18 @@ def chart_png(
     right = len(bars) + future
 
     fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=100)
-    fig.patch.set_facecolor("#f6f7f5")
-    ax.set_facecolor("#f0f2ef")
-    ax.axvspan(len(bars) - 0.5, right, facecolor="#e9ecea", zorder=0)
+    fig.patch.set_facecolor(_BG)
+    ax.set_facecolor(_BG)
+    ax.axvspan(len(bars) - 0.5, right, facecolor=_BG_FUTURE, zorder=0)
 
     tags: list[tuple[float, str, str]] = []
     """Отложенные ценовые плашки (y, текст, цвет): рисуются после цикла зон с
     раздвижкой по вертикали — до 2026-08-17 плашки близких уровней наезжали друг
     на друга и читались как одна (session-2026-08-17 §5)."""
-    used_marks: set[str] = set()
-    """Какие значки реально встретились — легенда рисуется только по ним."""
+
+    entry_boxes: list[tuple[str, float, float]] = []
+    """Кандидаты боксов входа (side, lo, hi): рисуются после цикла зон СО СКЛЕЙКОЙ
+    пересекающихся одной стороны в один бокс — как «диапазон интереса» у автора."""
 
     def bar_index(ms: int) -> int | None:
         """Номер бара по метке времени. None — метка вне окна графика."""
@@ -174,7 +192,6 @@ def chart_png(
                     zorder=6,
                 ))
                 drawn_box = True
-                used_marks.add("box")
 
         # 2. ЛИНИЯ УРОВНЯ — от структуры вправо, а не через весь экран.
         start = (i0 if drawn_box and i0 is not None else 0)
@@ -185,30 +202,30 @@ def chart_png(
         i_ev = bar_index(z.retired_at_ms) if z.state != "active" else None
         line_end = i_ev if i_ev is not None else right
         if lo <= z.price <= hi:
-            # Линия уровня — тоньше и серее свечей: раньше чёрные линии всех уровней
-            # сливались в «лес» (разбор session-2026-08-17 §5); иерархию задают
-            # цветные плашки и зоны, а не толщина чёрного.
-            ax.plot([start, line_end], [z.price, z.price], color="#6b6b6b",
-                    linewidth=0.9, zorder=3)
+            # Линия уровня — тонкий пунктир, как у автора на кадрах терминала:
+            # иерархию задают цветные плашки и зоны, а не толщина линии
+            # (разбор session-2026-08-17 §5 — «лес» одинаковых линий).
+            ax.plot([start, line_end], [z.price, z.price], color=_TICK,
+                    linewidth=0.8, linestyle=(0, (5, 3)), zorder=3)
             if i_ev is None:
                 # Плашка кладётся ОТЛОЖЕННО: сначала собираются все, потом раздвигаются
                 # по вертикали, чтобы не наезжать друг на друга (см. ниже).
                 tags.append((z.price, f"{z.price:g}", edge))
 
-        # 3. ЗОНА ВХОДА — прямоугольник В БУДУЩЕМ, подписанный стороной сделки.
-        if z.kind == "level" and z.entry_rule in ("limit", "retest_flipped"):
-            ax.add_patch(patches.Rectangle(
-                (len(bars) + future * 0.15, z_lo), future * 0.75,
-                max(z_hi - z_lo, (hi - lo) * 0.004),
-                facecolor=fill, edgecolor=edge, linewidth=1.2, alpha=0.9, zorder=4,
-            ))
-            ax.annotate(
-                "BUY" if z.side == "long" else "SELL",
-                xy=(len(bars) + future * 0.52, (z_lo + z_hi) / 2),
-                va="center", ha="center", fontsize=8, fontweight="bold",
-                color="#1b3a1b" if z.side == "long" else "#4a1414", zorder=6,
-            )
-            used_marks.add("entry")
+        # 3. ЗОНА ВХОДА — бокс кандидатом в `entry_boxes`, рисование ПОСЛЕ цикла со
+        # склейкой пересекающихся (см. ниже). Прежняя редакция рисовала бокс каждому
+        # уровню прямо здесь, и все вставали в одну колонку будущего: живой ответ по
+        # ONDO 18.08.2026 (14 зон на 1ч) дал стену перекрывающихся прямоугольников с
+        # наползающими подписями «SELL SELL» — владелец увидел это раньше меня.
+        # Бокс — только ЖИВОМУ входу: уровень активен И стоит по торгуемую сторону
+        # (лимитка на покупку — ниже цены, на продажу — выше; стр. 30 «вход от
+        # уровня»). Отработанным и пройденным остаются линия и значки судьбы: бокс
+        # BUY над ценой — приглашение войти там, где входа нет.
+        tradable_side = (z.price < ref_price if z.side == "long"
+                         else z.price >= ref_price)
+        if (z.kind == "level" and z.entry_rule in ("limit", "retest_flipped")
+                and z.state == "active" and tradable_side):
+            entry_boxes.append((z.side, z_lo, z_hi))
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
@@ -231,7 +248,6 @@ def chart_png(
                                     "linewidth": 2.4, "mutation_scale": 16},
                         zorder=8, annotation_clip=False,
                     )
-                    used_marks.add("arrow")
                 else:
                     # ⚠ КРЕСТИКА В КУРСЕ НЕТ. Проверено по всем 69 страницам: значков X
                     # нет ни на одной, слова «крестик» нет в тексте. Курс велит уровень
@@ -241,7 +257,6 @@ def chart_png(
                     # выдано за курс.
                     ax.plot([i_ev], [z.price], marker="x", color="#2f6fd0",
                             markersize=11, markeredgewidth=2.4, zorder=8)
-                    used_marks.add("flip")
 
         if z.kind == "pp":
             # Зона переприора — узкая полоса у правого края: это зона тени свечи слома,
@@ -251,7 +266,36 @@ def chart_png(
                 max(z_hi - z_lo, (hi - lo) * 0.003),
                 facecolor=fill, edgecolor=edge, linewidth=1.0, alpha=0.8, zorder=4,
             ))
-            used_marks.add("pp")
+
+    # БОКСЫ ВХОДА — после цикла, СКЛЕЕННЫЕ: пересекающиеся боксы одной стороны
+    # рисуются ОДНИМ прямоугольником с одной подписью — тот же приём, что строка
+    # «Диапазон интереса» в сводке (пост автора 17.08.2026: две структуры — один
+    # диапазон 64890–65200). Введено по живому ответу ONDO 18.08.2026: без склейки
+    # 6 лимиток одной стороны вставали стеной с кашей подписей «SELL SELL».
+    # Склейка транзитивная по перекрытию, критерий геометрический.
+    for side in ("long", "short"):
+        spans = sorted(((b_lo, b_hi) for s, b_lo, b_hi in entry_boxes if s == side),
+                       key=lambda p: p[0])
+        merged: list[list[float]] = []
+        for b_lo, b_hi in spans:
+            if merged and b_lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b_hi)
+            else:
+                merged.append([b_lo, b_hi])
+        fill, edge = ((_LONG_FILL, _LONG_EDGE) if side == "long"
+                      else (_SHORT_FILL, _SHORT_EDGE))
+        for b_lo, b_hi in merged:
+            ax.add_patch(patches.Rectangle(
+                (len(bars) + future * 0.06, b_lo), future * 0.5,
+                max(b_hi - b_lo, (hi - lo) * 0.004),
+                facecolor=fill, edgecolor=edge, linewidth=1.2, alpha=0.55, zorder=4,
+            ))
+            ax.annotate(
+                "BUY" if side == "long" else "SELL",
+                xy=(len(bars) + future * 0.31, (b_lo + b_hi) / 2),
+                va="center", ha="center", fontsize=8, fontweight="bold",
+                color="white", zorder=6,
+            )
 
     w = 0.62
     for i, b in enumerate(bars):
@@ -280,36 +324,51 @@ def chart_png(
                 buckets[k] += share
         vmax = max(buckets) or 1.0
         poc_k = buckets.index(max(buckets))
-        width_px = future * 0.9
+        # Узкая полоса у самого края (треть поля будущего): прежняя ширина 0.9
+        # съедала кадр и зоны входа ложились ПОВЕРХ профиля — разбор ответа
+        # 2026-08-17, замечание владельца о «ужасных графиках».
+        width_px = future * 0.32
         for k, v in enumerate(buckets):
             if v <= 0:
                 continue
-            colr = "#c8b93a" if k == poc_k else "#9fb8d4"
+            colr = "#c8b93a" if k == poc_k else "#2a3a55"
             ax.add_patch(patches.Rectangle(
                 (right - v / vmax * width_px, lo + k * step_px),
                 v / vmax * width_px, step_px * 0.92,
-                facecolor=colr, edgecolor="none", alpha=0.55, zorder=1,
+                facecolor=colr, edgecolor="none", alpha=0.8, zorder=1,
             ))
 
     # ТЕКУЩАЯ ЦЕНА — пунктир через весь график и контрастная плашка справа.
     # Без неё читатель не видел, ГДЕ рынок относительно зон (session-2026-08-17 §5).
     last_close = bars[-1].close
     if lo <= last_close <= hi:
-        ax.plot([-1, right], [last_close, last_close], color="#1a1a1a",
+        ax.plot([-1, right], [last_close, last_close], color=_TEXT,
                 linewidth=0.9, linestyle=(0, (4, 3)), zorder=7)
-        tags.append((last_close, f"{last_close:g}", "#1a1a1a"))
+        # Плашка текущей цены — цветом последней свечи, как в терминале автора.
+        tags.append((last_close, f"{last_close:g}",
+                     _UP if bars[-1].close >= bars[-1].open else _DN))
 
     # ПЛАШКИ ЦЕН — с раздвижкой: близкие сдвигаются по вертикали, чтобы каждая
     # читалась; линия остаётся на своей цене, сдвигается только подпись.
+    # ⚠ Раздвижка ОГРАНИЧЕНА КАДРОМ (2026-08-17, второй заход). Первая редакция двигала
+    # каждую следующую плашку вверх без предела и рисовала с annotation_clip=False:
+    # живой ответ по BTC (79 зон на графике) выстроил столбец плашек до 66817 при шкале
+    # до 64100 — подписи ушли за верх кадра и сломали компоновку. Теперь плашка, которой
+    # не хватило места до верха шкалы, НЕ рисуется: линия уровня остаётся, цену называет
+    # текст сводки. Повторы одной цены (уровень на двух ТФ) схлопываются в одну плашку.
     min_gap = (hi - lo) * 0.024
-    placed: list[float] = []
+    prev: float | None = None
+    seen_txt: set[str] = set()
     for y, txt, colr in sorted(tags, key=lambda t: t[0]):
-        y_lab = y
-        while any(abs(y_lab - q) < min_gap for q in placed):
-            y_lab += min_gap * 0.6
-        placed.append(y_lab)
+        if txt in seen_txt:
+            continue
+        seen_txt.add(txt)
+        y_lab = y if prev is None else max(y, prev + min_gap)
+        if y_lab > hi:
+            continue
+        prev = y_lab
         ax.annotate(
-            txt, xy=(right, y), xytext=(6, (y_lab - y) / (hi - lo) * 720),
+            txt, xy=(right, y_lab), xytext=(6, 0),
             textcoords="offset points",
             va="center", ha="left", fontsize=8.5, fontweight="bold", color="white",
             bbox={"boxstyle": "square,pad=0.22", "facecolor": colr, "edgecolor": "none"},
@@ -325,8 +384,8 @@ def chart_png(
     ax.set_xticks(idxs)
     ax.set_xticklabels(
         [datetime.fromtimestamp(bars[i].open_ms / 1000, UTC).strftime(fmt)
-         for i in idxs], fontsize=7.5, color="#555")
-    ax.tick_params(axis="x", length=2, color="#999")
+         for i in idxs], fontsize=7.5, color=_TICK)
+    ax.tick_params(axis="x", length=2, color=_TICK)
 
     # ШКАЛА ЦЕНЫ — редкие деления справа, как на платформе автора.
     ax.yaxis.tick_right()
@@ -341,37 +400,22 @@ def chart_png(
         yticks.append(yv)
         yv += step_y
     ax.set_yticks(yticks)
-    ax.set_yticklabels([f"{v:g}" for v in yticks], fontsize=7.5, color="#555")
-    ax.tick_params(axis="y", length=2, color="#999")
+    ax.set_yticklabels([f"{v:g}" for v in yticks], fontsize=7.5, color=_TICK)
+    ax.tick_params(axis="y", length=2, color=_TICK)
 
-    # ЛЕГЕНДА — только по значкам, реально попавшим на график: пустая легенда или
-    # легенда «про запас» была бы шумом. Словарь значков — авторский (стр. 19-47 + канал).
-    legend_words = {
-        "box": "рамка — структура (накопление)",
-        "entry": "полоса справа — зона входа",
-        "arrow": "стрелка — уровень отработан",
-        "flip": "× — пробит, сменил сторону",
-        "pp": "фиолетовая полоса — зона ПП",
-    }
-    lines = [legend_words[k] for k in ("box", "entry", "arrow", "flip", "pp")
-             if k in used_marks]
-    if lines:
-        ax.annotate(
-            chr(10).join(lines), xy=(0.01, 0.985), xycoords="axes fraction",
-            va="top", ha="left", fontsize=7.2, color="#444",
-            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white",
-                  "edgecolor": "#cccccc", "alpha": 0.85},
-            zorder=10,
-        )
+    # ЛЕГЕНДА-ПЛАШКА УБРАНА С КАРТИНКИ (решение владельца 2026-08-17 «как у призрака»:
+    # на его кадрах служебного текста нет). Зоны подписаны BUY/SELL прямо внутри,
+    # остальные значки объясняет хвост текстовой сводки бота.
 
     ax.set_xlim(-1, right)
     ax.set_ylim(lo, hi)
     for side in ("top", "right", "left", "bottom"):
         ax.spines[side].set_visible(False)
-    title = f"{symbol} · {timeframe} · карта уровней hunter"
+    # Шапка минимальная, как строка тикера в терминале: символ · ТФ · подпись.
+    title = f"{symbol} · {timeframe}"
     if caption:
         title += f" · {caption}"
-    ax.set_title(title, loc="left", fontsize=11, color="#333")
+    ax.set_title(title, loc="left", fontsize=10.5, color=_TEXT)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)

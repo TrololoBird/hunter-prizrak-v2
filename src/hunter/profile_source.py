@@ -1,4 +1,6 @@
-"""Профиль объёма ИЗ СВЕЧЕЙ. Реализация `TradeWindows` поверх минутных баров.
+"""Профиль объёма ИЗ СВЕЧЕЙ. Реализация `TradeWindows` поверх свечей младших ТФ:
+до 2026-08-18 — всегда минутных, теперь разрешение выбирает длина окна (`TVWindows`,
+лестница `PROFILE_LADDER`).
 
 ⚠ ЧИСТЫЙ МОДУЛЬ: часы, сеть и глобальное состояние не трогаются. Бары передаются извне.
 
@@ -36,7 +38,8 @@
 Объём бара раскладывается РАВНОМЕРНО по всем ценовым бинам его диапазона `low…high`.
 Это семейство TradingView, и приближение здесь названо честно: внутри бара цена не
 проводит одинаковое время на каждом уровне, и никакая свеча этого не знает. Чем младше
-разрешение, тем меньше цена приближения, — поэтому умолчание `1m`.
+разрешение, тем меньше цена приближения; с 2026-08-18 разрешение выбирает длина окна
+(лестница `PROFILE_LADDER`), размен точности замерен — см. `TV_INTRABAR_MAX_BARS`.
 
 Второй способ, «весь объём в бин цены закрытия» (так делает `volume_by_price` у
 `Haehnchen/crypto-trading-bot`), ПРОВЕРЕН и ОТВЕРГНУТ: он хуже на обоих символах и всех
@@ -49,8 +52,37 @@ import bisect
 from collections import OrderedDict
 from decimal import Decimal
 
+import numpy as np
+
 from .bars import tf_ms
-from .models import Bar, NotReady, TradeHistogram, bin_index
+from .models import Bar, NotReady, TradeHistogram, tick_scale
+
+PROFILE_LADDER = ("1m", "5m", "15m", "1h", "4h", "1d")
+TV_INTRABAR_MAX_BARS = 5000
+"""Кап числа intrabar-свечей на окно профиля. Применяется с 2026-08-18 по приказу
+владельца (п. 3).
+
+⚠ ЧЬЁ ЭТО ПРАВИЛО, названо точно (исправлено 2026-08-18 по находке аудита: прежняя
+редакция склеивала в одну «цитату» настоящую фразу TV и предложение, которого у TV
+нет). У TradingView дословно только это
+(tradingview.com/support/solutions/43000502040-volume-profile/, перечитано 2026-08-18):
+«Volume profile indicators are calculated using data from lower timeframes for the
+same symbol» и — о выборе разрешения — «The particular logic used to decide which
+lower timeframe should be used for the calculation varies depending on the specific
+indicator». То есть TV подтверждает ПРИНЦИП (профиль из свечей младшего ТФ, выбор
+разрешения зависит от длины задачи), но ни числа 5000, ни лестницы не публикует.
+Число 5000 и лестница 1м…1Д (без 30м — наши аналитические ТФ) ПОДОБРАНЫ НАМИ и
+держатся на собственном замере, а не на цитате.
+
+Замер точности размена, ДО принятия (зонд 2026-08-18, сравнено 3194 окна BTC+ONDO из
+3977 зон карты): ПОК по свечам своего ТФ отстоит от минутного на ~2 строки сетки —
+медиана одинакова на всех ТФ; это заметно лучше случайной строки (строка-в-строку
+21–23% против 2.5–3% у случайной). Цена размена: часть профилей по ТФ-свечам не
+строится из-за ничьей за ПОК (444+419 отказов, систематически короткие окна) —
+медианы посчитаны по благополучной подвыборке. Мотив: до правила intrabar-ТФ был
+всегда 1м, и полугодовое окно суточной структуры требовало ~259 000 минуток — отсюда
+минуты на сборку карты. Свод и контроль случайной строки — в разделе 20 журнала
+смены 2026-08-17 и вердикте фальсификатора."""
 
 MAX_BINS_PER_BAR = 200_000
 """Предел ширины одного бара в бинах. Свеча шире — свидетельство битых данных, а не
@@ -79,6 +111,53 @@ VRVP всех символов вселенной плюс годовые окн
 ⚠ Возвращается ОБЩИЙ объект: контракт потребителей — только чтение (build_level и
 _with_vrvp гистограмму не мутируют). Значения при попадании в кэш БАЙТ-В-БАЙТ те же,
 что при пересчёте, — это тот же объект, порядок сложений не менялся вовсе."""
+
+
+def intrabar_timeframe(duration_ms: int) -> str:
+    """ТФ intrabar-свечей окна по правилу TV: первый из лестницы с < 5000 баров.
+
+    Для окон длиннее лестницы (полгода и более на 1Д не бывает при горизонте 180 суток)
+    честно отдаётся старшая ступень — отказ по покрытию назовёт `CandleWindows.window`.
+    """
+    for tf in PROFILE_LADDER:
+        if duration_ms // tf_ms(tf) < TV_INTRABAR_MAX_BARS:
+            return tf
+    return PROFILE_LADDER[-1]
+
+
+class TVWindows:
+    """Профиль по правилу TV: intrabar-ТФ выбирается ДЛИНОЙ окна, а не задан навсегда.
+
+    Контракт `TradeWindows` (один метод `window`). Держит по `CandleWindows` на каждый
+    переданный ряд и на каждое окно делегирует тому, кого выбрало правило
+    `intrabar_timeframe`. Ряды приходят готовыми (минутки — из хранилища, аналитические
+    ТФ — из собранных рядов прогона): модуль остаётся чистым, I/O здесь нет.
+
+    ⚠ Отсутствие ряда выбранного ТФ — НЕ тихий даунгрейд на соседний: правило одно на
+    все окна, подмена ТФ по доступности дала бы профили, несравнимые между собой.
+    Отказ называется (§4.3), как и отказ покрытия внутри `CandleWindows`.
+    """
+
+    def __init__(self, symbol: str, tick: Decimal,
+                 series: dict[str, list[Bar]]) -> None:
+        self.symbol = symbol
+        self._sources = {tf: CandleWindows(symbol, tick, bars, tf)
+                         for tf, bars in series.items() if bars}
+        self.windows_refused = 0
+        self.refused_by_tf: dict[str, int] = {}
+        """Отказы «ряда нужного ТФ не собрано» ПО ТФ — измерение, вдоль которого
+        возможен перекос (правило сводки отказов); читает `run.decide_once`."""
+
+    def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
+        tf = intrabar_timeframe(to_ms - from_ms)
+        src = self._sources.get(tf)
+        if src is None:
+            self.windows_refused += 1
+            self.refused_by_tf[tf] = self.refused_by_tf.get(tf, 0) + 1
+            return NotReady(
+                reason=f"{self.symbol}: окну {from_ms}..{to_ms} по правилу TV нужны "
+                       f"свечи {tf}, а ряда {tf} не собрано")
+        return src.window(from_ms, to_ms)
 
 
 class CandleWindows:
@@ -142,35 +221,63 @@ class CandleWindows:
         # Равенство обоих способов ПРОВЕРЕНО, а не предположено: наибольшее расхождение
         # 9.1e-13 при масштабе 1.5e+03 на шести прогонах зонда
         # `docs/audit/probes/probe_author_candles_2026-08-12.py`.
-        spans: list[tuple[int, int, float]] = []
-        k_lo: int | None = None
-        k_hi: int | None = None
-        for b in chunk:
-            k0 = bin_index(b.low, self.tick)
-            k1 = bin_index(b.high, self.tick)
-            if k1 - k0 + 1 > MAX_BINS_PER_BAR:
-                self.bars_too_wide += 1
-                continue
-            spans.append((k0, k1, b.volume / (k1 - k0 + 1)))
-            k_lo = k0 if k_lo is None else min(k_lo, k0)
-            k_hi = k1 if k_hi is None else max(k_hi, k1)
-            h.trades_seen += 1
-            h.qty_seen += b.volume
-        if k_lo is None or k_hi is None:
+        #
+        # ⚠ С 2026-08-18 те же формулы считает numpy, и равенство здесь СТРОГОЕ, а не
+        # «до эпсилона». Порядок операций с плавающей точкой сохранён нарочно:
+        #   * бинирование — то же выражение, что в `models.bin_index`
+        #     (floor(price·scale + 0.5) // step), теми же float64;
+        #   * правки концов отрезков идут ЧЕРЕДУЯСЬ по барам — пары (+доля, −доля)
+        #     в порядке баров, как в прежнем цикле, — `np.add.at` без буферизации
+        #     исполняет их последовательно (a −= s и a += (−s) в IEEE 754 совпадают);
+        #   * префиксная сумма — последовательный `np.cumsum`, как прежний `run +=`;
+        #   * `qty_seen` — ЯВНЫЙ цикл `+=` по объёмам в порядке баров. Ни `np.sum`
+        #     (попарное суммирование), ни встроенный `sum` (с Python 3.12 — компенсация
+        #     Ноймайера, см. CPython gh-100425) порядок прежних сложений не повторяют:
+        #     диагностический зонд 2026-08-18 поймал на `sum` расхождение в 1 ulp —
+        #     единственную разошедшуюся стадию из пяти.
+        # Равенство бит-в-бит проверено пробником window_eq_probe 2026-08-18: дословная
+        # копия прежнего скалярного цикла против этого кода, окон сравнено 8118,
+        # разошлось 0 (отпечаток кэша на момент замера; первый прогон на 8114 окнах
+        # поймал расхождение qty_seen — см. пункт про sum() выше). Диффом повтора это
+        # НЕ держится: повтор строит профиль из архивных сделок, свечной путь ему не виден.
+        lows = np.array([b.low for b in chunk], dtype=np.float64)
+        highs = np.array([b.high for b in chunk], dtype=np.float64)
+        vols = np.array([b.volume for b in chunk], dtype=np.float64)
+        scale, step = tick_scale(self.tick)
+        k0s = np.floor(lows * scale + 0.5).astype(np.int64) // step
+        k1s = np.floor(highs * scale + 0.5).astype(np.int64) // step
+        widths_bins = k1s - k0s + 1
+        keep = widths_bins <= MAX_BINS_PER_BAR
+        self.bars_too_wide += int(np.count_nonzero(~keep))
+        k0s, k1s, widths_bins = k0s[keep], k1s[keep], widths_bins[keep]
+        vols_kept = vols[keep]
+        if k0s.size == 0:
             self.windows_refused += 1
             return NotReady(
                 reason=f"{self.symbol}: окно {from_ms}..{to_ms} — все {len(chunk)} свечей "
                        f"отвергнуты как неправдоподобно широкие")
+        h.trades_seen = int(k0s.size)
+        qty_seen = 0.0
+        for v in vols_kept.tolist():
+            qty_seen += v
+        h.qty_seen = qty_seen
+        share = vols_kept / widths_bins
+        k_lo = int(k0s.min())
+        k_hi = int(k1s.max())
         width = k_hi - k_lo + 2
-        diff = [0.0] * width
-        for k0, k1, share in spans:
-            diff[k0 - k_lo] += share
-            diff[k1 - k_lo + 1] -= share
-        run = 0.0
-        for idx in range(width - 1):
-            run += diff[idx]
-            if run > 0.0:
-                h.qty_by_bin[k_lo + idx] = run
+        diff = np.zeros(width, dtype=np.float64)
+        edge_idx = np.empty(2 * k0s.size, dtype=np.int64)
+        edge_val = np.empty(2 * k0s.size, dtype=np.float64)
+        edge_idx[0::2] = k0s - k_lo
+        edge_idx[1::2] = k1s - k_lo + 1
+        edge_val[0::2] = share
+        edge_val[1::2] = -share
+        np.add.at(diff, edge_idx, edge_val)
+        run = np.cumsum(diff[: width - 1])
+        positive = run > 0.0
+        h.qty_by_bin = dict(zip(
+            (np.nonzero(positive)[0] + k_lo).tolist(),
+            run[positive].tolist(), strict=True))
         if not h.qty_by_bin:
             self.windows_refused += 1
             return NotReady(reason=f"{self.symbol}: в окне {from_ms}..{to_ms} нет объёма")

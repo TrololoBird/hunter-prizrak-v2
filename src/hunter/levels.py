@@ -55,11 +55,25 @@ class Level(BaseModel):
 
     zone_lo: Decimal
     zone_hi: Decimal
-    """Объёмная зона (стр. 30: «цена забирает объёмную зону»).
+    """Объёмная зона (стр. 30: «цена забирает объемную зону, (выделено желтым цветом)»).
 
-    ⚠ Отождествление «объёмная зона» = область стоимости 70% — НЕ из курса. Курс рисует
-    зону на графике и доли не называет. Проверяется на корпусе (этап 3.3); до проверки
-    зона сообщается рядом с ПОК, а не вместо него.
+    Числа «70%» в тексте курса нет (греп по всем 69 страницам: «70», «value», «VAH»,
+    «VAL», «область стоимости» → пусто). Но зона вводится не правилом, а указанием на
+    РИСУНОК: жёлтым подсвечена центральная часть фиксированного профиля объёма — штатная
+    value area инструмента, который курс называет дословно (стр. 26 «фиксированного
+    профиля объема», стр. 63 «более точный»). Линии автора идут по кромкам подсветки.
+    Пиксельный замер рисунков стр. 24/30/31/32 (course-reader 2026-08-18, вырезки
+    docs/course/pages/p*-zoom.png): зона занимает 35–42% высоты коробки на всех
+    четырёх страницах, ПОК внутри зоны НЕ по центру (стр. 30: 36% высоты зоны выше
+    ПОК, 64% ниже) — расчёт VA70 от построенного профиля даёт ту же картину.
+    Мост от рисунка к числу 0.70 в коде — документация САМОГО инструмента:
+    tradingview.com/support/solutions/43000502040-volume-profile/ (прочитано
+    2026-08-18): «Value area (VA): The range of price levels in which the specified
+    percentage of all volume was traded… Typically, this percentage is set to 70%»;
+    алгоритм — «Multiply the total volume by the chosen percentage (default 70%)».
+    Референт — рисунок плюс документация названного курсом инструмента; сверка с
+    корпусом видео (этап 3.3) остаётся желательной. Зона сообщается рядом с ПОК,
+    а не вместо него.
     """
 
     created_at_index: int
@@ -374,6 +388,7 @@ def build_all(
     timeframes: tuple[str, ...],
     scans: dict[str, AccumulationScan],
     swings: dict[str, SwingSet] | None = None,
+    frame_bars: int | None = None,
 ) -> LevelBuild:
     """Все уровни по всем ТФ плюс НАЗВАННЫЕ причины, где уровень не построен.
 
@@ -383,6 +398,14 @@ def build_all(
     Причины возвращаются РАЗОБРАННЫМИ (ТФ отдельно от текста), а не готовой строкой:
     подпись ТФ — дело печати, и склеивать её здесь значит навязывать формат всем
     вызывающим.
+
+    ⚠ `frame_bars` — рамка ОТВЕТА, а не качества (введена 2026-08-18, приказ владельца,
+    п. 3): структура, чей конец старше `frame_bars` баров своего ТФ (считая от последнего
+    бара ряда, а не от настенных часов — ради детерминизма повтора), уровень всё равно
+    была бы скрыта фильтром «у структуры» (`tgbot.near_structure`, та же рамка 180),
+    поэтому строить её — платить профилем за невидимое. Пропуск НЕ молчит: он идёт в
+    `unbuilt` с названной причиной. `None` — рамки нет, боевой прогон строит всё
+    (леджер и исходы считаются по полной карте, а не по кадру ответа).
 
     ⚠ `scans` подаётся ГОТОВЫМ и обязателен с 2026-08-06. До этого функция звала
     `swings.detect` и `accumulation.detect` сама — и звала их ВТОРОЙ раз: первый делала
@@ -404,12 +427,20 @@ def build_all(
             continue
         accs = scan.closed
         younger = _younger_tfs(tf, timeframes)
+        frame_lo = (bars[-1].open_ms - frame_bars * TIMEFRAME_MS[tf]
+                    if frame_bars is not None else None)
         for acc in accs:
             if trades is None:
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason="сделок не собрано"))
                 continue
             lo, hi = structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
+            if frame_lo is not None and hi < frame_lo:
+                unbuilt.append(Unbuilt(
+                    timeframe=tf, index=acc.first_index,
+                    reason=f"вне кадра ответа: конец структуры старше {frame_bars} "
+                           f"баров {tf} — уровень скрыл бы фильтр «у структуры»"))
+                continue
             hist = trades.window(lo, hi)
             if isinstance(hist, NotReady):
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
