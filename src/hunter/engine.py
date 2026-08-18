@@ -30,7 +30,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from . import emit, geometry, levels, pereprior, priority, swings
+from . import absorption, emit, geometry, levels, pereprior, priority, swings
+from .absorption import AbsorptionRead
 from .accumulation import AccumulationScan
 from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS
@@ -127,6 +128,14 @@ class PPSignal(BaseModel):
     setup: geometry.PPSetup
     structure_note: str = ""
     """Подтверждение структурой (стр. 53): описание коробки либо пусто."""
+
+    absorption: AbsorptionRead | None = None
+    """Уторговка за зоной ПП — сырой доп-фактор БЕЗ вердикта (absorption-2026-08-17.md).
+    Порог «слом снят» в источниках не назван и здесь не выдуман: до замера порога
+    печатается величина со знаменателем."""
+
+    absorption_missing: str = ""
+    """Причина, по которой уторговка не измерена (§4.3). Пусто, когда измерена."""
 
     @property
     def emitted(self) -> bool:
@@ -280,10 +289,13 @@ def decide(
             continue
         for pp in r.perepriors:
             opposite = next((o for o in r.perepriors if o.side is not pp.side), None)
+            absorbed = absorption.measure(pp, series[tf], tf, trades)
             pp_signals.append(PPSignal(
                 timeframe=tf, pp=pp,
                 setup=geometry.build_pp_setup(pp, opposite),
                 structure_note=_pp_structure_note(pp, r.scan),
+                absorption=absorbed if not isinstance(absorbed, NotReady) else None,
+                absorption_missing=absorbed.reason if isinstance(absorbed, NotReady) else "",
             ))
 
     return SymbolDecision(symbol=symbol, timeframes=tfs, reads=reads,

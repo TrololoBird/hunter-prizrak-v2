@@ -169,6 +169,12 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             f"  {SIDE_LABEL[lvl.side.value]} {TF_LABEL.get(lvl.timeframe, lvl.timeframe):>3}  "
             f"ПОК {_num(lvl.price)}  зона {_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}  "
             f"объём {_num(lvl.structure_volume, 2)}  {STATE_LABEL[st.state.value]}"
+            # Цена по ту сторону всей структуры — печатается РЯДОМ СО СТАТУСОМ, потому
+            # что слово «активен» без этой пометки читается как ожидание цены, а цена
+            # его уже прошла (стр. 43). Заведено 2026-08-18: владелец увидел на карте
+            # наслоение встречных зон — у 25–35% активных уровней цена была не с той
+            # стороны, и в тексте это ничем не отличалось от нормального уровня.
+            + ("  цена ЗА структурой (стр. 43)" if st.price_beyond else "")
         )
         # Форма базы печатается ТОЛЬКО когда она не обычная: строка «горизонтальная,
         # свои границы» ничего не сообщала бы, а шум мешал бы увидеть остальное.
@@ -350,6 +356,18 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                 tgt = "цели нет — противоположный ПП позади входа, не по направлению"
             out.append(f"        сделка от ПП (стр. 50): вход {_num(ps.entry)}  "
                        f"стоп {_num(ps.stop)}  {tgt}")
+            # Уторговка за зоной — сырой доп-фактор (absorption-2026-08-17.md):
+            # порог «слом снят» в источниках не назван, вердикт не печатается.
+            beyond_word = "выше" if pp.side.value == "short" else "ниже"
+            if sig.absorption is not None:
+                ab = sig.absorption
+                out.append(f"        уторговка {beyond_word} зоны: объём {ab.qty_beyond:g} "
+                           f"из {ab.qty_window:g} за {ab.bars_after_confirm} баров после "
+                           f"подтверждения ({ab.share * 100:.1f}%) — порога курс не даёт, "
+                           f"вердикта нет")
+            elif sig.absorption_missing:
+                out.append(f"        уторговка {beyond_word} зоны: не измерена — "
+                           f"{sig.absorption_missing}")
         for fac in pereprior.failed_update(bars, sw):
             any_pp = True
             what = "хай" if fac.side.value == "short" else "лой"

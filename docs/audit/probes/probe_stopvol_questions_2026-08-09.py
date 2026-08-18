@@ -157,7 +157,8 @@ def main() -> int:  # noqa: C901
                         y_bars = per_tf.get(y)
                         if not y_closed or not y_bars:
                             continue
-                        items = classify(y_closed, y_bars, host, per_tf[tf], tf).items
+                        items = classify(y_closed, y_bars, host, per_tf[tf], tf,
+                                         symbol=key[1]).items
                         if only_one:
                             sv_one += len(items)
                             h = height(host)

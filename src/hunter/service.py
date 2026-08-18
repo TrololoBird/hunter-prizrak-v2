@@ -168,7 +168,28 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
     try:
         await c.start()
         while not c.stop.is_set():
-            report, violations = await cycle(c, run_id, uni, horizon_days)
+            # ⚠ Упавший ЦИКЛ не имеет права убить СЛУЖБУ (2026-08-18): сбор жив, и
+            # переходящий сбой (сеть долива, единичный битый снимок) лечится следующим
+            # тактом. Падение не глотается — оно считается циклом с нарушением и
+            # печатается с типом и текстом. Остановка по сигналу (CancelledError)
+            # проходит насквозь: это не сбой цикла, а приказ службе.
+            try:
+                report, violations = await cycle(c, run_id, uni, horizon_days)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                bad_cycles += 1
+                log.degraded("цикл расчёта УПАЛ — сбор продолжается, следующий цикл "
+                             "по такту", номер=c.report.cycles,
+                             причина=f"{type(e).__name__}: {e}",
+                             циклов_с_нарушениями=bad_cycles)
+                if max_cycles and c.report.cycles >= max_cycles:
+                    log.info("задан предел циклов — служба останавливается",
+                             циклов=c.report.cycles)
+                    break
+                if await run.sleep_or_stopped(c.stop, float(cycle_seconds)):
+                    break
+                continue
             if violations:
                 bad_cycles += 1
             log.info("цикл расчёта завершён", номер=report.cycles,

@@ -84,7 +84,7 @@ def main() -> int:
     sv_only_would_give = 0
     sv_changes_answer = 0
 
-    for _key, per_tf in corpus.items():
+    for key, per_tf in corpus.items():
         scans: dict[str, tuple] = {}
         for tf, bars in per_tf.items():
             sw = detect_swings(bars)
@@ -95,7 +95,8 @@ def main() -> int:
             for host in hosts:
                 svs = []
                 for y in younger:
-                    svs.extend(classify(scans[y], per_tf[y], host, per_tf[tf], tf).items)
+                    svs.extend(classify(scans[y], per_tf[y], host, per_tf[tf], tf,
+                                        symbol=key[1]).items)
                 svs_t = tuple(svs)
                 for down in (True, False):
                     sides += 1

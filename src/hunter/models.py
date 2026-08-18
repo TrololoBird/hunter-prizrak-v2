@@ -153,6 +153,17 @@ class Bar:
     volume: float
 
     def __post_init__(self) -> None:
+        # ⚠ Первой — проверка конечности (2026-08-18): все остальные проверки здесь
+        # написаны сравнениями, а сравнение с NaN всегда ложно — NaN-бар проходил их
+        # МОЛЧА и дальше отравлял min/max/суммы всего конвейера, где NaN не падает,
+        # а тихо съедает результат.
+        if not (math.isfinite(self.open) and math.isfinite(self.high)
+                and math.isfinite(self.low) and math.isfinite(self.close)
+                and math.isfinite(self.volume)):
+            raise ValueError(
+                f"бар {self.open_ms}: неконечное значение "
+                f"(o={self.open} h={self.high} l={self.low} c={self.close} "
+                f"v={self.volume})")
         if self.open_ms < 0:
             raise ValueError(f"бар {self.open_ms}: метка открытия отрицательна")
         if self.volume < 0:
@@ -213,6 +224,14 @@ class BarDetail:
     taker_buy_quote: float
 
     def __post_init__(self) -> None:
+        # Та же проверка конечности, что у `Bar`, и по той же причине: остальные
+        # проверки — сравнения, а сравнение с NaN всегда ложно.
+        if not (math.isfinite(self.open) and math.isfinite(self.high)
+                and math.isfinite(self.low) and math.isfinite(self.close)
+                and math.isfinite(self.volume) and math.isfinite(self.quote_volume)
+                and math.isfinite(self.taker_buy_base)
+                and math.isfinite(self.taker_buy_quote)):
+            raise ValueError(f"бар {self.open_ms}: неконечное значение в полях детали")
         if self.close_ms <= self.open_ms:
             raise ValueError(
                 f"бар {self.open_ms}: закрытие {self.close_ms} не позже открытия")
@@ -882,6 +901,16 @@ class RunReport(BaseModel):
     (правило сводки по измерению), а сумма двух типов в одном числе его прятала бы.
     """
 
+    absorption_measured_by_tf: dict[str, int] = Field(default_factory=dict)
+    absorption_refused_by_tf: dict[str, int] = Field(default_factory=dict)
+    """Мера уторговки у зоны ПП (`absorption.measure`): измерено/отказано ПО ТФ.
+
+    Заведено 2026-08-18 вместе с прибором: первый же смок показал перекос — на младших
+    ТФ отказ сплошной (окно от подтверждения слома длиннее собранного ряда минуток),
+    на старших мера есть. Сто честных отказов на одном ТФ без сводки читаются как
+    «рынок такой» (правило сводки отказов, разбор backfill-window-2026-08-04).
+    """
+
     outcomes_recorded: int = 0
     emitted_outcomes: dict[str, int] = Field(default_factory=dict)
     """Исход каждой эмиссии по `OutcomeKind`, включая те, что в леджер НЕ пишутся.
@@ -915,11 +944,16 @@ class RunReport(BaseModel):
     профиль никем не читается."""
 
     profile_windows_senior_tf: int = 0
-    """Окон, которым по лестнице intrabar-ТФ (по образцу TV, число подобрано — см.
-    `profile_source.TV_INTRABAR_MAX_BARS`; 2026-08-18) минутки НЕ нужны: их профиль
-    читает ряды старших ТФ, уже собранные засевом.
-    Это не отказ, а экономия закачки — но усечение набора качаемых окон обязано быть
-    числом (§4.3), иначе «окон 3, добрано 3» прочтётся как «профиль почти не нужен»."""
+    """ОБНУЛЁН С 2026-08-18 (вечер): закачка идёт по всем ступеням лестницы intrabar-ТФ,
+    и класса «окно старшей ступени — не качаем» больше нет. Прежний смысл: окна, которым
+    минутки не нужны, читают ряды засева. Предпосылка оказалась дырявой — засев собирает
+    ~180 суток, а окна дневных/недельных структур глубже (разбор ACE: возможная
+    шорт-зона потеряна отказом покрытия). Поле оставлено ради стабильности перечня
+    полей цикла (`CYCLE_FIELDS`), пишется всегда ноль."""
+
+    profile_spans_by_tf: dict[str, int] = Field(default_factory=dict)
+    """Добранных участков профиля ПО ТФ — измерение, вдоль которого возможен перекос
+    (правило сводки отказов): сто отказов, все на одном ТФ, — дефект, а не рынок."""
 
     profile_windows_out_of_frame: int = 0
     """Окон структур вне кадра ответа (сборка по запросу, рамка `frame_bars`): их

@@ -98,7 +98,7 @@ class StopVolumeSet(BaseModel):
         return sum(1 for x in self.densities if x <= d) / len(self.densities) * 100
 
 
-_VOL_MEMO: dict[tuple[int, int, int, int, int], float] = {}
+_VOL_MEMO: dict[tuple[str, int, int, int, int, int], float] = {}
 """Суммы объёма спанов младших накоплений: см. комментарий при использовании."""
 
 
@@ -120,6 +120,8 @@ def classify(
     host: Accumulation,
     host_bars: list[Bar],
     host_timeframe: str,
+    *,
+    symbol: str,
 ) -> StopVolumeSet:
     """Отнести накопления младшего ТФ к структуре старшего.
 
@@ -139,8 +141,13 @@ def classify(
         # число (дифф повтора пуст). Ключ несёт отпечаток ряда (края и длина), id не
         # используется — переиспользование id после сборки мусора дало бы ложное
         # попадание.
-        memo_key = (small_bars[0].open_ms, small_bars[-1].open_ms, len(small_bars),
-                    a.first_index, a.last_index)
+        #
+        # ⚠ СИМВОЛ В КЛЮЧЕ ОБЯЗАТЕЛЕН (правка 2026-08-18): ряды РАЗНЫХ символов
+        # выровнены одним окном бэкфилла — первый/последний open_ms и длина у них
+        # совпадают, индексы накоплений пересекаются, и без символа кэш отдавал бы
+        # объём спана ЧУЖОГО символа как свой.
+        memo_key = (symbol, small_bars[0].open_ms, small_bars[-1].open_ms,
+                    len(small_bars), a.first_index, a.last_index)
         vol = _VOL_MEMO.get(memo_key)
         if vol is None:
             vol = sum(b.volume for b in small_bars[a.first_index:a.last_index + 1])

@@ -30,6 +30,24 @@ def _expr(x: object) -> pl.Expr:
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+"""Периоды MACD 12/26/9 — конвенция классики (тип Б по §0.2), счёт источников соблюдён.
+
+До 2026-08-18 числа стояли БЕЗ источника — найдено сплошным пересчётом констант по
+вопросу владельца «сколько ещё таких выдумок в коде?». Источника три, страницы
+реально прочитаны 2026-08-18:
+
+  MetaTrader 5, справка по индикатору MACD: «the difference between a 26-period and
+  12-period Exponential moving averages (EMA)» + «signal line (9-period moving
+  average of the indicator)»;
+  StockCharts ChartSchool, MACD Oscillator: «The values of 12, 26, and 9 are the
+  typical settings used with the MACD» (там же авторство: «Developed by Gerald Appel
+  in the late seventies»);
+  Wikipedia, MACD: «The most commonly used values are 12, 26, and 9 days, that is,
+  MACD(12,26,9)».
+
+Курс числа не называет, но скриншоты стр. 64 показывают индикаторы с ДЕФОЛТНЫМИ
+настройками TradingView (корпус: research/prizrak_corpus/course_notes/notes_p52-69.md,
+помечено «только-на-картинке») — то есть автор торгует теми же 12/26/9."""
 
 
 # ⚠ `atr(period)` УДАЛЕНА 2026-08-06, и это НЕ мелкая уборка — читать вместе с §8.

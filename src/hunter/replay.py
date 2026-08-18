@@ -83,8 +83,24 @@ def replay_symbol(run_id: str, dir_name: str) -> SymbolDiff | NotReady:
     manifest = store.read_source_meta(run_id, dir_name)
     if isinstance(manifest, NotReady):
         return manifest
+    profile_tfs, analysis_tfs = manifest
+    # Манифест сверяется С СОДЕРЖАНИЕМ, а не только с существованием (2026-08-18):
+    # до этого состав ТФ повтора выводился из наличия файлов, и пропавший после
+    # прогона parquet менял набор молча — дифф из неполных кадров печатал «расчёт
+    # изменился» при неизменном коде. Старый манифест без списка аналитических
+    # рядов сверку состава пропускает, и это названо формой манифеста, а не молча.
+    if analysis_tfs is not None and set(analysis_tfs) != set(tfs):
+        return NotReady(reason=(
+            f"{symbol}: состав кадров разошёлся с манифестом — записывались "
+            f"{sorted(analysis_tfs)}, на диске {sorted(tfs)}; дифф из неполных "
+            f"кадров был бы ложным «расчёт изменился»"))
+    profile_read = store.read_profile_bars(run_id, dir_name)
+    if set(profile_read) != set(profile_tfs):
+        return NotReady(reason=(
+            f"{symbol}: профильные ряды разошлись с манифестом — записывались "
+            f"{sorted(profile_tfs)}, на диске {sorted(profile_read)}"))
     profile_series: dict[str, list[Bar]] = dict(series)
-    profile_series.update(store.read_profile_bars(run_id, dir_name))
+    profile_series.update(profile_read)
     source = TVWindows(symbol, tick, profile_series)
 
     # Решение строится ЗАНОВО из кадров, а не берётся готовым: §10.6 условие 2 требует
@@ -108,7 +124,13 @@ def replay_run(run_id: str) -> ReplayResult | NotReady:
     done: list[SymbolDiff] = []
     skipped: list[str] = []
     for d in dirs:
-        r = replay_symbol(run_id, d)
+        # Ошибка одного символа (битый parquet, нечитаемый кадр) не роняет весь
+        # повтор: остальные символы всё равно сверяются, а отказ назван (§4.3).
+        try:
+            r = replay_symbol(run_id, d)
+        except Exception as e:  # причина уходит в skipped, не глотается
+            skipped.append(f"{d}: повтор упал — {type(e).__name__}: {e}")
+            continue
         if isinstance(r, NotReady):
             skipped.append(r.reason)
         else:
@@ -117,7 +139,16 @@ def replay_run(run_id: str) -> ReplayResult | NotReady:
 
 
 def print_result(r: ReplayResult, show_diff: bool) -> int:
-    """Печатает вердикт по-русски. Возвращает число расхождений (§7.5)."""
+    """Печатает вердикт по-русски (§7.5). Код возврата различает исходы:
+
+    0 — все символы повторены, все совпали;
+    1 — расчёт изменился (есть построчные расхождения);
+    2 — расхождений нет, но часть символов не повторена (проверка неполная).
+
+    До 2026-08-18 возвращалась СУММА len(changed)+len(skipped): «2 пропущено»
+    и «2 изменилось» давали одинаковый код, и вызывающий не мог отличить
+    неполную проверку от проваленной.
+    """
     print()
     print("=" * 78)
     print(f"ПОВТОР ПРОГОНА {r.run_id} — FOUNDATION.md §10.6, условие 2")
@@ -136,10 +167,14 @@ def print_result(r: ReplayResult, show_diff: bool) -> int:
     if not r.symbols:
         print("ПЛОХО: не повторён ни один символ — проверка не состоялась")
         print("=" * 78)
-        return 1
+        return 2
     if not changed:
-        print(f"ХОРОШО: расчёт не изменился — все {len(r.symbols)} карточек совпали "
-              f"построчно с сохранёнными.")
+        if r.skipped:
+            print(f"НЕПОЛНО: {len(r.symbols)} карточек совпали построчно, но "
+                  f"{len(r.skipped)} символов не повторено — по ним проверки НЕ БЫЛО.")
+        else:
+            print(f"ХОРОШО: расчёт не изменился — все {len(r.symbols)} карточек "
+                  f"совпали построчно с сохранёнными.")
     else:
         print(f"ВНИМАНИЕ: расчёт изменился у {len(changed)} символов из {len(r.symbols)}.")
         print("Ниже — что было и что стало. Строки со знаком «-» были, со знаком «+» стали.")
@@ -150,4 +185,6 @@ def print_result(r: ReplayResult, show_diff: bool) -> int:
         else:
             print("(показать разницу: добавьте --diff)")
     print("=" * 78)
-    return len(changed) + len(r.skipped)
+    if changed:
+        return 1
+    return 2 if r.skipped else 0

@@ -39,6 +39,9 @@ _TEXT, _TICK = "#d1d4dc", "#787b86"
 _UP, _DN = "#26a69a", "#ef5350"
 _LONG_FILL, _LONG_EDGE = "#1b5e20", "#4caf50"
 _SHORT_FILL, _SHORT_EDGE = "#7f1d1d", "#ef5350"
+_CONF_FILL, _CONF_EDGE = "#6b5d1c", "#f2c94c"
+"""Жёлтый = режим входа «по факту/наблюдение» — семантика цвета у автора
+(корпус tg-prizrak-2026-08.md, разделы 4 и 8: 🟡/жёлтая полоса, id 7654)."""
 _PP_FILL, _PP_EDGE = "#4a3b6b", "#9575cd"
 _STRUCT_FILL, _STRUCT_EDGE = "none", "#4dd0e1"
 """Бокс СТРУКТУРЫ — голубой, как на разметке автора курса (скриншот владельца
@@ -149,6 +152,10 @@ def chart_png(
     """Кандидаты боксов входа (side, lo, hi): рисуются после цикла зон СО СКЛЕЙКОЙ
     пересекающихся одной стороны в один бокс — как «диапазон интереса» у автора."""
 
+    conf_boxes: list[tuple[float, float]] = []
+    """Зоны режима «по факту/наблюдение» — жёлтые, как у автора (id 7654: «работать
+    с ней лучше всего по факту»); лимиткой не торгуются, но на карте автора видны."""
+
     def bar_index(ms: int) -> int | None:
         """Номер бара по метке времени. None — метка вне окна графика."""
         if ms <= 0 or not bars:
@@ -223,11 +230,15 @@ def chart_png(
         # BUY над ценой — приглашение войти там, где входа нет.
         tradable_side = (z.price < ref_price if z.side == "long"
                          else z.price >= ref_price)
-        if (z.kind == "level" and z.entry_rule in ("limit", "retest_flipped")
-                and z.state == "active" and tradable_side):
+        if z.kind == "level" and z.state == "active" and tradable_side:
             # НАСТОЯЩИЕ границы, не обрезанные кадром: обрезка — при рисовании.
             # Иначе ценник границы печатал бы край кадра вместо цены зоны.
-            entry_boxes.append((z.side, z.zone_lo, z.zone_hi))
+            if z.entry_rule in ("limit", "retest_flipped"):
+                entry_boxes.append((z.side, z.zone_lo, z.zone_hi))
+            else:
+                # «По факту»-зона: не готовый вход (стр. 25 — лимитки сняты), но у
+                # автора она на карте ЖЁЛТАЯ, а не отсутствует (корпус, раздел 4).
+                conf_boxes.append((z.zone_lo, z.zone_hi))
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
@@ -275,18 +286,27 @@ def chart_png(
     # диапазон 64890–65200). Введено по живому ответу ONDO 18.08.2026: без склейки
     # 6 лимиток одной стороны вставали стеной с кашей подписей «SELL SELL».
     # Склейка транзитивная по перекрытию, критерий геометрический.
-    for side in ("long", "short"):
-        spans = sorted(((b_lo, b_hi) for s, b_lo, b_hi in entry_boxes if s == side),
-                       key=lambda p: p[0])
-        merged: list[list[float]] = []
-        for b_lo, b_hi in spans:
-            if merged and b_lo <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], b_hi)
+    def merge_spans(spans: list[tuple[float, float]]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for b_lo, b_hi in sorted(spans):
+            if out and b_lo <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b_hi)
             else:
-                merged.append([b_lo, b_hi])
-        fill, edge = ((_LONG_FILL, _LONG_EDGE) if side == "long"
-                      else (_SHORT_FILL, _SHORT_EDGE))
-        for b_lo, b_hi in merged:
+                out.append([b_lo, b_hi])
+        return out
+
+    groups = [
+        ("BUY", _LONG_FILL, _LONG_EDGE,
+         [(b_lo, b_hi) for s, b_lo, b_hi in entry_boxes if s == "long"]),
+        ("SELL", _SHORT_FILL, _SHORT_EDGE,
+         [(b_lo, b_hi) for s, b_lo, b_hi in entry_boxes if s == "short"]),
+        # Жёлтая зона наблюдения — подпись словами автора («по факту», id 7654).
+        ("ПО ФАКТУ", _CONF_FILL, _CONF_EDGE, conf_boxes),
+    ]
+    ruler_edges: list[float] = []
+    """Ближние края боксов вне цены — кандидаты линейки замера хода (ниже)."""
+    for label, fill, edge, spans in groups:
+        for b_lo, b_hi in merge_spans(spans):
             d_lo, d_hi = max(b_lo, lo), min(b_hi, hi)
             ax.add_patch(patches.Rectangle(
                 (len(bars) + future * 0.06, d_lo), future * 0.5,
@@ -294,7 +314,7 @@ def chart_png(
                 facecolor=fill, edgecolor=edge, linewidth=1.2, alpha=0.55, zorder=4,
             ))
             ax.annotate(
-                "BUY" if side == "long" else "SELL",
+                label,
                 xy=(len(bars) + future * 0.31, (d_lo + d_hi) / 2),
                 va="center", ha="center", fontsize=8, fontweight="bold",
                 color="white", zorder=6,
@@ -309,6 +329,29 @@ def chart_png(
             for y in (b_lo, b_hi):
                 if lo <= y <= hi:
                     tags.append((y, f"{y:g}", edge))
+            if ref_price > 0 and (ref_price < b_lo or ref_price > b_hi):
+                ruler_edges.append(b_lo if ref_price < b_lo else b_hi)
+
+    # Линейка замера хода — серая вертикаль с процентом, как у автора (корпус
+    # tg-prizrak, раздел 8: «−13,00%» у KAS). По ОДНОЙ на направление — до
+    # ближайшей зоны сверху и снизу; ход короче 1.5% высоты кадра не размечается.
+    above = [y for y in ruler_edges if y > ref_price]
+    below = [y for y in ruler_edges if y < ref_price]
+    for edge_y in ([min(above)] if above else []) + ([max(below)] if below else []):
+        if abs(edge_y - ref_price) < (hi - lo) * 0.015:
+            continue
+        x_r = len(bars) + future * 0.78
+        y0c, y1c = max(min(ref_price, edge_y), lo), min(max(ref_price, edge_y), hi)
+        if y1c <= y0c:
+            continue
+        move = (edge_y - ref_price) / ref_price * 100
+        ax.plot([x_r, x_r], [y0c, y1c], color=_TICK, linewidth=1.0, zorder=6)
+        ax.plot([x_r], [y1c if edge_y > ref_price else y0c],
+                marker="^" if edge_y > ref_price else "v",
+                color=_TICK, markersize=4, zorder=6)
+        ax.annotate(f"{move:+.2f}%", xy=(x_r, (y0c + y1c) / 2),
+                    xytext=(3, 0), textcoords="offset points",
+                    va="center", ha="left", fontsize=7.5, color=_TEXT, zorder=6)
 
     w = 0.62
     for i, b in enumerate(bars):

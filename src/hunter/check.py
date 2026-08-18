@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import sqlite3
 
 from . import log, store
 from .admission import REQUIRED_BARS, USED_BY_2_9, strictest_requirement
@@ -94,8 +96,13 @@ def _report_admission(
     if unknown:
         print(f"   ⚠ счёт не состоялся у {len(unknown)} из {total}: "
               f"{', '.join(unknown)} — про них вывод НЕ СЛЕДУЕТ")
-    return True, (f"{counted - missing_any} из {counted} сосчитанных символов имеют все "
-                  f"доп-факторы; не сосчитано {len(unknown)} из {total}")
+    # ⚠ До 2026-08-18 возвращалось безусловное `True` — строка вердикта не могла
+    # стать красной (дефект Д-1). Нарушение здесь — несостоявшийся СЧЁТ (прибор не
+    # ответил), а не отсутствие факторов: короткая история — состояние рынка, оно
+    # печатается числом выше и нарушением не является.
+    return len(unknown) == 0, (
+        f"{counted - missing_any} из {counted} сосчитанных символов имеют все "
+        f"доп-факторы; не сосчитано {len(unknown)} из {total}")
 
 
 def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:
@@ -115,6 +122,18 @@ def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:
         if now_ms and (expected - st.bars[-1].open_ms) // tf_ms(st.timeframe) > 0:
             stale += 1
     rejected = [x for s in r.series.values() for x in s.rejected_bars]
+    # Последствие отклонения битых баров: принятые ряды обязаны быть чистыми.
+    # Дефектная геометрия — нечисловая цена или экстремумы, не накрывающие тело;
+    # это те же условия, по которым бар отвергается на приёме, посчитанные заново
+    # НЕЗАВИСИМЫМ обходом (проверка не доверяет счётчику того, кого проверяет).
+    kept_bars = sum(len(s.bars) for s in ready)
+    bad_kept = sum(
+        1 for s in ready for b in s.bars
+        if not (math.isfinite(b.open) and math.isfinite(b.high)
+                and math.isfinite(b.low) and math.isfinite(b.close)
+                and math.isfinite(b.volume)
+                and b.low <= min(b.open, b.close)
+                and b.high >= max(b.open, b.close)))
     # Д-4: разрыв объясняется отклонённым баром ВНУТРИ него, а не самим фактом отказа
     # где-то в ряду. Формула живёт в `run.explained_gaps` — вторая копия разошлась бы.
     explained = sum(len(explained_gaps(s)) for s in ready)
@@ -154,9 +173,15 @@ def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:
          f"{sum(s.polled_bars for s in r.series.values())} баров; "
          f"биржа опоздала с ожидаемой свечой {late} раз — это ЗАМЕР отступа "
          f"POLL_OFFSET_S, не нарушение"),
+        # ⚠ До 2026-08-18 условием стояло `True` — строка не могла стать красной,
+        # ровно дефект Д-1 («зелёная по построению»), воспроизведённый заново после
+        # его разбора. Теперь проверяется ПОСЛЕДСТВИЕ отклонения: в принятых рядах
+        # не должно остаться ни одного бара с дефектной геометрией. Счёт отклонённых
+        # печатается рядом как замер, он нарушением не является.
         ("Битые бары биржи отклонены",
-         True,
-         f"отклонено {len(rejected)} " +
+         bad_kept == 0,
+         f"битых баров в принятых рядах {bad_kept} из {kept_bars}; "
+         f"отклонено на приёме {len(rejected)} " +
          (f"— {rejected[0][:90]}…" if rejected else "(ни одного за этот прогон)")),
         ("Сделки принимаются",
          trades > 0,
@@ -217,6 +242,7 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     lines.append(("Доп-факторы §2.9 перечислены поимённо", ok, detail))
 
     print("\n3. ЛЕДЖЕР")
+    conn = None
     try:
         conn = store.open_readonly()
         n = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
@@ -248,7 +274,6 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
             "SELECT timeframe, COUNT(*) FROM levels"
             " WHERE state='active' AND zone_hi+zone_lo > 0 GROUP BY timeframe"
         ).fetchall())
-        conn.close()
         lines.append(("Леджер читается", True, f"записей о сигналах: {n}"))
         print(f"   записей: {n}")
         if wide:
@@ -287,5 +312,15 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         lines.append(("Леджер читается", False,
                       "базы нет; создать: uv run python -m hunter ledger --init"))
         print("   базы нет")
+    # ⚠ До 2026-08-18 ловился только FileNotFoundError: любая ошибка SQL (битая база,
+    # старая схема без таблицы levels) роняла всю проверку трейсбеком и оставляла
+    # соединение открытым — вместо красной строки с причиной (§4.3).
+    except sqlite3.Error as e:
+        lines.append(("Леджер читается", False,
+                      f"база не прочитана: {type(e).__name__}: {e}"))
+        print(f"   база не прочитана: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
     return _verdict(lines)

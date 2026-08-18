@@ -280,8 +280,24 @@ def build_tv(
         else:
             lo -= 1
 
-    def row_center(r: int) -> Decimal:
-        return bottom + row_height * r + row_height / 2
+    # ⚠ ПОСЛЕДНЯЯ СТРОКА ОБРЕЗАЕТСЯ ПО `top`, и это не косметика. Высота строки
+    # квантована тиками (`ticks_per_row` — целое), а диапазон на неё нацело не делится,
+    # поэтому `rows_built` берётся с округлением ВВЕРХ и верх последней строки уезжает
+    # ВЫШЕ диапазона. Профиль натянут на выбранные свечи (стр. 26) — цены выше их хая
+    # прибор не показывает, и выдавать их значило бы рисовать объём там, где свечей нет.
+    #
+    # Найдено 2026-08-18 замером после объединения границ: ВАХ вылезал за коробку базы у
+    # 68 уровней из 9715 (0.7%) — остаток от 51.7% на двух сущностях. Владелец правило
+    # назвал прямо: «ЕСЛИ зона выходит за структуру то СТРУКТУРА ОПРЕДЛЕННА НЕ ВЕРНО».
+    # ⚠ Тем же самым лечится ЗАСАДА, которой на этих данных не случилось: центр
+    # последней строки тоже мог оказаться выше `top`, и тогда уровень отбрасывался бы
+    # инвариантом `levels.build_level` как «ПОК вне базы» — из-за квантования сетки, а
+    # не из-за рынка.
+    def row_bottom(r: int) -> Decimal:
+        return bottom + row_height * r
+
+    def row_top(r: int) -> Decimal:
+        return min(bottom + row_height * (r + 1), top)
 
     return TVProfile(
         row_size=mode,
@@ -289,10 +305,10 @@ def build_tv(
         ticks_per_row=ticks_per_row,
         rows_built=rows_built,
         poc_row=poc,
-        poc_price=row_center(poc),
+        poc_price=(row_bottom(poc) + row_top(poc)) / 2,
         poc_volume=peak,
-        val_price=bottom + row_height * lo,
-        vah_price=bottom + row_height * (hi + 1),
+        val_price=row_bottom(lo),
+        vah_price=row_top(hi),
         covered_volume=covered,
         total_volume=total,
         clamped_volume=clamped,

@@ -54,7 +54,7 @@ from .models import (
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
-from .profile_source import TVWindows, intrabar_timeframe
+from .profile_source import PROFILE_LADDER, TVWindows, intrabar_timeframe
 from .swings import detect as detect_swings
 
 
@@ -715,11 +715,21 @@ def profile_windows(
     ⚠ `frame_bars` (там же, сборка по запросу): окно, чей конец старше `frame_bars`
     баров своего ТФ, принадлежит структуре, чей уровень скрыл бы фильтр «у структуры», —
     его профиль не прочитает никто. Тоже считается, а не молчит.
+
+    ⚠ При заданном `frame_bars` отсечка ГОРИЗОНТОМ НЕ применяется (2026-08-18, разбор
+    ACE). Горизонт меряется СУТКАМИ и один на все ТФ, рамка — БАРАМИ СВОЕГО ТФ; для 1Н
+    180 суток — это 25 баров, а рамка ответа — 180. Двойная отсечка означала: уровни
+    строятся по рамке, а свечи под них качаются по горизонту, и недельные структуры
+    возрастом 26–180 недель честно отказывали «не покрыто свечами» — систематически и
+    только на старших ТФ. Потребитель у окон один (`levels` с той же рамкой), и резать
+    закачку вторым, более узким критерием значило кормить его отказами. Боевой прогон
+    (`frame_bars is None`) по-прежнему режется горизонтом: его охват — решение владельца
+    о цене, и менять его отсюда нельзя.
     """
     out: list[tuple[int, int]] = []
     used = dropped = senior = out_of_frame = 0
     now = max((b[-1].open_ms for b in series.values() if b), default=0)
-    cut = now - horizon_days * 86_400_000
+    cut = now - horizon_days * 86_400_000 if frame_bars is None else 0
     for tf, bars in series.items():
         if not bars:
             continue
@@ -784,10 +794,19 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
     «сейчас минус горизонт», значит при нуле он равен «сейчас», а окно закрытой
     структуры кончается раньше. Дымовой прогон напечатал «окон 0, отброшено 45» —
     прибор молчал бы, если бы отброшенные не считались отдельно.
+
+    ⚠ С 2026-08-18 (вечер) качаются окна ВСЕХ ступеней лестницы intrabar-ТФ, а не
+    только минутные. Прежняя редакция качала только `uni.profile_timeframe` и полагала,
+    что окна старших ступеней «читают ряды, уже собранные засевом», — но засев собирает
+    фиксированную глубину (`seed_depth`, ~180 суток на ТФ), а окна дневных и недельных
+    структур уходят глубже. Найдено разбором ACE: недельная структура дек-2025..мар-2026
+    (цены ВЫШЕ текущей — возможная шорт-зона) не получила уровня с отказом «окно покрыто
+    свечами 1h не полностью — 417 из 2352», и отказы ложились систематически на старшие
+    ТФ — ровно тот перекос по измерению, который правило сводки отказов обязано ловить
+    (у монет вселенной он маскируется накопленным хранилищем, у монет по запросу — нет).
+    Теперь недостающая часть окна ЛЮБОЙ ступени добирается у биржи в то же хранилище,
+    из которого `trade_source` подмешивает ряды профиля.
     """
-    tf = uni.profile_timeframe
-    step = tf_ms(tf)
-    page_ms = step * OHLCV_PAGE
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
@@ -796,11 +815,8 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                          причина=inst.reason)
             continue
         series = bars_of(report, sym)
-        # ⚠ С 2026-08-18 качаются ТОЛЬКО окна, которым правило TV назначило минутки
-        # (короткие); длинные окна читают ряды старших ТФ, уже собранные засевом.
-        wins, used, dropped, senior, out_of_frame = profile_windows(
-            series, horizon_days, intrabar_tf=tf, frame_bars=frame_bars)
-        report.profile_windows_senior_tf += senior
+        wins, used, dropped, _senior, out_of_frame = profile_windows(
+            series, horizon_days, frame_bars=frame_bars)
         report.profile_windows_out_of_frame += out_of_frame
         if not wins:
             # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
@@ -808,16 +824,11 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             # ни счётчика, ни строки. Полный проход вселенной 2026-08-17: карту получили
             # 9 символов из 27, сводка напечатала «новых уровней 14711», и назвать
             # пропущенных было нечем. Причина у пустых окон ровно две, и они РАЗНЫЕ —
-            # рядов нет вовсе против «структуры есть, но все старше горизонта», — поэтому
-            # печатаются обе.
-            #
-            # ⚠ С 2026-08-18 есть ТРЕТЬЯ причина, и она НЕ отказ: все окна символа по
-            # правилу TV читают старшие ТФ (или вне кадра ответа) — минутки им не нужны,
-            # уровни строятся из уже собранных рядов. Прежняя строка «уровней у символа
-            # не будет» здесь была бы ложью.
-            if senior or out_of_frame:
-                log.info("профиль: минутки символу не нужны — окна читают старшие ТФ",
-                         символ=sym, окон_старших_тф=senior, окон_вне_кадра=out_of_frame)
+            # рядов нет вовсе против «структуры есть, но все вне кадра/горизонта», —
+            # поэтому печатаются обе.
+            if out_of_frame:
+                log.info("профиль: все окна символа вне кадра ответа",
+                         символ=sym, окон_вне_кадра=out_of_frame)
                 continue
             report.profile_symbols_no_windows += 1
             log.degraded("профиль: окон структур нет — уровней у символа не будет",
@@ -825,42 +836,59 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                          баров=sum(len(b) for b in series.values()),
                          отброшено_горизонтом=dropped, горизонт_суток=horizon_days)
             continue
-        merged = merge_windows(wins, page_ms)
         report.profile_windows += used
         report.profile_windows_dropped += dropped
-        for lo, hi in merged:
-            # ⚠ `None` У `missing_tail_since` ЗНАЧИТ «ПРОСИТЬ ВСЁ», А НЕ «УЖЕ ЕСТЬ».
-            # Первая редакция читала его как «покрыто» и на ПУСТОМ хранилище объявляла
-            # все участки кэшированными: дымовой прогон напечатал «окон 49, добрано 0,
-            # из хранилища 4» при нуле файлов профиля на диске. Инверсия смысла —
-            # ровно тот дефект, который не виден по коду возврата и виден по числам.
-            since = barstore.missing_tail_since(uni.venue, inst.market_id, tf, lo)
-            if since is not None and since >= hi:
-                report.profile_spans_cached += 1
+        by_tf: dict[str, list[tuple[int, int]]] = {}
+        for lo, hi in wins:
+            by_tf.setdefault(intrabar_timeframe(hi - lo), []).append((lo, hi))
+        for tf in PROFILE_LADDER:
+            tf_wins = by_tf.get(tf)
+            if not tf_wins:
                 continue
-            start = lo if since is None else since
-            ask = (hi - start) // step + 2
-            got = await ex.fetch_closed_ohlcv(sym, tf, limit=int(ask), since_ms=start)
-            if isinstance(got, NotReady):
-                report.profile_spans_failed += 1
-                log.degraded("профиль: свечи окна не добраны", символ=sym, тф=tf,
-                             от=start, до=hi, причина=got.reason)
-                continue
-            added, rewritten = barstore.append(uni.venue, inst.market_id, tf, got.bars)
-            report.profile_bars_stored += added
-            report.profile_bars_rewritten += rewritten
-            report.profile_spans_filled += 1
+            step = tf_ms(tf)
+            for lo, hi in merge_windows(tf_wins, step * OHLCV_PAGE):
+                # ⚠ КРИТЕРИЙ «УЖЕ ЕСТЬ» — СЧЁТ БАРОВ В САМОМ ОКНЕ, а не хвостовой
+                # курсор (2026-08-18, разбор ACE). Прежний `missing_tail_since`
+                # отвечает про хвост от последнего сохранённого бара и СЛЕП К ДЫРЕ
+                # ВНУТРИ окна: хранилище минуток ACE начиналось раньше окна и
+                # кончалось позже него, а три окна свежих 5м-структур лежали в его
+                # внутренней дыре — участок объявлялся кэшированным, профиль отказывал
+                # «покрыто не полностью», и чинить это было некому. Критерий теперь
+                # тот же, что у читателя (`CandleWindows.window`: полных баров меньше
+                # слотов окна — отказ): неполный участок перекачивается ЦЕЛИКОМ,
+                # слияние в `append` уложит его вокруг имеющегося. Пустое хранилище
+                # отдельно не различается: ноль баров — тоже «меньше, чем нужно».
+                want = max(1, (hi - lo) // step)
+                have = len(barstore.load(uni.venue, inst.market_id, tf,
+                                         since_ms=lo, upto_ms=hi - 1))
+                if have >= want:
+                    report.profile_spans_cached += 1
+                    continue
+                got = await ex.fetch_closed_ohlcv(sym, tf, limit=int(want + 2),
+                                                  since_ms=lo)
+                if isinstance(got, NotReady):
+                    report.profile_spans_failed += 1
+                    log.degraded("профиль: свечи окна не добраны", символ=sym, тф=tf,
+                                 от=lo, до=hi, причина=got.reason)
+                    continue
+                added, rewritten = barstore.append(uni.venue, inst.market_id, tf,
+                                                   got.bars)
+                report.profile_bars_stored += added
+                report.profile_bars_rewritten += rewritten
+                report.profile_spans_filled += 1
+                report.profile_spans_by_tf[tf] = (
+                    report.profile_spans_by_tf.get(tf, 0) + 1)
     # ⚠ ЗНАМЕНАТЕЛЬ В ЭТОЙ ЖЕ СТРОКЕ. Прежде она печатала только то, что УДАЛОСЬ, и
     # «окон 1970, добрано 1» читалось как успех при девяти обслуженных символах из
     # двадцати семи. Теперь видно, скольких символов сводка касается вообще.
-    log.info("профиль: свечи под окна структур", тф=tf,
+    log.info("профиль: свечи под окна структур",
              символов=len(uni.symbols),
              символов_без_окон=report.profile_symbols_no_windows,
              символов_без_инструмента=report.profile_symbols_skipped,
              окон=report.profile_windows, отброшено_по_горизонту=report.profile_windows_dropped,
-             окон_старших_тф=report.profile_windows_senior_tf,
              окон_вне_кадра=report.profile_windows_out_of_frame,
              участков_добрано=report.profile_spans_filled,
+             добрано_по_тф=dict(sorted(report.profile_spans_by_tf.items())),
              участков_из_хранилища=report.profile_spans_cached,
              участков_с_отказом=report.profile_spans_failed,
              баров_записано=report.profile_bars_stored)
@@ -1242,18 +1270,25 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
     ⚠ С 2026-08-18 источник — `TVWindows` (п. 3 приказа владельца): intrabar-ТФ окна
     выбирает лестница по образцу TV (первый из 1м…1Д с < 5000 баров; число и лестница
     ПОДОБРАНЫ нами, TV публикует только принцип — см. `TV_INTRABAR_MAX_BARS`), а не
-    всегда `1m`. Минутки
-    по-прежнему читаются из хранилища (короткие окна), аналитические ТФ — из уже
-    собранных рядов прогона: под длинные окна отдельной закачки больше нет вовсе.
-    Точность размена замерена до принятия — докстрока `TV_INTRABAR_MAX_BARS`.
+    всегда `1m`.
+
+    ⚠ С 2026-08-18 (вечер) хранилище подмешивается по ВСЕМ ступеням лестницы, а не
+    только по минуткам. Прежде аналитические ТФ читались только из рядов прогона
+    (глубина `seed_depth` ~180 суток), и окна дневных/недельных структур, уходящие
+    глубже, получали отказ покрытия, хотя `backfill_profile_bars` уже умеет докачивать
+    их участки в хранилище (см. его докстроку — разбор ACE). Слияние: хранилище +
+    ряд прогона, свежий бар прогона побеждает по метке (`_merge_bars`).
     """
     inst = ex.instrument(sym)
     if isinstance(inst, NotReady):
         return None
     series: dict[str, list[Bar]] = dict(bars_of(report, sym))
-    minutes = barstore.load(uni.venue, inst.market_id, uni.profile_timeframe)
-    if minutes:
-        series[uni.profile_timeframe] = minutes
+    for tf in PROFILE_LADDER:
+        stored = barstore.load(uni.venue, inst.market_id, tf)
+        if not stored:
+            continue
+        have = series.get(tf)
+        series[tf] = _merge_bars(stored, have) if have else stored
     if not series:
         return None
     return TVWindows(sym, inst.tick_size, series)
@@ -1406,7 +1441,11 @@ def persist_source(run_id: str, report: RunReport,
             for tf, bars in extra.items():
                 store.write_profile_bars(run_id, sym, tf, bars)
                 report.profile_series_written += 1
-            store.write_source_meta(run_id, sym, list(extra))
+            # Состав аналитических рядов пишется в манифест: повтор сверяет его с
+            # файлами на диске, иначе пропавший parquet менял бы набор ТФ молча и
+            # дифф читался бы как «расчёт изменился» (2026-08-18).
+            store.write_source_meta(run_id, sym, list(extra),
+                                    analysis_tfs=sorted(saved))
             if not extra:
                 log.degraded("профильный ряд в кадры не положен — минуток в "
                              "хранилище нет, повтор воспроизведёт те же отказы",
@@ -1609,6 +1648,12 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # исход без цели не измерим. opened_at — бар ПОДТВЕРЖДЕНИЯ слома: раньше
             # него сигнала не существовало, а бар теста может быть далеко позже.
             for pssig in d.pp_signals:
+                # Сводка меры уторговки — по ВСЕМ ПП-сигналам, до отсева бесцелевых:
+                # перекос отказов идёт вдоль ТФ (окно длиннее ряда минуток), и сводка
+                # обязана его показывать, а не прятать за отбором (правило сводки).
+                ab_bucket = (report.absorption_measured_by_tf if pssig.absorption
+                             is not None else report.absorption_refused_by_tf)
+                ab_bucket[pssig.timeframe] = ab_bucket.get(pssig.timeframe, 0) + 1
                 ps = pssig.setup
                 if ps.target is None:
                     continue
@@ -1677,6 +1722,7 @@ CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
     "profile_series_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
+    "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
     "pending_no_target", "pending_no_bars", "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
@@ -2299,12 +2345,14 @@ def print_report(r: RunReport) -> int:
     print(f"   окон структур: {r.profile_windows}, "
           f"старше горизонта отброшено: {r.profile_windows_dropped}, "
           f"символов пропущено: {r.profile_symbols_skipped}")
-    print(f"   окон на старших ТФ (минутки не нужны, лестница intrabar-ТФ): "
-          f"{r.profile_windows_senior_tf}, вне кадра ответа: "
-          f"{r.profile_windows_out_of_frame}")
+    print(f"   окон вне кадра ответа: {r.profile_windows_out_of_frame}")
     print(f"   участков: добрано у биржи {r.profile_spans_filled}, "
           f"взято из хранилища {r.profile_spans_cached}, "
           f"с отказом {r.profile_spans_failed}")
+    if r.profile_spans_by_tf:
+        spans = ", ".join(f"{tf}: {n}"
+                          for tf, n in sorted(r.profile_spans_by_tf.items()))
+        print(f"   добрано по ТФ (перекос виден здесь): {spans}")
     print(f"   свечей записано: {r.profile_bars_stored}, "
           f"ПЕРЕЗАПИСАНО: {r.profile_bars_rewritten}")
     if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
@@ -2329,6 +2377,16 @@ def print_report(r: RunReport) -> int:
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
           f"известно раньше: {r.pp_signals_known}")
+    if r.absorption_measured_by_tf or r.absorption_refused_by_tf:
+        # Сводка по измерению, вдоль которого возможен перекос: отказ меры уторговки
+        # идёт по ТФ (окно от подтверждения слома длиннее собранного ряда минуток).
+        tfs_seen = sorted(
+            set(r.absorption_measured_by_tf) | set(r.absorption_refused_by_tf),
+            key=lambda t: TIMEFRAME_MS.get(t, 0))
+        parts = (f"{tf} {r.absorption_measured_by_tf.get(tf, 0)}/"
+                 f"{r.absorption_measured_by_tf.get(tf, 0) + r.absorption_refused_by_tf.get(tf, 0)}"
+                 for tf in tfs_seen)
+        print("   уторговка у зон ПП, измерено/всего по ТФ: " + ", ".join(parts))
     print(f"   исходов записано: {r.outcomes_recorded}, из них ДОРЕШАНО у сигналов, "
           f"которые прогон заново не эмитировал: {r.outcomes_resolved_late}")
     print(f"   состояний незакрытых сделок записано: {r.states_recorded} "

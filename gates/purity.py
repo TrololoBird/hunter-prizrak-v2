@@ -30,6 +30,7 @@ PURE_MODULES = [
     "src/hunter/stop_volume.py",
     "src/hunter/breach.py",
     "src/hunter/pereprior.py",
+    "src/hunter/absorption.py",
     "src/hunter/geometry.py",
     "src/hunter/priority.py",
     "src/hunter/factors.py",

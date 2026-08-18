@@ -34,13 +34,14 @@ from hunter.accumulation import detect as detect_accumulations
 from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
-from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_targets
+from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_setup, build_targets
 from hunter.levels import (
     Level,
     LevelSide,
     LevelState,
     LevelStatus,
     MappedLevel,
+    StopAnchorSource,
     status,
     stop_anchor,
 )
@@ -88,7 +89,6 @@ def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
         structure_from_ms=T0, structure_to_ms=T0 + max(created, 1) * STEP,
         structure_volume=100.0,
         boundary_lo=Decimal(str(lo)), boundary_hi=Decimal(str(hi)),
-        range_lo=Decimal(str(lo)), range_hi=Decimal(str(hi)),
         boundary_narrowed=narrowed,
         boundary_ladder=ladder,
     )
@@ -412,6 +412,49 @@ def c_stop_anchor_capped_by_base() -> tuple[object, object]:
     )
 
 
+def c_stop_hidden_beyond_anchor() -> tuple[object, object]:
+    """Стоп прячется ЗА якорь с запасом, а не ставится на его цену (приказ владельца
+    «делай все согласно курсу» 2026-08-18).
+
+    Курс: «СТОП прятать с запасом за структуру» (стр. 19, дословно; о том же стр. 33,
+    36, 58); прежний стоп ровно на цене якоря источника не имел. Добавка — ближний
+    край 1% от цены якоря, две рамки: потолок высотой базы и, для якоря НЕ-прокола,
+    внешний край полосы 5% от границы (стр. 18). Поверх всего — ПОЛ: стоп не ближе
+    курсового запаса 3% за границей (приказ владельца «стоп 3-5% за структуру
+    ставится!» 2026-08-18). Шесть плеч, чтобы прибор не был заперт в одном ответе:
+      * добавка целиком: якорь 88 в полосе, база широкая → 88 − 0.88 = 87.12
+        (пол 90 − 2.7 = 87.3 БЛИЖЕ якорного стопа — не вмешивается);
+      * потолок высоты: база 0.5, якорь 96, добавка 0.96 срезана до 0.5 → 95.5
+        (пол 96.709 ближе — не вмешивается);
+      * пол перебивает ближний якорь: та же база, якорь 98 → якорный стоп 97.5
+        ближе трёх процентов за границей 99.7 → стоп на полу 99.7·0.97 = 96.709;
+      * кап полосы: якорь 85.6 у края полосы (внешний край 85.5) → стоп 85.5;
+      * кап режет добавку, но не якорь: свинг-якорь 85 ЗА полосой → стоп на якоре;
+      * прокол полосе не подчинён: тот же якорь 85 проколом → 85 − 0.85 = 84.15.
+    """
+    full_add = build_setup(level(100.0, LevelSide.LONG),
+                           structural_anchor=Decimal("88"))
+    height_cap = build_setup(level(100.0, LevelSide.LONG, lo=99.7, hi=100.2),
+                             structural_anchor=Decimal("96"))
+    floor_wins = build_setup(level(100.0, LevelSide.LONG, lo=99.7, hi=100.2),
+                             structural_anchor=Decimal("98"))
+    band_cap = build_setup(level(100.0, LevelSide.LONG),
+                           structural_anchor=Decimal("85.6"))
+    swing_far = build_setup(level(100.0, LevelSide.LONG).model_copy(update={
+        "stop_anchor": Decimal("85"),
+        "stop_anchor_source": StopAnchorSource.SWING,
+    }))
+    puncture_far = build_setup(level(100.0, LevelSide.LONG).model_copy(update={
+        "stop_anchor": Decimal("85"),
+        "stop_anchor_source": StopAnchorSource.PUNCTURE,
+    }))
+    return (
+        (float(full_add.stop), float(height_cap.stop), float(floor_wins.stop),
+         float(band_cap.stop), float(swing_far.stop), float(puncture_far.stop)),
+        (87.12, 95.5, 96.709, 85.5, 85.0, 84.15),
+    )
+
+
 def c_outcome_only_future_bars() -> tuple[object, object]:
     """Б-3: исход считается только по барам, ЗАКРЫВШИМСЯ после записи сигнала.
 
@@ -466,6 +509,8 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
      c_target_structure_in_frame),
     ("якорь стопа не дальше высоты базы (решение 2026-08-18)",
      c_stop_anchor_capped_by_base),
+    ("стоп прячется ЗА якорь с запасом, а не на его цене (стр. 18 + 33/58)",
+     c_stop_hidden_beyond_anchor),
     ("«следующая свеча» — это время, а не индекс (стр. 55)", c_two_candles_are_time_not_index),
 ]
 

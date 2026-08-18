@@ -89,6 +89,20 @@ CHART_TFS = ("4h", "1h", "15m")
 """Какие графики отдаются на тикер: старший план → средний → локальный, как в обзорах."""
 
 BARS_ON_CHART = 180
+"""Ширина графика в барах. ⚠ ЧИСЛО РОДИЛОСЬ БЕЗ ИСТОЧНИКА (коммит 88827ac,
+2026-08-10, «в стилистике автора» — стилистику никто не мерил) и найдено сплошным
+пересчётом констант 2026-08-18 по вопросу владельца «сколько ещё таких выдумок?».
+
+Замер по корпусу 2026-08-18 (12 скринов разметки автора с 12 дат, выгрузка
+ТГ-канала prizzrak-tg/photos, оценка по шкале времени × шаг ТФ): видимых баров у
+автора 110–625, медиана ≈ 280; на 1ч — стабильный кластер 230–300; и автор ВСЕГДА
+держит ~30-40% кадра справа ПУСТЫМ под проекцию, чего это число не описывает.
+Ограничение замера названо: все скрины 2475×1360 — один экран, привычка зума
+одного человека. То есть 180 — нижняя треть авторского диапазона, не подтверждено
+и не опровергнуто. РАЗВИЛКА ВЛАДЕЛЬЦУ (2026-08-18, открыта): оставить 180 или
+перейти к ~280 с пустым полем справа — число также служит точкой отсчёта кадра
+целей (`geometry.TARGET_STRUCTURE_FRAME_BARS`), решение «делай 1+2» принималось
+при 180, менять его молча нельзя."""
 
 DOMINANCE_SYMBOL = "BTCDOM/USDT:USDT"
 """Фьючерсный индекс доминации BTC на той же площадке. Проверено ВЫЗОВОМ 2026-08-17.
@@ -192,11 +206,21 @@ TICKER_MAX_TOKENS = 2
 TICKER_COMMANDS = ("/coin", "/c", "/монета", "/тикер")
 HELP_COMMANDS = ("/start", "/help", "/помощь")
 PINNED_COMMANDS = ("/pinned", "/закреплённые", "/закрепленные")
+SIGNALS_COMMANDS = ("/signals", "/сигналы", "/сделки", "/журнал")
+REFRESH_COMMANDS = ("/update", "/refresh", "/обнови", "/пересобери")
+REFRESH_WORDS = ("ОБНОВИ", "ОБНОВИТЬ", "ПЕРЕСОБЕРИ", "UPDATE", "REFRESH")
+"""Слова-приказы пересборки. ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-18: «по запросу пользователя
+в чате ОБНОВЛЯЛась любая карта любого тикера по всем таймфреймам». Свежесть из кэша
+(`map_ttl_minutes`, `FRESH_MAP_MAX_MIN`) при таком запросе НЕ засчитывается — карта
+пересобирается всегда; идущая сборка при этом переиспользуется: она и есть свежая."""
 
 HELP_TEXT = (
     "Пришлите тикер монеты — отвечу картой уровней: три графика (4ч, 1ч, 15м) и сводка.\n"
     "Формат любой: BTC, btc, btcusdt, BTC/USDT:USDT.\n"
     "В группе можно так же или командой: /coin BTC.\n"
+    "«обнови BTC» или /update BTC — пересобрать карту прямо сейчас, по всем таймфреймам.\n"
+    "/сигналы — открытые сигналы системы и итог по закрытым;"
+    " /сигналы btc — то же по одной монете.\n"
     "/pinned — какие монеты публикуются в канал сами.\n"
     "Уровни — карта системы по методу PrizrakTrade, а не торговая рекомендация."
 )
@@ -207,10 +231,13 @@ class Request:
     """Что попросили. `explicit` — обратились к боту прямо (команда или личка)."""
 
     kind: str
-    """ticker | help | pinned"""
+    """ticker | help | pinned | signals"""
 
     query: str
     explicit: bool
+
+    force: bool = False
+    """Пересобрать карту, а не отдать свежую из кэша (приказ владельца 2026-08-18)."""
 
 
 def normalize(text: str) -> str:
@@ -330,10 +357,24 @@ def parse_request(text: str, *, is_private: bool, bot_name: str) -> Request | No
             return Request(kind="help", query="", explicit=True)
         if low in PINNED_COMMANDS:
             return Request(kind="pinned", query="", explicit=True)
+        if low in SIGNALS_COMMANDS:
+            # «/сигналы btc» — сводка по одной монете (2026-08-18): запрос уходит
+            # дальше как есть, символ разрешает обработчик через MarketIndex.
+            return Request(kind="signals", query=rest.strip(), explicit=True)
+        if low in REFRESH_COMMANDS:
+            return Request(kind="ticker", query=rest.strip(), explicit=True, force=True)
         if low in TICKER_COMMANDS:
             return Request(kind="ticker", query=rest.strip(), explicit=True)
         # `/btc` — тоже запрос тикера: команду с таким именем никто не заводил.
         return Request(kind="ticker", query=name[1:], explicit=True)
+    # «обнови btc» без слэша — тот же приказ пересборки (владелец, 2026-08-18).
+    # Слово-приказ отрезается ДО счёта слов: «обнови btc usdt» — три слова, но
+    # тикером из них являются два, и молчать на такую форму значит не исполнить приказ.
+    head, _, rest = body.partition(" ")
+    if head.strip().upper() in REFRESH_WORDS and rest.strip():
+        if is_private or len(rest.split()) <= TICKER_MAX_TOKENS:
+            return Request(kind="ticker", query=rest.strip(),
+                           explicit=True, force=True)
     if is_private:
         return Request(kind="ticker", query=body, explicit=True)
     if len(body.split()) <= TICKER_MAX_TOKENS:
@@ -357,12 +398,20 @@ def _fmt_price(x: float) -> str:
     Знаков после запятой — по величине самой цены, а не константой: у BTC дробная часть
     шум, у ANKR она и есть вся цена. Разряды разделяются узким пробелом — в Telegram он
     не переносит строку.
+
+    ⚠ Разрешение печати на всех диапазонах не грубее ~0.01% цены (2026-08-18).
+    Прежние 4 значащие цифры схлопывали близкие числа в одну печать: сигнал с
+    микро-стопом показывал вход и стоп ОДНИМ числом — по такому сообщению стоп
+    не выставить. Печать не обязана различать всё (это не карточка), но вход и
+    стоп одного сигнала обязана.
     """
-    if x >= 1000:
+    if x >= 10_000:
         return f"{x:,.0f}".replace(",", " ")
+    if x >= 1000:
+        return f"{x:,.1f}".replace(",", " ")
     if x >= 1:
-        return f"{x:.4g}"
-    return f"{x:.6f}".rstrip("0")
+        return f"{x:.5g}"
+    return f"{x:.8f}".rstrip("0")
 
 
 RETIRED_WINDOW_MS = BARS_ON_CHART * tf_ms(CHART_TFS[0])
@@ -437,22 +486,39 @@ def read_map(symbol: str) -> MapRead | NotReady:
     return MapRead(zones=zones, last_seen_ms=max((int(r[6]) for r in rows), default=0))
 
 
-def zones_of(decision: engine.SymbolDecision) -> tuple[ZoneSpec, ...]:
-    """Активные уровни РЕШЕНИЯ → те же полосы, что кладутся в карту леджера.
+def zones_of(decision: engine.SymbolDecision,
+             now_ms: int = 0) -> tuple[ZoneSpec, ...]:
+    """Уровни РЕШЕНИЯ → те же полосы, что кладутся в карту леджера.
 
     Поля берутся ровно те же и в том же виде, что пишет `store.sync_levels`: цена ПОК,
     границы зоны, состояние, правило входа. Два пути к одной картинке — один набор полей;
     иначе ответ по монете вселенной и по монете вне её различался бы неизвестно чем.
-    """
-    return tuple(sorted(
-        (ZoneSpec(side=m.level.side.value, timeframe=m.level.timeframe,
-                  price=float(m.level.price), zone_lo=float(m.level.zone_lo),
-                  zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
-                  boundary_lo=float(m.level.boundary_lo),
-                  boundary_hi=float(m.level.boundary_hi),
-                  from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms)
-         for m in decision.mapped if m.status.state is LevelState.ACTIVE),
-        key=lambda z: z.price))
+
+    ⚠ С 2026-08-18 отдаются и НЕАКТИВНЫЕ уровни (в окне `RETIRED_WINDOW_MS` от
+    `now_ms`; ноль — окно выключено, отдаётся всё) — ровно как в `read_map`, который
+    берёт снятые ради разметки: отработанный уровень получает красную стрелку
+    (стр. 25), пробитый — крестик отмены (стр. 43). Прежняя редакция отдавала только
+    активные, и сборка по запросу молчала о судьбе снятых уровней там, где ответ по
+    монете вселенной её показывал, — а текст ответа не мог назвать, почему сторона
+    пуста. `retired_at_ms` здесь — момент СОБЫТИЯ (`resolved_at_ms`), как и в
+    `read_map` (столбец `resolved_at`): значок ставится на бар пробоя, не на бар
+    прогона."""
+    out = []
+    for m in decision.mapped:
+        active = m.status.state is LevelState.ACTIVE
+        resolved = int(m.status.resolved_at_ms or 0)
+        if not active and now_ms and resolved < now_ms - RETIRED_WINDOW_MS:
+            continue
+        out.append(ZoneSpec(
+            side=m.level.side.value, timeframe=m.level.timeframe,
+            price=float(m.level.price), zone_lo=float(m.level.zone_lo),
+            zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
+            state=m.status.state.value,
+            retired_at_ms=0 if active else resolved,
+            boundary_lo=float(m.level.boundary_lo),
+            boundary_hi=float(m.level.boundary_hi),
+            from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms))
+    return tuple(sorted(out, key=lambda z: z.price))
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,9 +581,15 @@ class OnDemand:
     def waiting(self) -> int:
         return len(self._running)
 
-    async def map_of(self, symbol: str, now_ms: int) -> BuiltMap | NotReady:
-        """Свежая карта символа: из памяти, из идущей сборки или новой сборкой."""
-        got = self.fresh(symbol, now_ms)
+    async def map_of(self, symbol: str, now_ms: int, *,
+                     force: bool = False) -> BuiltMap | NotReady:
+        """Свежая карта символа: из памяти, из идущей сборки или новой сборкой.
+
+        `force` — пересобрать, игнорируя кэш (приказ владельца 2026-08-18: «по запросу
+        пользователя обновлялась любая карта»). Идущая сборка переиспользуется и при
+        `force`: она началась позже запроса и свежее любого кэша.
+        """
+        got = None if force else self.fresh(symbol, now_ms)
         if got is not None:
             return got
         task = self._running.get(symbol)
@@ -571,7 +643,8 @@ class OnDemand:
             log.degraded("сборка по запросу: рядов нет", символ=symbol)
             return NotReady(reason=f"{symbol}: рядов не собрано — карта не строится")
         spent = (clock.monotonic_ns() - started) / 1e9
-        built = BuiltMap(zones=zones_of(got), built_at_ms=clock.now_ms(), seconds=spent)
+        built = BuiltMap(zones=zones_of(got, clock.now_ms()),
+                         built_at_ms=clock.now_ms(), seconds=spent)
         self._done[symbol] = built
         self.built += 1
         log.info("сборка по запросу завершена", символ=symbol, секунд=round(spent, 1),
@@ -580,6 +653,17 @@ class OnDemand:
 
 
 # --- графики и текст --------------------------------------------------------------
+
+
+def _beyond_price(z: ZoneSpec, last_price: float) -> bool:
+    """Цена прошла СКВОЗЬ структуру зоны: лонговая целиком выше цены, шортовая ниже.
+
+    Границы, а не зона: коробка ХАЙ…ЛОЙ и есть структура (стр. 30), а заход внутрь неё
+    проходом сквозь не является. То же правило и тем же способом считает
+    `levels.status` (`LevelStatus.price_beyond`) — один смысл обязан считаться одинаково
+    в тексте и на картинке, иначе они снова разойдутся.
+    """
+    return z.boundary_lo > last_price if z.side == "long" else z.boundary_hi < last_price
 
 
 def zones_for_chart(
@@ -619,6 +703,14 @@ def zones_for_chart(
         fit = [z for z in fit if z.state == "active" or z.retired_at_ms >= first_ms]
     if now_ms > 0:
         fit = [z for z in fit if z.state != "active" or near_structure(z, now_ms)]
+    # 2026-08-18, приказ владельца «допускаешь НАСЛОЕНИЕ противоположных зон!»: активная
+    # зона, СКВОЗЬ которую цена уже прошла, на график не идёт. Лонговая зона выше цены —
+    # сопротивление, а не поддержка (стр. 43 «Уровень лонг/шорт менятся для нас на
+    # противоположный»), и именно такие зоны накладывались на встречные: замер по карте
+    # 5 символов дал 385–418 пар наслоения у одного символа при 25–35% активных уровней
+    # не с той стороны от цены. Снятых фильтр не касается — у них своя разметка (стрелка
+    # отработки, крестик отмены), она и рассказывает историю цены.
+    fit = [z for z in fit if z.state != "active" or not _beyond_price(z, last_price)]
 
     def nearest(cands: list[ZoneSpec], cap: int) -> list[ZoneSpec]:
         above = sorted((z for z in cands if z.price >= last_price), key=lambda z: z.price)
@@ -983,7 +1075,27 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         разные части поста, и зелёная строка в красном блоке читается как ошибка."""
         rows = sorted((z for z in unique if z.side == side), key=tradable_first)
         if not rows:
-            return [f"{title}: пока нет", ""]
+            # Пустая сторона НАЗЫВАЕТ ПРИЧИНУ, а не молчит «пока нет» (2026-08-18,
+            # вопрос владельца «почему по ACE не найдены шорт-зоны?!»). У ACE все
+            # шорт-уровни имели статус worked_off/flipped, ответ показывал пустоту —
+            # и «зон нет» читалось как «прибор ничего не видит», хотя прибор видел
+            # и снял их по правилам (отработка — стр. 25, переворот — стр. 43).
+            # Считается только то, что лежит в самой карте; будущего никто не обещает.
+            worked = sum(1 for z in zones
+                         if z.side == side and z.state == "worked_off")
+            flipped = sum(1 for z in zones
+                          if z.side == side and z.state == "flipped")
+            hidden = sum(1 for z in off_struct if z.side == side)
+            why = []
+            if worked:
+                why.append(f"{worked} отработано ценой")
+            if flipped:
+                why.append(f"{flipped} перевёрнуто пробоем")
+            if hidden:
+                why.append(f"{hidden} скрыто — структура старше кадра графика")
+            if why:
+                return [f"{title} свежих нет ({', '.join(why)})", ""]
+            return [f"{title} пока нет — структур этой стороны карта не нашла", ""]
         passed = [z for z in rows if tradable_first(z)[0] == 1]
         live_side = [z for z in rows if tradable_first(z)[0] == 0]
         groups = sorted(spans(live_side),
@@ -1195,8 +1307,10 @@ class Delivery:
 
     # --- карта -------------------------------------------------------------
 
-    async def _will_build(self, symbol: str) -> bool:
+    async def _will_build(self, symbol: str, *, force: bool = False) -> bool:
         """Понадобится ли долгая сборка. Дешёвая проверка тех же условий, что `analysis`."""
+        if force:
+            return True
         now = clock.now_ms()
         if self.on_demand.fresh(symbol, now) is not None:
             return False
@@ -1208,11 +1322,16 @@ class Delivery:
                     return False
         return True
 
-    async def analysis(self, symbol: str) -> Analysis | NotReady:
-        """Зоны символа плюс строка о том, откуда они. Две ветки, и они разные по смыслу."""
+    async def analysis(self, symbol: str, *,
+                       force: bool = False) -> Analysis | NotReady:
+        """Зоны символа плюс строка о том, откуда они. Две ветки, и они разные по смыслу.
+
+        `force` — приказ пересборки («обнови BTC», 2026-08-18): свежесть карты службы
+        и кэша сборки не засчитывается, карта считается заново по всем ТФ вселенной.
+        """
         now = clock.now_ms()
         in_uni = symbol in self.uni.symbols
-        if in_uni:
+        if in_uni and not force:
             got = await asyncio.to_thread(read_map, symbol)
             if not isinstance(got, NotReady) and got.zones:
                 age_min = max(0, (now - got.last_seen_ms) // 60_000)
@@ -1230,15 +1349,17 @@ class Delivery:
             # только ХВОСТ КЭША, который `missing_tail_since` доберёт следующим
             # чтением. Деградация самолечащаяся и видимая (счётчики добавлено/
             # переписано в логе), а не «потерянные бары навсегда».
-        built = await self.on_demand.map_of(symbol, now)
+        built = await self.on_demand.map_of(symbol, now, force=force)
         if isinstance(built, NotReady):
             return built
         age_min = max(0, (now - built.built_at_ms) // 60_000)
         if in_uni:
+            why = ("по приказу «обнови»" if force
+                   else "карта службы отстала")
             return Analysis(
                 symbol=symbol, zones=built.zones, stale_min=age_min,
                 origin=f"Карта пересобрана по запросу {_fmt_age(age_min)} назад:"
-                       f" карта службы отстала, посчитано заново.")
+                       f" {why}, посчитано заново.")
         return Analysis(
             symbol=symbol, zones=built.zones, stale_min=age_min,
             origin=f"Карта собрана по запросу {_fmt_age(age_min)} назад: за этой монетой"
@@ -1271,7 +1392,8 @@ class Delivery:
                 f" {_fmt_price(closes[-1])} · 4ч {d4:+.2f}% · сутки {d24:+.2f}%")
 
     async def answer(self, bot: Bot, chat: int | str, symbol: str,
-                     reply_to: int | None, *, announce_refusal: bool = True) -> bool:
+                     reply_to: int | None, *, announce_refusal: bool = True,
+                     force: bool = False) -> bool:
         """Три графика и сводка. Отказ на любом шаге НАЗЫВАЕТСЯ, а не молчит.
 
         ⚠ `announce_refusal=False` НЕ делает отказ молчаливым: он всё равно уходит в лог и
@@ -1286,13 +1408,14 @@ class Delivery:
         # GPS 89.8 с, ONDO 23.5 с;
         # evidence/bot-restart7-2026-08-18.log). Только при ответе человеку
         # (`announce_refusal`): публикации канала ждать умеют.
-        if announce_refusal and await self._will_build(symbol):
+        if announce_refusal and await self._will_build(symbol, force=force):
+            what = ("обновляю карту по вашему запросу"
+                    if force else "карта устарела или ещё не строилась — собираю свежую")
             await self.pacer.send(chat, "предупреждение о сборке", lambda: bot.send_message(
                 chat_id=chat,
-                text=f"⏳ Карта {symbol.split('/')[0]} устарела или ещё не строилась —"
-                     f" собираю свежую. Обычно это 1–2 минуты.",
+                text=f"⏳ {symbol.split('/')[0]}: {what}. Обычно это 1–2 минуты.",
                 reply_to_message_id=reply_to))
-        got = await self.analysis(symbol)
+        got = await self.analysis(symbol, force=force)
         if isinstance(got, NotReady):
             log.degraded("бот: ответа по монете нет", символ=symbol, чат=str(chat),
                          причина=got.reason)
@@ -1427,6 +1550,25 @@ class Delivery:
                 chat_id=chat, text=self._pinned_text()))
             self._trace(message, req, "список закреплённых", started_ns)
             return
+        if req.kind == "signals":
+            # «/сигналы btc» — сводка по одной монете; пустой хвост — весь журнал.
+            sig_symbol: str | None = None
+            if req.query.strip():
+                sig_symbol = self.index.resolve(req.query)
+                if sig_symbol is None:
+                    await self.pacer.send(chat, "не узнаю", lambda: bot.send_message(
+                        chat_id=chat,
+                        text=f"Не узнаю монету «{req.query.strip()[:32]}». Сводка по"
+                             f" всем: /сигналы. Пример монеты: BTC или btcusdt.",
+                        reply_to_message_id=message.message_id))
+                    self._trace(message, req, "сигналы: тикер не опознан", started_ns)
+                    return
+            # Чтение леджера синхронное (sqlite) — уводится с цикла событий.
+            text = await asyncio.to_thread(signals_summary, sig_symbol)
+            await self.pacer.send(chat, "сигналы", lambda: bot.send_message(
+                chat_id=chat, text=text, reply_to_message_id=message.message_id))
+            self._trace(message, req, "сводка сигналов", started_ns)
+            return
 
         symbol = self.index.resolve(req.query)
         if symbol is None:
@@ -1458,9 +1600,9 @@ class Delivery:
                 text=f"{symbol}: карты нет — собираю данные. Это минуты (в очереди"
                      f" {self.on_demand.waiting()}). Пришлю сюда, как посчитаю.",
                 reply_to_message_id=message.message_id))
-        ok = await self.answer(bot, chat, symbol, message.message_id)
+        ok = await self.answer(bot, chat, symbol, message.message_id, force=req.force)
         self._trace(message, req, "ответ доставлен" if ok else "ответа нет",
-                    started_ns, символ=symbol)
+                    started_ns, символ=symbol, пересборка=req.force)
 
     def _trace(self, message: Message, req: Request, исход: str, started_ns: int,
                **kw: object) -> None:
@@ -1591,7 +1733,8 @@ ALIVE_EVERY_S = 900.0
 """
 
 
-async def alive_loop(delivery: Delivery, watch: NetworkWatch) -> None:
+async def alive_loop(delivery: Delivery, watch: NetworkWatch,
+                     notifier: Notifier) -> None:
     """Периодическая сводка: бот жив, и вот чем он занимался."""
     while True:
         await asyncio.sleep(ALIVE_EVERY_S)
@@ -1602,7 +1745,11 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch) -> None:
                  в_очереди_сборки=delivery.on_demand.waiting(),
                  сообщений_потеряно=delivery.pacer.lost,
                  ожиданий_по_лимиту=delivery.pacer.flood_waits,
-                 обрывов_связи=watch.failures)
+                 обрывов_связи=watch.failures,
+                 уведомлений_сигналы=notifier.sent_signals,
+                 уведомлений_исходы=notifier.sent_outcomes,
+                 уведомлений_зоны=notifier.sent_zone_events,
+                 тактов_наблюдателя_с_отказом=notifier.ticks_failed)
         watch.note_recovery()
 
 
@@ -1623,6 +1770,389 @@ async def publish_loop(delivery: Delivery, bot: Bot) -> None:
         except (TelegramAPIError, ccxt.BaseError) as e:
             log.error("публикация закреплённых не состоялась",
                       причина=f"{type(e).__name__} {e}")
+
+
+# --- уведомления: сигнал активирован, исход, цена у зоны ---------------------------
+# ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-18: «бот должен присылать уведомления о том что цена близко
+# к зоне или сигнал активирован и так далее». Закрывает и находку №3 самоаудита
+# 2026-08-18 (журнал исходов есть — уведомлений о них не было).
+
+WATCH_EVERY_S = float(service.CYCLE_SECONDS)
+"""Такт наблюдателя = такту службы. Сигналы, исходы и карту пишет служба своим циклом —
+чаще леджер проверять не о чем; живая цена берётся тем же тактом ОДНИМ запросом
+`fetch_tickers` (вес 40 за все рынки — дешевле, чем свечи по каждому символу)."""
+
+SIDE_WORD = {"long": "лонг", "short": "шорт"}
+OUTCOME_WORD = {"stop": "🟥 стоп", "target": "🟩 цель",
+                "ambiguous": "⬜ неоднозначно (бар накрыл и стоп, и цель)"}
+
+NOTIFY_LINES_MAX = 30
+"""Строк событий в одном сообщении. Предел Telegram — 4096 знаков (`TEXT_LIMIT`);
+строка события ≤ ~120 знаков, тридцать строк — с запасом. Хвост НАЗЫВАЕТСЯ числом."""
+
+
+@dataclass(frozen=True, slots=True)
+class LevelRow:
+    """Активный уровень из карты леджера — то, с чем сравнивается живая цена."""
+
+    symbol: str
+    timeframe: str
+    side: str
+    price: float
+    zone_lo: float
+    zone_hi: float
+    from_ms: int
+    to_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerNews:
+    """Что появилось в леджере со прошлого такта, плюс новые водяные знаки."""
+
+    signals: tuple[tuple[str, str, str, float, float, float | None], ...]
+    """(symbol, timeframe, direction, entry, stop, target)"""
+
+    outcomes: tuple[tuple[str, str, str, str, float | None], ...]
+    """(symbol, timeframe, direction, kind, r)"""
+
+    states: tuple[tuple[int, str, str, str, str, float], ...]
+    """(signal_id, symbol, timeframe, direction, state, entry) — состояния ВСЕХ
+    незакрытых сигналов. Наблюдатель ловит переход not_filled→open: «вход
+    состоялся» — событие, о котором просил владелец (2026-08-18)."""
+
+    levels: tuple[LevelRow, ...]
+    max_signal_id: int
+    max_closed_ms: int
+
+
+def _read_ledger_news(after_id: int | None, after_ms: int | None,
+                      symbols: tuple[str, ...]) -> LedgerNews | NotReady:
+    """Один заход в леджер (только чтение) за всё, что нужно такту наблюдателя.
+
+    `after_id is None` — первый такт: водяные знаки ВЗВОДЯТСЯ по текущему максимуму,
+    события не читаются. Иначе перезапуск бота вылил бы в канал всю историю журнала,
+    и сегодняшние события утонули бы в ней.
+    """
+    try:
+        conn = store.open_readonly()
+    except FileNotFoundError as e:
+        return NotReady(reason=str(e))
+    try:
+        max_id = int(conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()[0])
+        max_closed = int(conn.execute(
+            "SELECT COALESCE(MAX(closed_at), 0) FROM outcomes").fetchone()[0])
+        sig_rows: list[tuple[str, str, str, float, float, float | None]] = []
+        out_rows: list[tuple[str, str, str, str, float | None]] = []
+        if after_id is not None:
+            sig_rows = [
+                (r[0], r[1], r[2], float(r[3]), float(r[4]),
+                 None if r[5] is None else float(r[5]))
+                for r in conn.execute(
+                    "SELECT symbol, timeframe, direction, entry, stop, target"
+                    " FROM signals WHERE id > ? ORDER BY id", (after_id,))]
+        if after_ms is not None:
+            out_rows = [
+                (r[0], r[1], r[2], r[3], None if r[4] is None else float(r[4]))
+                for r in conn.execute(
+                    "SELECT s.symbol, s.timeframe, s.direction, o.kind, o.r"
+                    " FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+                    " WHERE o.closed_at > ? ORDER BY o.closed_at", (after_ms,))]
+        state_rows = [
+            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]))
+            for r in conn.execute(
+                "SELECT st.signal_id, s.symbol, s.timeframe, s.direction, st.state,"
+                " s.entry FROM signal_states st JOIN signals s ON s.id = st.signal_id"
+                " ORDER BY st.signal_id")]
+        marks = ",".join("?" * len(symbols))
+        lvl_rows = conn.execute(
+            f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms"
+            f" FROM levels WHERE state='active' AND symbol IN ({marks})",
+            symbols).fetchall()
+    except sqlite3.DatabaseError as e:
+        return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
+    finally:
+        conn.close()
+    levels = tuple(LevelRow(symbol=r[0], timeframe=r[1], side=r[2], price=float(r[3]),
+                            zone_lo=float(r[4]), zone_hi=float(r[5]),
+                            from_ms=int(r[6]), to_ms=int(r[7])) for r in lvl_rows)
+    return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
+                      states=tuple(state_rows), levels=levels,
+                      max_signal_id=max_id, max_closed_ms=max_closed)
+
+
+def zone_position(price: float, lo: float, hi: float) -> str:
+    """Где цена относительно зоны: `inside` | `near` | `far`.
+
+    «Близко» — ближе ОДНОЙ ШИРИНЫ зоны от её края. Порог не выдуман числом в
+    процентах: курс строит уровень ЗОНОЙ (стр. 23–26), и ширина зоны — единственная
+    мера того, сколько это близко, которая лежит в самой карте. Узкая зона зовёт цену с
+    малого расстояния, широкая — с большого: масштаб задаёт сама структура, а не
+    константа. Зона нулевой ширины (вырожденный профиль) отвечает `far` всюду, кроме
+    точного равенства, — и это честно: у неё нет собственной меры расстояния.
+    """
+    if lo <= price <= hi:
+        return "inside"
+    width = hi - lo
+    if width > 0 and min(abs(price - lo), abs(price - hi)) <= width:
+        return "near"
+    return "far"
+
+
+SIGNALS_SHOW_MAX = 12
+"""Строк на раздел сводки сигналов. Кап читаемости: предел сообщения 4096 знаков
+(`TEXT_LIMIT`) страхует `_fit`, но сто строк «ждут входа» не прочтёт никто; хвост
+НАЗЫВАЕТСЯ числом (§4.3)."""
+
+
+def signals_summary(symbol: str | None = None) -> str:
+    """Сводка журнала сигналов ДЛЯ ЧАТА: в позиции, ждут входа, итог закрытых.
+
+    Закрывает дыру №4 самоаудита 2026-08-18 (журнал есть — спросить «что сейчас
+    живо» нечем). Читается из леджера, только чтение (§10.2). Каждое число называет
+    свою ПОДВЫБОРКУ (урок `outcome-survey-2026-08-10`): «R по закрытым» — не «R
+    системы», открытые и не наполненные исхода ещё не имеют; сигнал без записи
+    состояния называется отдельно, а не растворяется в «ждут входа».
+
+    `symbol` — полный символ рынка («BTC/USDT:USDT»): сводка по одной монете,
+    включая итог закрытых по ней же (подвыборка называется в заголовке).
+    """
+    try:
+        conn = store.open_readonly()
+    except FileNotFoundError as e:
+        return f"НЕ ГОТОВО: {e} — создать: uv run python -m hunter ledger --init"
+    sym_where = "" if symbol is None else " AND s.symbol = ?"
+    sym_args: tuple[str, ...] = () if symbol is None else (symbol,)
+    try:
+        open_rows = conn.execute(
+            "SELECT s.symbol, s.timeframe, s.direction, s.entry, s.stop, s.target,"
+            " st.state, s.recorded_at"
+            " FROM signals s"
+            " LEFT JOIN outcomes o ON o.signal_id = s.id"
+            " LEFT JOIN signal_states st ON st.signal_id = s.id"
+            " WHERE o.signal_id IS NULL" + sym_where +
+            " ORDER BY s.recorded_at DESC", sym_args).fetchall()
+        n_total = int(conn.execute(
+            "SELECT COUNT(*) FROM signals s WHERE 1=1" + sym_where,
+            sym_args).fetchone()[0])
+        closed = conn.execute(
+            "SELECT COUNT(*),"
+            " SUM(CASE WHEN o.kind='target' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN o.kind='stop' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END),"
+            " SUM(o.r) FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+            " WHERE 1=1" + sym_where, sym_args).fetchone()
+    except sqlite3.DatabaseError as e:
+        return f"НЕ ГОТОВО: леджер не прочитан ({type(e).__name__} {e})"
+    finally:
+        conn.close()
+    if symbol is not None and n_total == 0:
+        # Пустая подвыборка называется прямо, а не сводкой из одних нулей.
+        return (f"По {symbol.split('/')[0]} в журнале сигналов пока ничего нет."
+                f" Сводка по всем: /сигналы")
+    now = clock.now_ms()
+
+    def line(r: tuple[str, str, str, float, float, float | None, str | None,
+                      int]) -> str:
+        sym, tf, d, entry, stop, target, _state, rec = r
+        age = _fmt_age(max(0, (now - int(rec)) // 60_000))
+        tg = f", цель {_fmt_price(float(target))}" if target is not None else ""
+        return (f"• {sym.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(float(entry))}, "
+                f"стоп {_fmt_price(float(stop))}{tg} · {age} назад")
+
+    def section(
+        title: str,
+        rows: list[tuple[str, str, str, float, float, float | None, str | None,
+                         int]],
+    ) -> list[str]:
+        out = [f"{title}: {len(rows)}"]
+        out += [line(r) for r in rows[:SIGNALS_SHOW_MAX]]
+        if len(rows) > SIGNALS_SHOW_MAX:
+            out.append(f"… и ещё {len(rows) - SIGNALS_SHOW_MAX}")
+        return [*out, ""]
+
+    in_pos = [r for r in open_rows if r[6] == "open"]
+    waiting = [r for r in open_rows if r[6] == "not_filled"]
+    stateless = [r for r in open_rows if r[6] is None]
+    head = ("📒 Сигналы системы" if symbol is None
+            else f"📒 Сигналы системы — {symbol.split('/')[0]}")
+    lines = [head, ""]
+    lines += section("В позиции (вход состоялся)", in_pos)
+    lines += section("Ждут входа (цена не дошла)", waiting)
+    if stateless:
+        lines += section("Без записи состояния (прогон их ещё не пересчитывал)",
+                         stateless)
+    n_closed = int(closed[0] or 0)
+    n_amb = int(closed[3] or 0)
+    r_sum = float(closed[4] or 0.0)
+    lines.append(
+        f"Закрытых: {n_closed} из {n_total} в журнале"
+        f" (🟩 цель {int(closed[1] or 0)} · 🟥 стоп {int(closed[2] or 0)}"
+        f" · ⬜ неоднозначно {n_amb})"
+        # У неоднозначных R по схеме отсутствует — подвыборка называется явно.
+        f" · суммарный R по {n_closed - n_amb} со стопом/целью: {r_sum:+.2f}")
+    tail = ["Сводка журнала, а не торговая рекомендация."]
+    return _fit(lines + tail, len(tail))
+
+
+class Notifier:
+    """События для канала: новые сигналы, исходы и переходы цены у активных зон.
+
+    Всё берётся из ЛЕДЖЕРА (только чтение) и живых тикеров; наблюдатель ничего не
+    считает и не пишет — расчёт живёт в службе (§10.2). Уведомление — это ПЕРЕХОД,
+    а не состояние: «цена внутри зоны» шлётся один раз при входе, а не каждые пять
+    минут, пока она там стоит. Перевзвод — уход в `far`.
+
+    Первый такт взводит водяные знаки и состояния зон МОЛЧА (иначе перезапуск бота
+    выливал бы в канал историю), уровень, впервые появившийся в карте, — тоже:
+    его рождение уже видно в публикации закреплённых, событие здесь — движение цены.
+    """
+
+    def __init__(self) -> None:
+        self._last_signal_id: int | None = None
+        self._last_closed_ms: int | None = None
+        self._zone_state: dict[tuple[str, str, str, int, int], str] = {}
+        self._signal_state: dict[int, str] = {}
+        """Последнее виденное состояние незакрытых сигналов — для перехода
+        not_filled→open («вход состоялся», приказ владельца 2026-08-18)."""
+        self.sent_signals = 0
+        self.sent_outcomes = 0
+        self.sent_entries = 0
+        self.sent_zone_events = 0
+        self.ticks_failed = 0
+
+    def _cap(self, lines: list[str]) -> list[str]:
+        if len(lines) <= NOTIFY_LINES_MAX:
+            return lines
+        rest = len(lines) - NOTIFY_LINES_MAX
+        return [*lines[:NOTIFY_LINES_MAX], f"… и ещё {rest} — не поместились"]
+
+    async def tick(self, ex: Exchange, uni: Universe) -> list[str]:
+        """Один такт: прочитать, сравнить, вернуть готовые сообщения (может быть пусто)."""
+        news = await asyncio.to_thread(
+            _read_ledger_news, self._last_signal_id, self._last_closed_ms, uni.symbols)
+        if isinstance(news, NotReady):
+            self.ticks_failed += 1
+            log.degraded("наблюдатель: леджер не прочитан", причина=news.reason)
+            return []
+        priming = self._last_signal_id is None
+        prev_max_id = self._last_signal_id or 0
+        self._last_signal_id = news.max_signal_id
+        self._last_closed_ms = news.max_closed_ms
+
+        out: list[str] = []
+        if news.signals:
+            lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                     f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}, "
+                     f"стоп {_fmt_price(st)}"
+                     + (f", цель {_fmt_price(tg)}" if tg is not None else "")
+                     for s, tf, d, e, st, tg in news.signals]
+            self.sent_signals += len(news.signals)
+            out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines)]))
+        if news.outcomes:
+            lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                     f"{TF_LABEL.get(tf, tf)}: {OUTCOME_WORD.get(k, k)}"
+                     + (f" · R {r:+.2f}" if r is not None else "")
+                     for s, tf, d, k, r in news.outcomes]
+            self.sent_outcomes += len(news.outcomes)
+            out.append("\n".join(["📕 Исходы сигналов:", *self._cap(lines)]))
+
+        # «Вход состоялся» — переход not_filled→open (приказ владельца 2026-08-18).
+        # Событие, а не состояние: шлётся один раз, на такте, где переход увиден.
+        # Первый такт взводит память молча — как и остальные водяные знаки: иначе
+        # перезапуск бота объявил бы «входами» все давно открытые позиции.
+        entry_lines: list[str] = []
+        alive: set[int] = set()
+        for sid, sym, tf, d, state, entry in news.states:
+            alive.add(sid)
+            was = self._signal_state.get(sid)
+            self._signal_state[sid] = state
+            if priming or state != "open":
+                continue
+            # Свежий сигнал, чьё ПЕРВОЕ виденное состояние уже open, — вход состоялся
+            # в первый же такт; переход был, просто между двумя чтениями.
+            fresh_filled = was is None and sid > prev_max_id
+            if was == "not_filled" or fresh_filled:
+                entry_lines.append(
+                    f"• {sym.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                    f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(entry)} исполнен — "
+                    f"сигнал активирован")
+        # Сигналы, ставшие исходами, из таблицы состояний удалены — чистим память.
+        for sid in [s for s in self._signal_state if s not in alive]:
+            del self._signal_state[sid]
+        if entry_lines:
+            self.sent_entries += len(entry_lines)
+            out.append("\n".join(["✅ Входы состоялись:", *self._cap(entry_lines)]))
+
+        tickers = await ex.fetch_tickers(uni.symbols)
+        if isinstance(tickers, NotReady):
+            log.degraded("наблюдатель: тикеры не получены", причина=tickers.reason)
+            self.ticks_failed += 1
+            return out
+        now_ms = clock.now_ms()
+        rank = {"far": 0, "near": 1, "inside": 2}
+        zone_lines: list[str] = []
+        seen: set[tuple[str, str, str, int, int]] = set()
+        for lv in news.levels:
+            t = tickers.get(lv.symbol)
+            if t is None:
+                continue
+            key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
+            seen.add(key)
+            pos = zone_position(t.last, lv.zone_lo, lv.zone_hi)
+            was = self._zone_state.get(key)
+            self._zone_state[key] = pos
+            # Событие — только СБЛИЖЕНИЕ (far→near, near→inside, far→inside).
+            # Откат inside→near — не событие: «цена подходит к зоне», напечатанное
+            # при выходе ИЗ неё, врало бы направлением (поймано зондом 2026-08-18).
+            if priming or was is None or rank[pos] <= rank[was]:
+                continue
+            # Тот же фильтр «уровень у структуры», что в ответах бота
+            # (`near_structure`): автор размечает уровни только у структур в кадре,
+            # и звать ценой к зоне, которую сам бот в ответе прячет, — расхождение
+            # каналов доставки. Без него первый же зонд дал россыпь событий по
+            # давно отработанным 5м-структурам.
+            step = TIMEFRAME_MS.get(lv.timeframe)
+            if lv.to_ms > 0 and step is not None and (
+                    lv.to_ms < now_ms - BARS_ON_CHART * step):
+                continue
+            base = lv.symbol.split("/")[0]
+            side = SIDE_WORD.get(lv.side, lv.side)
+            what = (f"вошла в {side}-зону" if pos == "inside"
+                    else f"подходит к {side}-зоне")
+            zone_lines.append(
+                f"• {base}: цена {_fmt_price(t.last)} {what} "
+                f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} "
+                f"({TF_LABEL.get(lv.timeframe, lv.timeframe)}, "
+                f"ПОК {_fmt_price(lv.price)})")
+        # Снятые с карты уровни выбывают из памяти состояний — иначе она росла бы вечно.
+        for key in list(self._zone_state):
+            if key not in seen:
+                del self._zone_state[key]
+        if zone_lines:
+            self.sent_zone_events += len(zone_lines)
+            out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
+        return out
+
+
+async def notify_loop(delivery: Delivery, bot: Bot, notifier: Notifier) -> None:
+    """Вечный наблюдатель. Сбой такта НАЗЫВАЕТСЯ и не убивает следующие."""
+    if not delivery.channel:
+        log.degraded(f"уведомления слать некуда: пуст {CHANNEL_ENV} — наблюдатель"
+                     f" не запущен")
+        return
+    while True:
+        try:
+            for text in await notifier.tick(delivery.ex, delivery.uni):
+                await delivery.pacer.send(
+                    delivery.channel, "уведомление",
+                    lambda t=text: bot.send_message(  # type: ignore[misc]
+                        chat_id=delivery.channel, text=t))
+        except (ccxt.BaseError, CapabilityMissing) as e:
+            notifier.ticks_failed += 1
+            log.error("наблюдатель: такт не удался", причина=f"{type(e).__name__} {e}")
+        await asyncio.sleep(WATCH_EVERY_S)
 
 
 async def main(*, horizon_days: int, publish_now: bool = False,
@@ -1675,14 +2205,19 @@ async def main(*, horizon_days: int, publish_now: bool = False,
         logging.getLogger("aiogram").addHandler(watch)
         logging.getLogger("aiogram.dispatcher").addHandler(watch)
 
+        notifier = Notifier()
         publisher = asyncio.create_task(publish_loop(delivery, bot),
                                         name="публикация закреплённых")
-        alive = asyncio.create_task(alive_loop(delivery, watch), name="сводка бота")
+        watcher = asyncio.create_task(notify_loop(delivery, bot, notifier),
+                                      name="наблюдатель зон и сигналов")
+        alive = asyncio.create_task(alive_loop(delivery, watch, notifier),
+                                    name="сводка бота")
         try:
             await dp.start_polling(bot, handle_as_tasks=True,
                                    tasks_concurrency_limit=HANDLERS_MAX)
         finally:
             publisher.cancel()
+            watcher.cancel()
             alive.cancel()
             log.info("бот остановлен", запросов=delivery.requests,
                      ответов=delivery.answers,

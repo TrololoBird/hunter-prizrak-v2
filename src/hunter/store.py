@@ -371,7 +371,8 @@ def write_profile_bars(run_id: str, symbol: str, timeframe: str,
     return path
 
 
-def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str]) -> Path:
+def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str],
+                      analysis_tfs: list[str] | None = None) -> Path:
     """Манифест источника профиля: КАКИЕ профильные ряды прогон положил в кадры.
 
     Пустой список — честное «минуток в хранилище не было»: повтор тогда строит
@@ -382,17 +383,30 @@ def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str]) -> Path:
     45 из 46 прогонов на диске без профильных рядов давали «расчёт изменился» при
     неизменном коде). Манифест же закрывает и обратный отказ: если запись рядов
     когда-нибудь снова потеряется молча, повтор таких кадров скажет об этом кодом
-    возврата, а не диффом."""
+    возврата, а не диффом.
+
+    `analysis_tfs` (добавлено 2026-08-18) — состав АНАЛИТИЧЕСКИХ рядов, записанных
+    в кадры. Без него повтор выводил набор ТФ из наличия файлов на диске: пропавший
+    после прогона parquet менял состав молча, и дифф читался как «расчёт изменился».
+    None — манифест старой формы, сверка состава тогда не проводится (названно)."""
     path = FRAMES_DIR / run_id / _safe(symbol) / "source.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"transport": "tv_candles",
-                                "profile_tfs": sorted(profile_tfs)},
-                               ensure_ascii=False), encoding="utf-8", newline="\n")
+    d: dict[str, object] = {"transport": "tv_candles",
+                            "profile_tfs": sorted(profile_tfs)}
+    if analysis_tfs is not None:
+        d["analysis_tfs"] = sorted(analysis_tfs)
+    path.write_text(json.dumps(d, ensure_ascii=False),
+                    encoding="utf-8", newline="\n")
     return path
 
 
-def read_source_meta(run_id: str, dir_name: str) -> list[str] | NotReady:
-    """Список профильных ТФ из манифеста источника. `NotReady` — манифеста нет."""
+def read_source_meta(
+    run_id: str, dir_name: str,
+) -> tuple[list[str], list[str] | None] | NotReady:
+    """Манифест источника: (профильные ТФ, аналитические ТФ). `NotReady` — манифеста нет.
+
+    Второй элемент `None` — манифест старой формы (до 2026-08-18), состав
+    аналитических рядов тогда не записывался и сверить его повтору не с чем."""
     path = FRAMES_DIR / run_id / _safe(dir_name) / "source.json"
     if not path.exists():
         return NotReady(
@@ -400,7 +414,9 @@ def read_source_meta(run_id: str, dir_name: str) -> list[str] | NotReady:
                    f"2026-08-18, профильный ряд не сохранялся; сравнение свечного "
                    f"профиля из таких кадров не строится")
     d = json.loads(path.read_text(encoding="utf-8"))
-    return [str(tf) for tf in d.get("profile_tfs", [])]
+    analysis = d.get("analysis_tfs")
+    return ([str(tf) for tf in d.get("profile_tfs", [])],
+            None if analysis is None else [str(tf) for tf in analysis])
 
 
 def read_profile_bars(run_id: str, dir_name: str) -> dict[str, list[Bar]]:
@@ -518,7 +534,12 @@ def open_readonly(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     """Соединение только на чтение. Умолчание для всего, кроме боевой эмиссии."""
     if not path.exists():
         raise FileNotFoundError(f"нет базы {path}")
-    return sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    # Тот же busy_timeout, что у боевого соединения (2026-08-18): база живёт в WAL,
+    # и читатель без таймаута получает «database is locked» в момент чекпойнта
+    # писателя — то есть /сигналы у бота падал бы ровно тогда, когда служба пишет.
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
 
 
 def _tune(conn: sqlite3.Connection) -> None:
@@ -736,13 +757,31 @@ def record_outcome(
     conn: sqlite3.Connection, signal_id: int, kind: str, closed_at: int,
     exit_price: Decimal | None, r: float | None,
 ) -> NotReady | None:
-    """Записать исход. Открытые и несостоявшиеся сделки сюда НЕ пишутся (§4.3)."""
+    """Записать исход. Открытые и несостоявшиеся сделки сюда НЕ пишутся (§4.3).
+
+    ⚠ Исход — СОБЫТИЕ, и оно необратимо (в отличие от состояния `signal_states`).
+    До 2026-08-18 здесь стоял `INSERT OR REPLACE`: прогон с изменённым расчётом мог
+    МОЛЧА переписать уже записанный исход другим — журнал перестал бы быть журналом.
+    Теперь повторная запись того же исхода — тихий успех (дорешивание идемпотентно),
+    а попытка записать ДРУГОЙ исход — названный отказ, не перезапись.
+    """
+    px = None if exit_price is None else float(exit_price)
+    prev = conn.execute(
+        "SELECT kind, closed_at, exit_price, r FROM outcomes WHERE signal_id = ?",
+        (signal_id,),
+    ).fetchone()
+    if prev is not None:
+        if prev[0] == kind and int(prev[1]) == closed_at and prev[2] == px and prev[3] == r:
+            return None
+        return NotReady(reason=(
+            f"исход {signal_id} уже записан ({prev[0]} at {prev[1]}, r={prev[3]}) и "
+            f"отличается от нового ({kind} at {closed_at}, r={r}) — перезапись исхода "
+            f"запрещена, расхождение требует разбора"))
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO outcomes (signal_id, kind, closed_at, exit_price, r)"
+            "INSERT INTO outcomes (signal_id, kind, closed_at, exit_price, r)"
             " VALUES (?, ?, ?, ?, ?)",
-            (signal_id, kind, closed_at,
-             None if exit_price is None else float(exit_price), r),
+            (signal_id, kind, closed_at, px, r),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
