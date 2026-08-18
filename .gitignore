@@ -17,3 +17,15 @@ docs/course/pages/
 # наоборот КОММИТЯТСЯ: они часть того, как проект проверяется.
 .claude/settings.local.json
 .scratch/
+
+# Выгрузка Telegram-канала автора — данные владельца, чужой контент; в git НЕ идёт
+# (разбор с цитатами — docs/audit/tg-prizrak-2026-08.md, он идёт).
+prizzrak-tg/
+
+# Живые логи боевых процессов (бот, serve) — по стоп-листу смены в git не идут:
+# растут, содержат оперативные данные; их выжимки цитируются в журналах смен.
+docs/audit/evidence/bot-restart*.log
+docs/audit/evidence/bot-restart*.log.err
+docs/audit/evidence/bot-restart*.err.log
+docs/audit/evidence/serve*.log
+docs/audit/evidence/serve*.log.err

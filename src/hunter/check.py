@@ -224,9 +224,54 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         # молчит о том, что весь плюс сделан одним ТФ или одной стороной. Перекос
         # виден только в разрезе — урок backfill-window-2026-08-04.
         survey = store.outcome_survey(conn)
+        # Ширина зоны против корпуса (2026-08-18): самая широкая РАЗМЕЧЕННАЯ ЗОНА
+        # ИНТЕРЕСА, опубликованная автором за 17 дней канала, — 38.7% от СЕРЕДИНЫ
+        # диапазона (161 зона, разбор docs/audit/tg-prizrak-2026-08.md; у прибора
+        # потолок 60% по построению, отбросы проверены поштучно). БАЗЫ автор
+        # публикует и шире (LINK «база 7-11» = 44% прозой, мимо разметки) — порог
+        # сравнивает наши зоны уровней именно с зонами интереса, ближайшим аналогом
+        # по форме (диапазон + ПОК внутри). Линейка ТА ЖЕ — от середины зоны, не от
+        # ПОК: ПОК не в центре, и деление на него завышает ширину (falsifier
+        # 2026-08-18: 136% против 83% по одной и той же зоне). Порог 0.39 — максимум
+        # корпусной выборки, а не подобранное число; строка — диагностика перекоса,
+        # расчёт она не фильтрует. Способность ответить иначе проверена порогом выше
+        # максимума леджера (пусто) и ниже медианы (тысячи).
+        wide = conn.execute(
+            "SELECT symbol, timeframe,"
+            " (zone_hi-zone_lo)/((zone_hi+zone_lo)/2)*100 AS w FROM levels"
+            " WHERE state='active' AND zone_hi+zone_lo > 0"
+            " AND (zone_hi-zone_lo)/((zone_hi+zone_lo)/2) > 0.39 ORDER BY w DESC"
+        ).fetchall()
+        # Знаменатели по ТФ: одна худшая зона без «из скольких» скрыла бы измерение
+        # перекоса (урок backfill-window-2026-08-04 — сводка вдоль измерения).
+        tf_totals: dict[str, int] = dict(conn.execute(
+            "SELECT timeframe, COUNT(*) FROM levels"
+            " WHERE state='active' AND zone_hi+zone_lo > 0 GROUP BY timeframe"
+        ).fetchall())
         conn.close()
         lines.append(("Леджер читается", True, f"записей о сигналах: {n}"))
         print(f"   записей: {n}")
+        if wide:
+            worst = wide[0]
+            per_tf: dict[str, int] = {}
+            for _sym, tf, _w in wide:
+                per_tf[tf] = per_tf.get(tf, 0) + 1
+            tf_summary = ", ".join(
+                f"{tf} {per_tf[tf]}/{tf_totals.get(tf, 0)}" for tf in sorted(per_tf)
+            )
+            wide_detail = (
+                f"{len(wide)} из {sum(tf_totals.values())} активных (по ТФ: {tf_summary}); "
+                f"худшая {worst[0]} {worst[1]} = {worst[2]:.0f}% от середины; корпусный "
+                "максимум зоны интереса 38.7% (docs/audit/tg-prizrak-2026-08.md); "
+                "красная до решения открытого вопроса о широких структурах"
+            )
+        else:
+            wide_detail = (
+                f"активных зон шире 39% от середины нет (из {sum(tf_totals.values())})"
+            )
+        lines.append(
+            ("Зоны не шире корпусного максимума (39% от середины)", not wide, wide_detail)
+        )
         for row in store.format_outcome_survey(survey):
             print(f"   {row}" if not row.startswith(" ") else row)
         skewed = [c for c in survey.cells if c.closed == 0 and c.signals > 0]
