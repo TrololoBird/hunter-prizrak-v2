@@ -456,6 +456,11 @@ def read_map(symbol: str) -> MapRead | NotReady:
         conn = store.open_readonly()
     except FileNotFoundError as e:
         return NotReady(reason=f"{e} — создать: uv run python -m hunter ledger --init")
+    # Колонка плотности объёма появилась в схеме 8, а мигрирует базу ПИСАТЕЛЬ: до
+    # первого боевого прогона бот видит прежнюю схему, и запрос с `vrvp_density` вернул
+    # бы «леджер не прочитан», то есть пустую карту. Спрашиваем схему, а не предполагаем.
+    dens_col = ("COALESCE(vrvp_density, 0)"
+                if "vrvp_density" in store.level_columns(conn) else "0")
     try:
         rows = conn.execute(
             # ⚠ Берутся НЕ ТОЛЬКО активные. Снятые уровни нужны разметке: отработанный
@@ -465,7 +470,7 @@ def read_map(symbol: str) -> MapRead | NotReady:
             # месяц назад на график сегодняшних баров всё равно не попадёт.
             "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen,"
             " boundary_lo, boundary_hi, from_ms, to_ms, state,"
-            " COALESCE(resolved_at, 0)"
+            " COALESCE(resolved_at, 0), " + dens_col +
             " FROM levels WHERE symbol=? AND (state='active' OR retired_at >= ?)"
             " ORDER BY price", (symbol, clock.now_ms() - RETIRED_WINDOW_MS),
         ).fetchall()
@@ -481,7 +486,8 @@ def read_map(symbol: str) -> MapRead | NotReady:
                            entry_rule=r[5] or "",
                            boundary_lo=float(r[7]), boundary_hi=float(r[8]),
                            from_ms=int(r[9]), to_ms=int(r[10]),
-                           state=r[11], retired_at_ms=int(r[12]))
+                           state=r[11], retired_at_ms=int(r[12]),
+                           vrvp_density=float(r[13]))
                   for r in rows)
     return MapRead(zones=zones, last_seen_ms=max((int(r[6]) for r in rows), default=0))
 
@@ -517,7 +523,8 @@ def zones_of(decision: engine.SymbolDecision,
             retired_at_ms=0 if active else resolved,
             boundary_lo=float(m.level.boundary_lo),
             boundary_hi=float(m.level.boundary_hi),
-            from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms))
+            from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms,
+            vrvp_density=m.level.vrvp_density or 0.0))
     return tuple(sorted(out, key=lambda z: z.price))
 
 
@@ -861,6 +868,21 @@ def tradable_counts(
             len([z for z in t if z.side == "short"]))
 
 
+def _strength(z: ZoneSpec, order: dict[str, int]) -> tuple[int, float]:
+    """Сила уровня по стр. 22: «Сила уровня определяется ТФ и объемом».
+
+    Кортеж, а НЕ одно число: курс называет два признака и шкалы между ними не даёт.
+    Свёртка вида `вес_тф * k + плотность` требовала бы придуманного `k` — а придуманный
+    порог в этом проекте запрещён наравне с «результат плохой, добавим фильтр».
+    Поэтому ТФ решает первым (стр. 48: старший сильнее), плотность объёма — вторым.
+
+    ⚠ Плотность, а НЕ доля объёма. Доля («сколько композита лежит в зоне») растёт вместе
+    с шириной зоны — ранговая корреляция +0.716 на 9715 уровнях, — и отбор по ней
+    означал бы «показываем самую широкую полосу». Разбор: `levels.Level.vrvp_zone_bins`.
+    """
+    return order.get(z.timeframe, 0), z.vrvp_density
+
+
 def live_unique(
     zones: tuple[ZoneSpec, ...], price: float, now_ms: int,
 ) -> tuple[list[ZoneSpec], list[ZoneSpec], list[ZoneSpec]]:
@@ -881,10 +903,19 @@ def live_unique(
     off_struct = [z for z in alive if not near_structure(z, now_ms)]
     order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
     best: dict[tuple[str, str], ZoneSpec] = {}
+    # ⚠ СИЛА ПО ОБЪЁМУ РЕШАЕТ ПРИ РАВНОМ ТФ (2026-08-19, приказ владельца: "примени
+    # силу по объёму в отборе уровней"). Стр. 22: «Сила уровня определяется ТФ и объемом» —
+    # два измерения, и второе в отборе не участвовало вовсе. При равном ТФ прежняя
+    # редакция оставляла ПЕРВЫЙ встреченный, то есть решал порядок строк из SQL
+    # (`ORDER BY price`), а не свойство уровня.
+    #
+    # Измерения остаются РАЗДЕЛЬНЫМИ, в одно число не сворачиваются: ТФ старше — сильнее
+    # (стр. 48), и объём его не перебивает. Курс единой шкалы «ТФ + объём» не даёт, а
+    # выдуманный вес одного против другого был бы придумкой из головы.
     for z in live:
         key = (z.side, _fmt_price(z.price))
         kept = best.get(key)
-        if kept is None or order.get(z.timeframe, 0) > order.get(kept.timeframe, 0):
+        if kept is None or _strength(z, order) > _strength(kept, order):
             best[key] = z
     # ⚠ ВТОРОЙ ПРОХОД — склейка по ЗОНЕ, а не по строке цены (2026-08-17, разбор живого
     # ответа BTC): «64 100 · 15м» и «64 099 · 15м» с перекрывающимися зонами прошли
@@ -897,8 +928,15 @@ def live_unique(
     # взамен дальний. Остаётся старший ТФ (стр. 48), при равном — более широкая зона.
     # Порог не выдумывается — критерий геометрический.
     kept_zones: list[ZoneSpec] = []
+    # Порядок ключа: ТФ → ПЛОТНОСТЬ ОБЪЁМА → ширина зоны. Ширина — не критерий курса, а
+    # разрешение ничьей, придуманное проектом; объём назван курсом прямо (стр. 22),
+    # поэтому стоит выше. При нулевой плотности (композит не считался) ключ вырождается
+    # в прежний, то есть старые карты ведут себя как раньше. Сила берётся ТОЙ ЖЕ
+    # функцией, что и в первом проходе: два ключа отбора, написанных порознь, разъедутся
+    # при первой же правке — а разъехавшись, дадут разный ответ на один вопрос.
     for z in sorted(best.values(),
-                    key=lambda z: (-order.get(z.timeframe, 0), -(z.zone_hi - z.zone_lo))):
+                    key=lambda z: (*(-v for v in _strength(z, order)),
+                                   -(z.zone_hi - z.zone_lo))):
         if any(k.side == z.side and k.zone_lo <= z.price <= k.zone_hi
                and z.zone_lo <= k.price <= z.zone_hi
                for k in kept_zones):
@@ -1067,7 +1105,17 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         # где начинается «дальнее» — ни курс, ни корпус числа не дают.
         away = min(_away(z, price) for z in g) * 100
         far = f" · {away:.0f}% от цены" if away > 5 else ""
-        return f"{core} · {role(g)}{far}{marks}"
+        # ⚠ Сила по объёму ПЕЧАТАЕТСЯ (2026-08-19). С этой правки плотность объёма
+        # решает, какой из двух уровней одного ТФ читатель увидит, — а всё, на чём стоит
+        # решение, обязано быть предъявлено.
+        vol = max(z.vrvp_density for z in g)
+        # «×N к среднему», а не проценты: печатается ПЛОТНОСТЬ — во сколько раз объём
+        # на ценовую строку в зоне выше среднего по композиту. Единица означает «зона
+        # ничем не выделяется», поэтому называется только сгущение. Ноль — «не
+        # считалось» (карта до схемы 8), и тогда строки нет: печатать «×0» значило бы
+        # назвать пустым непосчитанное.
+        strength = f" · объём ×{vol:.1f} к среднему" if vol >= 1.2 else ""
+        return f"{core} · {role(g)}{strength}{far}{marks}"
 
     def block(side: str, title: str) -> list[str]:
         """Зоны ОДНОЙ стороны, склеенные в диапазоны, от ближнего к дальнему.
@@ -1110,6 +1158,19 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
             aways = sorted(min(_away(z, price) for z in g) * 100 for g in rest)
             out.append(f"… ещё {len(rest)} дальше — от {aways[0]:.1f}% до "
                        f"{aways[-1]:.0f}% от цены")
+            # ⚠ САМЫЙ СИЛЬНЫЙ ПО ОБЪЁМУ В ХВОСТЕ — НАЗЫВАЕТСЯ (2026-08-19). Показанное
+            # отбирается по РАССТОЯНИЮ до цены, и это правильно для очереди работы, но
+            # расстояние силой не является: стр. 22 называет силой ТФ и объём. Уровень
+            # сильнее всех показанных, ушедший в «… ещё N дальше», был бы скрыт ровно
+            # тем же способом, каким скрывались все четыре дефекта смены, — молчаливым
+            # сокращением. Порог не выдумывается: называется тогда и только тогда, когда
+            # хвост сильнее ЛЮБОГО показанного.
+            best_rest = max(rest, key=lambda g: max(z.vrvp_density for z in g))
+            rest_vol = max(z.vrvp_density for z in best_rest)
+            shown_vol = max((z.vrvp_density for g in shown for z in g), default=0.0)
+            if rest_vol > shown_vol and rest_vol >= 1.2:
+                out.append(f"   ⚠ сильнейший по объёму — не выше: "
+                           f"{span_line(best_rest)[2:]}")
         if passed:
             # Пройденные НАЗЫВАЮТСЯ, но не подаются как торгуемые: по карте цена их
             # уже прошла, а карта может быть старой — читатель вправе знать оба факта.
@@ -1138,7 +1199,28 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     if hidden_dupes:
         notes.append(f"{hidden_dupes} слились с соседями по зоне")
     if off_struct:
-        notes.append(f"{len(off_struct)} скрыто — структура старше кадра графика")
+        note = f"{len(off_struct)} скрыто — структура старше кадра графика"
+        # ⚠ СИЛЬНЕЙШИЙ ПО ОБЪЁМУ СРЕДИ СКРЫТЫХ — НАЗЫВАЕТСЯ (2026-08-19). Возрастной
+        # фильтр снимает основную массу карты: замер на кадрах прогона `last` — 340
+        # активных уровней из 376 у пяти символов. В четырёх символах он согласен с
+        # силой (сильнейший актив показан), в пятом — нет: у POL сильнейший актив
+        # (шорт 4ч, 18.32% композита) скрыт возрастом, а лучший показанный несёт 7.29%.
+        # Владелец видел «43 скрыто» и не мог узнать, что среди них сильнейший.
+        #
+        # Фильтр НЕ отменяется: он взят у автора (видео-обзор 17.08.2026 — «мне нужна
+        # структурка, без неё шорты не рассматриваю»), и заменять правило источника
+        # собственным замером запрещено. Скрытое именно НАЗЫВАЕТСЯ — как свёрнутый
+        # хвост строкой выше.
+        shown_max = max((z.vrvp_density for z in unique), default=0.0)
+        top_hidden = max(off_struct, key=lambda z: z.vrvp_density, default=None)
+        if top_hidden is not None and top_hidden.vrvp_density > max(shown_max, 1.2):
+            note += (f"; сильнейший из них по объёму — "
+                     f"{'лонг' if top_hidden.side == 'long' else 'шорт'} "
+                     f"{_fmt_price(top_hidden.price)} "
+                     f"({TF_LABEL.get(top_hidden.timeframe, top_hidden.timeframe)}, "
+                     f"объём ×{top_hidden.vrvp_density:.1f} к среднему против "
+                     f"×{shown_max:.1f} у показанных)")
+        notes.append(note)
     service = ("⚙ " + " · ".join(notes)) if notes else ""
     tail = [x for x in (service, origin,
                         "Это карта уровней, а не торговая рекомендация.") if x]

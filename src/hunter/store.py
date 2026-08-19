@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS levels (
     -- времени события. Расчёт момент знает (`LevelStatus.resolved_at_ms`), карта его
     -- теряла.
     resolved_at  INTEGER,
+    -- Плотность объёма в зоне: во сколько раз объём НА ЦЕНОВУЮ СТРОКУ профиля выше
+    -- среднего по композиту (стр. 22: «Сила уровня определяется ТФ и объемом»).
+    -- NULL — композит не построен либо строка до схемы 8.
+    -- ⚠ Заведена 2026-08-19 по приказу владельца «примени силу по объёму в отборе
+    -- уровней». Половина критерия силы существовала ТОЛЬКО в тексте карточки: карта
+    -- леджера несла `volume` (объём структуры в монетах, величина другая), и отбор зон
+    -- бота — какие уровни владелец увидит — про объём не знал ничего. Уровень с 51.8%
+    -- композита и уровень с 0.002% различались в карточке и не различались нигде более.
+    -- ⚠ Хранится ПЛОТНОСТЬ, а не доля объёма, и это исправление измерителя. Доля
+    -- (`объём зоны / объём композита`) оказалась переодетой ШИРИНОЙ ЗОНЫ: ранговая
+    -- корреляция с шириной +0.716 на 9715 уровнях, контроль по расстоянию до цены
+    -- −0.107. Отбор по такой мере означал бы «показываем самую широкую полосу».
+    -- Плотность безразмерна, сравнима между символами и от ширины не зависит по
+    -- построению. Разбор — докстрока `levels.Level.vrvp_zone_bins`.
+    vrvp_density REAL,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     CHECK (to_ms > from_ms),
@@ -156,8 +171,13 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+7 → 8 (2026-08-19): у уровня появилась `vrvp_density` — плотность объёма в зоне,
+вторая половина критерия силы по стр. 22. Прежние строки получают NULL: композит у них
+не считался вовсе, а подставить `volume` нельзя — это объём структуры в монетах.
+Первый боевой прогон перепишет строку настоящим значением.
 
 6 → 7 (2026-08-17): у уровня появился `resolved_at` — момент СОБЫТИЯ (прокола либо
 пробоя), отличный от `retired_at` (момента ПРОГОНА, в котором уровень сняли). Без него
@@ -584,7 +604,37 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "5"
     if lvl_cols and "resolved_at" not in lvl_cols:
         return "6"
+    if lvl_cols and "vrvp_density" not in lvl_cols:
+        return "7"
     return SCHEMA_VERSION
+
+
+# ⚠ ЛОВУШКА ЭТОЙ ЛЕСТНИЦЫ, найденная пробником 2026-08-19. Версия выводится ИЗ КОЛОНОК,
+# а не читается из `schema_meta`, — и последняя строка возвращает `SCHEMA_VERSION`. Значит
+# подъёма константы НЕДОСТАТОЧНО: пока новой ступени тут нет, база прежней версии называет
+# себя новой, ветка миграции не срабатывает НИ РАЗУ, а `schema_meta` в конце всё равно
+# штампуется новым числом — база помечена мигрированной, не будучи ею.
+#
+# Замер на копии боевого леджера (49735 строк, версия 7): подъём `SCHEMA_VERSION` до «8»
+# без этой ступени дал «версия ПОСЛЕ: 8» и новой колонки НЕТ. Первая же запись
+# уровня упала бы на `no such column`. Поймано ровно потому, что миграция была проверена
+# прогоном на копии, а не прочитана глазами.
+
+
+def level_columns(conn: sqlite3.Connection) -> set[str]:
+    """Колонки таблицы `levels` В ЭТОЙ базе. Нужна ЧИТАТЕЛЯМ, а не писателю.
+
+    ⚠ Заведена 2026-08-19, и повод боевой. Колонку добавляет МИГРАЦИЯ, а миграция
+    живёт в `open_production_ledger` — то есть у ПИСАТЕЛЯ. Бот и `check` открывают
+    леджер `mode=ro` и мигрировать не могут по построению. Значит между выкладкой кода
+    и первым боевым прогоном база остаётся прежней схемы, и запрос, называющий новую
+    колонку, отвечает `no such column` — у бота это «леджер не прочитан», то есть
+    ПУСТАЯ КАРТА вместо уровней.
+
+    Дефект был бы виден не сразу и не мне: у меня боевой леджер только для чтения.
+    Поэтому читатели спрашивают схему, а не предполагают её.
+    """
+    return {r[1] for r in conn.execute("PRAGMA table_info(levels)")}
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -672,6 +722,12 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # и подставить `retired_at` вместо него нельзя — это разные величины, ровно из-за
         # смешения которых колонка и заводится.
         conn.execute("ALTER TABLE levels ADD COLUMN resolved_at INTEGER")
+        conn.commit()
+    if _schema_version(conn) == "7":
+        # 7 → 8: та же дешёвая правка на месте, NULLABLE. Плотность у прежних строк не
+        # вычислялась — ноль был бы враньём (он означает «в зоне пусто»), а `volume`
+        # подставить нельзя: другая величина. NULL читается как «не считалось».
+        conn.execute("ALTER TABLE levels ADD COLUMN vrvp_density REAL")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -932,13 +988,13 @@ def sync_levels(
                 conn.execute(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
-                    " last_seen, state, retired_at, entry_rule, resolved_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " last_seen, state, retired_at, entry_rule, resolved_at, vrvp_density)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
-                     None if active else now_ms, rule.value, resolved),
+                     None if active else now_ms, rule.value, resolved, lvl.vrvp_density),
                 )
                 added += 1
                 retired += not active
@@ -947,11 +1003,33 @@ def sync_levels(
             # Дата снятия либо снимается вовсе (уровень снова активен), либо
             # сохраняет ПЕРВОЕ снятие: «когда перестал торговаться» — это первый раз.
             retired_at = None if active else (row[1] if row[1] is not None else now_ms)
+            # ⚠ ГЕОМЕТРИЯ ПЕРЕПИСЫВАЕТСЯ ЦЕЛИКОМ (2026-08-19). Прежняя редакция обновляла
+            # `price` и `zone_*`, но НЕ `boundary_*`, `volume` и `side` — они писались
+            # ровно раз в жизни строки, при вставке. После слияния границ 2026-08-18 у
+            # ранее известных уровней зона стала новой, а структура осталась прежней,
+            # узкой: 24884 строки из 49735 (50.0%) держали зону ВНЕ структуры — тот
+            # самый дефект №1 владельца, — и сама бы эта строка не зажила никогда.
+            #
+            # Замер поимённо по полям (ONDO, 1797 общих строк леджера и расчёта):
+            # переписываемые `price`/`zone_lo`/`zone_hi` разошлись у 0 — это контроль,
+            # он и обязан дать ноль; не переписываемые `boundary_lo` у 1408 (78.4%),
+            # `boundary_hi` у 1374 (76.5%), `volume` у 18 (1.0%). У `side` разошлось 0,
+            # и он всё равно внесён: величина выводится из ТОГО ЖЕ окна структуры, а
+            # устаревшая сторона в карте есть ровно наслоение встречных зон.
+            # Воспроизведение: docs/audit/evidence/E-stale-ledger-geometry-2026-08-19/
+            #
+            # Правило, из которого это следует, — «прибор обязан смотреть на ТУ ЖЕ
+            # величину, которую видит владелец»: карточка того же прогона печатала 0
+            # нарушений, пока леджер держал 50%. Две геометрии под одним уровнем.
             conn.execute(
-                "UPDATE levels SET last_seen=?, price=?, zone_lo=?, zone_hi=?, state=?,"
+                "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
+                " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
                 " retired_at=?, entry_rule=?, resolved_at=? WHERE symbol=? AND timeframe=? AND"
                 " from_ms=? AND to_ms=?",
-                (now_ms, float(lvl.price), float(lvl.zone_lo), float(lvl.zone_hi),
+                (now_ms, lvl.side.value, float(lvl.price),
+                 float(lvl.zone_lo), float(lvl.zone_hi),
+                 float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
+                 lvl.vrvp_density,
                  state.value, retired_at, rule.value, resolved, *key),
             )
             updated += 1

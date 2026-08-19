@@ -297,6 +297,34 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         lines.append(
             ("Зоны не шире корпусного максимума (39% от середины)", not wide, wide_detail)
         )
+        # ⚠ ВТОРАЯ ПОЛОВИНА СИЛЫ — СВОДКА ПО ТФ, а не одно число (2026-08-19). Стр. 22:
+        # «Сила уровня определяется ТФ и объемом». С этой смены плотность объёма
+        # участвует в отборе уровней бота, значит владельцу нужно видеть, ЕСТЬ ли у
+        # отбора данные: у строк карты до схемы 8 плотность NULL, и отбор по ним
+        # вырождается в прежний. Знаменатель и разрез по ТФ — по уроку backfill-window-2026-08-04:
+        # сто честных «не посчитано», все на одном ТФ, читаются как «рынок такой».
+        vol_rows: dict[str, tuple[int, int]] = {}
+        # Колонки может не быть: миграцию делает писатель, а `check` читает `mode=ro`.
+        # Тогда посчитанных нет ни одной — это и есть честный ответ, а не отказ.
+        have_col = ("COUNT(vrvp_density)"
+                    if "vrvp_density" in store.level_columns(conn) else "0")
+        for tf, total, have in conn.execute(
+            f"SELECT timeframe, COUNT(*), {have_col} FROM levels"
+            " WHERE state='active' GROUP BY timeframe"
+        ).fetchall():
+            vol_rows[tf] = (int(total), int(have))
+        v_total = sum(t for t, _ in vol_rows.values())
+        v_have = sum(h for _, h in vol_rows.values())
+        vol_summary = ", ".join(f"{tf} {vol_rows[tf][1]}/{vol_rows[tf][0]}"
+                                for tf in sorted(vol_rows))
+        lines.append((
+            "Сила по объёму посчитана у активных уровней (стр. 22)",
+            v_total > 0 and v_have == v_total,
+            (f"плотность объёма есть у {v_have} из {v_total} (по ТФ: {vol_summary}); "
+             "у остальных NULL — карта записана до схемы 8, отбор по ним идёт "
+             "прежним ключом (ТФ, ширина зоны)")
+            if v_total else "активных уровней в карте нет — мерить нечего",
+        ))
         for row in store.format_outcome_survey(survey):
             print(f"   {row}" if not row.startswith(" ") else row)
         skewed = [c for c in survey.cells if c.closed == 0 and c.signals > 0]
