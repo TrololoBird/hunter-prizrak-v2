@@ -2185,9 +2185,17 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                 " s.entry FROM signal_states st JOIN signals s ON s.id = st.signal_id"
                 " ORDER BY st.signal_id")]
         marks = ",".join("?" * len(symbols))
+        # ⚠ КОЛОНКА СПРАШИВАЕТСЯ У СХЕМЫ, А НЕ ПРЕДПОЛАГАЕТСЯ (2026-08-19). Наблюдатель
+        # ходит в леджер ТОЛЬКО НА ЧТЕНИЕ и мигрировать не может; схему поднимает
+        # ПИСАТЕЛЬ, и делает это в конце своего круга. Между подъёмом версии в коде и
+        # первым кругом службы запрос с новой колонкой роняет наблюдателя целиком —
+        # ровно это и случилось при вводе `mtf_break`: «no such column: mtf_break»,
+        # уведомления молчали. Проект уже знал этот класс по `vrvp_density` в `read_map`
+        # (строкой выше), и я его повторил.
+        mtf_col = ("mtf_break" if "mtf_break" in store.level_columns(conn) else "NULL")
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
-            f" entry_rule, boundary_lo, boundary_hi, mtf_break"
+            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}"
             f" FROM levels WHERE state='active' AND symbol IN ({marks})",
             symbols).fetchall()
     except sqlite3.DatabaseError as e:
