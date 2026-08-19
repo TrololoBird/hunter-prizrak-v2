@@ -283,7 +283,7 @@ async def exchange_loop(exchange_id, symbols):
 
 Пример binance-reload-markets.py показывает ровно нашу схему: отдельная корутина в `gather`,
 `load_markets(True)` по таймеру, рядом с потоком. Совпадает с `reload_markets` в нашем
-`exchange.py`.
+exchange.py.
 
 ## 7.4. Оконный ограничитель — синтаксис подтверждён примером
 

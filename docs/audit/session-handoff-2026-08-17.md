@@ -51,7 +51,7 @@
 
 ## 2. НАЙДЕННЫЕ И ПОЧИНЕННЫЕ ДЕФЕКТЫ
 
-### 2.1. `cached_days` возвращала пусто ВСЕГДА (`archive.py`)
+### 2.1. `cached_days` возвращала пусто ВСЕГДА (archive.py)
 
 Регулярка `CACHE_STEM` требовала сегмент ПОСЛЕ даты, который к моменту сопоставления уже
 отрезан. Сводка бэкфилла печатала «из_кэша=0, качать=75» поверх 73 лежащих на диске суток.
@@ -226,10 +226,10 @@ continue`: точка той же стороны, что предыдущая, �
 
 | файл | что делает |
 |---|---|
-| `docs/audit/probes/probe_xau_micro_2026-08-11.py` | оборот и плотность сделок XAU/XAG/PAXG против BTC и ASTR |
-| `docs/audit/probes/probe_xau_weekend_2026-08-11.py` | доля структур в выходных, золото против BTC |
-| `docs/audit/probes/probe_xau_index_2026-08-11.py` | насколько перп повторяет свой индекс |
-| `docs/audit/probes/probe_backfill_window_2026-08-11.py` | регресс-проверка пагинации REST по времени |
+| docs/audit/probes/probe_xau_micro_2026-08-11.py | оборот и плотность сделок XAU/XAG/PAXG против BTC и ASTR |
+| docs/audit/probes/probe_xau_weekend_2026-08-11.py | доля структур в выходных, золото против BTC |
+| docs/audit/probes/probe_xau_index_2026-08-11.py | насколько перп повторяет свой индекс |
+| docs/audit/probes/probe_backfill_window_2026-08-11.py | регресс-проверка пагинации REST по времени |
 
 Команды воспроизведения:
 

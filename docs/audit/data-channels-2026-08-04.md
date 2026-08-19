@@ -13,9 +13,9 @@
 
 | канал | что берёт (04.08) | стало 05.08 | где |
 |---|---|---|---|
-| **WebSocket** (ccxt.pro) | живые бары `watch_ohlcv`, живые сделки `watch_trades` | **только сделки**; `watch_closed_ohlcv` удалён | `exchange.py::watch_agg_trades` |
-| **REST** (ccxt) | исторические БАРЫ `fetch_ohlcv` (до 1000 за запрос, с `since`), время сервера | **+ добор баров по границам ТФ** | `exchange.py::fetch_closed_ohlcv`, `count_history`, `run.py::_poll_bars_impl` |
-| **Прямой HTTPS** | суточные ZIP сделок с `data.binance.vision` + `.CHECKSUM` | без изменений | `archive.py` |
+| **WebSocket** (ccxt.pro) | живые бары `watch_ohlcv`, живые сделки `watch_trades` | **только сделки**; `watch_closed_ohlcv` удалён | exchange.py::watch_agg_trades |
+| **REST** (ccxt) | исторические БАРЫ `fetch_ohlcv` (до 1000 за запрос, с `since`), время сервера | **+ добор баров по границам ТФ** | exchange.py::fetch_closed_ohlcv, `count_history`, run.py::_poll_bars_impl |
+| **Прямой HTTPS** | суточные ZIP сделок с `data.binance.vision` + `.CHECKSUM` | без изменений | archive.py |
 
 **Сделки по REST не запрашивались вообще** — ни одного вызова `fetch_trades` в дереве.
 
@@ -26,9 +26,9 @@
 > дневном таймфрейме?»
 
 **Для БАРОВ архив не используется нигде, и вопрос снимается проверкой кода.** В
-`archive.py` есть единственный путь — `aggTrades/`; klines оттуда качает только зонд
+archive.py есть единственный путь — `aggTrades/`; klines оттуда качает только зонд
 `bar_vs_tick`, и именно затем, чтобы доказать, что барами профиль не построить.
-Бары в боевом пути идут исключительно REST-ом (`exchange.py::fetch_closed_ohlcv`).
+Бары в боевом пути идут исключительно REST-ом (exchange.py::fetch_closed_ohlcv).
 
 Замер: **1000 дневных баров — 999 суток за 1.10 с**, 1000 четырёхчасовых — 166 суток за
 0.64 с. Владелец прав: REST закрывает бары полностью, включая 1Д.
@@ -47,7 +47,7 @@
 
 ## Опровергнуто: «REST не отдаёт старые сделки»
 
-Докстрока `archive.py` утверждала, что `/fapi/v1/aggTrades` отдаёт сделки «не старше 24
+Докстрока archive.py утверждала, что `/fapi/v1/aggTrades` отдаёт сделки «не старше 24
 часов». Утверждение взято из документации по памяти и **ни разу не проверялось**.
 
 Замер 2026-08-04, `fetch_trades("BTC/USDT:USDT", since=…)`:

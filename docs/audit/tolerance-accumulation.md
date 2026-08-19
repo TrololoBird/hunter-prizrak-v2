@@ -3,7 +3,7 @@
 Файл после прогона не правится. Хеш снимается до запуска зонда и приводится в протоколе
 [accumulation-projects-2026-08-07.md](accumulation-projects-2026-08-07.md).
 
-Зонд: [probes/probe_accumulation_questions_2026-08-07.py](probes/probe_accumulation_questions_2026-08-07.py)
+Зонд: probes/probe_accumulation_questions_2026-08-07.py
 
 ---
 
@@ -61,7 +61,7 @@
   и [TradingPatternScanner](https://github.com/white07S/TradingPatternScanner) `detect_channel`
   (`channel_range = 0.1`), два независимых проекта, одно число;
 * длительность 5 баров — нижний предел у трёх реализаций Дарваса и у
-  [Consolidation Zones](https://github.com/fmzquant/strategies/blob/master/Consolidation-Zones-Live.md);
+  Consolidation Zones;
 * длительность 140 баров — [BreakOutBox](https://www.mql5.com/en/code/37415).
 
 **Порог решения, назван ДО прогона.**

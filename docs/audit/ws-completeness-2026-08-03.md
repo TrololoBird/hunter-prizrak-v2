@@ -35,7 +35,7 @@ FOUNDATION.md §5 (профиль строится на реальных сде�
 
 ## Команда воспроизведения
 
-Полный текст зонда — в `docs/audit/probes/probe_ws_reconcile.py` рядом с этим файлом.
+Полный текст зонда — в docs/audit/probes/probe_ws_reconcile.py рядом с этим файлом.
 
 ```bash
 uv run python docs/audit/probes/probe_ws_reconcile.py

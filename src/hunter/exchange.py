@@ -478,7 +478,7 @@ class Venue(NamedTuple):
     разделение объёма свечи на покупки и продажи БЕЗ единой сделки.
 
     Цена вопроса в весе: тот же бар через `aggTrades` стоит 20 за запрос, а через свечи —
-    2 за 499 баров. Разбор корпуса (`prizrak_btc_eth_keyzone.txt`) показывает, что автор
+    2 за 499 баров. Разбор корпуса (prizrak_btc_eth_keyzone.txt) показывает, что автор
     смотрит именно на разделение объёма: «по дельте ордербука крупных продаж нету, крупняк
     не появлялся, при том, что откупы больш[ие]».
 
@@ -2522,7 +2522,7 @@ class Exchange:
             if not raw:
                 # ⚠ ЗДЕСЬ БЫЛ ВЫВОД «после since сделок нет, окно покрыто целиком», и он
                 # НЕВЕРЕН. ccxt сам дописывает верхнюю границу запроса в ОДИН ЧАС —
-                # `ccxt/async_support/binance.py::fetch_trades`, ccxt 4.5.71:
+                # ccxt/async_support/binance.py::fetch_trades, ccxt 4.5.71:
                 #     request['startTime'] = since
                 #     request['endTime'] = self.sum(since, 3600000)
                 # (обход правила Binance «time between startTime and endTime must be less
@@ -2615,7 +2615,7 @@ class Exchange:
         """Поток стакана. ccxt держит книгу инкрементально и отдаёт согласованный снимок.
 
         ⚠ `timestamp` В ЭТОМ ПОТОКЕ ВСЕГДА ПУСТ, и это признано САМОЙ ccxt, а не наша
-        догадка: `skip-tests.json` в её репозитории отключает проверку метки времени для
+        догадка: skip-tests.json в её репозитории отключает проверку метки времени для
         `binanceusdm` / `watchOrderBook` и `watchOrderBookForSymbols` с пометкой «not
         present». То же для `orderBook` спотовой площадки.
 

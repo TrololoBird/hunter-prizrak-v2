@@ -119,7 +119,7 @@ Binance USDⓈ-M: **Update Speed = 250 ms**. То есть форминг-све
 
 ---
 
-## 5. Что это означает для `hunter/exchange.py` — в порядке уверенности
+## 5. Что это означает для hunter/exchange.py — в порядке уверенности
 
 1. **Правило закрытия свечи надо менять.** Это единственная рекомендация, у которой согласованное большинство (3 из 3 решающих реализаций) плюс подтверждение первоисточника о том, почему часы не годятся. hunter здесь одинок в выборке.
 2. **Ловить `ccxt.BaseError`, отделив `ExchangeClosedByUser` и не зацикливая `BadRequest`.** 2 из 2 сопоставимых проектов; плюс доказано деревом классов, что `OperationFailed` и `UnsubscribeError` сейчас проходят мимо.
@@ -137,7 +137,7 @@ Binance USDⓈ-M: **Update Speed = 250 ms**. То есть форминг-све
 2. **Выборка смещена в сторону зрелых проектов.** Все пять — известные системы с многолетней историей. Это отвечает на вопрос «как делают аккуратно», а не «как делают обычно».
 3. **Комментарии в заявках GitHub прочитать не удалось** — инструмент отдаёт только тело заявки. Позиция сопровождающих ccxt по флагу закрытия (#21885), по `newUpdates` (#24658) и по отказам при большом числе подписок (#23929) выведена из статуса заявок и из кода, а не из их слов. Это существенное ограничение, и я его не обхожу.
 4. **Задержка `x=true` до 3 секунд** — сообщение пользователя форума, подтверждённое сотрудником Binance качественно, но не количественно. Собственного замера нет: `fapi.binance.com` из этого окружения отвечает `HTTP 451`.
-5. **Прочитаны разделы, а не проекты целиком.** У OctoBot — пути свечей, ошибок и переподключения из 1350 строк; у Hummingbot — candles_base.py и три коннектора; у freqtrade — exchange_ws.py целиком и ws-путь в `exchange.py`. Механизмы вне этих путей я не видел.
+5. **Прочитаны разделы, а не проекты целиком.** У OctoBot — пути свечей, ошибок и переподключения из 1350 строк; у Hummingbot — candles_base.py и три коннектора; у freqtrade — exchange_ws.py целиком и ws-путь в exchange.py. Механизмы вне этих путей я не видел.
 6. **Ни одна из бирж выборки не проверена на живом соединении** — только по спецификации.
 7. **Кросс-версионность не проверялась**: изучены текущие ветки `master`/`develop`. Как эти решения выглядели год назад и почему менялись — не смотрел, хотя история изменений exchange_ws.py и ccxt_websocket_connector.py была бы сильным источником: она показывает, какие подходы отбрасывались.
 
@@ -189,10 +189,10 @@ grep -n 'def is_closed' -A6 src/hunter/bars.py
 
 **Реализации**
 
-* [freqtrade — exchange_ws.py](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/freqtrade/exchange/exchange_ws.py) · [`exchange.py`](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/freqtrade/exchange/exchange.py) · [PR#10273](https://github.com/freqtrade/freqtrade/pull/10273)
-* [OctoBot-Trading — ccxt_websocket_connector.py](https://raw.githubusercontent.com/Drakkar-Software/OctoBot-Trading/master/octobot_trading/exchanges/connectors/ccxt/ccxt_websocket_connector.py)
-* [Hummingbot — candles_base.py](https://raw.githubusercontent.com/hummingbot/hummingbot/master/hummingbot/data_feed/candles_feed/candles_base.py) · [binance_perpetual_candles.py](https://raw.githubusercontent.com/hummingbot/hummingbot/master/hummingbot/data_feed/candles_feed/binance_perpetual_candles/binance_perpetual_candles.py) · [bybit_perpetual_candles.py](https://raw.githubusercontent.com/hummingbot/hummingbot/master/hummingbot/data_feed/candles_feed/bybit_perpetual_candles/bybit_perpetual_candles.py) · [okx_perpetual_candles.py](https://raw.githubusercontent.com/hummingbot/hummingbot/master/hummingbot/data_feed/candles_feed/okx_perpetual_candles/okx_perpetual_candles.py)
-* [cryptofeed — `types.pyx`](https://raw.githubusercontent.com/bmoscon/cryptofeed/master/cryptofeed/types.pyx) · [exchanges/binance.py](https://raw.githubusercontent.com/bmoscon/cryptofeed/master/cryptofeed/exchanges/binance.py) · [cryptofeed#782](https://github.com/bmoscon/cryptofeed/issues/782)
+* freqtrade — exchange_ws.py · exchange.py · [PR#10273](https://github.com/freqtrade/freqtrade/pull/10273)
+* OctoBot-Trading — ccxt_websocket_connector.py
+* Hummingbot — candles_base.py · binance_perpetual_candles.py · bybit_perpetual_candles.py · okx_perpetual_candles.py
+* [cryptofeed — `types.pyx`](https://raw.githubusercontent.com/bmoscon/cryptofeed/master/cryptofeed/types.pyx) · exchanges/binance.py · [cryptofeed#782](https://github.com/bmoscon/cryptofeed/issues/782)
 * [gocryptotrader — `binance_websocket.go`](https://raw.githubusercontent.com/thrasher-corp/gocryptotrader/master/exchanges/binance/binance_websocket.go)
 
 **Первоисточники бирж**

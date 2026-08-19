@@ -78,7 +78,7 @@ uv run python docs/audit/probes/probe_backfill_window_2026-08-11.py
 | `src/hunter/archive.py` | `BASE`, `AGG_COLUMNS`, `ArchiveDay`, `agg_trades_url`, `FETCH_TRIES`, `_fetch`, `fetch_agg_trades_day`, `binned_day`, `histogram_from_day` и импорты `urllib`, `zipfile`, `hashlib`, `io`, `http.client` — 121 строка |
 | `src/hunter/run.py` | ветка выбора источника в `_backfill_impl`: всё, чего нет в кэше, добирается REST-ом |
 | `src/hunter/__main__.py` | команда `profile` переписана на `fetch_agg_trades_window` — диагностика обязана ходить туда же, куда боевой расчёт |
-| `scripts/probes.py` | `_fetch_day` и `bar_vs_tick` — единственные зонды, качавшие архив; их числа остались в протоколах |
+| scripts/probes.py | `_fetch_day` и `bar_vs_tick` — единственные зонды, качавшие архив; их числа остались в протоколах |
 
 ⚠ **Потеряна одна гарантия, и это надо назвать.** Архив клал рядом `.CHECKSUM`, и
 целостность суток проверялась sha256. У REST-пути такой сверки нет: непрерывность держится
@@ -203,7 +203,7 @@ uv run python docs/audit/probes/probe_backfill_window_2026-08-11.py
 
 ### ⚠ Контроль зонда провалился и нашёл ДВА дефекта в только что написанном
 
-Механизм проверен зондом `docs/audit/probes/probe_live_flush_2026-08-11.py` на трёх случаях: смежное
+Механизм проверен зондом docs/audit/probes/probe_live_flush_2026-08-11.py на трёх случаях: смежное
 покрытие, дыра в две корзины, закрытые сутки. Контроль был устроен так, что случаи 1 и 2
 отличаются РОВНО смежностью — значит одинаковый ответ на них означает неисправность.
 

@@ -1,2 +1,0 @@
-cp -r data/frames/a1 data/frames/swingbase
-uv run python docs/audit/probes/probe_swing_alternation_2026-08-07.py

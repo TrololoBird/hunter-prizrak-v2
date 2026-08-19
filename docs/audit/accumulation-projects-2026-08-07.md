@@ -48,7 +48,7 @@
 | **Н3** сколько точек | «4 и более точек» (стр. 22); на стр. 21 размечено ровно четыре, лишние касания внутри коробки не нумеруются | `MIN_BOUNDARY_POINTS = 4` ✅ |
 | **Н4** чередование | обязательно, 13 схем; сторону первой точки задаёт направление входа цены | **внесено 2026-08-07** ✅ |
 | **Н5** прокол | точку засчитывает, границу НЕ двигает | ✅ следуем |
-| **Н6** выход | «2-3 полных тел свечей ЭТОГО ТФ» (стр. 55); ретест и продолжение относятся к УРОВНЮ после пробоя, а не к выходу | ✅ следуем; ретест и флип — в `levels.py` |
+| **Н6** выход | «2-3 полных тел свечей ЭТОГО ТФ» (стр. 55); ретест и продолжение относятся к УРОВНЮ после пробоя, а не к выходу | ✅ следуем; ретест и флип — в levels.py |
 | **Н7** уровень у невышедшей | уровня нет (стр. 23), но границами она торгуется | ✅ следуем |
 | **Н8** ширина | числового предела НЕТ | ✅ следуем |
 | **Н9** длительность | числового предела НЕТ, вместо него привязка к ТФ | ✅ следуем |
@@ -304,7 +304,7 @@ git worktree add --detach /tmp/pin 7213f00 && cd /tmp/pin && uv run python docs/
 Таблица выше получена 2026-08-08 ЧЕРНОВЫМ СКРИПТОМ во временном каталоге сессии. Она
 попала в сообщение коммита и в докстроку `BorderSource` — а зонда в репозитории не имела.
 То есть правка боевого кода была обоснована числом, которое §7.3 не фиксирует. Скрипт
-перенесён в [`docs/audit/probes/probe_foreign_border_control_2026-08-08.py`](docs/audit/probes/probe_foreign_border_control_2026-08-08.py)
+перенесён в docs/audit/probes/probe_foreign_border_control_2026-08-08.py
 дословно и перегнан; BTC и ETH сошлись до цифры. Первая редакция переноса несла ТРЕТЬЮ
 строку — «BCH, 675 анкеров, 26%», — выписанную по памяти: её не существует, и первый же
 прогон её опроверг.
@@ -318,16 +318,16 @@ git worktree add --detach /tmp/pin 7213f00 && cd /tmp/pin && uv run python docs/
 
 | зонд | коммит закрепления | что с ним стало |
 |---|---|---|
-| [`docs/audit/probes/probe_accumulation_questions_2026-08-07.py`](docs/audit/probes/probe_accumulation_questions_2026-08-07.py) | `65144ca` | строит `BoundaryZone` без поля `edge` → `ValidationError` |
-| [`docs/audit/probes/probe_accumulation_alt_fine_2026-08-07.py`](docs/audit/probes/probe_accumulation_alt_fine_2026-08-07.py) | `65144ca` | импортирует машину предыдущего, падает вместе с ним |
-| [`docs/audit/probes/probe_accumulation_wedge_2026-08-08.py`](docs/audit/probes/probe_accumulation_wedge_2026-08-08.py) | `9622f1d` | НЕ падает: собственный контроль печатает «РАСХОЖДЕНИЙ 18» и возвращает 1 |
+| docs/audit/probes/probe_accumulation_questions_2026-08-07.py | `65144ca` | строит `BoundaryZone` без поля `edge` → `ValidationError` |
+| docs/audit/probes/probe_accumulation_alt_fine_2026-08-07.py | `65144ca` | импортирует машину предыдущего, падает вместе с ним |
+| docs/audit/probes/probe_accumulation_wedge_2026-08-08.py | `9622f1d` | НЕ падает: собственный контроль печатает «РАСХОЖДЕНИЙ 18» и возвращает 1 |
 
 Третья строка — единственная приятная в этой таблице: контроль «копия против боевого
 `detect`» сработал ровно так, как задуман, и старые числа отозвали себя сами, без меня.
 
 Править зонды нельзя (соглашение о заморозке, `pyproject.toml`): отредактированный зонд
 перестаёт быть тем, что дало опубликованное число. Поэтому написан новый —
-[`docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py`](docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py),
+docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py,
 он заменяет все три. Старые воспроизводятся на своих коммитах через `git worktree`.
 
 **Контроль: инструментованная копия `detect` совпала с боевой ПОБИТОВО на всех 18 рядах** —
@@ -399,7 +399,7 @@ git worktree add --detach /tmp/pin 7213f00 && cd /tmp/pin && uv run python docs/
 
 Агент критического разбора 2026-08-08 выдал числа, полученные черновиком, которого в
 репозитории не было. Они проверены зондом
-[`docs/audit/probes/probe_two_point_sides_2026-08-08.py`](docs/audit/probes/probe_two_point_sides_2026-08-08.py)
+docs/audit/probes/probe_two_point_sides_2026-08-08.py
 на ОДНОМ корпусе (все 324 ряда под `data/frames`, 160 126 баров) в трёх деревьях.
 
 | | `main` 5e0edb1 | `7213f00` — что разбирал агент | HEAD `fa9977c` |
@@ -524,7 +524,7 @@ git worktree add --detach /tmp/pin 7213f00 && cd /tmp/pin && uv run python docs/
 где источник даёт худший РР, он всё равно арбитр.
 
 ⚠ Строку «ПРЯМОЕ СЛЕДСТВИЕ — прокол есть, но `stop_anchor` его ИГНОРИРУЕТ» зонд
-[`docs/audit/probes/probe_two_point_sides_2026-08-08.py`](docs/audit/probes/probe_two_point_sides_2026-08-08.py)
+docs/audit/probes/probe_two_point_sides_2026-08-08.py
 печатает по своей копии снятого порога, и после правки она НЕ описывает `stop_anchor` —
 там такой проверки больше нет. Зонд заморожен на коммите `762d680`; его число 3961 читается
 теперь как «проколов, пришедших от второй точки пары», и это не то, что написано в подписи.
@@ -717,7 +717,7 @@ uv run python docs/audit/probes/probe_accumulation_clones_2026-08-07.py <кат�
 | **засчитано независимых реализаций** | **14** |
 
 **Семья, найденная хешем** — три Pine-скрипта Дарваса с хешем `e959c55f6b86`:
-[Darvas-Box-Buy-Sell](https://github.com/fmzquant/strategies/blob/master/Darvas-Box-Buy-Sell.md),
+Darvas-Box-Buy-Sell,
 Darvas-Box-Breakout-and-Risk-Management (порт на v5) и 52-Week-High-Low-Box (тот же код на
 дневных данных). Формула `TopBox = valuewhen(barssince(high > k1[1]) == boxp - 2 and box1, NH, 0)`
 у всех троих совпадает посимвольно после нормализации.
@@ -788,7 +788,7 @@ Darvas-Box-Breakout-and-Risk-Management (порт на v5) и 52-Week-High-Low-B
 | [white07S/TradingPatternScanner](https://github.com/white07S/TradingPatternScanner) `detect_channel` | Python | ★302 / 2023-08-02 | своя | `rolling(window).max()` и `.min()` по High/Low | не отвечает |
 | [pranjal-joshi/Screeni-py](https://github.com/pranjal-joshi/Screeni-py) `validateConsolidation` | Python | ★697 / 2026-08-05 | MIT | max и min ЗАКРЫТИЙ за окно | не отвечает |
 | [BreakOutBox](https://www.mql5.com/en/code/37415) (DarkRyd3r) | MQL5 | 2021-12-07 | CodeBase | бегущие max/min ЗАКРЫТИЙ | закрытие за коробкой, 1 бар |
-| [Darvas Box](https://github.com/fmzquant/strategies/blob/master/Darvas-Box-Buy-Sell.md) (ceyhun), семья из 3 | Pine | 2022-05-31 | MPL-2.0 | хай, не перебитый `boxp-2` бара; низ = `lowest(low, boxp)` | `crossover(close, TopBox)`, 1 закрытие |
+| Darvas Box (ceyhun), семья из 3 | Pine | 2022-05-31 | MPL-2.0 | хай, не перебитый `boxp-2` бара; низ = `lowest(low, boxp)` | `crossover(close, TopBox)`, 1 закрытие |
 | [Darvas_Box](https://www.mql5.com/en/code/21706) (Scriptor/GODZILLA), семья из 3 | MQL4/5 | 2008…2018 | CodeBase | машина из 5 состояний по high/low | не отвечает (только рисует) |
 | [Ranging Market Detector](https://www.mql5.com/en/code/57684) (phade) | MQL5 | 2025-03-30 | CodeBase | high/low баров окна `backstep` | шаг закрытия больше ATR×множитель |
 | [Support and Resistance](https://www.mql5.com/en/code/45132) (Mullerp04) | MQL5 | 2023-07-27 | CodeBase | max за `period`, сверенный с max за `period+overlook` | тень за коробкой, 1 бар |
@@ -797,8 +797,8 @@ Darvas-Box-Breakout-and-Risk-Management (порт на v5) и 52-Week-High-Low-B
 
 | проект | язык | ★ / дата | лицензия | Н1: граница | Н2: цена или зона |
 |---|---|---|---|---|---|
-| [Consolidation Zones - Live](https://github.com/fmzquant/strategies/blob/master/Consolidation-Zones-Live.md) (LonesomeTheBlue) | Pine | 2022-05-24 | MPL-2.0 | `highest(conslen)`/`lowest(conslen)` в момент набора счётчика зигзаг-пивотов | цена, две линии |
-| [TrendScalp-FractalBox](https://github.com/fmzquant/strategies/blob/master/TrendScalp-FractalBox-3EMA.md) (vireshdb) | Pine | 2022-05-23 | GPL-3.0 | ПОСЛЕДНИЙ завершённый 5-баровый фрактал каждой стороны | цена |
+| Consolidation Zones - Live (LonesomeTheBlue) | Pine | 2022-05-24 | MPL-2.0 | `highest(conslen)`/`lowest(conslen)` в момент набора счётчика зигзаг-пивотов | цена, две линии |
+| TrendScalp-FractalBox (vireshdb) | Pine | 2022-05-23 | GPL-3.0 | ПОСЛЕДНИЙ завершённый 5-баровый фрактал каждой стороны | цена |
 | [joshyattridge/smart-money-concepts](https://github.com/joshyattridge/smart-money-concepts) `liquidity` | Python | ★1915 / 2026-04-03 | MIT | ПЕРВЫЙ свинг задаёт уровень, следующие присоединяются | **ЗОНА** ±1% глобального размаха |
 | [day0market/support_resistance](https://github.com/day0market/support_resistance) `_cluster_prices_to_levels` | Python | ★469 / 2023-07-06 | нет файла | кластеризация ВСЕХ пивотов, уровень = среднее/медиана кластера | цена + допуск слияния |
 | [Adaptive S/R Zones](https://www.mql5.com/en/code/74421) (TalalEissa) | MQL5 | 2026-06-27 | CodeBase | подтверждённый пивот глубины 3 | **ЗОНА**, полуширина `0.18×ATR` |
@@ -821,7 +821,7 @@ const double merge_distance  = MathMax(candidate_width, atr * InpMergeDistanceAT
 ```
 
 Единственная реализация, где коробка ЯВНО РАСШИРЯЕТСЯ каждым новым баром —
-[Consolidation Zones - Live](https://github.com/fmzquant/strategies/blob/master/Consolidation-Zones-Live.md), Pine, MPL-2.0:
+Consolidation Zones - Live, Pine, MPL-2.0:
 
 ```pinescript
 if conscnt == conslen
@@ -1208,11 +1208,11 @@ uv run python -c "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('doc
 
 ## Чем этот обзор остался слаб — названо числом, а не умолчанием
 
-* **Клоны не пересчитываются.** [`docs/audit/probes/probe_accumulation_clones_2026-08-07.py`](docs/audit/probes/probe_accumulation_clones_2026-08-07.py)
+* **Клоны не пересчитываются.** docs/audit/probes/probe_accumulation_clones_2026-08-07.py
   требует каталог со скачанным, а клоны удалены после фазы 3 по правилу безопасности.
   Число «4 копии из 18 ядер» воспроизводится только повторным скачиванием.
 * **Три зонда заморожены на своих коммитах** и в текущем дереве не запускаются: их числа
-  описывают код до правок. Замена — [`docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py`](docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py).
+  описывают код до правок. Замена — docs/audit/probes/probe_accumulation_after_fixes_2026-08-08.py.
 * **Контроль чужой границы прошёл на ДВУХ символах из трёх:** у BCH проход 1 не даёт
   уровней вовсе.
 * **Хешированные допуски относятся к гипотезам, которые закрыл не замер, а курс.**

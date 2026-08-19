@@ -41,7 +41,7 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 ### Находки фазы 0
 
 **1. Три константы без источника:** 1 час (`MAX_SYNC_AGE_MS`), 900 с (`CLOCK_RESYNC_S`),
-5000 мс (порог вердикта в `check.py`). Первая честно помечена как незамеренная, две другие
+5000 мс (порог вердикта в check.py). Первая честно помечена как незамеренная, две другие
 нет.
 
 **2. Путь пересведения в штатных прогонах не исполняется ни разу.** `hunter check`
@@ -49,7 +49,7 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 сам печатает предупреждение, что дрейф между сведениями не наблюдался. Механизм есть,
 замера его работы нет.
 
-**3. ⚠ Я едва не опубликовал неверное утверждение.** Прочитав `service.py`, я увидел, что
+**3. ⚠ Я едва не опубликовал неверное утверждение.** Прочитав service.py, я увидел, что
 цикл службы часы не сводит, и уже готов был назвать находкой «на службе 24/7 сведение
 делается один раз». Проверка нашла отдельную задачу пересведения в `run.py:106`.
 Утверждение было бы связным и ложным. Записано как урок: связность — не признак верности,
@@ -72,7 +72,7 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 
 ### 1. hummingbot — [hummingbot/hummingbot](https://github.com/hummingbot/hummingbot)
 
-Прочитан [time_synchronizer.py](https://github.com/hummingbot/hummingbot/blob/master/hummingbot/connector/time_synchronizer.py) —
+Прочитан time_synchronizer.py —
 ВЫДЕЛЕННЫЙ класс для этой задачи, а не пара строк в транспорте. Лицензия Apache-2.0.
 
 * **Ч3 сколько замеров и как сводятся — ГЛАВНОЕ РАСХОЖДЕНИЕ С НАМИ.** Хранится последние
@@ -86,7 +86,7 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 
 ### 2. ccxt — [ccxt/ccxt](https://github.com/ccxt/ccxt)
 
-Прочитан [async_support/base/exchange.py](https://github.com/ccxt/ccxt/blob/master/python/ccxt/async_support/base/exchange.py). Лицензия MIT.
+Прочитан async_support/base/exchange.py. Лицензия MIT.
 
 * **Ч2, Ч3 — ОДИН замер и НИКАКОЙ компенсации rtt:**
 
@@ -107,7 +107,7 @@ async def load_time_difference(self, params={}):
 
 ### 3. python-binance — [sammchardy/python-binance](https://github.com/sammchardy/python-binance)
 
-Прочитан [base_client.py](https://github.com/sammchardy/python-binance/blob/master/binance/base_client.py). Лицензия MIT.
+Прочитан base_client.py. Лицензия MIT.
 
 * **Ч1 — сдвиг применяется к НАСТЕННЫМ часам:** `int(time.time() * 1000 + self.timestamp_offset)`.
   Ровно то, что наша докстрока `now_ms` отвергает: прыжок системного времени сдвинет всю
@@ -117,7 +117,7 @@ async def load_time_difference(self, params={}):
 
 ### ⚠⚠ НАХОДКА: у нашего «числа без источника» источник ЕСТЬ
 
-Разбор 2026-08-04 назвал порог `abs(offset_ms) < 5000` в `check.py` абсолютным числом без
+Разбор 2026-08-04 назвал порог `abs(offset_ms) < 5000` в check.py абсолютным числом без
 источника, и в фазе 0 я записал то же. Оказалось иначе.
 
 **Умолчание `recvWindow` у Binance — ровно 5000 мс**, максимум 60000. Правило сервера:
@@ -159,7 +159,7 @@ async def load_time_difference(self, params={}):
 
 ### 6. pybit — [bybit-exchange/pybit](https://github.com/bybit-exchange/pybit)
 
-Официальный SDK Bybit. Прочитан [_http_manager.py](https://github.com/bybit-exchange/pybit/blob/master/pybit/_http_manager.py). Лицензия MIT.
+Официальный SDK Bybit. Прочитан _http_manager.py. Лицензия MIT.
 
 * **Ч9 — `recv_window: bool = field(default=5000)`.** ⚠ ВТОРАЯ биржа с тем же числом 5000.
 * **Ч2 — сдвиг не измеряется вообще.** Вместо этого РЕАКТИВНО: при коде ошибки 10002
@@ -196,7 +196,7 @@ if error_code == 10002:  # recv_window error
 ### 7. binance-connector-python — [binance/binance-connector-python](https://github.com/binance/binance-connector-python)
 
 ОФИЦИАЛЬНЫЙ коннектор самой Binance. Прочитан
-[binance_common/utils.py](https://github.com/binance/binance-connector-python/blob/master/common/src/binance_common/utils.py). Лицензия MIT.
+binance_common/utils.py. Лицензия MIT.
 
 * **Ч2 — сдвиг НЕ МЕРЯЕТСЯ ВОВСЕ:** `def get_timestamp() -> int: return int(time.time() * 1000)`.
   Сама биржа в своём SDK на сведение часов не полагается — только на окно допуска.
@@ -205,7 +205,7 @@ if error_code == 10002:  # recv_window error
 ### 8. python-okx — [okxapi/python-okx](https://github.com/okxapi/python-okx)
 
 Официальный SDK OKX. Прочитан
-[okx/okxclient.py](https://github.com/okxapi/python-okx/blob/master/okx/okxclient.py). Лицензия Apache-2.0.
+okx/okxclient.py. Лицензия Apache-2.0.
 
 * **Ч2 — третье семейство: НЕ СВОДИТЬ, А СПРАШИВАТЬ.** По умолчанию берутся локальные часы;
   при `use_server_time` клиент КАЖДЫЙ РАЗ ходит за серверной меткой и подставляет её.
@@ -214,7 +214,7 @@ if error_code == 10002:  # recv_window error
 ### 9. ntplib — [cf-natali/ntplib](https://github.com/cf-natali/ntplib)
 
 Эталонная реализация клиента NTP на питоне. Прочитан
-[ntplib.py](https://github.com/cf-natali/ntplib/blob/master/ntplib.py). Лицензия MIT.
+ntplib.py. Лицензия MIT.
 
 ```python
 # сдвиг
@@ -246,7 +246,7 @@ NTP работает с ЧЕТЫРЬМЯ метками: `orig` (ушёл зап
 ### 10. kucoin-python-sdk — [Kucoin/kucoin-python-sdk](https://github.com/Kucoin/kucoin-python-sdk)
 
 Официальный SDK KuCoin. Прочитан
-[base_request.py](https://github.com/Kucoin/kucoin-python-sdk/blob/master/kucoin/base_request/base_request.py). Лицензия MIT.
+base_request.py. Лицензия MIT.
 
 * **Ч2 — сдвиг не меряется.** `now_time = int(time.time()) * 1000` — и здесь же виден
   побочный изъян: секунды усекаются ДО умножения, значит метка всегда кратна 1000 мс,
@@ -275,14 +275,14 @@ match delta_since_last_event_live_time {
 ### 12. hyperliquid-python-sdk — [hyperliquid-dex/hyperliquid-python-sdk](https://github.com/hyperliquid-dex/hyperliquid-python-sdk)
 
 Официальный SDK. Прочитан
-[utils/signing.py](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/utils/signing.py). Лицензия MIT.
+utils/signing.py. Лицензия MIT.
 
 * **Ч2 — сдвиг не меряется:** `def get_timestamp_ms() -> int: return int(time.time() * 1000)`.
 
 ### 13. coinbase-advanced-py — [coinbase/coinbase-advanced-py](https://github.com/coinbase/coinbase-advanced-py)
 
 Официальный SDK Coinbase. Прочитан
-[jwt_generator.py](https://github.com/coinbase/coinbase-advanced-py/blob/master/coinbase/jwt_generator.py). Лицензия Apache-2.0.
+jwt_generator.py. Лицензия Apache-2.0.
 
 * **Ч2 — сдвиг не меряется**, берётся `time.time()`.
 * **Ч9 — окно допуска 120 СЕКУНД:** `"nbf": int(time.time()), "exp": int(time.time()) + 120`.
@@ -291,7 +291,7 @@ match delta_since_last_event_live_time {
 
 ### 14. jesse — [jesse-ai/jesse](https://github.com/jesse-ai/jesse)
 
-Прочитан [jesse/helpers.py](https://github.com/jesse-ai/jesse/blob/master/jesse/helpers.py). Лицензия MIT.
+Прочитан jesse/helpers.py. Лицензия MIT.
 
 * **Ч1 — живое время это локальные часы**, `arrow.utcnow().int_timestamp * 1000`; и здесь
   та же потеря дробной части, что у KuCoin: секунды умножаются на 1000 после усечения.
@@ -301,7 +301,7 @@ match delta_since_last_event_live_time {
 
 ### 15. freqtrade — [freqtrade/freqtrade](https://github.com/freqtrade/freqtrade)
 
-Прочитан [util/datetime_helpers.py](https://github.com/freqtrade/freqtrade/blob/develop/freqtrade/util/datetime_helpers.py). Лицензия GPL-3.0.
+Прочитан util/datetime_helpers.py. Лицензия GPL-3.0.
 
 * **Ч1 — `datetime.now(UTC)`**, часовой пояс задан явно.
 * **Ч2 — собственного сведения нет**; при желании включается адаптация ccxt, то есть та
@@ -309,7 +309,7 @@ match delta_since_last_event_live_time {
 
 ### 16. backtrader — [mementum/backtrader](https://github.com/mementum/backtrader)
 
-Прочитан [feeds/vcdata.py](https://github.com/mementum/backtrader/blob/master/backtrader/feeds/vcdata.py). Лицензия GPL-3.0.
+Прочитан feeds/vcdata.py. Лицензия GPL-3.0.
 
 * **Ч2 — ЧЕТВЁРТОЕ семейство: сдвиг считается ИЗ САМОГО ПОТОКА ДАННЫХ**, а не из
   отдельного запроса времени:
@@ -325,7 +325,7 @@ dtnow = datetime.now() - self._TOFFSET  # adjust local time
 
 ### 17. krakenex — [veox/python3-krakenex](https://github.com/veox/python3-krakenex)
 
-Прочитан [krakenex/api.py](https://github.com/veox/python3-krakenex/blob/master/krakenex/api.py). Лицензия LGPL-3.0.
+Прочитан krakenex/api.py. Лицензия LGPL-3.0.
 
 * **Ч1 — `return int(1000*time.time())`**, и в докстроке обещано «всегда возрастающее
   целое». ⚠ Обещание опирается на настенные часы, которые как раз и ходят назад при
@@ -350,7 +350,7 @@ dtnow = datetime.now() - self._TOFFSET  # adjust local time
 ### 20. gateapi-python — [gateio/gateapi-python](https://github.com/gateio/gateapi-python)
 
 Официальный SDK Gate.io. Прочитан
-[gate_api/api_client.py](https://github.com/gateio/gateapi-python/blob/master/gate_api/api_client.py). Лицензия Apache-2.0.
+gate_api/api_client.py. Лицензия Apache-2.0.
 
 * **Ч2 — `t = time.time()`**, сдвига нет.
 
@@ -664,7 +664,7 @@ git show HEAD:docs/audit/tolerance-clock.md | uv run python -c "import sys,hashl
 
 # Фаза 5. Живая проверка
 
-Зонд: [probe_clock_questions_2026-08-08.py](docs/audit/probes/probe_clock_questions_2026-08-08.py).
+Зонд: probe_clock_questions_2026-08-08.py.
 Серия — 50 замеров с паузой 20 с (покрытие 1000 с, сопоставимо с периодом пересведения 900 с)
 плюс столько же вплотную. **Отказов сети ноль из 100 запросов.**
 
@@ -732,7 +732,7 @@ rtt:   min 532   медиана 549   max 1134 мс
 
 Первое, что пришло в голову: ограничитель частоты ccxt спит внутри окна замера у второго
 запроса, смещая середину `(t0+t1)/2`. Объяснение связное — и ровно поэтому оно проверено, а
-не рассказано ([probe_clock_ratelimit_2026-08-08.py](docs/audit/probes/probe_clock_ratelimit_2026-08-08.py)):
+не рассказано (probe_clock_ratelimit_2026-08-08.py):
 
 ```
  с паузой, ограничитель ВКЛ:  rtt медиана 344 мс
@@ -746,7 +746,7 @@ rtt:   min 532   медиана 549   max 1134 мс
 
 ### Разбор №2: положение в паре тоже ни при чём — но он дал ключ
 
-[probe_clock_pairorder_2026-08-08.py](docs/audit/probes/probe_clock_pairorder_2026-08-08.py)
+probe_clock_pairorder_2026-08-08.py
 воспроизвёл ТУ ЖЕ петлю, что основной зонд, но с паузой **5 секунд** вместо двадцати:
 
 ```
@@ -797,8 +797,8 @@ rtt:   min 532   медиана 549   max 1134 мс
 ## Внесено в код — четыре правки, расчёт НЕ меняется
 
 Все четыре — докстроки и комментарии. Что расчёт не тронут, **доказано сравнением
-синтаксических деревьев** с вырезанными строковыми выражениями: `clock.py`, `check.py` и
-`run.py` совпадают до и после.
+синтаксических деревьев** с вырезанными строковыми выражениями: clock.py, check.py и
+run.py совпадают до и после.
 
 ⚠ **Инструмент сравнения пришлось расширить прямо по ходу, и это стоит записать.** Первая
 редакция вырезала только ПЕРВЫЙ оператор тела — то есть настоящие докстроки — и потому
@@ -818,7 +818,7 @@ MAX_SYNC_AGE_MS = 3_600_000
 | 1 | `clock.measure` — назван источник ОБЕИХ формул: NTP RFC 5905, с выводом вырожденного случая | фаза 3, находка внутри Ч2 |
 | 2 | `clock.measure` — записано, что регистр из восьми ПРОВЕРЕН И ОТВЕРГНУТ, с числами | К2 |
 | 3 | `MAX_SYNC_AGE_MS` — записано, что попытка замерить дрейф не удалась, и почему | К1 |
-| 4 | `check.py` — назван внешний референт порога 5000 мс и записана асимметрия правила биржи | К3 |
+| 4 | check.py — назван внешний референт порога 5000 мс и записана асимметрия правила биржи | К3 |
 
 ### Правка 1 — самая важная, и она про источник, а не про поведение
 
@@ -849,8 +849,8 @@ MAX_SYNC_AGE_MS = 3_600_000
 
 * **5000 мс** — референт нашёлся в фазе 1 (умолчание `recvWindow` у Binance и Bybit);
 * **900 с** — обоснование БЫЛО ЗАПИСАНО с самого начала, прямо над строкой: период выведен
-  из порога устаревания, вчетверо чаще. Я его не заметил, читая модуль `clock.py`, потому
-  что константа живёт в `run.py`. Без источника остаётся ПОРОГ, а не период;
+  из порога устаревания, вчетверо чаще. Я его не заметил, читая модуль clock.py, потому
+  что константа живёт в run.py. Без источника остаётся ПОРОГ, а не период;
 * **1 час** — единственная, у которой источника действительно нет, и она сама об этом
   честно сообщала ещё до обзора.
 

@@ -83,7 +83,7 @@ git log --oneline 4265594..b89bafa
 
 ### 1.8. Зонд полного разбора символа не досчитывается
 
-`docs/audit/probes/probe_symbol_full_2026-08-12.py` качает всю историю (546 суток × 15 ТФ) и считает уровни
+docs/audit/probes/probe_symbol_full_2026-08-12.py качает всю историю (546 суток × 15 ТФ) и считает уровни
 БЕЗ горизонта: 3416 структур на 5м, каждая просит окно из 785 тысяч минутных баров.
 Прогон остановлен вручную. Правильный расчёт — по горизонту: 90 суток дают 866 уровней за
 75 секунд.
@@ -263,9 +263,9 @@ nautilus_trader 166, binance-public-data 428). `Haehnchen/crypto-trading-bot`, 3
 
 В репозитории:
 
-* `docs/audit/probes/probe_author_candles_2026-08-12.py` — свечной профиль против
+* docs/audit/probes/probe_author_candles_2026-08-12.py — свечной профиль против
   разметки автора, рамка импортируется из зонда R-03;
-* `docs/audit/probes/probe_symbol_full_2026-08-12.py` — полный разбор одного символа;
+* docs/audit/probes/probe_symbol_full_2026-08-12.py — полный разбор одного символа;
   ⚠ качает всю историю и считает без горизонта, см. §1.8;
 * `docs/audit/poc-candles-vs-ticks-2026-08-12.md` — разбор со всеми таблицами;
 * `docs/audit/crypto-signal-transport-2026-08-12.md` — разбор чужого транспорта.

@@ -216,7 +216,7 @@ def main() -> int:
          plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14)),
         # ⚠ Правка аудита 2026-08-06 (М-06 = Н-5): здесь стояли прямые вызовы `plta.*`,
         # то есть гейт сверял с формулой БИБЛИОТЕКУ, а не обёртку проекта. Подмена
-        # периода в `hunter/indicators.py` проезжала мимо (evidence/E-020-gate-probes).
+        # периода в hunter/indicators.py проезжала мимо (evidence/E-020-gate-probes).
         ("rsi14", rsi(c, 14), indicators.rsi()),
         ("ema200", ema(c, 200), indicators.ema(200)),
         # MACD сверяется с ПРОЕКТНЫМ определением (ema12 - ema26), а не с

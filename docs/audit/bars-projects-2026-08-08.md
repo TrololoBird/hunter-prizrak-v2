@@ -104,8 +104,8 @@ gh api -X GET search/code -f q='ohlcv[:-1] language:python' --jq '.total_count' 
 
 ### 1. freqtrade — [freqtrade/freqtrade](https://github.com/freqtrade/freqtrade)
 
-Крупнейший открытый крипто-фреймворк. Прочитаны [exchange_utils_timeframe.py](https://github.com/freqtrade/freqtrade/blob/develop/freqtrade/exchange/exchange_utils_timeframe.py)
-и [converter.py](https://github.com/freqtrade/freqtrade/blob/develop/freqtrade/data/converter/converter.py). Лицензия GPL-3.0.
+Крупнейший открытый крипто-фреймворк. Прочитаны exchange_utils_timeframe.py
+и converter.py. Лицензия GPL-3.0.
 
 * **Б1 набор ТФ** — не фиксирован, любой, который отдаёт биржа.
 * **Б2 закрытость — ПО ПОЗИЦИИ, а не по времени.** Последняя свеча отбрасывается безусловно:
@@ -134,7 +134,7 @@ df.loc[:, ["open", "high", "low"]] = df[["open", "high", "low"]].fillna(
 ### 2. ccxt — [ccxt/ccxt](https://github.com/ccxt/ccxt)
 
 Транспортная библиотека, которую мы же и используем (§10.1). Прочитан
-[base/exchange.py](https://github.com/ccxt/ccxt/blob/master/python/ccxt/base/exchange.py). Лицензия MIT.
+base/exchange.py. Лицензия MIT.
 
 * **Б3 сетка — СЫРАЯ ЭПОХА, якоря нет:**
 
@@ -154,7 +154,7 @@ def round_timeframe(timeframe, timestamp, direction=ROUND_DOWN):
 
 ### 3. hummingbot — [hummingbot/hummingbot](https://github.com/hummingbot/hummingbot)
 
-Прочитан [candles_base.py](https://github.com/hummingbot/hummingbot/blob/master/hummingbot/data_feed/candles_feed/candles_base.py). Лицензия Apache-2.0.
+Прочитан candles_base.py. Лицензия Apache-2.0.
 
 * **Б2 закрытость — ДЕЛЕГИРУЕТСЯ БИРЖЕ.** У каждого коннектора свой флаг, включает ли
   REST-ответ формирующуюся свечу, и время сдвигается на него:
@@ -198,7 +198,7 @@ if not np.all(timestamp_steps == interval_in_seconds):
 
 ### 5. jesse — [jesse-ai/jesse](https://github.com/jesse-ai/jesse)
 
-Прочитан [candle_service.py](https://github.com/jesse-ai/jesse/blob/master/jesse/services/candle_service.py). Лицензия MIT.
+Прочитан candle_service.py. Лицензия MIT.
 
 * **Б2 закрытость — ПАРАМЕТР, зависящий от режима:** `accept_forming_candles: bool = False`;
   в живом режиме отдаются только завершённые свечи, в бэктесте формирующаяся добавляется.
@@ -212,7 +212,7 @@ if not np.all(timestamp_steps == interval_in_seconds):
 
 ### 6. cryptofeed — [bmoscon/cryptofeed](https://github.com/bmoscon/cryptofeed)
 
-Прочитан [binance.py](https://github.com/bmoscon/cryptofeed/blob/master/cryptofeed/exchanges/binance.py). Лицензия XFree86 1.1.
+Прочитан binance.py. Лицензия XFree86 1.1.
 
 * **Б2 закрытость — ФЛАГ САМОЙ БИРЖИ.** Binance шлёт в свече поле `x` («закрыта»), и
   библиотека читает именно его:
@@ -250,7 +250,7 @@ if should_trigger {
 ### 8. pandas — [pandas-dev/pandas](https://github.com/pandas-dev/pandas)
 
 Не торговая система, а инструмент, на котором строит сетку половина поля. Прочитан
-[core/resample.py](https://github.com/pandas-dev/pandas/blob/main/pandas/core/resample.py). Лицензия BSD-3-Clause. Помечен как БИБЛИОТЕКА ОБЩЕГО НАЗНАЧЕНИЯ.
+core/resample.py. Лицензия BSD-3-Clause. Помечен как БИБЛИОТЕКА ОБЩЕГО НАЗНАЧЕНИЯ.
 
 * **Б3 сетка — ЭТО ИМЕННО ПАРАМЕТР, и у него ПЯТЬ значений:** `origin` принимает `'epoch'`
   (начало 1970-01-01), `'start'` (первое значение ряда), `'start_day'` (полночь первого дня),
@@ -280,7 +280,7 @@ if (includeLatestCandle === false) {
 
 ### 10. backtrader — [mementum/backtrader](https://github.com/mementum/backtrader)
 
-Классическая библиотека бэктеста. Прочитан [resamplerfilter.py](https://github.com/mementum/backtrader/blob/master/backtrader/resamplerfilter.py). Лицензия GPL-3.0.
+Классическая библиотека бэктеста. Прочитан resamplerfilter.py. Лицензия GPL-3.0.
 
 * **Б3 сетка — параметр `bar2edge`**, привязывающий бары к часам (xx:00, xx:05, xx:10), плюс
   `adjbartime`, подменяющий метку последней сделки меткой границы. Выравнивание по сетке —
@@ -356,7 +356,7 @@ if (_workingBar != null && data.Time - _workingBar.Time >= _period.Value
 
 ### 14. market_prices — [maread99/market_prices](https://github.com/maread99/market_prices) ★104, Python
 
-Прочитан [other_internals.md](https://github.com/maread99/market_prices/blob/master/docs/developers/other_internals.md); поиск по коду указал на [prices/base.py](https://github.com/maread99/market_prices/blob/master/src/market_prices/prices/base.py). Лицензия MIT.
+Прочитан other_internals.md; поиск по коду указал на prices/base.py. Лицензия MIT.
 
 * **Б2 — БАР МОЖЕТ БЫТЬ КОРОЧЕ СВОЕГО ИНТЕРВАЛА.** Параметр `openend` с двумя значениями:
   `"maintain"` держит нормальную длину интервала, `"shorten"` укорачивает последний бар так,
@@ -786,7 +786,7 @@ uv run python -c "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('doc
 
 # Фаза 5. Живая проверка
 
-Зонд: [probe_bars_questions_2026-08-08.py](docs/audit/probes/probe_bars_questions_2026-08-08.py).
+Зонд: probe_bars_questions_2026-08-08.py.
 Допуск хеширован ДО прогона, хеш не сдвинулся.
 
 ```bash
@@ -1083,7 +1083,7 @@ uv run python -c "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('doc
 ## ✅ ЗАКРЫТО: гейт заведён 2026-08-08
 
 Выше сказано «гейт не заведён, но он напрашивается». Он заведён:
-[gates/tolerance_hashes.py](gates/tolerance_hashes.py), шаг в
+gates/tolerance_hashes.py (гейт удалён 2026-08-19), шаг в
 [.github/workflows/ci.yml](.github/workflows/ci.yml) — иначе это скрипт, а не гейт.
 
 ### Что он проверяет

@@ -136,7 +136,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 ### 1. smart-money-concepts — [joshyattridge/smart-money-concepts](https://github.com/joshyattridge/smart-money-concepts) ★1920
 
 Самая популярная библиотека ICT-разметки. Прочитана
-[smartmoneyconcepts/smc.py](https://github.com/joshyattridge/smart-money-concepts/blob/master/smartmoneyconcepts/smc.py). Лицензия MIT.
+smartmoneyconcepts/smc.py. Лицензия MIT.
 
 * **С1 что считается зоной** — не накопление, а ОДНА СВЕЧА: экстремум перед сломом
   структуры. `obBtm = _low[candidate_index]`, `obTop = _high[candidate_index]`.
@@ -147,7 +147,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 2. PyIndicators — [coding-kitties/PyIndicators](https://github.com/coding-kitties/PyIndicators)
 
-Прочитан [volumetric_supply_demand_zones.py](https://github.com/coding-kitties/PyIndicators/blob/main/pyindicators/indicators/volumetric_supply_demand_zones.py). Лицензия Apache-2.0.
+Прочитан volumetric_supply_demand_zones.py. Лицензия Apache-2.0.
 
 * **С1** — зона это свинг плюс импульс не меньше `1.2 × ATR`.
 * **С4 — объём РАСПРЕДЕЛЯЕТСЯ по ценовым строкам зоны** (`alloc_vol = bar_vol * overlap_pct`),
@@ -158,7 +158,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 3. ai-crypto-trader — [zd87pl/ai-crypto-trader](https://github.com/zd87pl/ai-crypto-trader)
 
-Прочитан [volume_profile_analyzer.py](https://github.com/zd87pl/ai-crypto-trader/blob/main/services/utils/volume_profile_analyzer.py).
+Прочитан volume_profile_analyzer.py.
 
 * **С4, С6 — ПОРОГ ЕСТЬ, и он абсолютный относительный:**
   `hvn_threshold = 0.7 * max_volume`, узлом считается корзина с объёмом не ниже 70% от
@@ -168,7 +168,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 4. CryptoTrade — [faishaltsq/CryptoTrade](https://github.com/faishaltsq/CryptoTrade)
 
-Прочитан [app/analysis/smc.py](https://github.com/faishaltsq/CryptoTrade/blob/main/app/analysis/smc.py).
+Прочитан app/analysis/smc.py.
 
 * **С1** — зона по свече: `(recent['close'] < recent['open']) & ((recent['high'] - recent['low']) > atr * 0.5)`.
 * **С4 — объём НЕ УЧАСТВУЕТ ВОВСЕ**, столбец объёма не читается ни одной функцией.
@@ -177,7 +177,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 ### 5. StockSharp AlgoTrading — [StockSharp/AlgoTrading](https://github.com/StockSharp/AlgoTrading)
 
 Стратегия «накопление по Вайкоффу». Прочитан
-[wyckoff_accumulation_strategy.py](https://github.com/StockSharp/AlgoTrading/blob/master/API/0101-0200/0108_Wyckoff_Accumulation/PY/wyckoff_accumulation_strategy.py).
+wyckoff_accumulation_strategy.py.
 
 * **С1** — диапазон из недавних экстремумов, вход при `close <= lowest + rng * 0.2`.
 * ⚠ **«Плотность» считается СОВСЕМ ИНАЧЕ: по узким свечам, а не по объёму** —
@@ -188,7 +188,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 6. smartmoney-analysic — [taydhcm/smartmoney-analysic](https://github.com/taydhcm/smartmoney-analysic)
 
-Прочитан [analytics/accumulation_detection.py](https://github.com/taydhcm/smartmoney-analysic/blob/main/analytics/accumulation_detection.py).
+Прочитан analytics/accumulation_detection.py.
 
 * **С4 — объём участвует в ОПОЗНАНИИ, а не в ранге:** порог кульминации `vol_mean + 2.5 * vol_std`,
   признак скрытого набора `recent.volume.mean() > previous.volume.mean() * 1.2`.
@@ -197,7 +197,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 7. ai-market-maker — [olaxbt/ai-market-maker](https://github.com/olaxbt/ai-market-maker)
 
-Прочитан [scripts/token_screeners/wyckoff_scanner.py](https://github.com/olaxbt/ai-market-maker/blob/main/scripts/token_screeners/wyckoff_scanner.py).
+Прочитан scripts/token_screeners/wyckoff_scanner.py.
 
 * ⚠ **ВЫСОТА ДИАПАЗОНА ОГРАНИЧЕНА:** `range_max_width_pct: 40.0` — не шире 40% от середины.
   **Второй проект с ограничением размера зоны.**
@@ -207,7 +207,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 8. aqrs_fx_v3_pro — [TshifhunguCodes/aqrs_fx_v3_pro](https://github.com/TshifhunguCodes/aqrs_fx_v3_pro)
 
-Прочитан [strategy/liquidity.py](https://github.com/TshifhunguCodes/aqrs_fx_v3_pro/blob/main/strategy/liquidity.py).
+Прочитан strategy/liquidity.py.
 
 * Съём ликвидности по сравнению с окном `lookback=10`; **объём не читается вовсе**;
   ограничения размера нет; **старшего ТФ нет.**
@@ -215,7 +215,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 ### 9. freqtradestrategies — [jaredrsommer/freqtradestrategies](https://github.com/jaredrsommer/freqtradestrategies)
 
 Стратегия KitchenSink для freqtrade, узлы объёма внутри стратегии. Прочитан
-[KitchenSink.py](https://github.com/jaredrsommer/freqtradestrategies/blob/main/KitchenSink.py).
+KitchenSink.py.
 
 * **С4, С6 — порог ДИНАМИЧЕСКИЙ**, считается на каждой свече от среднего объёма периода,
   плюс жёсткое условие `volume_in_bin / total_volume_period >= 0.2`.
@@ -233,7 +233,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 11. rust_quant — [fairwic/rust_quant](https://github.com/fairwic/rust_quant)
 
-Прочитан [scripts/analyze_volume_profile_buckets.py](https://github.com/fairwic/rust_quant/blob/main/scripts/analyze_volume_profile_buckets.py).
+Прочитан scripts/analyze_volume_profile_buckets.py.
 
 * **С4, С6** — узел объёма при `close_bin_volume >= average_bin_volume * 1.25`, низкий узел
   при `<= * 0.75`. Порог кратный среднему, не перцентиль. 24 корзины, окно 48 свечей.
@@ -241,7 +241,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 12. Titannia-Cronjob-scripts — [Reddy7860/Titannia-Cronjob-scripts](https://github.com/Reddy7860/Titannia-Cronjob-scripts)
 
-Прочитан [demand_and_supply_zone_automation.py](https://github.com/Reddy7860/Titannia-Cronjob-scripts/blob/master/demand_and_supply_zone_automation.py).
+Прочитан demand_and_supply_zone_automation.py.
 
 * **С1 — база это РОВНО ОДНА свеча** между двумя импульсными: тело не больше 30% диапазона
   у базовой и больше 50% у соседних. У нас база это накопление из 4+ точек.
@@ -249,13 +249,13 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 13. AlgoTrading — [pintusahi1428/AlgoTrading](https://github.com/pintusahi1428/AlgoTrading)
 
-Прочитан [smart_money.py](https://github.com/pintusahi1428/AlgoTrading/blob/main/smart_money.py).
+Прочитан smart_money.py.
 Блок по отклонению от среднего десяти свечей, съём ликвидности по окну 25.
 **Объёма нет вовсе, ограничения размера нет, старшего ТФ нет.**
 
 ### 14. profittown-sniper-smc — [manuelinfosec/profittown-sniper-smc](https://github.com/manuelinfosec/profittown-sniper-smc)
 
-Прочитан [shared/rules/ob_filters.py](https://github.com/manuelinfosec/profittown-sniper-smc/blob/main/shared/rules/ob_filters.py).
+Прочитан shared/rules/ob_filters.py.
 Блок — последняя противоположная свеча перед импульсом, окно `df.iloc[-20:-1]`.
 **Объёма нет, ограничения размера нет, старшего ТФ нет** (данные берутся одним запросом с
 `granularity: 14400`).
@@ -296,7 +296,7 @@ density, density_percentile, StopVolumeSet, placement — потребителе
 
 ### 19. quantalogic — [quantalogic/quantalogic](https://github.com/quantalogic/quantalogic)
 
-Прочитан [examples/finance_advanced_analysis/technical_analysis.py](https://github.com/quantalogic/quantalogic/blob/main/examples/finance_advanced_analysis/technical_analysis.py).
+Прочитан examples/finance_advanced_analysis/technical_analysis.py.
 
 * **С4 — «узел объёма» здесь ВООБЩЕ НЕ ПРО ЦЕНУ:** `Volume > Volume_MA + volume_std`, то
   есть это свеча с большим объёмом, а не область цены. Ширина не участвует.
@@ -633,7 +633,7 @@ sha256 `9901f6dea34f00d4554a5d3a20dd06d6f61f195727df2e8ec31d4f3d65b2bd1d`.
 
 # Фаза 5. Живая проверка
 
-Зонд: [probe_stopvol_questions_2026-08-09.py](docs/audit/probes/probe_stopvol_questions_2026-08-09.py).
+Зонд: probe_stopvol_questions_2026-08-09.py.
 Корпус: 54 набора «кадры × символ», 324 ряда, 5644 закрытых структуры, рядов отброшено
 NotReady — ноль. Допуск хеширован ДО прогона, хеш не сдвинулся.
 
@@ -762,7 +762,7 @@ BCH 284 → 284   BTC 427 → 427   ETH 362 → 362     совпало 3 из 3
 
 **Первое объяснение — ОПРОВЕРГНУТО.** Я предположил, что стоповые объёмы вообще не влияют
 на якорь стопа: якорь берётся самый дальний, а прокол после правки 2026-08-08 есть почти
-всегда. Проверка ([probe_stopvol_anchor_2026-08-09.py](docs/audit/probes/probe_stopvol_anchor_2026-08-09.py))
+всегда. Проверка (probe_stopvol_anchor_2026-08-09.py)
 это опровергла:
 
 ```

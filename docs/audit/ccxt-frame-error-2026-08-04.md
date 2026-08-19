@@ -6,7 +6,7 @@
 
 ## 0. В чём ошибка рамки
 
-Я искал по строке `watch_ohlcv`, потому что её использует `hunter/exchange.py`. Это **отбор по исходу**: такой запрос находит ровно тех, кто принял то же решение, что и hunter, и не находит никого, кто принял другое. Дальше я описывал найденное как «практику» и — хуже всего — объявил малое число находок свойством популяции:
+Я искал по строке `watch_ohlcv`, потому что её использует hunter/exchange.py. Это **отбор по исходу**: такой запрос находит ровно тех, кто принял то же решение, что и hunter, и не находит никого, кто принял другое. Дальше я описывал найденное как «практику» и — хуже всего — объявил малое число находок свойством популяции:
 
 > «выборка узкая не потому, что я плохо искал, а потому что популяция узкая»
 
@@ -198,8 +198,8 @@ as ``Future exception was never retrieved``.
 ## Источники
 
 * Счётчики: [grep.app](https://grep.app) — запросы `import ccxt`, `fetch_ohlcv`, `fetchOHLCV`, `watch_ohlcv`, `watchOHLCV`
-* [passivbot — src/live/candle_ws.py](https://raw.githubusercontent.com/enarjord/passivbot/master/src/live/candle_ws.py) · [src/candlestick_manager.py](https://raw.githubusercontent.com/enarjord/passivbot/master/src/candlestick_manager.py)
-* [freqtrade — `exchange.py`](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/freqtrade/exchange/exchange.py) · [exchange_ws.py](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/freqtrade/exchange/exchange_ws.py)
-* [OctoBot-Trading — ccxt_websocket_connector.py](https://raw.githubusercontent.com/Drakkar-Software/OctoBot-Trading/master/octobot_trading/exchanges/connectors/ccxt/ccxt_websocket_connector.py)
+* passivbot — src/live/candle_ws.py · src/candlestick_manager.py
+* freqtrade — exchange.py · exchange_ws.py
+* OctoBot-Trading — ccxt_websocket_connector.py
 * [opentrader — `packages/exchanges/src/exchanges/ccxt/exchange.ts`](https://raw.githubusercontent.com/Open-Trader/opentrader/master/packages/exchanges/src/exchanges/ccxt/exchange.ts)
 * Исходник `ccxt==4.5.70`: таблица весов `api`, `tokenBucket`, дерево классов ошибок

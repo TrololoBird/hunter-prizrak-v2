@@ -105,6 +105,6 @@ uv run python docs/audit/probes/probe_conformance_by_tf_2026-08-07.py
 ```
 
 Отдельный файл зонда, а не правка
-`docs/audit/probes/probe_author_conformance_2026-08-07.py`: правку я начал
+docs/audit/probes/probe_author_conformance_2026-08-07.py: правку я начал
 и откатил, потому что `pyproject.toml` прямо запрещает менять зонд, давший опубликованное
 число. Числа R-03 и R-05 остаются за прежним зондом, R-06 отвечает на свой вопрос.

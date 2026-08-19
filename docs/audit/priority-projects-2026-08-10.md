@@ -113,7 +113,7 @@ uv run --group tools python -c "import pymupdf; d=pymupdf.open('docs/course/Ми
 ### ⚠⚠ Отдельно: репозиторий того же автора, что и наш
 
 Поиск №2 выдал файл
-[bot/policy/mtf.py](https://github.com/TrololoBird/Crypto-Analytic-Signal-Bot/blob/main/bot/policy/mtf.py)
+bot/policy/mtf.py
 в репозитории TrololoBird/Crypto-Analytic-Signal-Bot. Владелец этого репозитория —
 владелец нашего проекта.
 
@@ -224,7 +224,7 @@ critical: { displacement: 2.5, liquidity_sweep: 2.5, htf_bias_aligned: 2.0 }
 ```
 
 Карта «младший → ровно один старший», [Dryik/trading_bot](https://github.com/Dryik/trading_bot),
-файл [strategy/mtf_filter.py](https://github.com/Dryik/trading_bot/blob/main/strategy/mtf_filter.py), лицензии нет:
+файл strategy/mtf_filter.py, лицензии нет:
 
 ```python
 def get_higher_timeframe(self, ltf: str) -> str:

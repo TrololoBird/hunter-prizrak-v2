@@ -4,7 +4,7 @@
 `C:\Users\Антон\Downloads\37627648-2Je_Tj1cckTmcXpa.mp4`, 42.8 МБ, 3:49, 1920×1080\@60,
 запись экрана TradingView со звуком) + скриншот той же разметки (1ч, 21:31 UTC+3).
 Видео в git не кладётся (бинарь, чужой контент); расшифровка речи сохранена:
-[`evidence/prizrak-video-2026-08-17-transcript.txt`](evidence/prizrak-video-2026-08-17-transcript.txt)
+evidence/prizrak-video-2026-08-17-transcript.txt
 (faster-whisper small, локально; ⚠ цифры в речи распознаются с искажениями — все цены
 ниже сверены с кадрами, не с речью).
 
@@ -42,10 +42,10 @@
 
 ## Сверка с картой бота (пересборка по запросу 17.08 ~22:00, 192 уровня)
 
-Зонд: [`evidence/fresh-btc-probe-2026-08-17.py`](evidence/fresh-btc-probe-2026-08-17.py)
+Зонд: evidence/fresh-btc-probe-2026-08-17.py
 (collect+decide_once тем же путём, что бот); отпечаток данных: BTC 180 сут, цена на
 момент сверки 64 299. Сохранённый вывод на момент сверки —
-[`evidence/fresh-btc-out-2026-08-17.txt`](evidence/fresh-btc-out-2026-08-17.txt);
+evidence/fresh-btc-out-2026-08-17.txt;
 повторный запуск даст ДРУГУЮ карту (кэш растёт, цена ушла) — числа таблицы ниже
 сверяются по сохранённому выводу, а не по свежему прогону:
 

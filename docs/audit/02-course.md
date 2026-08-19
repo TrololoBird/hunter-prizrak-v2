@@ -187,7 +187,7 @@ def upper_zone() -> tuple[float, float]:
 Код реализует оба в `levels.stop_anchor` ([levels.py:367](../../src/hunter/levels.py:367)):
 `MIN_PUNCTURE_POINTS = 3`, полоса `STOP_ANCHOR_BAND_MIN/MAX_PCT = 2.0/5.0`, берётся дальний
 из применимых якорей. Соединено 2026-08-05; до того `BoundaryZone.puncture` вычислялся и не
-читался, `stop_volume.py` не вызывался ниоткуда (находка А-7 прошлого разбора).
+читался, stop_volume.py не вызывался ниоткуда (находка А-7 прошлого разбора).
 
 ### D-09. Вход от 2–3 касания — ПОДТВЕРЖДЕНО; тип есть, исполнения НЕТ
 

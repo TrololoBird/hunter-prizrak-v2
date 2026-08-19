@@ -887,7 +887,7 @@ higher highs **И** higher lows; "losing either condition signals the trend is w
 volume* / *stopping action*: всплеск объёма, ОСТАНАВЛИВАЮЩИЙ тренд. Он описывает
 **всплеск объёма**, а стоповый объём курса — **маленькую плотную структуру**. Общее у них
 только слово "останавливает". **Отождествлять их нельзя**, и в коде оно не сделано:
-`stop_volume.py` ищет маленькое накопление, а не всплеск.
+stop_volume.py ищет маленькое накопление, а не всплеск.
 
 **В коде:** `src/hunter/stop_volume.py` — `Placement.INSIDE/ABOVE/BELOW/BEFORE` (четыре
 положения со стр. 36, 37, 39), классификация через тот же `accumulation.detect`.
@@ -1345,7 +1345,7 @@ BandWidth, у Боллинджера ориентир «меньше 4% от ц�
 сделки, закрывшиеся в пределах 100 мс по одной цене и с одной стороны тейкера.** Система
 работает на USDⓈ-M, то есть действует вторая формулировка.
 
-**В коде:** `models.RawTrade`, `models.BarBinnedTrades`; `archive.py` качает суточные
+**В коде:** `models.RawTrade`, `models.BarBinnedTrades`; archive.py качает суточные
 архивы `data.binance.vision/data/futures/um/daily`; `exchange.fetch_agg_trades_from()`
 доборает разрывы по `aggId`.
 
@@ -1358,7 +1358,7 @@ BandWidth, у Боллинджера ориентир «меньше 4% от ц�
 **Внешние (9):** [Binance: Filters](https://developers.binance.com/docs/binance-spot-api-docs/filters) ·
 [Binance: Exchange Information (COIN-M)](https://developers.binance.com/docs/derivatives/coin-margined-futures/market-data/rest-api/Exchange-Information) ·
 [Binance: Common Definition](https://developers.binance.com/docs/derivatives/portfolio-margin/common-definition) ·
-[binance-us-api-docs: filters.md](https://github.com/binance-us/binance-us-api-docs/blob/master/filters.md) ·
+binance-us-api-docs: filters.md ·
 [sammchardy: Binance Order Filters](https://sammchardy.github.io/binance-order-filters/) ·
 [Binance Academy: Price Filter](https://www.binance.com/en/academy/articles/binance-api-responses-price-filter-and-percent-price) ·
 [Medium: Binance Futures client](https://medium.com/@joaotx/building-a-binance-futures-client-in-python-part-ii-fc5fc644b6ab) ·
@@ -1561,7 +1561,7 @@ BandWidth, у Боллинджера ориентир «меньше 4% от ц�
 даёт и число — откаты вида 18% → 12% → 6%, то есть каждый примерно вдвое меньше прежнего.
 
 **В коде:** прямого механизма нет. Косвенно есть `BoundaryZone.narrowed` — счётчик того,
-сколько раз граница сдвинулась ВНУТРЬ (`accumulation.py`). Это признак сужения, но не
+сколько раз граница сдвинулась ВНУТРЬ (accumulation.py). Это признак сужения, но не
 фигура: он считает сдвиги, а не проверяет убывание амплитуды.
 
 **Статус:** **НЕ РЕАЛИЗОВАНО.** Референт у величины появился бы легко (Минервини даёт
@@ -1800,7 +1800,7 @@ TradingView); TOTAL3 — капитализация без BTC и ETH. У BTC.D 
 | **Роль цели** | `geometry.TargetRole` | основная (свой ТФ или старший) или промежуточная (ТФ−1), по стр. 24 |
 | **ПП-сетап** | `geometry.PPSetup` | сделка от переприора: вход тестом ПП, стоп за хай или лой места слома (стр. 50) |
 | **Расширение профиля** | `volume_profile.Expansion` | как набирается Value Area: парами строк или по одной. Парами — по документации TradingView |
-| **Допуск по барам** | `hunter/admission.py` | сколько баров нужно величине, чтобы вообще существовать. `ema200` требует 200 — на 1Н столько истории есть не у всех символов |
+| **Допуск по барам** | hunter/admission.py | сколько баров нужно величине, чтобы вообще существовать. `ema200` требует 200 — на 1Н столько истории есть не у всех символов |
 | **Часы биржи** | `clock.ClockSync` | сдвиг локальных часов относительно биржевых. Своим часам система не верит |
 | **Непрерывный хвост** | `bars.continuous_tail` | самый свежий кусок ряда без дыр. Расчёт идёт по нему, а не по всему собранному |
 | **Разрыв потока** | `TradeSequence.gaps` | пропуск в номерах aggTrade. Считается и добирается REST-ом, а не проглатывается |
@@ -1851,17 +1851,17 @@ TradingView); TOTAL3 — капитализация без BTC и ETH. У BTC.D 
 
 Три зонда, все в `docs/audit/probes/`:
 
-1. **[probe_rest_trade_depth](audit/probes/probe_rest_trade_depth_2026-08-11.py)** — REST
+1. **probe_rest_trade_depth** — REST
    отдаёт сделки минимум 30-суточной давности. ⚠ Проверены ВРЕМЕНА сделок, а не только их
    число: прежний замер 2026-08-04 записал «вернул 1000 сделок» и тем ничего не доказал.
    Контроль пройден: час назад прибор отдаёт часовые сделки, 30 суток назад — 30-суточные.
 
-2. **[probe_backfill_window](audit/probes/probe_backfill_window_2026-08-11.py)** — курсор
+2. **probe_backfill_window** — курсор
    `fromId` старше суток отклоняется кодом −1000, и это **падение, а не деградация**:
    ccxt относит его к `OperationFailed`, а тот наследуется от `BaseError` напрямую, мимо
    и `NetworkError`, и `ExchangeError`. Теперь зонд служит регресс-проверкой.
 
-3. **[probe_rest_empty_page](audit/probes/probe_rest_empty_page_2026-08-11.py)** — ccxt для
+3. **probe_rest_empty_page** — ccxt для
    binance САМ дописывает `endTime = since + 3600000`, обходя правило Binance про час.
    Значит пустой ответ означает пустой ЧАС, а не конец сделок. Контроль различает случаи:
    у BTC страницу обрезал `limit` (1000 сделок за 75 с), у ARPA — время (792 сделки при

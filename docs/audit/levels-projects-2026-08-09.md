@@ -250,7 +250,7 @@ K-means по ценам, elbow для числа кластеров. (1) цен�
 
 ### 17. [tristcoil/zero-sum-public](https://github.com/tristcoil/zero-sum-public) — Python, ★118, посл. коммит 2026-03-27, MIT
 
-Файл [backend/ta_engine/volume_profile.py](https://github.com/tristcoil/zero-sum-public/blob/main/backend/ta_engine/volume_profile.py).
+Файл backend/ta_engine/volume_profile.py.
 (1) ПОК = строка с максимумом; (2) **область стоимости 70%, расширение от ПОК к большему
 соседу**; (3) **диапазон сетки — `min(lows)`…`max(highs)` всех баров**, плюс поля 0.5%;
 80 строк. Объём бара размазывается: 60% равномерно по диапазону свечи, 40% в строку закрытия.
@@ -266,7 +266,7 @@ bin_size = (price_max - price_min) / n_bins
 
 ### 18. [KirillKas17/ATB](https://github.com/KirillKas17/ATB) — Python, ★1, посл. коммит 2025-08-09, лицензии нет
 
-Файл [domain/value_objects/volume_profile.py](https://github.com/KirillKas17/ATB/blob/main/domain/value_objects/volume_profile.py).
+Файл domain/value_objects/volume_profile.py.
 Профиль сам не считает — держит готовый и **выводит из него уровни порогом**:
 `get_support_resistance_levels(threshold=0.1)` берёт ВСЕ ценовые строки с объёмом не ниже
 10% от максимума и делит их на поддержку и сопротивление по положению относительно ПОК.
@@ -274,14 +274,14 @@ bin_size = (price_max - price_min) / n_bins
 
 ### 19. [Hitheshkaranth/OpenTerminalUI](https://github.com/Hitheshkaranth/OpenTerminalUI) — Python, ★100, посл. коммит 2026-07-11, MIT
 
-Файл [backend/services/volume_profile_service.py](https://github.com/Hitheshkaranth/OpenTerminalUI/blob/main/backend/services/volume_profile_service.py).
+Файл backend/services/volume_profile_service.py.
 (1) ПОК = середина строки-максимума; (2) область стоимости, доля параметром `value_area_ratio`
 с умолчанием **0.70**; (3) сетка `global_low`…`global_high`. Границы зоны берутся у КРАЙНИХ
 СТРОК целиком: `value_area_low = profile[val_idx]["price_low"]`, `..._high = ...["price_high"]`.
 
 ### 20. [kimseunghyun-kr/binanceTradingBot](https://github.com/kimseunghyun-kr/binanceTradingBot) — Python, ★0, посл. коммит 2026-02-11, MIT
 
-Файл [app/indicators/volume_profile.py](https://github.com/kimseunghyun-kr/binanceTradingBot/blob/main/app/indicators/volume_profile.py).
+Файл app/indicators/volume_profile.py.
 Тот же контур: сетка `lows.min()`…`highs.max()`, 20 строк, `value_area_pct=0.7`, расширение
 от ПОК. Объём свечи раскладывается выборкой из 10 точек по её диапазону.
 
@@ -305,7 +305,7 @@ bin_size = (price_max - price_min) / n_bins
 ### 23. [srpatcha/Stocks_Trading_Scripts](https://github.com/srpatcha/Stocks_Trading_Scripts) — Python, ★0, посл. коммит 2026-08-07, лицензии нет
 
 Коробка Дарваса, файл
-[strategies/examples/darvas_box.py](https://github.com/srpatcha/Stocks_Trading_Scripts/blob/main/strategies/examples/darvas_box.py).
+strategies/examples/darvas_box.py.
 (1) уровень = потолок и пол коробки, а не одна цена внутри; (3) коробка закрывается после
 `box_confirm_bars = 3` баров без обновления потолка; (5) вход по закрытию выше потолка с
 подтверждением объёмом `volume_surge_mult = 1.5`.
@@ -670,7 +670,7 @@ uv run python -c "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('doc
 по-разному, но различает не то.
 
 Замена — второй зонд, отдельным файлом (правка зонда, давшего число, запрещена конвенцией
-`pyproject.toml`): [probe_levels_shift_2026-08-10.py](probes/probe_levels_shift_2026-08-10.py).
+`pyproject.toml`): probe_levels_shift_2026-08-10.py.
 Он меряет ВЕЛИЧИНУ смещения в трёх шкалах.
 
 ```

@@ -1,4 +1,4 @@
-# ccxt: документация, исходник 4.5.70 и практика схожих проектов — против `hunter/exchange.py`
+# ccxt: документация, исходник 4.5.70 и практика схожих проектов — против hunter/exchange.py
 
 **Дата:** 2026-08-04. Третий документ серии; предыдущие — `critical-review-2026-08-04.md` и `critical-review-verified-2026-08-04.md`.
 
@@ -7,7 +7,7 @@
 * официальный CCXT Pro Manual (`docs.ccxt.com/docs/pro-manual`) и справочник по `watchOHLCV`;
 * **исходник установленной версии `ccxt==4.5.70`** — той самой, что закреплена в `pyproject.toml`;
 * открытые и закрытые issue в репозитории ccxt по интересующим механизмам;
-* **freqtrade** — самый используемый открытый торговый бот на Python поверх ccxt: реализация freqtrade/exchange/exchange_ws.py (297 строк) и путь принятия решения в `exchange.py`.
+* **freqtrade** — самый используемый открытый торговый бот на Python поверх ccxt: реализация freqtrade/exchange/exchange_ws.py (297 строк) и путь принятия решения в exchange.py.
 
 **Почему исходник, а не только документация.** Первое же сопоставление показало, что документация ccxt отстаёт от кода по ключевому для проекта параметру (раздел 1). §10.1 FOUNDATION говорит: «Документация ccxt — внешний референт, самописный вебсокет-клиент — нет». Это верно как принцип, но **референтом здесь работает исходник**, а не сайт документации, и это надо зафиксировать явно.
 
@@ -17,7 +17,7 @@
 
 | что | документация (pro-manual) | код 4.5.70 | следствие для проекта |
 |---|---|---|---|
-| `newUpdates` | «**you should instantiate the exchange with the newUpdates flag set to true**… *Deprecation Warning*: in the future `newUpdates: true` will be the default» | `newUpdates = True` — атрибут класса, `ccxt/async_support/base/exchange.py:68`. Проверено: `ccxt.pro.binanceusdm().newUpdates → True` | «будущее» уже наступило. `watch_ohlcv` **не** отдаёт весь кэш, а отдаёт только новые обновления. Комментариев об этом в `exchange.py` проекта нет — поведение принято на веру и оказалось верным случайно |
+| `newUpdates` | «**you should instantiate the exchange with the newUpdates flag set to true**… *Deprecation Warning*: in the future `newUpdates: true` will be the default» | `newUpdates = True` — атрибут класса, `ccxt/async_support/base/exchange.py:68`. Проверено: `ccxt.pro.binanceusdm().newUpdates → True` | «будущее» уже наступило. `watch_ohlcv` **не** отдаёт весь кэш, а отдаёт только новые обновления. Комментариев об этом в exchange.py проекта нет — поведение принято на веру и оказалось верным случайно |
 | закрытие свечи | **не упоминается вовсе** (проверено запросом к тексту руководства) | `handle_ohlcv` разбирает `k` в шесть чисел, поле `k.x` не сохраняет | §6 «незакрытая свеча отбрасывается» реализуема только обходным путём; какой именно — ccxt не советует |
 | rate limit на WS-подписки | **не описан** | `Throttler` (leaky bucket) + `options['ws']['cost'] = 5`, `tokenBucket.refillRate = 0.02` | замер в разделе 2.4 |
 | переподключение | «Upon a critical exception, a disconnect or a connection timeout/failure, the next iteration of the tick function will call the `watch` method that will **trigger a reconnection**. This way the library handles disconnections and reconnections for the user **transparently**» | подтверждается: `Client.ping_loop` c `keepAlive = 5000` мс и `maxPingPongMisses = 2.0` поднимает `RequestTimeout`; `Client.future()` пересоздаёт отменённое будущее | цикл «поймал исключение → позвал `watch` снова» **и есть документированный паттерн**. Проект делает правильно, но называет это неправильно (раздел 4, C-10) |
@@ -47,7 +47,7 @@ parsed = [
 
 Заявка **[ccxt#21885 «Add a `candle_closed_only` parameter or return boolean `closed` parameter with the candle data from websockets»](https://github.com/ccxt/ccxt/issues/21885)** (открыта 23.03.2024) **до сих пор открыта и не реализована**. В ней же зафиксировано, что флаг есть в сыром потоке у Binance, Coinbase и Bybit и отсутствует у Kraken и KuCoin — то есть унифицировать его ccxt пока не готов.
 
-**Что это значит для проекта.** Решение `exchange.py` определять закрытость по часам — не самодеятельность, а вынужденный обход известного пробела библиотеки. Но докстрока (`exchange.py:219–226`) подаёт его как выбор в пользу лучшего варианта («признак закрытия — биржевое время дошло до правой границы, **а не** отбросить последний элемент кэша»). Правильная формулировка: **ccxt не даёт признака закрытия; из двух доступных обходных путей выбран второй, и у него есть известная гонка.**
+**Что это значит для проекта.** Решение exchange.py определять закрытость по часам — не самодеятельность, а вынужденный обход известного пробела библиотеки. Но докстрока (`exchange.py:219–226`) подаёт его как выбор в пользу лучшего варианта («признак закрытия — биржевое время дошло до правой границы, **а не** отбросить последний элемент кэша»). Правильная формулировка: **ccxt не даёт признака закрытия; из двух доступных обходных путей выбран второй, и у него есть известная гонка.**
 
 ### 2.2. `ArrayCacheByTimestamp`: что именно возвращает `watch_ohlcv`
 
@@ -223,7 +223,7 @@ logger.info(f"Couldn't reuse watch for {pair}, {timeframe}, falling back to REST
 return None
 ```
 
-Три правила, и все три — то, чего нет в `hunter/exchange.py`:
+Три правила, и все три — то, чего нет в hunter/exchange.py:
 
 1. **Преемник обязателен.** Свеча считается пригодной, только если в кэше есть более новая. Часы для этого не нужны вовсе.
 2. **Свежесть измеряется В ДОЛЯХ ТАЙМФРЕЙМА** (`last_refresh_time >= half_candle`), а не фиксированными 60 секундами.
@@ -289,7 +289,7 @@ except ccxt.BaseError:
 
 ---
 
-## 4. Расхождения `hunter/exchange.py` с документацией и практикой
+## 4. Расхождения hunter/exchange.py с документацией и практикой
 
 ### C-1. Разгон подписок съедает половину окна наблюдения
 
@@ -368,7 +368,7 @@ freqtrade выносит весь WS в отдельный поток именн
 
 То есть цикл `_watch_step` **делает ровно то, что предписано**, и это надо записать в его пользу. Неверны только две вещи: слово «переподключение» в логе (переподключается ccxt, и по своему ping/pong, а не по 60-секундному таймауту) и счётчик `ws_reconnects`, который в отчёте владельцу считает **таймауты ожидания**, а не переподключения.
 
-### C-11. Что в `hunter/exchange.py` сделано ЛУЧШЕ типовой практики
+### C-11. Что в hunter/exchange.py сделано ЛУЧШЕ типовой практики
 
 Перечисляю, чтобы при переделке не потерять:
 
@@ -522,5 +522,5 @@ def silence_threshold_ms(timeframe: str) -> int:
 * [ccxt#20946 — The socket hangs on Bybit's watch_ohlcv](https://github.com/ccxt/ccxt/issues/20946)
 * [freqtrade PR#10273 — ccxt.pro support: using websockets to get data](https://github.com/freqtrade/freqtrade/pull/10273)
 * [freqtrade — Configuration: websocket support](https://www.freqtrade.io/en/stable/configuration/)
-* [freqtrade/exchange/exchange_ws.py](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/freqtrade/exchange/exchange_ws.py)
-* Исходник `ccxt==4.5.70`: ccxt/pro/binance.py, `ccxt/async_support/base/exchange.py`, ccxt/async_support/base/ws/client.py, ccxt/async_support/base/ws/cache.py, ccxt/async_support/base/ws/future.py, ccxt/async_support/base/throttler.py
+* freqtrade/exchange/exchange_ws.py
+* Исходник `ccxt==4.5.70`: ccxt/pro/binance.py, ccxt/async_support/base/exchange.py, ccxt/async_support/base/ws/client.py, ccxt/async_support/base/ws/cache.py, ccxt/async_support/base/ws/future.py, ccxt/async_support/base/throttler.py

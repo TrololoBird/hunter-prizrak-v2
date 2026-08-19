@@ -14,9 +14,9 @@ REST-опросом, вебсокет остаётся только на сде�
 
 | было | стало |
 |---|---|
-| `watch_closed_ohlcv` в `exchange.py` — WS-поток баров | удалён; бары идут `exchange.py::fetch_closed_ohlcv` |
+| `watch_closed_ohlcv` в exchange.py — WS-поток баров | удалён; бары идут exchange.py::fetch_closed_ohlcv |
 | `exchange.py::WS_SILENCE_S = 60.0` — порог молчания баров | удалён: сторожить нечего |
-| `_watch_bars_impl` в `run.py` | `run.py::_poll_bars_impl` — опрос по границам ТФ |
+| `_watch_bars_impl` в run.py | run.py::_poll_bars_impl — опрос по границам ТФ |
 | `SeriesState.ws_bars` | `polled_bars` |
 | `SeriesState.ws_unclosed_violations` | **удалён** — см. раздел 3 |
 | `SeriesState.ws_offgrid_violations` | **удалён** — см. раздел 4 |
@@ -158,7 +158,7 @@ ccxt по своему ping/pong. Переименована СТРОКА ПЕЧ
 
 **Д-4 остаётся открытым** и в этой правке не тронут: «объяснённые» разрывы по-прежнему
 засчитываются оптом (`sum(1 for s in ready if s.rejected_bars for _ in s.gaps)` в
-`run.py` и в `check.py`) — один битый бар объявляет объяснёнными ВСЕ разрывы ряда.
+run.py и в check.py) — один битый бар объявляет объяснёнными ВСЕ разрывы ряда.
 Починка требует сопоставления битого бара с интервалом разрыва, то есть структурного
 `rejected_at_ms` вместо строки, — это меняет `OhlcvFetch`, и в один коммит с транспортом
 не кладётся: §10.6 требует предъявлять изменение расчёта диффом повтора, а смешанный
