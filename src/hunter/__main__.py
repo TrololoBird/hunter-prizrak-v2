@@ -7,6 +7,7 @@ import asyncio
 import sqlite3
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -483,6 +484,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="разово опубликовать закреплённые монеты в канал и выйти — "
                          "проверка канала одной командой, без ожидания закрытия бара")
 
+    snt = sub.add_parser("sent",
+                         help="ЧТО УШЛО В ТЕЛЕГРАМ: последние сообщения дословно")
+    snt.add_argument("--limit", type=int, default=50,
+                     help="сколько последних сообщений показать")
+
     rep = sub.add_parser("replay",
                          help="ПОВТОР: пересобрать карточку из кадров и показать разницу")
     rep.add_argument("--run-id", default="last")
@@ -504,6 +510,25 @@ def main(argv: list[str] | None = None) -> int:
         return _ledger(args)
     if args.cmd == "replay":
         return _replay(args)
+    if args.cmd == "sent":
+        # ⚠ Заведено 2026-08-19 по вопросу владельца «почему у тебя нигде не
+        # сохраняется сообщения которые были отправлены в телеграм?». Ответ был —
+        # никто этого не написал: лог держал СОБЫТИЕ отправки без текста, и проверить,
+        # что прочитал читатель, было нечем.
+        from .tgbot import last_sent
+        rows = last_sent(args.limit)
+        if not rows:
+            print("Архив пуст: с момента заведения архива (2026-08-19) бот ничего не"
+                  " отправлял, либо каталог data/sent ещё не создан.")
+            return 0
+        print(f"ПОСЛЕДНИЕ {len(rows)} СООБЩЕНИЙ, свежие сверху")
+        print("=" * 78)
+        for r in rows:
+            at = datetime.fromtimestamp(int(r["at_ms"]) / 1000, tz=UTC)
+            print(f"\n[{at:%Y-%m-%d %H:%M:%S} UTC] {r['kind']} → {r['chat']}")
+            print("-" * 78)
+            print(r["text"])
+        return 0
     if args.cmd == "bot":
         from .tgbot import main as bot_main
         return asyncio.run(bot_main(horizon_days=args.horizon_days,

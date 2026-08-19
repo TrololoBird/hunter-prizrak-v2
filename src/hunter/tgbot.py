@@ -59,6 +59,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -66,6 +67,7 @@ import tempfile
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import ccxt
@@ -1444,6 +1446,59 @@ def _fmt_age(minutes: int) -> str:
 # --- отправка ---------------------------------------------------------------------
 
 
+SENT_DIR = Path("data/sent")
+"""Куда складывается ТЕКСТ каждого отправленного сообщения, по суткам.
+
+⚠ ЗАВЕДЕНО 2026-08-19 по вопросу владельца: "почему у тебя нигде не сохраняется
+сообщения которые были отправлены в телеграм?". Ответ был — никто этого не написал.
+Лог писал СОБЫТИЕ отправки (символ, пользователь, длительность, исход) и не писал
+текст, поэтому проверить, что именно прочитал читатель, было НЕЧЕМ. Для проекта, где
+всё предъявляемое обязано быть проверяемо, это дыра в самом конце конвейера: карточку
+и сигнал проверить можно, а то, что реально ушло в канал, — нет.
+
+`data/` не идёт в git (`.gitignore`), поэтому архив не попадёт в репозиторий.
+Формат — JSONL по суткам: одна строка на сообщение, дописывается, ничего не
+переписывается."""
+
+
+def archive_sent(chat: int | str, kind: str, text: str) -> None:
+    """Записать отправленное. Отказ архива НЕ роняет доставку — сообщение важнее записи."""
+    if not text:
+        return
+    try:
+        SENT_DIR.mkdir(parents=True, exist_ok=True)
+        at = clock.now_ms()
+        day = datetime.fromtimestamp(at / 1000, tz=UTC).strftime("%Y-%m-%d")
+        row = {"at_ms": at, "chat": str(chat), "kind": kind, "text": text}
+        with open(SENT_DIR / f"{day}.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.degraded("архив отправленного не записан", причина=f"{type(e).__name__} {e}")
+
+
+def last_sent(limit: int = 50) -> list[dict[str, str | int]]:
+    """Последние отправленные сообщения, свежие первыми. Пусто — архива ещё нет."""
+    if not SENT_DIR.exists():
+        return []
+    out: list[dict[str, str | int]] = []
+    for f in sorted(SENT_DIR.glob("*.jsonl"), reverse=True):
+        rows: list[dict[str, str | int]] = []
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                rows.append(json.loads(line))
+            except ValueError as e:
+                # Битая строка НАЗЫВАЕТСЯ, а не пропускается молча: архив пишется
+                # дописыванием, и оборванная запись означает, что бота убили посреди
+                # строки. Молчание здесь скрыло бы ровно тот момент, ради которого
+                # архив и заведён.
+                rows.append({"at_ms": 0, "chat": "", "kind": "БИТАЯ ЗАПИСЬ",
+                             "text": f"{f.name}:{n} не разобрана: {e}"})
+        out += rows[::-1]
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
 class Pacer:
     """Темп отправки по ДОКУМЕНТИРОВАННЫМ лимитам Telegram, а не по надежде.
 
@@ -1477,12 +1532,14 @@ class Pacer:
         return lock
 
     async def send(self, chat: int | str, what: str,
-                   call: Callable[[], Awaitable[object]]) -> bool:
+                   call: Callable[[], Awaitable[object]], text: str = "") -> bool:
         key = str(chat)
         async with self._lock(key):
             await self._wait_turn(key)
             ok = await self._deliver(key, what, call)
             self._sent.setdefault(key, deque()).append(clock.monotonic_ns() / 1e9)
+            if ok:
+                archive_sent(chat, what, text)
             return ok
 
     async def _wait_turn(self, key: str) -> None:
@@ -1753,12 +1810,15 @@ class Delivery:
                 pps += tf_pps
                 await self.pacer.send(chat, f"график {tf}", lambda p=png: bot.send_photo(  # type: ignore[misc]
                     chat_id=chat, photo=FSInputFile(p)))
+            # Текст считается ОДИН раз: он же уходит в Telegram и он же в архив
+            # отправленного. Считать его дважды значило бы завести две версии одного
+            # сообщения — тот самый класс «две сущности под одним именем».
+            summary = compose_text(symbol, got.zones, pps, got.origin, tuple(missing),
+                                   price=price, stale_min=got.stale_min, now_ms=now_ms,
+                                   dominance=dominance, notes=got.notes)
             await self.pacer.send(chat, "сводка", lambda: bot.send_message(
-                chat_id=chat,
-                text=compose_text(symbol, got.zones, pps, got.origin, tuple(missing),
-                                  price=price, stale_min=got.stale_min, now_ms=now_ms,
-                                  dominance=dominance, notes=got.notes),
-                reply_to_message_id=reply_to))
+                chat_id=chat, text=summary, reply_to_message_id=reply_to),
+                text=summary)
         self.answers += 1
         return True
 
@@ -2532,7 +2592,8 @@ async def notify_loop(delivery: Delivery, bot: Bot, notifier: Notifier) -> None:
                 await delivery.pacer.send(
                     delivery.channel, "уведомление",
                     lambda t=text: bot.send_message(  # type: ignore[misc]
-                        chat_id=delivery.channel, text=t))
+                        chat_id=delivery.channel, text=t),
+                    text=text)
         except (ccxt.BaseError, CapabilityMissing) as e:
             notifier.ticks_failed += 1
             log.error("наблюдатель: такт не удался", причина=f"{type(e).__name__} {e}")
