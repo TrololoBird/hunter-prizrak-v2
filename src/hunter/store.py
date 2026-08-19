@@ -112,6 +112,12 @@ CREATE TABLE IF NOT EXISTS levels (
     -- владельцу наравне со свежими. Расчёт различал (`LevelStatus.entry_rule`), карта —
     -- нет, и потому различие до владельца не доходило.
     entry_rule   TEXT    CHECK (entry_rule IN ('limit', 'confirmation', 'retest_flipped')),
+    -- Подтверждён ли слом структуры на младшем ТФ У ЭТОГО уровня: 1 — да, 0 — нет,
+    -- NULL — вопрос неприменим (цена к уровню не приходила либо младшего ТФ нет:
+    -- 5м младший в курсе, стр. 17). Нужен ДОСТАВКЕ: уведомление обязано сказать,
+    -- что вход по слому безопаснее лимитки (стр. 19), а бары наблюдателю
+    -- недоступны — он ходит одним `fetch_tickers`.
+    mtf_break    INTEGER,
     -- Закрытие бара, на котором СОБЫТИЕ разрешилось (прокол/пробой). NULL — события нет
     -- либо строка до схемы 7.
     -- ⚠ Это НЕ `retired_at`. Тот хранит момент ПРОГОНА, в котором уровень сняли с карты,
@@ -177,7 +183,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
@@ -628,6 +634,8 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "8"
     if "breakeven_at" not in cols:
         return "9"
+    if lvl_cols and "mtf_break" not in lvl_cols:
+        return "10"
     return SCHEMA_VERSION
 
 
@@ -786,6 +794,11 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # 9 → 10: дешёвая правка на месте, NULLABLE. У прежних сигналов правила
         # безубытка не считалось — NULL и означает «не считалось», а не «нет правила».
         conn.execute("ALTER TABLE signals ADD COLUMN breakeven_at REAL")
+        conn.commit()
+    if _schema_version(conn) == "10":
+        # 10 → 11: NULLABLE на месте. У прежних строк вопрос не задавался — NULL и
+        # означает «не спрашивали», а не «слома не было».
+        conn.execute("ALTER TABLE levels ADD COLUMN mtf_break INTEGER")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -1009,7 +1022,7 @@ class MapSync(BaseModel):
 def sync_levels(
     conn: sqlite3.Connection,
     symbol: str,
-    seen: list[tuple[Level, LevelState, EntryRule, int | None]],
+    seen: list[tuple[Level, LevelState, EntryRule, int | None, int | None]],
     now_ms: int,
 ) -> MapSync:
     """Слить свежепосчитанную карту с накопленной.
@@ -1041,7 +1054,7 @@ def sync_levels(
     """
     added = updated = retired = 0
     rejected: list[str] = []
-    for lvl, state, rule, resolved in seen:
+    for lvl, state, rule, resolved, mtf in seen:
         key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
         row = conn.execute(
             "SELECT state, retired_at FROM levels WHERE symbol=? AND timeframe=? AND"
@@ -1053,13 +1066,15 @@ def sync_levels(
                 conn.execute(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
-                    " last_seen, state, retired_at, entry_rule, resolved_at, vrvp_density)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " last_seen, state, retired_at, entry_rule, resolved_at,"
+                    " vrvp_density, mtf_break)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
-                     None if active else now_ms, rule.value, resolved, lvl.vrvp_density),
+                     None if active else now_ms, rule.value, resolved,
+                     lvl.vrvp_density, mtf),
                 )
                 added += 1
                 retired += not active
@@ -1089,13 +1104,13 @@ def sync_levels(
             conn.execute(
                 "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
                 " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
-                " retired_at=?, entry_rule=?, resolved_at=? WHERE symbol=? AND timeframe=? AND"
-                " from_ms=? AND to_ms=?",
+                " retired_at=?, entry_rule=?, resolved_at=?, mtf_break=?"
+                " WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
                 (now_ms, lvl.side.value, float(lvl.price),
                  float(lvl.zone_lo), float(lvl.zone_hi),
                  float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
                  lvl.vrvp_density,
-                 state.value, retired_at, rule.value, resolved, *key),
+                 state.value, retired_at, rule.value, resolved, mtf, *key),
             )
             updated += 1
             retired += was_active and not active

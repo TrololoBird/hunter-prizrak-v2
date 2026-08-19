@@ -2117,6 +2117,13 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры — чтобы назвать СТОП. Ноль — не записаны."""
 
+    mtf_break: int | None = None
+    """Подтверждён ли слом структуры на младшем ТФ: 1 да, 0 нет, None неприменимо.
+
+    Стр. 19: «также можно смотреть слом структуры на мтф, и брать более безопасную
+    позицию с хорошим соотношением РР» — у свежего уровня слом это не запрет лимитки,
+    а альтернатива ей, и читатель обязан о ней знать."""
+
 
 @dataclass(frozen=True, slots=True)
 class LedgerNews:
@@ -2180,7 +2187,7 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         marks = ",".join("?" * len(symbols))
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
-            f" entry_rule, boundary_lo, boundary_hi"
+            f" entry_rule, boundary_lo, boundary_hi, mtf_break"
             f" FROM levels WHERE state='active' AND symbol IN ({marks})",
             symbols).fetchall()
     except sqlite3.DatabaseError as e:
@@ -2192,7 +2199,9 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             from_ms=int(r[6]), to_ms=int(r[7]),
                             entry_rule=r[8] or "",
                             boundary_lo=float(r[9] or 0.0),
-                            boundary_hi=float(r[10] or 0.0)) for r in lvl_rows)
+                            boundary_hi=float(r[10] or 0.0),
+                            mtf_break=None if r[11] is None else int(r[11]))
+                   for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
                       max_signal_id=max_id, max_closed_ms=max_closed)
@@ -2486,6 +2495,14 @@ def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
         stop = edge - margin if buy else edge + margin
         out.append(f"    стоп {_fmt_price(stop)}")
+    # ВТОРАЯ СТРОКА про слом — только когда он ЕСТЬ. Стр. 19 называет вход по слому
+    # более безопасным при том же уровне: «также можно смотреть слом структуры на мтф,
+    # и брать более безопасную позицию с хорошим соотношением РР». Отсутствие слома НЕ
+    # печатается: лимитка и без него законна (стр. 30), а строка «слома не было» была бы
+    # шумом в каждом уведомлении.
+    if lv.mtf_break == 1:
+        out.append("    слом на младшем ТФ подтверждён — вход по нему безопаснее, "
+                   "стоп короче")
     return "\n".join(out)
 
 

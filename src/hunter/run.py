@@ -1586,8 +1586,24 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # Четвёртым идёт МОМЕНТ СОБЫТИЯ (схема 7): `retired_at` хранит время прогона
             # и у всех снятых уровней одинаков, а разметке нужен бар, на котором прокол
             # или пробой действительно случился.
+            # Пятым — ПРИЗНАК СЛОМА на младшем ТФ (схема 11). Он живёт на РЕШЕНИИ, а
+            # не на уровне, поэтому связывается по ключу структуры: доставке он нужен,
+            # чтобы сказать это читателю: стр. 19 «также можно смотреть слом структуры
+            # на мтф, и брать более безопасную позицию с хорошим соотношением РР». Бары
+            # наблюдателю недоступны.
+            broke: dict[tuple[str, int, int], int] = {}
+            for one in d.decisions:
+                note = one.mtf_break or ""
+                if not note:
+                    continue
+                k = (one.level.timeframe, one.level.structure_from_ms,
+                     one.level.structure_to_ms)
+                broke[k] = 1 if "подтверждён" in note else 0
             seen = [(m.level, m.status.state, m.status.entry_rule,
-                     m.status.resolved_at_ms) for m in d.mapped]
+                     m.status.resolved_at_ms,
+                     broke.get((m.level.timeframe, m.level.structure_from_ms,
+                                m.level.structure_to_ms)))
+                    for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
             report.map_added += sync.added
