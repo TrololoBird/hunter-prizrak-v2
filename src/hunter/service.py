@@ -43,6 +43,7 @@ from typing import Any
 from . import clock, log, run
 from .config import Universe
 from .models import RunReport, TradeWindows
+from .render import BARS_ON_CHART
 
 CYCLE_SECONDS = 300
 """Как часто пересчитывать. Число ВЫВЕДЕНО из §2.8, а не подобрано.
@@ -118,7 +119,13 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
 
     # Долив архива — до сборки карточки: без него окна исторических структур не покрыты
     # и уровней не бывает вовсе. Внутри — свой `to_thread` (Д-8 и его дополнение).
-    await run.backfill_profile_bars(c.ex, uni, report, horizon_days)
+    # ⚠ РАМКА КАДРА И ЗДЕСЬ (2026-08-19). Шаг 2 (`decide_once`) получил её первым, а
+    # этот остался без неё — и готовил минутки под ВСЕ окна структур горизонта, тогда
+    # как построит уровни только по тем, что в кадре. Замер по логу службы:
+    # «окон=43092, окон_вне_кадра=0» при 102 реально используемых на символ.
+    # Половинчатая правка — та же ошибка, что чинилась строкой ниже, только этажом выше.
+    await run.backfill_profile_bars(c.ex, uni, report, horizon_days,
+                                    frame_bars=BARS_ON_CHART)
     # Источники строятся на цикле: им нужен `market_id` инструмента, а рынки живут на
     # объекте биржи, который задача перечитывания меняет именно здесь.
     sources: dict[str, TradeWindows] = {
@@ -127,7 +134,17 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
     }
 
     await asyncio.to_thread(run.persist_frames, run_id, report)
-    decided = await asyncio.to_thread(run.decide_once, report, uni, sources)
+    # ⚠ РАМКА КАДРА (2026-08-19). Служба строила уровни ЗА ВЕСЬ ГОРИЗОНТ, а сборка по
+    # запросу в боте — только в кадре ответа. Две карты одного символа по разным
+    # правилам: замер BTC — служба 1987 уровней, ответ по запросу 29. Из 1987 читатель
+    # видит СЕМЬ, а 87 секунд из 89 уходят на профили объёма тем, кого не покажут.
+    #
+    # Потребить структуру вне кадра не может НИКТО: ни показ (`near_structure`, 180
+    # баров своего ТФ), ни цели (`geometry.TARGET_STRUCTURE_FRAME_BARS`, те же 180), ни
+    # лестница стр. 32 — вложенность идёт ровно на одну ступень ТФ (`NESTED_MAX_STEPS`),
+    # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
+    decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
+                                      frame_bars=BARS_ON_CHART)
     await asyncio.to_thread(run.produce_cards, run_id, report, uni, decided)
     await asyncio.to_thread(run.persist_source, run_id, report, sources)
     await asyncio.to_thread(run.record, run_id, report, uni, decided)

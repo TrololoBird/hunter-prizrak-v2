@@ -1513,9 +1513,9 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
             res = outcome_resolve(
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
-                breakeven_at=p.target,
+                breakeven_at=p.breakeven_at,
             )
-            if res.kind.value in ("stop", "target", "ambiguous"):
+            if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
                     conn, p.id, res.kind.value, bars[res.closed_at_index].open_ms,
@@ -1608,6 +1608,14 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
                     # ни в одном прогоне, кроме выдавшего сигнал.
                     target=targets[0].price if targets else None,
+                    # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Берётся ПЕРВОЕ по ходу
+                    # сделки правило стр. 19 («цена показала реакцию и ушла внутрь
+                    # базы»): оно наступает раньше цели и потому вообще способно
+                    # сработать. Подача сюда `target` (первая редакция 2026-08-19)
+                    # делала исход «в безубытке» недостижимым: взведение и закрытие
+                    # по цели приходятся на один бар, а цель проверяется первой.
+                    breakeven_at=(em.setup.breakeven_rules[0].watch_price
+                                  if em.setup.breakeven_rules else None),
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)
@@ -1627,7 +1635,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     report.emitted_stop_pct.append(
                         float(abs(em.setup.entry - em.ledger_stop) / em.setup.entry * 100)
                     )
-                if res.kind.value in ("stop", "target", "ambiguous"):
+                if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
                     assert res.closed_at_index is not None
                     err = store.record_outcome(
                         conn, sig.id, res.kind.value,
@@ -1688,7 +1696,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         pbars, pssig.timeframe, row.recorded_at,
                         pssig.pp.confirmed_at_index + 1),
                 )
-                if pres.kind.value in ("stop", "target", "ambiguous"):
+                if pres.kind.value in ("stop", "target", "ambiguous", "breakeven"):
                     assert pres.closed_at_index is not None
                     err = store.record_outcome(
                         conn, row.id, pres.kind.value,
@@ -2106,6 +2114,11 @@ OUTCOME_LABEL = {
     "stop": "по стопу",
     "target": "по цели",
     "ambiguous": "неоднозначно (стоп и цель в одном баре)",
+    # Заведено 2026-08-19 вместе с исходом BREAKEVEN (стр. 14: «цена вернулась к точке
+    # открытия сделки»). ⚠ Отсутствие этой строки уронило первый же цикл службы после
+    # правки — KeyError через 79 минут расчёта. Защита сработала как обещает докстрока
+    # ниже, но цена ошибки — потерянный круг по всей вселенной.
+    "breakeven": "в безубытке",
 }
 """Подписи исходов для владельца, который не программист (§7.6).
 

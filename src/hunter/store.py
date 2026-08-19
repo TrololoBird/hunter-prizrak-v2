@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS signals (
     entry       REAL    NOT NULL,
     stop        REAL    NOT NULL,
     target      REAL,
+    -- Цена, по достижении которой стоп переносится в ТВХ (стр. 19, 15, 44). NULL —
+    -- правила безубытка у сделки нет. ⚠ Это НЕ цель: до 2026-08-19 дорешивание
+    -- подавало сюда `target`, и исход «в безубытке» становился недостижим — взведение
+    -- срабатывало тем же баром, что и закрытие по цели, а цель проверяется первой.
+    breakeven_at REAL,
     frames_ref  TEXT    NOT NULL,
     CHECK (stop != entry),
     CHECK (entry > 0),
@@ -172,7 +177,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
@@ -621,6 +626,8 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     ).fetchone()
     if out_sql is not None and "breakeven" not in (out_sql[0] or ""):
         return "8"
+    if "breakeven_at" not in cols:
+        return "9"
     return SCHEMA_VERSION
 
 
@@ -775,6 +782,11 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         conn.commit()
     if _schema_version(conn) == "8":
         _migrate_8_to_9(conn)
+    if _schema_version(conn) == "9":
+        # 9 → 10: дешёвая правка на месте, NULLABLE. У прежних сигналов правила
+        # безубытка не считалось — NULL и означает «не считалось», а не «нет правила».
+        conn.execute("ALTER TABLE signals ADD COLUMN breakeven_at REAL")
+        conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -819,6 +831,7 @@ def record_signal(
     conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
     opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str, recorded_at: int,
     kind: str = "level", target: Decimal | None = None,
+    breakeven_at: Decimal | None = None,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -841,11 +854,12 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, target, frames_ref)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, breakeven_at, frames_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop),
-             None if target is None else float(target), frames_ref),
+             None if target is None else float(target),
+             None if breakeven_at is None else float(breakeven_at), frames_ref),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -908,6 +922,10 @@ class PendingSignal(BaseModel):
     entry: Decimal
     stop: Decimal
     target: Decimal | None
+    breakeven_at: Decimal | None = None
+    """Цена взведения безубытка (стр. 19, 15, 44). None — правила у сделки нет либо
+    строка записана до схемы 10. ⚠ Целью НЕ является: цель закрывает сделку, а это
+    условие переносит стоп в ТВХ и сделку продолжает."""
     """`None` — сигнал записан до схемы v5: цель не сохранялась. Такой не дорешать, и
     считать его «без объяснения» нельзя — причина известна и названа."""
 
@@ -923,7 +941,7 @@ def pending_signals(
     следующих барах может смениться исходом. Отменяет только сам исход.
     """
     sql = ("SELECT s.id, s.symbol, s.timeframe, s.direction, s.entry, s.stop,"
-           " s.target, s.recorded_at FROM signals s"
+           " s.target, s.recorded_at, s.breakeven_at FROM signals s"
            " LEFT JOIN outcomes o ON o.signal_id = s.id"
            " WHERE o.signal_id IS NULL")
     args: tuple[str, ...] = ()
@@ -937,6 +955,7 @@ def pending_signals(
             entry=Decimal(str(r[4])), stop=Decimal(str(r[5])),
             target=None if r[6] is None else Decimal(str(r[6])),
             recorded_at=int(r[7]),
+            breakeven_at=None if r[8] is None else Decimal(str(r[8])),
         )
         for r in rows
     )
