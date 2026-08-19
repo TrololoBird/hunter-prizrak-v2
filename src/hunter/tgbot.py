@@ -1621,14 +1621,13 @@ class Delivery:
         """
         now = clock.now_ms()
         in_uni = symbol in self.uni.symbols
-        if in_uni and not force:
-            got = await asyncio.to_thread(read_map, symbol)
-            if not isinstance(got, NotReady) and got.zones:
-                age_min = max(0, (now - got.last_seen_ms) // 60_000)
-                if age_min <= FRESH_MAP_MAX_MIN:
-                    return Analysis(
-                        symbol=symbol, zones=got.zones, stale_min=age_min,
-                        origin=f"Карта системы, обновлена {_fmt_age(age_min)} назад.")
+        # ⚠⚠ КАРТА ЛЕДЖЕРА БОЛЬШЕ НЕ ОТДАЁТСЯ НА ЗАПРОС (2026-08-19, приказ владельца:
+        # «пересобирай символ по запросу всегда»). Прежде ответ брался из карты службы,
+        # если она моложе `FRESH_MAP_MAX_MIN`, — а карту служба пишет раз в круг, и круг
+        # идёт десятки минут. Цена в ответе при этом всегда живая, уровни — нет:
+        # владелец видел это как «при запросе символа приходит устаревшая информация».
+        # Пересборка идёт в рамке кадра и потому дешева; очередь и остывание запросов
+        # ограничивают частоту (`build_queue_max`, `answer_cooldown_s`).
             # ⚠ РЕШЕНИЕ ВЛАДЕЛЬЦА 2026-08-17: «все карты должны обновляться по запросу
             # и быть актуальными». Устаревшая (или пустая, или нечитаемая) карта
             # вселенной пересобирается тем же путём, что монета вне вселенной, а не
@@ -1644,13 +1643,10 @@ class Delivery:
             return built
         age_min = max(0, (now - built.built_at_ms) // 60_000)
         if in_uni:
-            why = ("по приказу «обнови»" if force
-                   else "карта службы отстала")
             return Analysis(
                 symbol=symbol, zones=built.zones, stale_min=age_min,
                 notes=built.notes,
-                origin=f"Карта пересобрана по запросу {_fmt_age(age_min)} назад:"
-                       f" {why}, посчитано заново.")
+                origin="Карта посчитана заново на ваш запрос.")
         return Analysis(
             symbol=symbol, zones=built.zones, stale_min=age_min, notes=built.notes,
             origin=f"Карта собрана по запросу {_fmt_age(age_min)} назад: за этой монетой"
@@ -2438,6 +2434,18 @@ class Notifier:
             if lv.to_ms > 0 and step is not None and (
                     lv.to_ms < now_ms - BARS_ON_CHART * step):
                 continue
+            # ⚠ ЗОВЁМ ТОЛЬКО ТУДА, ГДЕ ЕСТЬ ЧТО ВЗЯТЬ (2026-08-19). Владелец: бот
+            # «должен говорить про актуальные ближайшие лимитки». Уровень, который
+            # лимитками уже не торгуется (стр. 25 — отработан; стр. 43 — пробит и
+            # сменил сторону), в уведомление не идёт ВООБЩЕ: звать к нему значит
+            # предлагать вход там, где входа нет. Такие уровни бот продолжает вести
+            # молча — они вернутся в уведомления, если снова станут торгуемыми.
+            if lv.entry_rule != "limit":
+                continue
+            # Лимитка на покупку стоит НИЖЕ цены, на продажу — ВЫШЕ (стр. 30 «вход от
+            # уровня»). Уровень по другую сторону — уже пройденное, а не вход.
+            if (lv.price > t.last) if lv.side == "long" else (lv.price < t.last):
+                continue
             zone_lines.append(_zone_alert(lv, t.last, pos))
         # Снятые с карты уровни выбывают из памяти состояний — иначе она росла бы вечно.
         for key in list(self._zone_state):
@@ -2449,19 +2457,12 @@ class Notifier:
         return out
 
 
-ENTRY_WORD = {
-    "limit": "вход лимиткой можно ставить сейчас",
-    "confirmation": "лимитками НЕ входим — уровень уже отработан; вход только по слому"
-                    " структуры на младшем ТФ (стр. 25, 31)",
-    "retest_flipped": "уровень пробит и сменил сторону — вход по ретесту с ОБРАТНОЙ"
-                      " стороны (стр. 43)",
-    "": "правило входа у этой строки карты не записано",
-}
-"""Ответ на вопрос «можно ли входить», словами, а не кодом правила.
-
-⚠ Заведено 2026-08-19 по вопросу владельца: «когда цена достигает зоны, бот находит
-подтверждение входа в сделку или нет?». До этого уведомление сообщало только факт
-сближения, и подтверждение входа читателю приходилось искать самому."""
+# ⚠ СЛОВАРЬ `ENTRY_WORD` УБРАН 2026-08-19. Он объяснял читателю МЕТОД строкой вида
+# "уровень пробит и сменил сторону — вход по ретесту с обратной стороны".
+# Владелец снял это дословно (кавычки ОБЫЧНЫЕ — это его слова, а не текст курса):
+# "зачем пользователю информация про торгуется ретестом с обратной стороны и так
+# далее? это все должен делать бот". Различение правил входа осталось —
+# но теперь оно РЕШАЕТ, звать ли вообще, а не печатается как справка.
 
 
 def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
@@ -2475,17 +2476,16 @@ def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
     act = "ПОКУПКА" if buy else "ПРОДАЖА"
     where = "цена В ЗОНЕ" if pos == "inside" else "цена подходит"
     out = [f"• {base} · {act} · {where} {_fmt_price(price)}",
-           f"    зона {_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)}, "
-           f"вход {_fmt_price(lv.price)} ({TF_LABEL.get(lv.timeframe, lv.timeframe)})"]
+           f"    лимитка {_fmt_price(lv.price)}, зона "
+           f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} "
+           f"({TF_LABEL.get(lv.timeframe, lv.timeframe)})"]
     # СТОП — курсовой: за всю структуру с запасом (стр. 58 «Стоп ВСЕГДА прячем за всю
     # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
     edge = lv.boundary_lo if buy else lv.boundary_hi
     if edge > 0:
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
         stop = edge - margin if buy else edge + margin
-        out.append(f"    стоп {_fmt_price(stop)} — за структуру с запасом "
-                   f"{geometry.DEFAULT_MARGIN_PCT:.0f}%")
-    out.append(f"    {ENTRY_WORD.get(lv.entry_rule, ENTRY_WORD[''])}")
+        out.append(f"    стоп {_fmt_price(stop)}")
     return "\n".join(out)
 
 
