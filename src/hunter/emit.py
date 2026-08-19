@@ -25,11 +25,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .bars import tf_ms
+from .bars import TIMEFRAME_MS, tf_ms
 from .geometry import Setup
 from .levels import Level, LevelSide, LevelState, LevelStatus
 from .models import Bar
@@ -109,6 +111,130 @@ def hold_reason(status: LevelStatus) -> str:
         return ("цена уже касалась уровня — стр. 25 «этот уровень становиться больше не "
                 "актуальным»; вход со 2-3 касания только по слому структуры на младшем ТФ")
     return ""
+
+
+class TFBucket(StrEnum):
+    """Три корзины, по которым стр. 48 требует баланса: «должен соблюдаться баланс
+    кол-ва сделок/отложек по СТФ, локальным уровням и МТФ»."""
+
+    SENIOR = "senior"
+    LOCAL = "local"
+    JUNIOR = "junior"
+
+
+TF_BUCKET = {
+    "1w": TFBucket.SENIOR,
+    "1d": TFBucket.SENIOR,
+    "4h": TFBucket.SENIOR,
+    "1h": TFBucket.LOCAL,
+    "15m": TFBucket.LOCAL,
+    "5m": TFBucket.JUNIOR,
+}
+"""Состав корзин назван ТОЙ ЖЕ страницей, а не подобран: стр. 48 «Любое крупное движение
+по рынку - дамп/памп и т.п. – идет чаще всего по 4ч-1Д уровням» (СТФ; 1н старше и идёт
+туда же), стр. 48 «Чтобы выйти из трейда 15м-1ч ТФ» (локальные интрадей), стр. 48
+«иногда хватает и 5мин тф для отработки» (МТФ). ⚠ МТФ/СТФ у автора — понятия
+ОТНОСИТЕЛЬНЫЕ (стр. 4 «МТФ/СТФ - младший таймфрейм / старший таймфрейм»), поэтому
+раскладка держится на конкретных ТФ, названных стр. 48, а не на самих словах."""
+
+
+class TFCount(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    bucket: TFBucket | None
+    """None — этот ТФ стр. 48 не называет; такие ТФ перечислены в `TFBalance.unlisted`,
+    а не растворены в корзинах."""
+
+    count: int
+    share_pct: float
+
+
+class BucketCount(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bucket: TFBucket
+    count: int
+    share_pct: float
+    timeframes: tuple[str, ...]
+
+
+class TFBalance(BaseModel):
+    """Сколько отложек по каждому ТФ и по каждой корзине стр. 48. Со знаменателем."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total: int
+    by_timeframe: tuple[TFCount, ...]
+    by_bucket: tuple[BucketCount, ...]
+    unlisted: tuple[str, ...]
+    note: str
+    """Готовая строка для карточки; пусто — отложек нет вовсе."""
+
+
+_BUCKET_WORD = {
+    TFBucket.JUNIOR: "МТФ",
+    TFBucket.LOCAL: "локальные",
+    TFBucket.SENIOR: "СТФ",
+}
+
+_BALANCE_RULE = (
+    "Стр. 48: «должен соблюдаться баланс кол-ва сделок/отложек по СТФ, локальным уровням и МТФ». "
+    "«Важно не выставлять сразу много отложек по МТФ» (стр. 48), "
+    "«при дампе они все получат стоп» (стр. 48). "
+    "Сколько отложек считать многими, курс не называет — счёт предъявляется оператору, "
+    "отсева по нему нет"
+)
+
+
+def _balance_note(
+    total: int,
+    by_tf: tuple[TFCount, ...],
+    by_bucket: tuple[BucketCount, ...],
+    unlisted: tuple[str, ...],
+) -> str:
+    if total == 0:
+        return ""
+    per_tf = ", ".join(f"{c.timeframe} {c.count} ({c.share_pct:.0f}%)" for c in by_tf)
+    per_bucket = ", ".join(f"{_BUCKET_WORD[b.bucket]} {b.count}" for b in by_bucket)
+    tail = f"; ТФ вне разбивки стр. 48: {', '.join(unlisted)}" if unlisted else ""
+    return (f"баланс отложек — всего {total}: {per_tf}; по корзинам: {per_bucket}. "
+            f"{_BALANCE_RULE}{tail}")
+
+
+def tf_balance(emissions: Sequence[Emission]) -> TFBalance:
+    """Разбивка отложек по ТФ и по корзинам стр. 48 — ПРЕДУПРЕЖДЕНИЕ, а не отсев.
+
+    Отсекать сигналы по этому счёту нельзя: числа баланса стр. 48 не даёт, а порог на
+    выходе спрятал бы ровно те сигналы, по которым видны ошибки расчёта зон и целей.
+    Поэтому здесь только счёт со знаменателем и текст правила курса.
+
+    Область счёта задаёт вызывающий: карточка считает по символу, леджер — по прогону.
+    Порядок ТФ — от младшего к старшему, чтобы разбивка была одинаковой при повторе.
+    """
+    counts: dict[str, int] = {}
+    for em in emissions:
+        counts[em.level.timeframe] = counts.get(em.level.timeframe, 0) + 1
+    total = sum(counts.values())
+    # ТФ, которого нет в шкале, идёт В КОНЕЦ и попадает в `unlisted`: неизвестный шаг —
+    # это не «самый младший», и молча ставить его первым значило бы соврать порядком.
+    order = sorted(counts, key=lambda tf: (tf not in TIMEFRAME_MS, TIMEFRAME_MS.get(tf, 0), tf))
+    by_tf = tuple(
+        TFCount(timeframe=tf, bucket=TF_BUCKET.get(tf), count=counts[tf],
+                share_pct=counts[tf] / total * 100 if total else 0.0)
+        for tf in order
+    )
+    by_bucket: list[BucketCount] = []
+    for bucket in (TFBucket.JUNIOR, TFBucket.LOCAL, TFBucket.SENIOR):
+        tfs = tuple(tf for tf in order if TF_BUCKET.get(tf) is bucket)
+        n = sum(counts[tf] for tf in tfs)
+        by_bucket.append(BucketCount(bucket=bucket, count=n,
+                                     share_pct=n / total * 100 if total else 0.0,
+                                     timeframes=tfs))
+    unlisted = tuple(tf for tf in order if tf not in TF_BUCKET)
+    return TFBalance(total=total, by_timeframe=by_tf, by_bucket=tuple(by_bucket),
+                     unlisted=unlisted,
+                     note=_balance_note(total, by_tf, tuple(by_bucket), unlisted))
 
 
 def first_bar_after(bars: list[Bar], timeframe: str, since_ms: int, not_before: int) -> int:

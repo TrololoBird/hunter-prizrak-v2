@@ -11,8 +11,12 @@
            индикаторе, наоборот, затухают… лои на графике понижаются, а на индикаторе,
            наоборот, лои повышаются» (второе — про конвергенцию; «хая» — опечатка автора,
            сохранена: правленая цитата перестаёт быть проверяемой)
+  стр. 67  «RSI можно использовать, что бы найти наличие дивергенций/конвергенций.
+           Также можно смотреть трендовые линии»
   стр. 68  Боллинджер: «используем, чтобы понять как скоро будет выход цены из
            накопления. Чем сильнее сузились эти линии — тем быстрее будет выход»
+           ⚠ Фактор зовётся `band_narrowing`, а НЕ «сквиз»: сквиз — термин стр. 8 про
+           резкое движение с каскадом ликвидаций, полосы к нему отношения не имеют.
   стр. 69  MA/EMA 200: «если местоположение этих скользящих или одной из них совпадает
            с нашей точкой входа/выхода, то для нас это дополнительный фактор»
            ⚠ «или одной из них» — не украшение: хватает ОДНОЙ скользящей. Прежняя
@@ -24,12 +28,13 @@
 from __future__ import annotations
 
 import math
+import statistics
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
 from .models import Bar
-from .swings import SwingKind, SwingSet
+from .swings import FRACTAL_BARS, SwingKind, SwingSet
 
 
 def _absent(x: float | None) -> bool:
@@ -40,10 +45,10 @@ def _absent(x: float | None) -> bool:
     и это давало разный вред в каждой:
 
       * `ma_touch` — считал `abs(nan - entry) / entry * 100` и отдавал фактор с
-        `distance_pct = nan`. Карточка владельца печатала «EMA200 в nan% от цены»,
+        расстоянием `nan`. Карточка владельца печатала «EMA200 в nan% от цены»,
         то есть ЧИСЛО БЕЗ РЕФЕРЕНТА в тексте, который читает человек (§0, §4.3);
-      * `squeeze` — клал NaN в список ширин, а дальше `w <= last` с NaN всегда ложно,
-        и перцентиль считался по испорченной выборке МОЛЧА;
+      * `band_narrowing` (тогда `squeeze`) — клал NaN в список ширин, а `w <= last` с
+        NaN всегда ложно, и перцентиль считался по испорченной выборке МОЛЧА;
       * `divergences` — сравнения с NaN всегда ложны, то есть отсутствие индикатора
         выглядело как «дивергенции нет». Отсутствие, поданное как ответ (§4.3).
 
@@ -113,19 +118,58 @@ class Divergence(BaseModel):
     indicator_second: float
 
 
-class SqueezeFactor(BaseModel):
-    """Сужение полос Боллинджера (стр. 68). Предиктор ВЫХОДА, не сигнал входа."""
+class BandNarrowingFactor(BaseModel):
+    """Сужение полос Боллинджера (стр. 68). Предиктор ВЫХОДА, не сигнал входа.
+
+    ⚠ Класс назывался `SqueezeFactor` до 2026-08-19, и это имя было ЗАНЯТИЕМ ЧУЖОГО
+    ТЕРМИНА. «Сквиз» курс определяет на стр. 8 как совсем другое явление — «резкий
+    рост/падение цены сразу на несколько % … Сопровождается ликвидациями позиций» с
+    каскадом ликвидаций, — и на стр. 33 стоп ставится с запасом именно «от сквизов на
+    рынке». Полосы Боллинджера (стр. 68) к ликвидациям отношения не имеют. Одно
+    человеческое имя на две сущности — тот самый дефект, из-за которого 51.7% зон
+    вылезали за границы: одна из сущностей всегда останется непроверенной.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     width_pct: float
-    """Ширина полос в процентах от средней линии на последнем баре."""
+    """Ширина полос в процентах от средней линии НА ПОСЛЕДНЕМ баре.
+
+    ⚠ Именно на последнем: до 2026-08-19 недостающие значения выбрасывались из ряда, и
+    `widths[-1]` мог оказаться шириной другого, более раннего бара — а печаталась она
+    как текущая. Теперь ряд остаётся выровненным по барам, и если ширины последнего
+    бара нет, фактор не выдаётся вовсе.
+    """
 
     percentile: float
     """Место этой ширины среди ширин собственной истории символа, в процентах.
 
     §4.1: порог относительный — «перцентиль собственной истории». Абсолютного «узко»
     здесь нет и быть не может: у каждого инструмента своя волатильность.
+    """
+
+    exit_bars_median: float | None
+    """«КАК СКОРО будет выход» (стр. 68) — В БАРАХ, а не словом.
+
+    Курс требует именно этой величины: «Мы их используем, чтобы понять как скоро будет
+    выход цены из накопления. Чем сильнее сузились эти линии - тем быстрее будет выход».
+    Числа курс не даёт, и классика не даёт тоже: StockCharts ChartSchool, Bollinger Band
+    Squeeze — сужение опознаётся как "BandWidth near the low end of its six-month range",
+    выход как "Price breaks above the upper band or below the lower band", а СРОК не
+    назван нигде («often followed by» без числа). Придумать срок нельзя (§0).
+
+    Поэтому срок здесь не постулируется, а ЗАМЕРЯЕТСЯ по собственной истории символа:
+    медиана числа баров от бара, чья ширина не больше текущей, до первого закрытия за
+    полосой. Оба условия взяты у источников, а не выбраны: «не больше текущей» — это
+    ординальное правило курса («чем сильнее сузились»), «закрытие за полосой» — выход по
+    Боллинджеру. `None` — прошлых случаев не нашлось; знаменатель в `exit_cases`.
+    """
+
+    exit_cases: int
+    """ЗНАМЕНАТЕЛЬ медианы: сколько прошлых случаев её образовали.
+
+    Медиана по трём случаям и медиана по тремстам — разные утверждения, и без этого
+    числа их не различить. Ноль означает, что срок не замерен, а не что выхода не будет.
     """
 
 
@@ -167,13 +211,81 @@ def rsi_zone(value: float | None) -> RsiZoneFactor | None:
 
 
 class MaTouchFactor(BaseModel):
-    """MA/EMA 200 рядом с точкой входа (стр. 69)."""
+    """MA/EMA 200 рядом с ТОЧКОЙ ВХОДА ИЛИ ТОЧКОЙ ВЫХОДА (стр. 69).
+
+    ⚠ Правка 2026-08-19, и она про РАСЧЁТ, а не про имена. Курс: «если местоположение
+    этих скользящих или одной из них совпадает с нашей точкой входа/выхода, то для нас
+    это дополнительный фактор». Сравнивалась же скользящая с `close` последнего бара —
+    то есть с текущей ценой, которая не есть ни ТВХ, ни цель. ТВХ курс определяет
+    отдельным термином (стр. 4: «ТВХ – Точка Входа в позицию – то есть цена открытия
+    сделки»), и ПОК-вход стоит лимиткой в стороне от текущей цены (стр. 30) — значит
+    прежняя мера отвечала на вопрос, которого курс не задавал.
+
+    Порога «совпадает» здесь НЕТ намеренно: числа для него не даёт ни курс, ни классика,
+    а придуманный порог был бы фильтром поверх непроверенного входа. Печатаются
+    расстояния, решение остаётся человеку.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     ma_value: float
     entry: float
-    distance_pct: float
+    target: float | None
+    """Цель сделки — «точка выхода» стр. 69. `None` — цели у сетапа нет."""
+
+    distance_entry_pct: float
+    distance_target_pct: float | None
+    nearest_pct: float
+    """Ближайшее из двух расстояний: курс требует совпадения с ЛЮБОЙ из двух точек."""
+
+
+class TrendlineKind(StrEnum):
+    SUPPORT_BROKEN = "support_broken"
+    """Восходящая трендовая по лоям индикатора пробита ВНИЗ (стр. 67, случай автора)."""
+
+    RESISTANCE_BROKEN = "resistance_broken"
+    """Нисходящая трендовая по хаям индикатора пробита ВВЕРХ — зеркальный случай."""
+
+
+class TrendlineBreak(BaseModel):
+    """Пробой трендовой линии, построенной ПО САМОМУ ИНДИКАТОРУ (стр. 67).
+
+    Курс дословно: «RSI можно использовать, что бы найти наличие
+    дивергенций/конвергенций. Также можно смотреть трендовые линии» — и дальше разбирает
+    случай: «Актив формировал структуру с приоритетом выхода вверх, но по RSI был пробой
+    трендовой, пробой случился заранее еще в структуре». Корпус подтверждает по рисунку:
+    трендовая нарисована на панели RSI, не на цене (research/prizrak_corpus/course_notes/
+    notes_p52-69.md, стр. 67).
+
+    КАК строится линия, курс не говорит — это добирается из классики (§0.1):
+      StockCharts ChartSchool, Trend Lines: "It takes two points to draw a trend line,
+      and the third one confirms the validity"; "An uptrend line has a positive slope
+      and is formed by connecting two or more low points"; "A break below the uptrend
+      line indicates that net demand has weakened".
+    Две точки — минимум по источнику, и именно он здесь взят: третьего касания курс не
+    требует, а требовать его значило бы ужесточить правило автора.
+
+    Экстремумы индикатора ищутся ТЕМ ЖЕ фрактальным определением, что и свинги цены
+    (`swings.FRACTAL_BARS`, пять баров, экстремум на среднем) — другая конвенция на том
+    же графике означала бы две сущности под одним именем «экстремум».
+
+    Про «закрытие за линией» здесь нет отдельного условия и не может быть: RSI считается
+    ПО ЗАКРЫТИЮ, у него нет тени, и значение бара — уже закрытие.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: TrendlineKind
+    indicator: str
+    first_index: int
+    second_index: int
+    first_value: float
+    second_value: float
+    line_value: float
+    """Куда линия пришла на последнем баре."""
+
+    last_value: float
+    """Значение индикатора на последнем баре — оно и оказалось за линией."""
 
 
 def divergences(
@@ -233,36 +345,155 @@ def divergences(
     return tuple(out)
 
 
-def squeeze(upper: list[float | None], lower: list[float | None],
-            middle: list[float | None]) -> SqueezeFactor | None:
-    """Сужение полос на последнем баре и его место в собственной истории (стр. 68).
+def band_narrowing(upper: list[float | None], lower: list[float | None],
+                   middle: list[float | None],
+                   close: list[float]) -> BandNarrowingFactor | None:
+    """Сужение полос на последнем баре, его место в истории и СРОК выхода (стр. 68).
 
-    `None` — ширину на последнем баре посчитать не из чего. Это не «широко».
+    `None` — ширину НА ПОСЛЕДНЕМ баре посчитать не из чего. Это не «широко».
+
+    Срок считается так: бар-случай — тот, чья ширина не больше текущей и чей `close`
+    внутри полос (бар, уже вышедший за полосу, — не накопление); ожидание — расстояние
+    в барах до первого следующего закрытия за полосой. Медиана этих ожиданий и есть
+    ответ на «как скоро», а `exit_cases` — сколько их было.
     """
-    widths: list[float] = []
+    widths: list[float | None] = []
     for u, low, m in zip(upper, lower, middle, strict=True):
         if _absent(u) or _absent(low) or _absent(m) or m == 0:
+            widths.append(None)
             continue
         assert u is not None and low is not None and m is not None
         widths.append((u - low) / m * 100)
-    if not widths:
+    last = widths[-1] if widths else None
+    if last is None:
         return None
-    last = widths[-1]
-    return SqueezeFactor(
+    known = [w for w in widths if w is not None]
+
+    n = len(widths)
+    # Выход по Боллинджеру — закрытие ЗА полосой. Ближайший такой бар справа ищется
+    # одним проходом назад: иначе на каждый случай пришлось бы сканировать хвост, и
+    # цена вопроса стала бы квадратичной по длине ряда.
+    outside: list[bool] = []
+    for i in range(n):
+        u, low = upper[i], lower[i]
+        if _absent(u) or _absent(low):
+            outside.append(False)
+            continue
+        assert u is not None and low is not None
+        outside.append(close[i] > u or close[i] < low)
+    next_out: list[int | None] = [None] * n
+    nxt: int | None = None
+    for i in range(n - 1, -1, -1):
+        if outside[i]:
+            nxt = i
+        next_out[i] = nxt
+    waits: list[int] = []
+    for i in range(n - 1):
+        w, out_at = widths[i], next_out[i]
+        if w is None or outside[i] or w > last or out_at is None:
+            continue
+        waits.append(out_at - i)
+
+    return BandNarrowingFactor(
         width_pct=last,
-        percentile=sum(1 for w in widths if w <= last) / len(widths) * 100,
+        percentile=sum(1 for w in known if w <= last) / len(known) * 100,
+        exit_bars_median=statistics.median(waits) if waits else None,
+        exit_cases=len(waits),
     )
 
 
-def ma_touch(ma: list[float | None], entry: float) -> MaTouchFactor | None:
-    """MA200 против точки входа (стр. 69). `None` — MA ещё не определена.
+def ma_touch(ma: list[float | None], entry: float,
+             target: float | None) -> MaTouchFactor | None:
+    """MA200 против ТВХ и цели (стр. 69). `None` — MA ещё не определена.
 
     Не определена — это и `None`, и `NaN`: см. `_absent`. Раньше проверялся только
     `None`, и карточка печатала «EMA200 в nan% от цены».
+
+    ⚠ Второй аргумент — ЦЕНА ВХОДА, а не последняя цена: вызов с `bars[-1].close`
+    отвечает не на тот вопрос (см. докстроку `MaTouchFactor`).
     """
     last = ma[-1] if ma else None
     if _absent(last) or entry == 0:
         return None
     assert last is not None
-    return MaTouchFactor(ma_value=last, entry=entry,
-                         distance_pct=abs(last - entry) / entry * 100)
+    d_entry = abs(last - entry) / entry * 100
+    d_target = None if target is None or target == 0 else abs(last - target) / target * 100
+    return MaTouchFactor(
+        ma_value=last, entry=entry, target=target,
+        distance_entry_pct=d_entry, distance_target_pct=d_target,
+        nearest_pct=d_entry if d_target is None else min(d_entry, d_target),
+    )
+
+
+def _fractal_pivots(values: list[float | None], lows: bool) -> list[int]:
+    """Индексы фрактальных экстремумов РЯДА ИНДИКАТОРА (та же конвенция, что у свингов).
+
+    Пять баров, экстремум на среднем, соседи строго слабее — `swings.FRACTAL_BARS` и
+    три источника в шапке `swings.py`. Бар с неизвестным значением в окне экстремума не
+    даёт: сравнивать с NaN значит молча получить «экстремума нет» (`_absent`).
+    """
+    wing = FRACTAL_BARS // 2
+    out: list[int] = []
+    for i in range(wing, len(values) - wing):
+        window = values[i - wing:i + wing + 1]
+        if any(_absent(v) for v in window):
+            continue
+        mid = values[i]
+        assert mid is not None
+        side = [v for j, v in enumerate(window) if j != wing]
+        if all(v is not None and (v > mid if lows else v < mid) for v in side):
+            out.append(i)
+    return out
+
+
+def trendline_breaks(values: list[float | None], name: str) -> tuple[TrendlineBreak, ...]:
+    """Пробой трендовой по самому индикатору на ПОСЛЕДНЕМ баре (стр. 67).
+
+    Линия строится по двум последним фрактальным экстремумам одной стороны и требует
+    наклона в свою сторону: восходящая поддержка — лои растут, нисходящее сопротивление
+    — хаи падают. Линия, которую значения индикатора уже пересекали МЕЖДУ её точками,
+    не считается линией: классика строит трендовую так, чтобы ряд держался с одной её
+    стороны, — иначе «пробой» на последнем баре был бы не первым.
+    """
+    out: list[TrendlineBreak] = []
+    if len(values) < FRACTAL_BARS + 1:
+        return ()
+    last = values[-1]
+    if _absent(last):
+        return ()
+    assert last is not None
+    n = len(values)
+    for kind in (TrendlineKind.SUPPORT_BROKEN, TrendlineKind.RESISTANCE_BROKEN):
+        on_lows = kind is TrendlineKind.SUPPORT_BROKEN
+        piv = _fractal_pivots(values, lows=on_lows)
+        if len(piv) < 2:
+            continue
+        i1, i2 = piv[-2], piv[-1]
+        v1, v2 = values[i1], values[i2]
+        assert v1 is not None and v2 is not None
+        if i2 <= i1 or i2 >= n - 1:
+            continue
+        if (v2 <= v1) if on_lows else (v2 >= v1):
+            continue
+        slope = (v2 - v1) / (i2 - i1)
+
+        def line(i: int, *, _v1: float = v1, _i1: int = i1, _s: float = slope) -> float:
+            return _v1 + _s * (i - _i1)
+
+        pierced = False
+        for j in range(i1 + 1, i2):
+            v = values[j]
+            if v is None or math.isnan(v):
+                continue
+            if (v < line(j)) if on_lows else (v > line(j)):
+                pierced = True
+                break
+        if pierced:
+            continue
+        here = line(n - 1)
+        if (last < here) if on_lows else (last > here):
+            out.append(TrendlineBreak(
+                kind=kind, indicator=name, first_index=i1, second_index=i2,
+                first_value=v1, second_value=v2, line_value=here, last_value=last,
+            ))
+    return tuple(out)

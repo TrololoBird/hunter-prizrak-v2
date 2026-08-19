@@ -1,4 +1,4 @@
-"""Геометрия сделки §2.7. Источник — мини-курс, стр. 9, 19, 24, 30, 33, 18.
+"""Геометрия сделки §2.7. Источник — мини-курс, стр. 9, 14-16, 18-19, 24, 30, 33, 35-39, 43-44.
 
 ЧИСТЫЙ МОДУЛЬ (§10.3): часы, сеть и глобальное состояние не трогаются.
 
@@ -15,6 +15,13 @@
            Уровни ТФ-2 (15м и ниже) обычно не берутся в расчет»
   стр. 19  «По верхней границе делаете тейк 50% — но не 100%»
   стр. 9   «Золотым стандартом считаются сделки с РР 1к3 и выше»
+  стр. 14  б/у: «Безубыток (БУ) – это когда цена вернулась к точке открытия сделки»
+  стр. 19  б/у: «Цена показала реакцию и ушла внутрь базы – ставите стоп в б/у»
+  стр. 19  добор: «добираете снова те же 50% позиции»
+  стр. 44  б/у: «быть готовым выйти в б/у при пробое уровня – на ретесте»
+  стр. 24  доливка: «долить к текущей позиции» — на новом уровне после взятия цели
+  стр. 35  стоповый: «на тесте данного уровня мы и открываем позицию»
+  стр. 39  стоповый: «ТВХ позиции от уровня Стопового, цель - верхняя граница»
 
 Проценты здесь допустимы вопреки §4.1: он сам делает исключение для величин, которые курс
 задаёт в процентах прямо, и называет ровно этот случай — стоп 1-3% за структуру.
@@ -36,6 +43,7 @@ from .levels import (
     StopAnchorSource,
 )
 from .levels import nested as nested_levels
+from .models import NotReady
 from .pereprior import Pereprior, PPSide
 
 TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
@@ -51,13 +59,36 @@ STOP_MARGIN_MAX_PCT = 3.0
 """
 
 PARTIAL_TAKE_PCT = 50.0
-"""Стр. 19: «делаете тейк 50% — но не 100%». Число названо курсом прямо."""
+"""Стр. 19: «делаете тейк 50% - но не 100%». Число названо курсом прямо."""
+
+BOUNDARY_TAKE_MIN_PCT = 30.0
+BOUNDARY_TAKE_MAX_PCT = 50.0
+"""Стр. 39: «цель - верхняя граница, где кроем часть 30-50%». Курс даёт ДИАПАЗОН."""
+
+ADD_ON_SHARE_PCT = 50.0
+"""Стр. 19: «добираете снова те же 50% позиции» — доля ДОБОРА, а не тейка."""
 
 GOLDEN_RR = 3.0
 """Стр. 9: «Золотым стандартом считаются сделки с РР 1к3 и выше». Не гейт, а отметка."""
 
-BIG_STRUCTURE_TFS = frozenset({"1d", "1w"})
-"""Стр. 30: крупное накопление — закуп делить на зону И уровень. Мелкое — одним ордером."""
+BIG_STRUCTURE_TFS = frozenset({"1d", "1w", "1M"})
+"""ТФ, на которых закуп делится на зону И уровень — стр. 30.
+
+стр. 30: «Если накопление очень большое ТФ 1Д-1Н-1М - то закуп всегда стоит делить на
+зону и на уровень».
+
+стр. 30: «Если накопление маленькое - 5м-1ч – эффективнее входить 1 ордером от уровня».
+
+Список взят у курса буквально, вместе с 1М, которого проект не собирает: копия,
+отредактированная под собранные ТФ, перестала бы быть цитатой.
+
+⚠ 4ч курс не называет НИ В ОДНОЙ из двух раскладок. РЕШЕНИЕ (2026-08-19): 4ч идёт к
+одному ордеру, то есть к мелкой раскладке. Опора текстовая, а не замер — стр. 19
+называет 4ч содержимым крупной базы: «в крупной базе 1Д-1Н ТФ – имеет смысл делать
+частичные тейки», и примером таких тейков там стоят 4ч уровни ВНУТРИ базы 1Д-1Н. То
+есть сам 4ч крупным накоплением курс не считает. Решение переворачивается добавлением
+"4h" в этот набор и ничем больше.
+"""
 
 
 class StopBasis(StrEnum):
@@ -102,6 +133,59 @@ class TargetRole(StrEnum):
     INTERMEDIATE = "intermediate"
     """ТФ-1: «промежуточные цели с небольшими тейками» (стр. 24)."""
 
+    BOUNDARY = "boundary"
+    """Граница базы как цель: стр. 19 (тейк по верхней границе) и стр. 39.
+
+    Роль заведена 2026-08-19 вместе с долями тейка: доля у этой цели своя, и без роли
+    её пришлось бы назначать вызывающему. `build_targets` эту роль не порождает —
+    он работает по уровням пула; её ставит сделка от стопового объёма (стр. 39).
+    """
+
+
+class TakeShare(BaseModel):
+    """Какую ЧАСТЬ позиции курс велит крыть на этой цели. Заведено 2026-08-19.
+
+    До этого доля жила одним полем `Setup.partial_take_pct` на всю сделку, и его не
+    читал никто. Курс же задаёт долю ПО РОЛИ цели, и в трёх местах по-разному: 50%
+    на границе (стр. 19), 30-50% на границе в сделке от стопового (стр. 39), а на
+    промежуточных — стр. 24 — «небольшими тейками», без числа вовсе.
+
+    `min_pct is None` — доля курсом НЕ НАЗВАНА. Это отказ с причиной в `note`, а не
+    ноль и не подставленное число (§4.3).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_pct: float | None
+    max_pct: float | None
+    note: str
+
+
+def take_share(role: TargetRole, *, first: bool = True) -> TakeShare:
+    """Доля фиксации по роли цели И ПО ПОРЯДКУ. Все ответы — из курса, своих чисел нет.
+
+    ⚠ `first` заведён 2026-08-19 по чтению карточки ГЛАЗАМИ: без него доля 50%
+    печаталась на КАЖДОЙ основной цели, а их у 5м-уровня шесть — в сумме 300%
+    позиции. Курс на стр. 19 называет 50% ровно один раз и ровно для первой цели:
+    «По верхней границе – делаете тейк 50% - но не 100%», то есть на встречной
+    границе, к которой цена идёт первой. Долей ОСТАЛЬНЫХ целей курс не называет
+    нигде, и подставлять её нельзя — остаток позиции ведётся по стр. 15 (тейки по
+    достигнутым целям и стоп в б/у), а не по выдуманному проценту.
+    """
+    if role is TargetRole.INTERMEDIATE:
+        return TakeShare(min_pct=None, max_pct=None,
+                         note="стр. 24: «промежуточные цели с небольшими тейками» — "
+                              "доли курс не называет")
+    if role is TargetRole.BOUNDARY:
+        return TakeShare(min_pct=BOUNDARY_TAKE_MIN_PCT, max_pct=BOUNDARY_TAKE_MAX_PCT,
+                         note="стр. 39: «цель - верхняя граница, где кроем часть 30-50%»")
+    if not first:
+        return TakeShare(min_pct=None, max_pct=None,
+                         note="доли курс не называет: 50% на стр. 19 сказано про ПЕРВУЮ "
+                              "цель; остаток ведётся по стр. 15")
+    return TakeShare(min_pct=PARTIAL_TAKE_PCT, max_pct=PARTIAL_TAKE_PCT,
+                     note="стр. 19: «делаете тейк 50% - но не 100%»")
+
 
 class Target(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -110,6 +194,118 @@ class Target(BaseModel):
     price: Decimal
     timeframe: str
     distance_pct: float
+    take: TakeShare
+    """Доля фиксации ИМЕННО НА ЭТОЙ цели — `take_share(role)`."""
+
+
+class EntryOrderKind(StrEnum):
+    """Куда ставится лимитка входа. Стр. 30 называет ровно два адреса."""
+
+    ZONE = "zone"
+    """На объёмную зону уровня — ближний её край по ходу цены.
+
+    Стр. 30: «используем 2-3 ордера, на зону, и на уровень ПОК» — и делается это,
+    словами той же строки, чтобы ордер точно забрало.
+    Ближний край, а не дальний, потому что смысл ордера — быть забранным
+    даже если до ПОК цена не дошла; там же стр. 30 про ПОК: «немного выше/ниже, т.к.
+    идеально может не доходить».
+    """
+
+    POC = "poc"
+    """На уровень ПОК — стр. 30: «надежнее всего брать от уровня ПОК»."""
+
+
+class EntryOrder(BaseModel):
+    """Одна лимитка входа. Заведено 2026-08-19 ВМЕСТО булева флага `split_orders`.
+
+    Флаг сообщал «дробим/не дробим», а вход всё равно оставался одной ценой: ордера НА
+    ЗОНУ не существовало ни в карточке, ни в сигнале, то есть половина правила стр. 30
+    была объявлена, но не исполнена. Здесь список цен, и `split_orders` стал его видом
+    сверху, а не отдельной сущностью.
+
+    Долей МЕЖДУ ордерами курс не даёт (стр. 30 говорит «2-3 ордера» и не делит объём),
+    поэтому поля доли здесь нет: пустое поле выглядело бы как известная величина.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: EntryOrderKind
+    price: Decimal
+
+
+class BreakevenTrigger(StrEnum):
+    """Когда стоп переводится в безубыток. Все три случая названы курсом."""
+
+    REACTION_INSIDE_BASE = "reaction_inside_base"
+    """Стр. 19: «Цена показала реакцию и ушла внутрь базы – ставите стоп в б/у»."""
+
+    PARTIAL_TAKE_DONE = "partial_take_done"
+    """Стр. 15: «Вы сделали тейки по достигнутым целям и передвинули стоп в бу».
+
+    То же на стр. 16 после доливки: «вы передвигаете стоп в безубыток».
+    """
+
+    LEVEL_BREACH_RETEST = "level_breach_retest"
+    """Стр. 44: «быть готовым выйти в б/у при пробое уровня – на ретесте».
+
+    Тот же случай стр. 43 обоими вариантами: «Мы закрываем позицию в БУ».
+    """
+
+
+class BreakevenRule(BaseModel):
+    """Условие перевода стопа в б/у и цена, на которой оно проверяется.
+
+    Заведено 2026-08-19: безубытка в проекте не было ВОВСЕ, хотя курс называет его на
+    пяти страницах и делает основным способом выйти из сделки, пошедшей не по сценарию.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    trigger: BreakevenTrigger
+    watch_price: Decimal
+    """Цена, достижение которой и есть условие. Куда переносится стоп — `breakeven_price`."""
+
+    note: str
+    """Слова курса, которыми условие задано, вместе со страницей."""
+
+
+class AddOnKind(StrEnum):
+    """Виды доливки/добора. Стр. 16: «метод усиления уже имеющейся позиции на рынке»."""
+
+    RETURN_TO_ENTRY = "return_to_entry"
+    """Возврат цены к своему же уровню после частичного тейка.
+
+    Стр. 19: «Если цена возвращается - и нет доп факторов за разворот – добираете снова
+    те же 50% позиции».
+    """
+
+    NEW_LEVEL_AFTER_TAKE = "new_level_after_take"
+    """Новый уровень, сформированный ПОСЛЕ взятия цели, — стр. 24 и 16.
+
+    Стр. 24, второе из трёх прав на таком уровне: «долить к текущей позиции».
+    Цена известна не будет: уровня в момент постройки сетапа ещё нет.
+    """
+
+
+class AddOn(BaseModel):
+    """Доливка как ЭЛЕМЕНТ СЕТАПА, а не как совет в тексте. Заведено 2026-08-19.
+
+    `price is None` — курс называет МЕСТО доливки словами, а цены в момент постройки
+    сделки не существует (новый уровень стр. 24 ещё не сформирован). Это отказ с
+    причиной в `note`, а не пропуск (§4.3).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: AddOnKind
+    price: Decimal | None
+    trigger_price: Decimal | None
+    """Что должно случиться РАНЬШЕ доливки — обычно взятие первой цели (стр. 16, 19, 24)."""
+
+    share_pct: float | None
+    """Доля добора. None — курс её для этого вида не называет."""
+
+    note: str
 
 
 class Setup(BaseModel):
@@ -123,8 +319,18 @@ class Setup(BaseModel):
 
     entry_zone_lo: Decimal
     entry_zone_hi: Decimal
-    split_orders: bool
-    """Стр. 30: крупная база — делить закуп на зону и уровень; мелкая — один ордер."""
+
+    entry_orders: tuple[EntryOrder, ...]
+    """Лимитки входа, В ПОРЯДКЕ ВСТРЕЧИ ЦЕНОЙ (стр. 30). Пустым не бывает."""
+
+    @property
+    def split_orders(self) -> bool:
+        """Дробится ли закуп — стр. 30. Теперь это ВИД на `entry_orders`, а не поле.
+
+        Пока флаг был отдельным полем, он говорил «дробим», а печаталась одна цена
+        входа: сущностей было две, и расходиться они могли молча.
+        """
+        return len(self.entry_orders) > 1
 
     ladder: tuple[Decimal, ...]
     """Все уровни внутри большой структуры, снизу вверх (стр. 32).
@@ -172,7 +378,24 @@ class Setup(BaseModel):
     """
 
     targets: tuple[Target, ...]
-    partial_take_pct: float = PARTIAL_TAKE_PCT
+
+    breakeven_rules: tuple[BreakevenRule, ...]
+    """Условия перевода стопа в б/у, словами курса (стр. 15, 19, 44). Порядок постоянен."""
+
+    add_ons: tuple[AddOn, ...]
+    """Доливка и добор (стр. 16, 19, 24). Пусто — цели нет, добирать не после чего."""
+
+    @property
+    def breakeven_price(self) -> Decimal:
+        """Цена б/у — стр. 14: «Безубыток (БУ) – это когда цена вернулась к точке
+        открытия сделки».
+
+        Это ПОК уровня, он же `entry`. При делённом закупе (`entry_orders`) настоящая
+        точка открытия — средняя цена ИСПОЛНЕННЫХ лимиток, но долей между ордерами
+        курс не даёт (стр. 30 говорит «2-3 ордера» и не делит объём), поэтому планом
+        она не считается: назначить доли значило бы выдумать число.
+        """
+        return self.entry
 
     def rr(self, stop: Decimal | None = None) -> float | None:
         """РР до ПЕРВОЙ цели (стр. 9). None — целей нет, а не «ноль».
@@ -270,8 +493,19 @@ def build_targets(level: Level, pool: tuple[MappedLevel, ...]) -> tuple[Target, 
             continue
         role = TargetRole.INTERMEDIATE if step == 1 else TargetRole.PRIMARY
         out.append(Target(role=role, price=other.price, timeframe=other.timeframe,
-                          distance_pct=float(abs(other.price - entry) / entry * 100)))
-    return tuple(sorted(out, key=lambda t: t.distance_pct))
+                          distance_pct=float(abs(other.price - entry) / entry * 100),
+                          take=take_share(role)))
+    # Доля назначается ПОСЛЕ сортировки: «первая цель» стр. 19 — та, к которой цена
+    # придёт раньше всех, то есть ближайшая ко входу, а не первая по порядку обхода пула.
+    ordered = sorted(out, key=lambda t: t.distance_pct)
+    seen_primary = False
+    final: list[Target] = []
+    for t in ordered:
+        first = False
+        if t.role is TargetRole.PRIMARY and not seen_primary:
+            first, seen_primary = True, True
+        final.append(t.model_copy(update={"take": take_share(t.role, first=first)}))
+    return tuple(final)
 
 
 RR_EMIT_MIN = 3.0
@@ -300,6 +534,88 @@ def risk_reward(setup: Setup) -> float | None:
     if risk == 0:
         return None
     return float(abs(primary[0].price - setup.entry) / risk)
+
+
+def build_entry_orders(level: Level) -> tuple[EntryOrder, ...]:
+    """Лимитки входа по стр. 30 — конкретные цены, а не признак «дробим».
+
+    Мелкое накопление — один ордер на ПОК. Крупное (`BIG_STRUCTURE_TFS`) — два: на
+    ближний по ходу цены край объёмной зоны и на ПОК. Порядок — тот, в котором цена
+    их встретит: для лонга она подходит сверху, для шорта снизу.
+
+    Курс говорит «2-3 ордера», а адресов называет два — «на зону, и на уровень ПОК»
+    (стр. 30). Третьей цены здесь нет: её курс не называет, и придумывать её нельзя.
+
+    Совпадение края зоны с ПОК (зона выродилась в точку) даёт один ордер, а не два
+    одинаковых.
+    """
+    poc = EntryOrder(kind=EntryOrderKind.POC, price=level.price)
+    if level.timeframe not in BIG_STRUCTURE_TFS:
+        return (poc,)
+    near = level.zone_hi if level.side is LevelSide.LONG else level.zone_lo
+    if near == level.price:
+        return (poc,)
+    return (EntryOrder(kind=EntryOrderKind.ZONE, price=near), poc)
+
+
+def build_breakeven_rules(
+    *, inside_base: Decimal, level_price: Decimal, first_take: Decimal | None,
+) -> tuple[BreakevenRule, ...]:
+    """Условия перевода стопа в безубыток. Стр. 15, 19, 43, 44.
+
+    `inside_base` — цена, по которой видно, что «цена показала реакцию и ушла внутрь
+    базы» (стр. 19). Курс эту фразу не оцифровывает; РЕШЕНИЕ (2026-08-19): берётся
+    ДАЛЬНИЙ по ходу сделки край объёмной зоны входа — за ним позиция уже набрана вся,
+    и цена вышла из области набора внутрь базы. Решение меняется одним аргументом.
+
+    `first_take` — цена ближайшей цели; None (целей нет) убирает правило стр. 15, но
+    не остальные: б/у по стр. 19 и 44 от целей не зависит.
+
+    ⚠ Цены правил встречаются и НА ПОДХОДЕ к уровню: `inside_base` — это тот же край
+    зоны, через который цена входит, а `level_price` — сама ТВХ. Правила смотрят на
+    них только ПОСЛЕ набора позиции: это сопровождение открытой сделки, а не вход.
+    """
+    out = [
+        BreakevenRule(
+            trigger=BreakevenTrigger.REACTION_INSIDE_BASE, watch_price=inside_base,
+            note="стр. 19: «Цена показала реакцию и ушла внутрь базы – ставите стоп в б/у»"),
+    ]
+    if first_take is not None:
+        out.append(BreakevenRule(
+            trigger=BreakevenTrigger.PARTIAL_TAKE_DONE, watch_price=first_take,
+            note="стр. 15: «Вы сделали тейки по достигнутым целям и передвинули стоп в бу»"))
+    out.append(BreakevenRule(
+        trigger=BreakevenTrigger.LEVEL_BREACH_RETEST, watch_price=level_price,
+        note="стр. 44: «быть готовым выйти в б/у при пробое уровня – на ретесте»"))
+    return tuple(out)
+
+
+def build_add_ons(
+    *, entry: Decimal, first_take: Decimal | None, repeat_share_pct: float | None,
+) -> tuple[AddOn, ...]:
+    """Доливка и добор. Стр. 16, 19, 24.
+
+    Оба вида идут ПОСЛЕ взятия цели — так их и описывает курс, — поэтому без цели
+    список пуст: добирать не после чего, и молчаливой доливки «когда-нибудь» не бывает.
+
+    `repeat_share_pct` — доля повторного добора на своём же уровне. 50% там, где курс
+    называет число (стр. 19); None там, где не называет (стр. 39: «с низу каждый раз
+    повторно откупаем», доли нет).
+    """
+    if first_take is None:
+        return ()
+    share_note = ("стр. 19: «добираете снова те же 50% позиции»"
+                  if repeat_share_pct is not None
+                  else "стр. 39: «с низу каждый раз повторно откупаем» — доли курс не даёт")
+    return (
+        AddOn(kind=AddOnKind.RETURN_TO_ENTRY, price=entry, trigger_price=first_take,
+              share_pct=repeat_share_pct,
+              note=share_note + "; условие стр. 19: нет доп факторов за разворот"),
+        AddOn(kind=AddOnKind.NEW_LEVEL_AFTER_TAKE, price=None, trigger_price=first_take,
+              share_pct=None,
+              note="стр. 24: на новом уровне после коррекции можно «долить к текущей "
+                   "позиции» — цена уровня в момент постройки сделки не существует"),
+    )
 
 
 def build_setup(
@@ -437,12 +753,14 @@ def build_setup(
             stop, basis = anchored, StopBasis.ANCHOR
     else:
         stop, basis = floor, StopBasis.MARGIN
+    targets = build_targets(level, pool)
+    first_take = targets[0].price if targets else None
     return Setup(
         level=level,
         entry=level.price,
         entry_zone_lo=level.zone_lo,
         entry_zone_hi=level.zone_hi,
-        split_orders=level.timeframe in BIG_STRUCTURE_TFS,
+        entry_orders=build_entry_orders(level),
         ladder=tuple(sorted({level.price, *(x.price for x in inner)})),
         stop_safe_near=with_margin(margin_min_pct),
         stop_safe_far=with_margin(margin_max_pct),
@@ -450,10 +768,155 @@ def build_setup(
         stop=stop,
         stop_basis=basis,
         structural_anchor=anchor,
-        targets=build_targets(level, pool),
+        targets=targets,
+        breakeven_rules=build_breakeven_rules(
+            # «Внутрь базы» (стр. 19) — дальний по ходу сделки край зоны входа.
+            inside_base=level.zone_hi if up else level.zone_lo,
+            level_price=level.price, first_take=first_take),
+        add_ons=build_add_ons(entry=level.price, first_take=first_take,
+                              repeat_share_pct=ADD_ON_SHARE_PCT),
     )
 
 
+
+
+class StopVolumeSetup(BaseModel):
+    """ОТДЕЛЬНАЯ сделка от уровня стопового объёма. Стр. 35, 37, 39.
+
+    ⚠ Заведено 2026-08-19. До этого стоповый объём участвовал в расчёте ровно одним
+    способом — как якорь стопа сделки от основного уровня, — тогда как курс говорит о
+    нём как о самостоятельной точке входа: стр. 35 «После выхода из стопового вверх, у
+    нас также появляется уровень в лонг, на тесте данного уровня мы и открываем
+    позицию». Там же курс прямо разводит две сделки: «Также снизу у нас есть уровень
+    лонговый всего накопления, он также актуален и от него берем позицию в лонг», а
+    стр. 37 называет нижнее накопление «отдельный трейд». Поэтому это отдельная модель,
+    а `Setup` от основного уровня не меняется ни на йоту.
+
+    Состав по курсу:
+      * ТВХ — ПОК стопового: стр. 39 «ТВХ позиции от уровня Стопового»;
+      * стоп — за границу стопового: стр. 37 «со стопом за границу стопового», запас
+        3% по общему правилу стр. 58 (`DEFAULT_MARGIN_PCT`);
+      * цель — граница базы по ходу сделки: стр. 39 «цель - верхняя граница»,
+        доля фиксации 30-50% (`TargetRole.BOUNDARY`);
+      * повторный откуп — стр. 39 «с низу каждый раз повторно откупаем», доли нет.
+
+    В эмиссию сигналов это НЕ идёт: новый тип сигнала меняет состав леджера — тот же
+    выбор, что у `PPSetup`, и он принимается отдельно.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    base: Level
+    """Основное накопление, от границы которого искался стоповый объём."""
+
+    level: Level
+    """Уровень САМОГО стопового объёма: его ПОК и есть ТВХ (стр. 39)."""
+
+    side: LevelSide
+    entry: Decimal
+    entry_orders: tuple[EntryOrder, ...]
+    stop: Decimal
+    stop_basis: StopBasis
+    target: Target
+    breakeven_rules: tuple[BreakevenRule, ...]
+    add_ons: tuple[AddOn, ...]
+
+    @property
+    def breakeven_price(self) -> Decimal:
+        """Стр. 14: б/у — точка открытия, здесь это ПОК стопового."""
+        return self.entry
+
+    @property
+    def rr(self) -> float | None:
+        """РР до границы базы (стр. 9). None — риск нулевой, а не «ноль»."""
+        risk = abs(self.entry - self.stop)
+        if risk == 0:
+            return None
+        return float(abs(self.target.price - self.entry) / risk)
+
+
+def stop_volume_level(base: Level, pool: tuple[MappedLevel, ...]) -> Level | NotReady:
+    """Уровень стопового объёма, за который спрятан стоп сделки от `base`.
+
+    Стоповый объём — накопление младшего ТФ (стр. 18, 34), поэтому его ПОК живёт в пуле
+    обычным уровнем. Связь с якорем восстанавливается по цене: якорь взят у ГРАНИЦЫ
+    стопового (`levels.stop_anchor`), значит искомый уровень — тот, чья коробка эту цену
+    содержит. Из подходящих берётся ближайший границей к якорю.
+
+    Отбор такой же, как у целей и лестницы: уровень обязан быть живым НА МОМЕНТ
+    появления базы, иначе сделка строилась бы от уровня, которого тогда ещё не было.
+
+    Сторона совпадает со стороной базы: стр. 35 говорит про выход из стопового ВВЕРХ,
+    после которого «появляется уровень в лонг», то есть в ту же сторону, что и сделка
+    от нижней границы накопления.
+    """
+    if base.stop_anchor_source is not StopAnchorSource.STOP_VOLUME or base.stop_anchor is None:
+        return NotReady(reason=f"{base.symbol} {base.timeframe}: стоп держится не на стоповом "
+                               f"объёме — сделки стр. 35/37/39 нет")
+    anchor = base.stop_anchor
+    up = base.side is LevelSide.LONG
+    best: Level | None = None
+    for mapped in pool:
+        lvl = mapped.level
+        step = _tf_step(base.timeframe, lvl.timeframe)
+        if lvl.symbol != base.symbol or lvl.side is not base.side:
+            continue
+        if step is None or step < 1 or not mapped.alive_at(base.created_at_ms):
+            continue
+        if not (lvl.boundary_lo <= anchor <= lvl.boundary_hi):
+            continue
+        if best is None or abs(_sv_edge(lvl, up) - anchor) < abs(_sv_edge(best, up) - anchor):
+            best = lvl
+    if best is None:
+        return NotReady(reason=f"{base.symbol} {base.timeframe}: ПОК стопового объёма у цены "
+                               f"{anchor} не построен — сделку от него не от чего строить")
+    return best
+
+
+def _sv_edge(lvl: Level, up: bool) -> Decimal:
+    """Граница стопового по ходу сделки: для лонга нижняя, для шорта верхняя (стр. 37)."""
+    return lvl.boundary_lo if up else lvl.boundary_hi
+
+
+def build_stop_volume_setup(
+    base: Level, pool: tuple[MappedLevel, ...] = (),
+) -> StopVolumeSetup | NotReady:
+    """Сделка от стопового объёма (стр. 35, 37, 39) или НАЗВАННАЯ причина её отсутствия.
+
+    Сделку от основного уровня не трогает: `build_setup` вызывается отдельно и о
+    существовании этой не знает.
+    """
+    found = stop_volume_level(base, pool)
+    if isinstance(found, NotReady):
+        return found
+    up = base.side is LevelSide.LONG
+    entry = found.price
+    edge = _sv_edge(found, up)
+    sign = Decimal(-1) if up else Decimal(1)
+    stop = edge + sign * edge * Decimal(str(DEFAULT_MARGIN_PCT)) / Decimal(100)
+    goal = base.boundary_hi if up else base.boundary_lo
+    if (goal <= entry) if up else (goal >= entry):
+        return NotReady(reason=f"{base.symbol} {base.timeframe}: граница базы {goal} не впереди "
+                               f"ТВХ стопового {entry} — цели стр. 39 нет")
+    target = Target(role=TargetRole.BOUNDARY, price=goal, timeframe=base.timeframe,
+                    distance_pct=float(abs(goal - entry) / entry * 100),
+                    take=take_share(TargetRole.BOUNDARY))
+    return StopVolumeSetup(
+        base=base,
+        level=found,
+        side=base.side,
+        entry=entry,
+        entry_orders=build_entry_orders(found),
+        stop=stop,
+        stop_basis=StopBasis.MARGIN,
+        target=target,
+        breakeven_rules=build_breakeven_rules(
+            inside_base=found.zone_hi if up else found.zone_lo,
+            level_price=entry, first_take=goal),
+        # Стр. 39 велит откупать повторно, но доли для этого случая не называет —
+        # в отличие от стр. 19, где названы 50%.
+        add_ons=build_add_ons(entry=entry, first_take=goal, repeat_share_pct=None),
+    )
 
 
 class PPSetup(BaseModel):

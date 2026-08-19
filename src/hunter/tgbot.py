@@ -73,7 +73,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import FSInputFile, Message
 
-from . import clock, engine, log, pereprior, run, service, store, swings
+from . import clock, emit, engine, geometry, log, pereprior, run, service, store, swings
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, tf_ms
 from .card import TF_LABEL
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
@@ -535,6 +535,9 @@ class BuiltMap:
     zones: tuple[ZoneSpec, ...]
     built_at_ms: int
     seconds: float
+    notes: tuple[TradeNote, ...] = ()
+    """Как брать уровни этой карты (стр. 30, 14, 19, 46). Есть только здесь: решение,
+    из которого они считаются, при сборке по запросу под рукой, а в леджере его нет."""
 
 
 class OnDemand:
@@ -651,7 +654,8 @@ class OnDemand:
             return NotReady(reason=f"{symbol}: рядов не собрано — карта не строится")
         spent = (clock.monotonic_ns() - started) / 1e9
         built = BuiltMap(zones=zones_of(got, clock.now_ms()),
-                         built_at_ms=clock.now_ms(), seconds=spent)
+                         built_at_ms=clock.now_ms(), seconds=spent,
+                         notes=trade_notes(got))
         self._done[symbol] = built
         self.built += 1
         log.info("сборка по запросу завершена", символ=symbol, секунд=round(spent, 1),
@@ -979,10 +983,103 @@ def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
     return sorted(kept_zones, key=lambda z: _away(z, price))
 
 
+@dataclass(frozen=True, slots=True)
+class TradeNote:
+    """КАК брать конкретный уровень: лимитки, безубыток, доли тейка, ловушка ТФ.
+
+    Считается из решения (`engine.SymbolDecision`), поэтому существует только там, где
+    карта пересобрана по запросу: строка карты леджера этих величин не хранит, и
+    сочинять их по цене и зоне значило бы завести вторую сущность под теми же именами.
+    """
+
+    side: str
+    timeframe: str
+    price: float
+    text: str
+
+
+def _take_words(share: geometry.TakeShare) -> str:
+    """Доля фиксации словами. Курс её не назвал — так и говорится (§4.3)."""
+    if share.min_pct is None or share.max_pct is None:
+        return "долю курс не называет"
+    if share.min_pct == share.max_pct:
+        return f"крыть {share.min_pct:.0f}%"
+    return f"крыть {share.min_pct:.0f}-{share.max_pct:.0f}%"
+
+
+def trade_notes(decision: engine.SymbolDecision) -> tuple[TradeNote, ...]:
+    """По строке на каждый ЭМИТИРУЕМЫЙ уровень — то, что меняет решение читателя.
+
+    В сообщение попадает не всё: предел Telegram 4096 знаков (`TEXT_LIMIT`), поэтому
+    строка несёт четыре величины курса — лимитки входа (стр. 30), безубыток (стр. 14),
+    доли тейка (стр. 19, 24, 39) и предупреждение о ловушке ТФ (стр. 46). Остальное —
+    лестница, якорь стопа, картина отработки — остаётся карточке.
+    """
+    out: list[TradeNote] = []
+    for dec in decision.decisions:
+        setup = dec.setup
+        if setup is None:
+            continue
+        limits = " · ".join(
+            ("зона" if o.kind is geometry.EntryOrderKind.ZONE else "ПОК")
+            + f" {_fmt_price(float(o.price))}" for o in setup.entry_orders)
+        takes = "; ".join(f"{_fmt_price(float(t.price))} — {_take_words(t.take)}"
+                          for t in setup.targets) or "целей нет"
+        text = (f"лимитки: {limits} · б/у {_fmt_price(float(setup.breakeven_price))}"
+                f" (стр. 14) · тейк: {takes}")
+        if dec.counters:
+            # Числами, а не пересказом строки `tf_trap`: полный текст правила стр. 46
+            # живёт в карточке, здесь — сам факт и расстояние.
+            near = dec.counters[0]
+            text += (f" · ⚠ ловушка ТФ (стр. 46): встречный уровень "
+                     f"{TF_LABEL.get(near.timeframe, near.timeframe)} "
+                     f"{_fmt_price(float(near.price))}, {near.distance_pct:.1f}% от ПОК")
+        out.append(TradeNote(side=dec.level.side.value, timeframe=dec.level.timeframe,
+                             price=float(dec.level.price), text=text))
+    return tuple(out)
+
+
+_BUCKET_WORD = {
+    emit.TFBucket.JUNIOR: "МТФ (5м)",
+    emit.TFBucket.LOCAL: "локальные (15м-1ч)",
+    emit.TFBucket.SENIOR: "СТФ (4ч-1Д-1н)",
+}
+"""Корзины стр. 48 человеческими словами. Состав корзин берётся у `emit.TF_BUCKET` —
+таблица одна на проект, здесь только подписи."""
+
+
+def balance_line(rows: list[ZoneSpec]) -> str:
+    """Разбивка ПОКАЗАННЫХ уровней по корзинам стр. 48. Пусто — показывать нечего.
+
+    ⚠ Подвыборка названа прямо в строке: это счёт по уровням ЭТОЙ карты, а не по
+    эмиссиям прогона (их считает `emit.tf_balance` для карточки). Порога здесь нет и
+    быть не может — стр. 48 требует баланса, но числа не называет, а отсечка на выходе
+    спрятала бы ровно те уровни, по которым видно, верно ли считается расчёт.
+    """
+    if not rows:
+        return ""
+    counts: dict[emit.TFBucket, int] = {}
+    unlisted = 0
+    for z in rows:
+        bucket = emit.TF_BUCKET.get(z.timeframe)
+        if bucket is None:
+            unlisted += 1
+            continue
+        counts[bucket] = counts.get(bucket, 0) + 1
+    parts = [f"{_BUCKET_WORD[b]} {counts[b]}"
+             for b in (emit.TFBucket.JUNIOR, emit.TFBucket.LOCAL, emit.TFBucket.SENIOR)
+             if b in counts]
+    if unlisted:
+        parts.append(f"вне шкалы стр. 48 — {unlisted}")
+    return ("⚖ Баланс уровней этой карты (стр. 48): " + " · ".join(parts)
+            + " — курс велит держать баланс между МТФ, локальными и СТФ и не набирать "
+              "много отложек по МТФ; сколько считать многими, он не называет")
+
+
 def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                  origin: str, charts_missing: tuple[str, ...] = (), *,
                  price: float = 0.0, stale_min: int = 0, now_ms: int = 0,
-                 dominance: str = "") -> str:
+                 dominance: str = "", notes: tuple[TradeNote, ...] = ()) -> str:
     """Сводка ДЛЯ ЧИТАТЕЛЯ КАНАЛА. Устройство взято у автора, а не придумано.
 
     ⚠ ПЕРЕПИСАНО 2026-08-17 по разбору `docs/audit/bot-review-2026-08-17.md`. Прежняя
@@ -1017,6 +1114,11 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     `dominance` — готовая строка о доминации BTC (см. `Bot._dominance_line`); пустая —
     не печатается. Шаг взят у автора: видео 17.08.2026, ~1:14–1:36 — переход на график
     доминации как отдельный шаг разбора.
+
+    `notes` — как БРАТЬ ближайший уровень каждой стороны: лимитки (стр. 30), безубыток
+    (стр. 14), доли тейка (стр. 19, 24, 39), ловушка ТФ (стр. 46). Пустой кортеж —
+    карта пришла из леджера, где этих величин нет; это НАЗЫВАЕТСЯ служебной строкой, а
+    не выдаётся за их отсутствие у самих уровней (§4.3).
     """
     base = symbol.split("/")[0]
     live, unique, off_struct, flipped = live_unique(zones, price, now_ms)
@@ -1183,7 +1285,14 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                         key=lambda g: min(_away(z, price) for z in g))
         shown = groups[:ZONES_PER_SIDE]
         out = [title]
-        out += [span_line(g) for g in shown]
+        for i, g in enumerate(shown):
+            out.append(span_line(g))
+            # Подробности сделки — только у БЛИЖАЙШЕЙ группы стороны: предел Telegram
+            # 4096 знаков, а решение читатель принимает по тому уровню, к которому цена
+            # подходит первым. Остальное — в карточке.
+            note = _note_for(g, notes) if i == 0 else None
+            if note is not None:
+                out.append(f"   ↳ {note.text}")
         rest = groups[len(shown):]
         if rest:
             # Свёрнутый хвост НАЗЫВАЕТСЯ числом (§4.3): молчаливое сокращение списка
@@ -1228,9 +1337,19 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     # у призрака»: пост автора не носит легенду прибора). Но скрытое по-прежнему
     # НАЗЫВАЕТСЯ числом (§4.3): «уровня нет в списке» и «уровень скрыт» — разные
     # ответы, а молчаливое сокращение неотличимо от отсутствия в карте.
-    notes = []
+    tradable = [z for z in unique if not _passed(z, price)]
+    balance = balance_line(tradable)
+    if balance:
+        lines.append(balance)
+        lines.append("")
+
+    service_notes = []
+    if tradable and not notes:
+        # §4.3: «подробностей нет» и «подробности не считались» — разные ответы.
+        service_notes.append("как брать уровень (лимитки, б/у, доли тейка) — только при "
+                             "пересборке по запросу; эта карта взята из леджера")
     if hidden_dupes:
-        notes.append(f"{hidden_dupes} слились с соседями по зоне")
+        service_notes.append(f"{hidden_dupes} слились с соседями по зоне")
     if off_struct:
         note = f"{len(off_struct)} скрыто — структура старше кадра графика"
         # ⚠ СИЛЬНЕЙШИЙ ПО ОБЪЁМУ СРЕДИ СКРЫТЫХ — НАЗЫВАЕТСЯ (2026-08-19). Возрастной
@@ -1253,17 +1372,31 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                      f"({TF_LABEL.get(top_hidden.timeframe, top_hidden.timeframe)}, "
                      f"объём ×{top_hidden.vrvp_density:.1f} к среднему против "
                      f"×{shown_max:.1f} у показанных)")
-        notes.append(note)
+        service_notes.append(note)
     if flipped:
         # ⚠ Курс на стр. 43 этот класс торгует: «По возврату цены на ретест уровня -
         # открываем позицию и ставим СТОП за накопление». Значит «их нет в списке» и
         # «их не показывают» для читателя разные ответы, и второй обязан быть назван.
-        notes.append(f"{len(flipped)} пробитых не в списке — по стр. 43 они торгуются "
-                     f"ретестом с обратной стороны")
-    service = ("⚙ " + " · ".join(notes)) if notes else ""
+        service_notes.append(f"{len(flipped)} пробитых не в списке — по стр. 43 они "
+                             f"торгуются ретестом с обратной стороны")
+    service = ("⚙ " + " · ".join(service_notes)) if service_notes else ""
     tail = [x for x in (service, origin,
                         "Это карта уровней, а не торговая рекомендация.") if x]
     return _fit(lines + tail, len(tail))
+
+
+def _note_for(group: list[ZoneSpec], notes: tuple[TradeNote, ...]) -> TradeNote | None:
+    """Заметка того уровня группы, для которого она посчитана. `None` — заметок нет.
+
+    Сопоставление по тройке сторона+ТФ+цена: `ZoneSpec.price` и `TradeNote.price` оба
+    получены из `float(level.price)` одного и того же уровня, поэтому совпадают точно, а
+    не с допуском. Допуск здесь был бы порогом без источника.
+    """
+    for z in group:
+        for n in notes:
+            if n.side == z.side and n.timeframe == z.timeframe and n.price == z.price:
+                return n
+    return None
 
 
 def _fmt_age(minutes: int) -> str:
@@ -1399,6 +1532,10 @@ class Analysis:
     zones: tuple[ZoneSpec, ...]
     origin: str
 
+    notes: tuple[TradeNote, ...] = ()
+    """Как брать ближайший уровень каждой стороны. Пусто — карта из леджера, где этих
+    величин нет; сообщение называет это служебной строкой, а не молчит."""
+
     stale_min: int = 0
     """Возраст карты в минутах — ОТДЕЛЬНЫМ числом, а не только словами в `origin`.
 
@@ -1479,10 +1616,11 @@ class Delivery:
                    else "карта службы отстала")
             return Analysis(
                 symbol=symbol, zones=built.zones, stale_min=age_min,
+                notes=built.notes,
                 origin=f"Карта пересобрана по запросу {_fmt_age(age_min)} назад:"
                        f" {why}, посчитано заново.")
         return Analysis(
-            symbol=symbol, zones=built.zones, stale_min=age_min,
+            symbol=symbol, zones=built.zones, stale_min=age_min, notes=built.notes,
             origin=f"Карта собрана по запросу {_fmt_age(age_min)} назад: за этой монетой"
                    f" система постоянно не следит.")
 
@@ -1590,7 +1728,7 @@ class Delivery:
                 chat_id=chat,
                 text=compose_text(symbol, got.zones, pps, got.origin, tuple(missing),
                                   price=price, stale_min=got.stale_min, now_ms=now_ms,
-                                  dominance=dominance),
+                                  dominance=dominance, notes=got.notes),
                 reply_to_message_id=reply_to))
         self.answers += 1
         return True

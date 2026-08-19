@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
+from itertools import pairwise
 
 from pydantic import BaseModel, ConfigDict
 
@@ -102,8 +104,14 @@ def _test_index(bars: list[Bar], lo: float, hi: float, from_index: int) -> int |
 
 def _detect_side(
     bars: list[Bar], swings: SwingSet, side: PPSide, timeframe: str, confirm_bodies: int
-) -> Pereprior | None:
-    """Один ПП нужной стороны — самый поздний из подтверждённых."""
+) -> list[Pereprior]:
+    """ВСЕ подтверждённые ПП нужной стороны, в порядке подтверждения.
+
+    ⚠ Возвращает список с 2026-08-19, раньше возвращал последний. `detect` от этого не
+    изменился (он берёт тот же последний), а вот стр. 51 без списка не выражается вовсе:
+    «Иногда бывает истинный ПП и ранний ПП +- рядом» — двух ПП одной стороны в прежнем
+    выводе быть не могло по построению.
+    """
     broken_kind = SwingKind.LOW if side is PPSide.SHORT else SwingKind.HIGH
     other_kind = SwingKind.HIGH if side is PPSide.SHORT else SwingKind.LOW
     direction = Direction.BELOW if side is PPSide.SHORT else Direction.ABOVE
@@ -120,7 +128,7 @@ def _detect_side(
     ordered = sorted(swings.swings, key=lambda s: s.index)
     others = [s for s in ordered if s.kind is other_kind]
     if len(others) < 2:
-        return None
+        return []
 
     # ⚠ ДВА УКАЗАТЕЛЯ ВМЕСТО ФИЛЬТРА НА КАЖДОМ ШАГЕ — правка 2026-08-17 по живому
     # стеку (py-spy: decide жил здесь минутами на 5м-ряде в 51 тыс. баров). Прежний
@@ -131,7 +139,7 @@ def _detect_side(
     # Семантика тождественна (тот же candidates[-1]); дифф повтора пуст.
     brokens = [s for s in ordered if s.kind is broken_kind]
 
-    found: Pereprior | None = None
+    found: list[Pereprior] = []
     bi = 0
     for i in range(1, len(others)):
         prev_other, last_other = others[i - 1], others[i]
@@ -225,13 +233,13 @@ def _detect_side(
             # Прокол подтверждением не является (стр. 55) — переприора нет.
             continue
 
-        found = Pereprior(
+        found.append(Pereprior(
             kind=PPKind.TRUE if updated else PPKind.EARLY, side=side,
             broken_index=broken.index, broken_price=broken.price,
             zone_lo=lo, zone_hi=hi,
             confirmed_at_index=ev.resolved_index,
             tested_at_index=_test_index(bars, lo, hi, ev.resolved_index + 1),
-        )
+        ))
     return found
 
 
@@ -244,9 +252,85 @@ def detect(
     Не «все за историю»: ПП — это смена приоритета (стр. 49), и актуальна последняя.
     Обе стороны возвращаются, если обе нашлись, — выбирать между ними по одному лишь
     порядку было бы правилом, которого курс не даёт.
+
+    Для стр. 51 (истинный и ранний ПП рядом) последнего мало — там нужен `detect_all`.
+    """
+    out = [seq[-1] for side in (PPSide.SHORT, PPSide.LONG)
+           if (seq := _detect_side(bars, swings, side, timeframe, confirm_bodies))]
+    return tuple(out)
+
+
+def detect_all(
+    bars: list[Bar], swings: SwingSet, timeframe: str, *,
+    confirm_bodies: int = CONFIRM_BODIES,
+) -> tuple[Pereprior, ...]:
+    """ВСЕ подтверждённые переприоры обеих сторон, по возрастанию бара подтверждения.
+
+    Нужен там, где важна не последняя смена приоритета, а СОСЕДСТВО двух ПП: стр. 51
+    «Иногда бывает истинный ПП и ранний ПП +- рядом, тогда закуп лучше делить на 2 части».
+    `detect` для этого не годится — он отдаёт по одному ПП на сторону.
     """
     out = [pp for side in (PPSide.SHORT, PPSide.LONG)
-           if (pp := _detect_side(bars, swings, side, timeframe, confirm_bodies)) is not None]
+           for pp in _detect_side(bars, swings, side, timeframe, confirm_bodies)]
+    return tuple(sorted(out, key=lambda p: (p.confirmed_at_index, p.side.value)))
+
+
+SPLIT_PARTS = 2
+"""На сколько частей стр. 51 велит делить закуп: «закуп лучше делить на 2 части».
+
+Долей курс не называет, и они не выдумываются: делится ЧИСЛО частей, а не размер каждой.
+"""
+
+
+class SplitEntry(BaseModel):
+    """Истинный и ранний ПП одной стороны рядом — повод делить закуп (стр. 51).
+
+    ⚠ ПОРОГА БЛИЗОСТИ ЗДЕСЬ НЕТ, и это не недосмотр. Курс говорит «+- рядом» и числа не
+    даёт; отсечка по расстоянию была бы выдуманной и заодно спрятала бы ровно те пары,
+    по которым видно, верно ли считаются зоны. Поэтому признак ПЕЧАТАЕТ зазор, а решение
+    остаётся за читающим: `zones_overlap` — сильное прочтение «рядом» (зоны пересекаются,
+    входы совпадают), `gap_pct` — измеренное расстояние, когда не пересекаются.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    side: PPSide
+    true_pp: Pereprior
+    early_pp: Pereprior
+    parts: int = SPLIT_PARTS
+    bars_apart: int
+    """Сколько баров между подтверждениями обоих ПП."""
+
+    zones_overlap: bool
+    gap_pct: float
+    """Зазор между зонами в процентах цены; 0.0 при пересечении зон."""
+
+
+def split_entries(pps: Sequence[Pereprior]) -> tuple[SplitEntry, ...]:
+    """Пары «истинный + ранний» одной стороны, идущие подряд (стр. 51).
+
+    Подряд — значит между ними нет другого ПП той же стороны: у стр. 51 речь о ДВУХ
+    сломах одного движения, а не о любых двух за историю. Разные стороны в пару не
+    сводятся: они дают входы в разные стороны, делить между ними нечего.
+    """
+    out: list[SplitEntry] = []
+    for side in (PPSide.SHORT, PPSide.LONG):
+        seq = sorted((p for p in pps if p.side is side), key=lambda p: p.confirmed_at_index)
+        for first, second in pairwise(seq):
+            if first.kind is second.kind:
+                continue
+            true_pp = first if first.kind is PPKind.TRUE else second
+            early_pp = second if first.kind is PPKind.TRUE else first
+            gap = max(first.zone_lo, second.zone_lo) - min(first.zone_hi, second.zone_hi)
+            mid = (min(first.zone_lo, second.zone_lo) + max(first.zone_hi, second.zone_hi)) / 2
+            out.append(SplitEntry(
+                side=side,
+                true_pp=true_pp,
+                early_pp=early_pp,
+                bars_apart=abs(second.confirmed_at_index - first.confirmed_at_index),
+                zones_overlap=gap <= 0,
+                gap_pct=0.0 if gap <= 0 or mid == 0 else gap / mid * 100,
+            ))
     return tuple(out)
 
 

@@ -327,6 +327,20 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         ))
         for row in store.format_outcome_survey(survey):
             print(f"   {row}" if not row.startswith(" ") else row)
+        # Винрейт (стр. 9: «доля успешных/профитных сделок от общего числа сделок»).
+        # Печатается ТОЛЬКО со знаменателем: доля без числа закрытых сделок — это то
+        # самое «совпало N из M» без M, которое уже один раз соврало в этом проекте.
+        wr = store.win_rate(conn)
+        for row in store.format_win_rate(wr):
+            print(f"   {row}" if not row.startswith(" ") else row)
+        lines.append((
+            "Винрейт назван вместе со знаменателем (стр. 9)",
+            wr.total.win_rate_pct is not None,
+            (f"винрейт {wr.total.win_rate_pct:.1f}% при {wr.total.trades} закрытых "
+             f"сделках; отпечаток: {wr.fingerprint}"
+             if wr.total.win_rate_pct is not None else
+             "закрытых сделок нет — доля не считается, и это отказ, а не ноль"),
+        ))
         skewed = [c for c in survey.cells if c.closed == 0 and c.signals > 0]
         lines.append((
             "Исходы сведены по ТФ, стороне и типу сигнала",

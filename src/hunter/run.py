@@ -1506,9 +1506,14 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 no_target += 1
             side = (levels.LevelSide.LONG if p.direction == "long"
                     else levels.LevelSide.SHORT)
+            # Безубыток (стр. 19: «Цена показала реакцию и ушла внутрь базы – ставите
+            # стоп в б/у»). Порог взведения — ПЕРВАЯ цель: именно на ней курс велит
+            # крыть часть и двигать стоп (стр. 15). Цели нет — безубытка тоже нет, и
+            # это отказ с причиной, а не подставленный вход.
             res = outcome_resolve(
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
+                breakeven_at=p.target,
             )
             if res.kind.value in ("stop", "target", "ambiguous"):
                 assert res.closed_at_index is not None

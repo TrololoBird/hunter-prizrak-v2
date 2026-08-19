@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE TABLE IF NOT EXISTS outcomes (
     signal_id  INTEGER PRIMARY KEY REFERENCES signals(id),
-    kind       TEXT    NOT NULL CHECK (kind IN ('stop', 'target', 'ambiguous')),
+    kind       TEXT    NOT NULL CHECK (kind IN ('stop', 'target', 'ambiguous',
+                                                'breakeven')),
     closed_at  INTEGER NOT NULL,
     exit_price REAL,
     r          REAL,
@@ -171,8 +172,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
+знала три исхода, и `CHECK (kind IN …)` отклонил бы четвёртый — то есть сделка, вышедшая
+в ноль по правилу курса, либо не записалась бы вовсе, либо была бы записана стопом с
+R = −1. Прежние строки не меняются: ни одна из них безубытком не была, потому что такого
+исхода расчёт не производил. Ограничение перестраивается целиком — `CHECK` в SQLite на
+месте не правится.
 
 7 → 8 (2026-08-19): у уровня появилась `vrvp_density` — плотность объёма в зоне,
 вторая половина критерия силы по стр. 22. Прежние строки получают NULL: композит у них
@@ -606,6 +614,13 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "6"
     if lvl_cols and "vrvp_density" not in lvl_cols:
         return "7"
+    # 8 → 9 не видно по колонкам: меняется ОГРАНИЧЕНИЕ, а не состав полей. Спрашивается
+    # сам текст `CREATE TABLE`, который SQLite хранит в `sqlite_master`.
+    out_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='outcomes'"
+    ).fetchone()
+    if out_sql is not None and "breakeven" not in (out_sql[0] or ""):
+        return "8"
     return SCHEMA_VERSION
 
 
@@ -690,6 +705,35 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
+    """Расширить `CHECK` исходов безубытком (стр. 14) перестройкой таблицы.
+
+    SQLite не правит `CHECK` на месте, поэтому таблица создаётся заново и строки
+    переносятся один в один: их смысл не меняется — ни один прежний исход безубытком
+    не был. Внешние ключи выключаются на время перестройки по той же причине, что и в
+    `_migrate_2_to_3`: `DROP` таблицы, на которую смотрит `signal_id`, при включённых FK
+    отклоняется.
+    """
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript(
+        "BEGIN;"
+        "CREATE TABLE outcomes_v9 ("
+        " signal_id INTEGER PRIMARY KEY REFERENCES signals(id),"
+        " kind TEXT NOT NULL CHECK (kind IN ('stop','target','ambiguous','breakeven')),"
+        " closed_at INTEGER NOT NULL,"
+        " exit_price REAL,"
+        " r REAL,"
+        " CHECK ((kind = 'ambiguous') = (r IS NULL)),"
+        " CHECK ((kind = 'ambiguous') = (exit_price IS NULL)));"
+        "INSERT INTO outcomes_v9 (signal_id, kind, closed_at, exit_price, r)"
+        " SELECT signal_id, kind, closed_at, exit_price, r FROM outcomes;"
+        "DROP TABLE outcomes;"
+        "ALTER TABLE outcomes_v9 RENAME TO outcomes;"
+        "COMMIT;"
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     """Соединение на запись. ЕДИНСТВЕННАЯ точка записи в боевую базу (§10.2).
 
@@ -729,6 +773,8 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # подставить нельзя: другая величина. NULL читается как «не считалось».
         conn.execute("ALTER TABLE levels ADD COLUMN vrvp_density REAL")
         conn.commit()
+    if _schema_version(conn) == "8":
+        _migrate_8_to_9(conn)
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1114,6 +1160,11 @@ class OutcomeCell(BaseModel):
 
     by_target: int
     by_stop: int
+    by_breakeven: int
+    """Вышли в безубыток (стр. 14). Не выигрыш и не проигрыш — третий исход, и без своей
+    колонки он растворился бы в `closed`, где `closed != цель + стоп + неоднозначно`
+    читалось бы как дефект счёта."""
+
     ambiguous: int
     """Неоднозначные (стоп и цель в одном баре) — у них `r` нет по схеме, и в сумму R
     они не идут. Считаются отдельно, а не растворяются в «не закрыто»."""
@@ -1202,7 +1253,8 @@ def outcome_survey(conn: sqlite3.Connection) -> OutcomeSurvey:
         " SUM(CASE WHEN st.state='not_filled' THEN 1 ELSE 0 END) AS not_filled,"
         " SUM(CASE WHEN st.state='open' THEN 1 ELSE 0 END) AS still_open,"
         " SUM(CASE WHEN o.signal_id IS NULL AND st.signal_id IS NULL"
-        "          AND s.target IS NULL THEN 1 ELSE 0 END) AS no_target"
+        "          AND s.target IS NULL THEN 1 ELSE 0 END) AS no_target,"
+        " SUM(CASE WHEN o.kind='breakeven' THEN 1 ELSE 0 END) AS by_breakeven"
         " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
         " LEFT JOIN signal_states st ON st.signal_id = s.id"
         " GROUP BY s.kind, s.timeframe, s.direction"
@@ -1212,7 +1264,7 @@ def outcome_survey(conn: sqlite3.Connection) -> OutcomeSurvey:
         OutcomeCell(
             kind=r[0], timeframe=r[1], direction=r[2], signals=int(r[3]),
             closed=int(r[4]), by_target=int(r[5]), by_stop=int(r[6]),
-            ambiguous=int(r[7]),
+            by_breakeven=int(r[14]), ambiguous=int(r[7]),
             sum_r=None if r[8] is None else float(r[8]),
             avg_r=None if r[9] is None else float(r[9]),
             not_filled=int(r[11]), still_open=int(r[12]), no_target=int(r[13]),
@@ -1248,15 +1300,17 @@ def format_outcome_survey(s: OutcomeSurvey) -> list[str]:
         return out
     out.append(f"   всего сигналов {s.signals_total}, с исходом {s.closed_total}, "
                f"без исхода {s.signals_total - s.closed_total}")
-    out.append("   тип   ТФ    сторона  сигн.  закр.  цель  стоп  неодн.  средний R  "
-               "мимо  идёт  б/ц  ?  возраст")
+    out.append("   тип   ТФ    сторона  сигн.  закр.  цель  стоп   б/у  неодн.  "
+               "средний R  мимо  идёт  б/ц  ?  возраст")
     for c in s.cells:
         avg = "     —" if c.avg_r is None else f"{c.avg_r:6.3f}"
         out.append(f"   {c.kind:5} {c.timeframe:5} {c.direction:8} {c.signals:5} "
-                   f"{c.closed:6} {c.by_target:5} {c.by_stop:5} {c.ambiguous:7} {avg}  "
+                   f"{c.closed:6} {c.by_target:5} {c.by_stop:5} {c.by_breakeven:5} "
+                   f"{c.ambiguous:7} {avg}  "
                    f"{c.not_filled:4} {c.still_open:5} {c.no_target:4} "
                    f"{c.unknown_state:2} {c.age_bars_max:8}")
-    out.append("   «мимо» — цена не дошла до входа (стр. 30); «идёт» — вход был, "
+    out.append("   «б/у» — вышли в безубыток, R = 0 (стр. 14); "
+               "«мимо» — цена не дошла до входа (стр. 30); «идёт» — вход был, "
                "исхода ещё нет; «б/ц» — цель не сохранена, дорешать нечем (до v5); "
                "«?» — система не сказала ничего")
 
@@ -1295,12 +1349,159 @@ def format_outcome_survey(s: OutcomeSurvey) -> list[str]:
                        + "; ноль исходов при прожитых барах и без записанного состояния "
                          "объяснения не имеет и требует разбора по шагам "
                          "(backfill-window-2026-08-04)")
+    # Знак есть только у цели и стопа: безубыток по определению ни то ни другое (стр. 14),
+    # и считать его в пороге значило бы поднимать тревогу на клетке, где всё объяснено.
     one_sided = [c for c in s.cells
-                 if c.closed >= 3 and (c.by_target == 0 or c.by_stop == 0)]
+                 if c.by_target + c.by_stop >= 3
+                 and (c.by_target == 0 or c.by_stop == 0)]
     if one_sided:
         out.append(f"   ⚠ клеток, где ВСЕ закрытия одного знака (≥3): {len(one_sided)} — "
                    + ", ".join(f"{c.kind}/{c.timeframe}/{c.direction}"
                                for c in one_sided[:6]))
+    return out
+
+
+class WinRateCell(BaseModel):
+    """Винрейт одного разреза. Мини-курс стр. 9.
+
+    Курс дословно: «Винрейт - англ. win rate - доля успешных/профитных сделок от общего
+    числа сделок. Например, винрейт 60% - значит, из 10 сделок 6 принесли профит и
+    только 4 - убыток».
+
+    ⚠ ЗНАМЕНАТЕЛЬ здесь — «СДЕЛОК», а не «сигналов», и это не придирка к слову. Сигнал,
+    до которого цена не дошла, сделкой не стал вовсе (стр. 30: вход лимитками) — в
+    примере курса таких строк нет: там 6 + 4 = 10, то есть знаменатель состоит из
+    завершённых сделок. Поэтому `trades` считает ровно исходы, у которых сделка была И
+    завершилась: цель, стоп, безубыток. Неоднозначные (стоп и цель в одном баре) в
+    знаменатель НЕ идут — у них исход не назначен по построению, и отнести их к любой
+    из двух частей значило бы придумать ответ; их число печатается рядом, чтобы
+    подвыборка была названа (правило CLAUDE.md о подвыборке).
+
+    ⚠ Безубыток В ЗНАМЕНАТЕЛЕ, но НЕ в числителе: сделка состоялась и завершилась, но
+    успешной и профитной курс её не называет — стр. 14 «закрыть позицию в ноль».
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    """ТФ, либо `ВСЕ` у итоговой строки."""
+
+    trades: int
+    """ЗНАМЕНАТЕЛЬ: завершённых сделок (цель + стоп + безубыток)."""
+
+    wins: int
+    """ЧИСЛИТЕЛЬ: сделок, закрытых по цели."""
+
+    losses: int
+    breakeven: int
+    ambiguous: int
+    """Вне знаменателя: исход не назначен, порядок касаний из OHLC не следует."""
+
+    not_filled: int
+    """Вне знаменателя: сделки не было — цена не дошла до входа (стр. 30)."""
+
+    still_open: int
+    """Вне знаменателя: сделка идёт, исход ещё не наступил."""
+
+    win_rate_pct: float | None
+    """`None` при `trades == 0`. Доли без знаменателя не бывает, и ноль вместо неё
+    означал бы «ни одна сделка не была прибыльной» — другое утверждение."""
+
+
+class WinRate(BaseModel):
+    """Винрейт целиком и в разрезе по ТФ (стр. 9 + стр. 48).
+
+    Разрез по ТФ обязателен не для красоты: стр. 48 делает о нём прямое утверждение —
+    «Чем старше ТФ – тем выше винрейт, но дольше отработка». Один общий процент это
+    утверждение проверить не даёт и, хуже, СКРЫВАЕТ перекос: тот же класс дефекта, что
+    нашёлся 2026-08-04, когда сто девяносто честных отказов подряд оказались собраны на
+    одном таймфрейме.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total: WinRateCell
+    by_timeframe: tuple[WinRateCell, ...]
+    fingerprint: str
+    """ОТПЕЧАТОК ДАННЫХ: состав леджера на момент замера (правило 2026-08-09)."""
+
+
+def win_rate(conn: sqlite3.Connection) -> WinRate:
+    """Винрейт по стр. 9. Соединение — только на чтение.
+
+    ТФ берутся из `signals`, а не из `outcomes`: ТФ без единой завершённой сделки обязан
+    попасть в разрез со своим `trades = 0` и `win_rate_pct = None`, иначе перекос
+    «на 1Д не закрылось ничего» будет молча съеден соединением.
+    """
+    rows = conn.execute(
+        "SELECT s.timeframe,"
+        " SUM(CASE WHEN o.kind='target' THEN 1 ELSE 0 END) AS wins,"
+        " SUM(CASE WHEN o.kind='stop' THEN 1 ELSE 0 END) AS losses,"
+        " SUM(CASE WHEN o.kind='breakeven' THEN 1 ELSE 0 END) AS be,"
+        " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS amb,"
+        " SUM(CASE WHEN st.state='not_filled' THEN 1 ELSE 0 END) AS not_filled,"
+        " SUM(CASE WHEN st.state='open' THEN 1 ELSE 0 END) AS still_open"
+        " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
+        " LEFT JOIN signal_states st ON st.signal_id = s.id"
+        " GROUP BY s.timeframe ORDER BY s.timeframe"
+    ).fetchall()
+
+    def cell(tf: str, wins: int, losses: int, be: int, amb: int,
+             not_filled: int, still_open: int) -> WinRateCell:
+        trades = wins + losses + be
+        return WinRateCell(
+            timeframe=tf, trades=trades, wins=wins, losses=losses, breakeven=be,
+            ambiguous=amb, not_filled=not_filled, still_open=still_open,
+            win_rate_pct=None if trades == 0 else wins / trades * 100,
+        )
+
+    cells = tuple(cell(r[0], int(r[1]), int(r[2]), int(r[3]), int(r[4]),
+                       int(r[5]), int(r[6])) for r in rows)
+    total = cell("ВСЕ", sum(c.wins for c in cells), sum(c.losses for c in cells),
+                 sum(c.breakeven for c in cells), sum(c.ambiguous for c in cells),
+                 sum(c.not_filled for c in cells), sum(c.still_open for c in cells))
+    n_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    n_closed = conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0]
+    return WinRate(
+        total=total, by_timeframe=cells,
+        fingerprint=f"сигналов {n_signals}, исходов {n_closed}",
+    )
+
+
+def format_win_rate(w: WinRate) -> list[str]:
+    """Винрейт словами для владельца (§7.5). Доля НЕ печатается без знаменателя.
+
+    Строка «винрейт 60%» сама по себе не проверяема; строка «6 из 10» проверяема, и
+    именно в таком виде число называет курс на стр. 9.
+    """
+    out = [f"ВИНРЕЙТ (стр. 9) — доля сделок по цели. ОТПЕЧАТОК: {w.fingerprint}"]
+    out.append("   ТФ     сделок  по цели  по стопу  б/у   винрейт   "
+               "вне счёта: неодн.  мимо  идёт")
+    for c in (w.total, *w.by_timeframe):
+        share = ("      —" if c.win_rate_pct is None
+                 else f"{c.wins} из {c.trades} = {c.win_rate_pct:.1f}%")
+        out.append(f"   {c.timeframe:6} {c.trades:6} {c.wins:8} {c.losses:9} "
+                   f"{c.breakeven:4}   {share:18} {c.ambiguous:5} {c.not_filled:5} "
+                   f"{c.still_open:5}")
+    if w.total.trades == 0:
+        out.append("   завершённых сделок нет — доли не существует, и это данные, "
+                   "а не ноль процентов")
+        return out
+    out.append("   знаменатель — ЗАВЕРШЁННЫЕ сделки (цель + стоп + б/у). Не вошли: "
+               "неоднозначные (исход не назначен), «мимо» (сделки не было, стр. 30), "
+               "«идёт» (исход ещё не наступил)")
+    # Утверждение стр. 48 проверяемо ровно тогда, когда разрез напечатан, — но
+    # проверять его здесь нечем: порядок ТФ по старшинству знает `bars`, а клеток с
+    # нулевым знаменателем в сравнении быть не должно. Печатается разрез, вывод — за
+    # владельцем и за отдельным замером.
+    # Порога «мало сделок» здесь нет: числа для него не даёт ни курс, ни классика, а
+    # придуманный порог отсекал бы клетки от глаз владельца. Вместо порога печатается
+    # арифметика — на сколько процентных пунктов двигает долю ОДНА сделка. Клетка, где
+    # это число сравнимо с самой долей, читателю видна без всякой отсечки.
+    out.append("   одна сделка двигает долю на: "
+               + ", ".join(f"{c.timeframe} {100 / c.trades:.1f} п.п."
+                           for c in w.by_timeframe if c.trades)
+               + (f"; по всем {100 / w.total.trades:.1f} п.п."))
     return out
 
 
@@ -1319,6 +1520,7 @@ OWNER_QUERIES: dict[str, str] = {
         "(SELECT COUNT(*) FROM signals WHERE target IS NULL) AS без_цели_не_дорешать, "
         "SUM(CASE WHEN kind='target' THEN 1 ELSE 0 END) AS по_цели, "
         "SUM(CASE WHEN kind='stop' THEN 1 ELSE 0 END) AS по_стопу, "
+        "SUM(CASE WHEN kind='breakeven' THEN 1 ELSE 0 END) AS в_безубыток, "
         "SUM(CASE WHEN kind='ambiguous' THEN 1 ELSE 0 END) AS неоднозначно, "
         "ROUND(SUM(COALESCE(r,0)), 3) AS сумма_R, "
         "ROUND(AVG(r), 3) AS средний_R "
@@ -1329,6 +1531,25 @@ OWNER_QUERIES: dict[str, str] = {
     # дошла, и сделки, ещё не закрывшиеся, в таблицу исходов не попадают вовсе. Замер
     # 2026-08-04: половина эмиссий не заполнялась, и владелец видел долю выигрышей,
     # посчитанную по другому множеству, чем «сколько раз система советовала».
+    # ⚠ Доля идёт ПОСЛЕ своего знаменателя и рядом с ним, а не вместо него: стр. 9
+    # называет винрейт как «6 из 10», и в таком виде его можно перепроверить руками.
+    # Разрез по ТФ — не украшение: стр. 48 утверждает «Чем старше ТФ – тем выше
+    # винрейт», и один общий процент это утверждение скрывает.
+    "винрейт по ТФ (стр. 9)": (
+        "SELECT s.timeframe AS тф, "
+        "SUM(CASE WHEN o.kind IN ('target','stop','breakeven') THEN 1 ELSE 0 END) "
+        "  AS завершённых_сделок, "
+        "SUM(CASE WHEN o.kind='target' THEN 1 ELSE 0 END) AS по_цели, "
+        "SUM(CASE WHEN o.kind='stop' THEN 1 ELSE 0 END) AS по_стопу, "
+        "SUM(CASE WHEN o.kind='breakeven' THEN 1 ELSE 0 END) AS в_безубыток, "
+        "ROUND(100.0 * SUM(CASE WHEN o.kind='target' THEN 1 ELSE 0 END) / "
+        "  NULLIF(SUM(CASE WHEN o.kind IN ('target','stop','breakeven') "
+        "               THEN 1 ELSE 0 END), 0), 1) AS винрейт_проц, "
+        "SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS вне_счёта_неоднозначных, "
+        "COUNT(*) AS всего_сигналов_на_этом_тф "
+        "FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id "
+        "GROUP BY s.timeframe ORDER BY s.timeframe;"
+    ),
     "чем куплены выигрыши — геометрия сделок": (
         "SELECT s.timeframe AS тф, COUNT(*) AS сделок, "
         "ROUND(AVG(ABS(s.entry - s.stop) / s.entry * 100), 3) AS средняя_дистанция_стопа_проц, "

@@ -34,7 +34,9 @@ from .breach import (
     Breach,
     BreachKind,
     Direction,
+    closed_beyond,
     first_verdict,
+    retest_after,
 )
 from .models import Bar, NotReady, TradeHistogram, TradeWindows
 from .stop_volume import StopVolume
@@ -846,6 +848,174 @@ def _tf_rank(tf: str) -> int:
     return list(TIMEFRAME_MS).index(tf)
 
 
+class TakeDepth(StrEnum):
+    """Насколько глубоко цена зашла при заборе уровня. Три варианта — стр. 30.
+
+    Дословно: «1 - цена забирает объемную зону, (выделено желтым цветом) и идет в нужном
+    направлении. 2 - цена забирает идеально уровень ПОК, и идет в нужном направлении.
+    3 - цена проколом забирает уровень + все объемы и идет в нужном направлении.»
+    Рисунок стр. 30 нумерует ими три стрелки к одной и той же зоне: первая доходит до
+    ближней кромки, вторая до линии ПОК, третья протыкает зону насквозь.
+
+    ⚠ До 2026-08-19 отработкой считалось ЛЮБОЕ касание зоны (`first_test_index`), то есть
+    все три варианта курса были одним значением, а четвёртый случай — «закрылась за
+    уровнем» — от них не отделялся вовсе.
+    """
+
+    NONE = "none"
+    """Цена в зону не заходила."""
+
+    ZONE = "zone"
+    """Вариант 1: дошла до объёмной зоны, дальше ближней кромки не пошла."""
+
+    POC = "poc"
+    """Вариант 2: дошла до самого ПОК."""
+
+    PUNCTURE = "puncture"
+    """Вариант 3: проколом забрала уровень И ВСЕ ОБЪЁМЫ — вышла за дальнюю кромку зоны."""
+
+    BEYOND = "beyond"
+    """Общее условие стр. 30 нарушено: «Важно чтобы цена не закрывалась свечами за
+    уровнем – иначе это уже будет пробой и может быть вариантом ловушки». Забора нет."""
+
+
+class ZoneTake(BaseModel):
+    """Вердикт глубины захода по стр. 30 вместе с тем, была ли реакция."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    depth: TakeDepth
+    first_index: int | None = None
+    """Первый бар в зоне — то самое «1 касание» стр. 25."""
+
+    deepest_index: int | None = None
+    """Бар, на котором достигнута названная глубина."""
+
+    reacted: bool = False
+    """Цена ушла из зоны В НУЖНОМ НАПРАВЛЕНИИ — «хорошая реакция» стр. 25 и 31.
+
+    Стр. 30 повторяет условие у всех трёх вариантов забора: «и идет в нужном
+    направлении». Реакцией считается ЗАКРЫТИЕ свечи вне зоны с рабочей стороны, тем же
+    критерием закрытия, каким стр. 30 и 55 меряют обратный случай («не закрывалась
+    свечами за уровнем»): тень из зоны — это ещё торговля в зоне, а не уход.
+    Величины «сколько процентов прошла» курс не даёт, и выдумывать её здесь нельзя.
+    """
+
+    reaction_index: int | None = None
+
+
+_DEPTH_ORDER = {TakeDepth.NONE: 0, TakeDepth.ZONE: 1, TakeDepth.POC: 2,
+                TakeDepth.PUNCTURE: 3}
+
+
+def take_depth(
+    level: Level,
+    bars: list[Bar],
+    *,
+    confirm_bodies: int = CONFIRM_BODIES,
+) -> ZoneTake:
+    """Как глубоко цена забрала уровень (стр. 30) и получила ли он реакцию (стр. 25).
+
+    Считается от бара появления уровня и до конца ряда либо до пробоя. Глубина берётся
+    САМАЯ ДАЛЬНЯЯ за всё время: заход в зону, потом до ПОК, потом проколом — это одна
+    отработка, а не три, и рисунок стр. 30 рисует их как варианты одного события.
+    """
+    lo, hi = float(level.zone_lo), float(level.zone_hi)
+    poc = float(level.price)
+    direction = level.breach_direction
+    long_side = level.side is LevelSide.LONG
+    depth = TakeDepth.NONE
+    first: int | None = None
+    deepest: int | None = None
+    reacted = False
+    reaction: int | None = None
+    run = 0
+    for i in range(level.created_at_index + 1, len(bars)):
+        bar = bars[i]
+        run = run + 1 if closed_beyond(bar, poc, direction) else 0
+        if run >= confirm_bodies:
+            return ZoneTake(depth=TakeDepth.BEYOND, first_index=first, deepest_index=i)
+        edge = bar.low if long_side else bar.high
+        inside = edge <= hi if long_side else edge >= lo
+        if inside:
+            if long_side:
+                got = (TakeDepth.PUNCTURE if edge < lo
+                       else TakeDepth.POC if edge <= poc else TakeDepth.ZONE)
+            else:
+                got = (TakeDepth.PUNCTURE if edge > hi
+                       else TakeDepth.POC if edge >= poc else TakeDepth.ZONE)
+            if first is None:
+                first = i
+            if _DEPTH_ORDER[got] > _DEPTH_ORDER[depth]:
+                depth, deepest = got, i
+        if first is not None and not reacted:
+            out = bar.close > hi if long_side else bar.close < lo
+            if out:
+                reacted, reaction = True, i
+    return ZoneTake(depth=depth, first_index=first, deepest_index=deepest,
+                    reacted=reacted, reaction_index=reaction)
+
+
+class Playout(StrEnum):
+    """Чем кончился приход цены к уровню. Семь вариантов стр. 28 одним вердиктом.
+
+    Прежде эти семь конфигураций жили тремя разными способами: 1 — через `LevelState`,
+    2/5/7 — через `PressedKind` (и только текстом в карточке), 3/4/6 — не выражались
+    ничем. Один перечислимый вердикт заведён 2026-08-19, чтобы страница читалась целиком.
+
+    ⚠ Три значения ниже (`NONE`, `IN_PROGRESS`, `BROKEN`) курсу не принадлежат и названы
+    так, чтобы это было видно: они означают «этой картины ещё нет», а не восьмой сценарий.
+    """
+
+    NONE = "none"
+    """Цена к уровню ещё не приходила."""
+
+    IN_PROGRESS = "in_progress"
+    """Цена у уровня, но ни реакции, ни закрепа за ним ещё нет — картина не сложилась."""
+
+    TAKEN = "taken"
+    """1: «цена пришла, забрала уровень ( могут быть проколы по объемной области ) -
+    получаем шорт реакцию»."""
+
+    BASE_NEAR = "base_near"
+    """2: «цена пришла, сформировала новое накопление под уровнем. Т.к. уровень был
+    шортовый - вышли вниз» — новая база с ближней стороны, выход В СТОРОНУ уровня."""
+
+    STOP_RUN_FLIP = "stop_run_flip"
+    """3: «цена пробила уровень, пролетела мимо, выбила стоп и ушла выше. Спустя время -
+    вернулась за тестом данного уровня с обратной стороны - теперь для нас это уровень
+    поддержки (в лонг) для новой позиции»."""
+
+    QUIET_FLIP = "quiet_flip"
+    """4: «цена пробила уровень, закрепилась полноценно свечами над уровнем, не выбила
+    ваш стоп, сделала тест с обратной стороны – на тесте вы закрываете свою шорт позицию
+    в бу и заходите в Лонг (переворачиваетесь)».
+
+    От варианта 3 отличается ровно одним — «не выбила ваш стоп», — поэтому и считается
+    одним: доходила ли цена до стопа между закрепом и ретестом.
+    """
+
+    BASE_BEYOND = "base_beyond"
+    """5: «цена пробили уровень, закрепилась, сформировав новую структуру НАД уровнем…
+    открываете от уровня (нижняя граница нового накопления) лонг позицию»."""
+
+    TRADED_OUT = "traded_out"
+    """6: «цена пришла к уровню, сформировала структуру, расторговала уровень и вышла
+    вверх» — новая база с ближней стороны, но выход ПРОТИВ стороны уровня."""
+
+    SAW = "saw"
+    """7: «цена пришла к уровню и начала его «пилить» (накопление НА уровне) с двух
+    сторон. Приоритет - выйти в бу, дождаться выхода из «пилы»…»."""
+
+    BROKEN = "broken"
+    """Закреп за уровнем есть, ретеста с обратной стороны ещё не было.
+
+    Стр. 42: «Как правило, Пробой сильных уровней цена подтверждает с обратной стороны»;
+    все три ловушки стр. 43 действуют НА РЕТЕСТЕ. Пока его нет, картины 3 и 4 не
+    сложились, и объявлять любую из них значило бы выдумать.
+    """
+
+
 class LevelState(StrEnum):
     ACTIVE = "active"
     """Уровень жив: цена за него ещё не заходила."""
@@ -946,6 +1116,16 @@ class LevelStatus(BaseModel):
     первом же касании зоны.
     """
 
+    take: ZoneTake | None = None
+    """Глубина забора уровня по стр. 30 и была ли реакция. `None` — не считалась.
+
+    ⚠ Заведено 2026-08-19. До этого отработкой считалось любое пересечение бара с зоной,
+    и три варианта стр. 30 наружу не выходили ничем — ни в карточку, ни в отбор.
+    """
+
+    playout: Playout = Playout.NONE
+    """Какая из семи картин стр. 28 сложилась у этого уровня. Одно поле на всю страницу."""
+
     resolved_at_ms: int | None
     """ЗАКРЫТИЕ бара, на котором событие разрешилось. None — не разрешилось (или его нет).
 
@@ -1002,15 +1182,22 @@ class MappedLevel(BaseModel):
 
 
 def map_levels(
-    built: tuple[Level, ...], series: dict[str, list[Bar]]
+    built: tuple[Level, ...],
+    series: dict[str, list[Bar]],
+    scans: dict[str, AccumulationScan] | None = None,
 ) -> tuple[MappedLevel, ...]:
     """Уровни со свежепосчитанной судьбой. Одно место, где `status` зовётся по всему пулу.
 
     Уровень, чьего ряда в кадрах нет, в карту НЕ попадает: состояние у него неизвестно, а
     подставить `active` значило бы объявить живым то, что не проверялось (§4.3).
+
+    `scans` — разбор структур по ТФ; без него картины 2, 5, 6 и 7 стр. 28 не считаются
+    (`LevelStatus.playout` тогда знает только 1, 3, 4 и закреп без ретеста). Умолчание
+    `None` оставлено для зондов и старых вызовов, и оно ВИДНО в вердикте, а не молчит.
     """
+    by_tf = scans or {}
     return tuple(
-        MappedLevel(level=lvl, status=status(lvl, bars))
+        MappedLevel(level=lvl, status=status(lvl, bars, scan=by_tf.get(lvl.timeframe)))
         for lvl in built
         if (bars := series.get(lvl.timeframe))
     )
@@ -1020,6 +1207,7 @@ def status(
     level: Level,
     bars: list[Bar],
     *,
+    scan: AccumulationScan | None = None,
     confirm_bodies: int = CONFIRM_BODIES,
     return_bars: int = RETURN_BARS,
 ) -> LevelStatus:
@@ -1044,11 +1232,20 @@ def status(
     событие было `unresolved`, то есть цена за уровень заходила, но курс вердикта
     прокол-или-пробой не давал, и `status` оставлял лимитки разрешёнными.
 
-    Касание меняет РАЗРЕШЕНИЕ, а не состояние, и это существенно. Иначе флипов не было бы
-    вовсе: любой пробой начинается с касания, и «первое событие — касание» объявляло бы
-    отработанным даже то, что стр. 43 велит считать противоположным уровнем. Поэтому
-    `state` выводится из ВЕРДИКТА (прокол или пробой), а касание снимает лимитки и
-    переводит вход на слом младшего ТФ.
+    Отработка зоны меняет РАЗРЕШЕНИЕ, а не состояние, и это существенно. Иначе флипов не
+    было бы вовсе: любой пробой начинается с касания, и «первое событие — касание»
+    объявляло бы отработанным даже то, что стр. 43 велит считать противоположным уровнем.
+    Поэтому `state` выводится из ВЕРДИКТА (прокол или пробой), а отработка зоны снимает
+    лимитки и переводит вход на слом младшего ТФ.
+
+    ⚠⚠ 2026-08-19 УСЛОВИЕ СНЯТИЯ ЛИМИТОК ИСПРАВЛЕНО. Снимало его ЛЮБОЕ пересечение бара
+    с зоной (`first_test_index`), тогда как стр. 25 и 31 требуют ДВУХ вещей сразу:
+    «уровень был отработан на 1 касание (как на графике - увидели хорошую реакцию)» и
+    «если цена ранее забирала зону И уже получила от нее хорошую лонг реакцию». Скобка на
+    стр. 25 — не пояснение, а второе условие. Теперь снятие связано с вердиктом глубины
+    (`take_depth`, три варианта стр. 30) и с реакцией; уровень, которого цена коснулась и
+    в котором она сидит без реакции, лимитки не теряет — его держит стр. 44 через
+    `price_in_zone`, и держит по своей причине, а не по чужой.
 
     ⚠ До 2026-08-19 здесь стояло «`state` по-прежнему выводит `first_breach`». С правкой
     того дня это неверно: `state` выводит `first_verdict`, а посылка «первое событие
@@ -1079,23 +1276,38 @@ def status(
     beyond = bool(last is not None and (
         last.close < float(level.boundary_lo) if level.side is LevelSide.LONG
         else last.close > float(level.boundary_hi)))
+    # Глубина забора (стр. 30) и «хорошая реакция» (стр. 25, 31) — ими решается снятие
+    # лимиток. Стр. 31 называет ОБА условия в одном предложении: «если цена ранее
+    # забирала зону И уже получила от нее хорошую лонг реакцию, уровень лимитными
+    # ордерами больше не торгуем». Прежде проверялось только первое — любое пересечение
+    # бара с зоной (`first_test_index`), — то есть уровень терял лимитки от касания без
+    # всякой реакции. Стр. 25 говорит то же самое ещё яснее: «уровень был отработан на
+    # 1 касание (как на графике - увидели хорошую реакцию)» — скобка и есть условие.
+    take = take_depth(level, bars, confirm_bodies=confirm_bodies)
+    took = take.reacted and take.depth in (
+        TakeDepth.ZONE, TakeDepth.POC, TakeDepth.PUNCTURE)
+    pressed = pressed_structures(level, scan) if scan is not None else ()
+    play = playout(level, bars, event=ev, take=take, pressed=pressed)
     if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
-        if beyond or first_test_index(level, bars) is not None:
+        if beyond or took:
             return LevelStatus(state=LevelState.ACTIVE, event=ev,
                                limit_orders_allowed=False, price_in_zone=in_zone,
-                               price_beyond=beyond,
+                               price_beyond=beyond, take=take, playout=play,
                                entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=None)
         return LevelStatus(state=LevelState.ACTIVE, event=ev, limit_orders_allowed=True,
-                           price_in_zone=in_zone, price_beyond=beyond,
+                           price_in_zone=in_zone, price_beyond=beyond, take=take,
+                           playout=play,
                            entry_rule=EntryRule.LIMIT, resolved_at_ms=None)
     assert ev.resolved_index is not None  # у разрешившегося события бар есть по построению
     at = bars[ev.resolved_index].open_ms + tf_ms(level.timeframe)
     if ev.kind is BreachKind.BREAKOUT:
         return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False,
-                           price_in_zone=in_zone, price_beyond=beyond,
+                           price_in_zone=in_zone, price_beyond=beyond, take=take,
+                           playout=play,
                            entry_rule=EntryRule.RETEST_FLIPPED, resolved_at_ms=at)
     return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
-                       price_in_zone=in_zone, price_beyond=beyond,
+                       price_in_zone=in_zone, price_beyond=beyond, take=take,
+                       playout=play,
                        entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
 
 
@@ -1132,6 +1344,9 @@ class PressedStructure(BaseModel):
     last_index: int
     box_lo: float
     box_hi: float
+    exit_long: bool = False
+    """Из новой базы вышли ВВЕРХ (стр. 22). Этим и различаются картины 2 и 6 стр. 28:
+    геометрия у них одна — база с ближней стороны уровня, — а выход противоположный."""
 
 
 def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStructure, ...]:
@@ -1155,12 +1370,78 @@ def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStr
         kind = (PressedKind.ASTRIDE if lo <= price <= hi
                 else PressedKind.BELOW if hi < price else PressedKind.ABOVE)
         out.append(PressedStructure(kind=kind, first_index=acc.first_index,
-                                    last_index=acc.last_index, box_lo=lo, box_hi=hi))
+                                    last_index=acc.last_index, box_lo=lo, box_hi=hi,
+                                    exit_long=acc.is_long))
     return tuple(out)
 
 
+def _stop_taken(level: Level, bars: list[Bar], event: Breach, retest_index: int) -> bool:
+    """Дошла ли цена до стопа между закрепом и ретестом — тем и различаются 3 и 4 стр. 28.
+
+    Порогом берётся якорь стопа (стр. 18), а если якоря нет — дальняя граница базы:
+    стр. 43 ставит стоп «за накопление», стр. 58 — «за всю структуру».
+    """
+    long_side = level.side is LevelSide.LONG
+    edge = level.stop_anchor if level.stop_anchor is not None else (
+        level.boundary_lo if long_side else level.boundary_hi)
+    lo = max(event.start_index, 0)
+    hi = min(retest_index, len(bars) - 1)
+    if hi < lo:
+        return False
+    seg = bars[lo:hi + 1]
+    return (min(b.low for b in seg) < float(edge) if long_side
+            else max(b.high for b in seg) > float(edge))
+
+
+def playout(
+    level: Level,
+    bars: list[Bar],
+    *,
+    event: Breach | None,
+    take: ZoneTake,
+    pressed: tuple[PressedStructure, ...] = (),
+) -> Playout:
+    """Какая из семи картин стр. 28 сложилась. Новых правил здесь нет — только сведение.
+
+    Порядок разбора идёт от самой определённой картины к самой общей: «пила» (7) видна
+    сразу по накоплению НА уровне, закреп за уровнем разводит 5/3/4, база с ближней
+    стороны — 2 и 6, и лишь потом остаётся простой забор (1).
+
+    `pressed` пустой означает «структуры у уровня не подавались», а не «их нет»: без
+    разбора того же ТФ картины 2, 5, 6 и 7 не выражаются вовсе.
+    """
+    if any(p.kind is PressedKind.ASTRIDE for p in pressed):
+        return Playout.SAW
+    long_side = level.side is LevelSide.LONG
+    beyond_kind = PressedKind.BELOW if long_side else PressedKind.ABOVE
+    near_kind = PressedKind.ABOVE if long_side else PressedKind.BELOW
+    if event is not None and event.kind is BreachKind.BREAKOUT:
+        if any(p.kind is beyond_kind for p in pressed):
+            return Playout.BASE_BEYOND
+        assert event.resolved_index is not None  # у пробоя бар закрепа есть по построению
+        rt = retest_after(bars, float(level.price), event.resolved_index + 1)
+        if rt is None:
+            return Playout.BROKEN
+        return (Playout.STOP_RUN_FLIP if _stop_taken(level, bars, event, rt)
+                else Playout.QUIET_FLIP)
+    near = [p for p in pressed if p.kind is near_kind]
+    if near:
+        return (Playout.BASE_NEAR if any(p.exit_long == long_side for p in near)
+                else Playout.TRADED_OUT)
+    if take.reacted and take.depth in (TakeDepth.ZONE, TakeDepth.POC, TakeDepth.PUNCTURE):
+        return Playout.TAKEN
+    if take.depth is TakeDepth.NONE and event is None:
+        return Playout.NONE
+    return Playout.IN_PROGRESS
+
+
 def first_test_index(level: Level, bars: list[Bar]) -> int | None:
-    """Первое касание уровня после его появления. Стр. 25: дальше уровень удаляется.
+    """Первое касание уровня после его появления — момент, от которого ищется слом на
+    младшем ТФ (стр. 25, 31).
+
+    ⚠ С 2026-08-19 ЭТО НЕ УСЛОВИЕ СНЯТИЯ ЛИМИТОК. Снятие требует ещё и «хорошей
+    реакции» (стр. 25, 31) и потому считается `take_depth`; здесь остался ровно вопрос
+    «когда цена пришла к уровню впервые», и на нём стоит `engine._mtf_break`.
 
     ⚠ КАСАНИЕМ СЧИТАЕТСЯ ЗАХОД В ЗОНУ, А НЕ ДОСТИЖЕНИЕ ПОК. Правка аудита 2026-08-07,
     находка М-08.

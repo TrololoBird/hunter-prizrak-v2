@@ -36,14 +36,21 @@ from .bars import steps_between
 from .models import Bar
 
 CONFIRM_BODIES = 2
-"""Стр. 55: подтверждение — «2-3 полных тел свечей ЭТОГО ТФ».
+"""Стр. 55: подтверждение — «то есть закрытия под/над уровнем ПП 2-3 полных тел свечей
+ЭТОГО ТФ».
 
 Курс даёт ДИАПАЗОН и внутри него не выбирает. Взята нижняя граница: уровень,
-подтверждённый тремя телами, подтверждён и двумя, то есть двойка — более раннее и более
-слабое условие, а не более сильное. Фактическое число тел едет вместе с событием полем
-`bodies`, поэтому ничего не прячется.
+подтверждённый тремя закрытиями, подтверждён и двумя, то есть двойка — более раннее и
+более слабое условие, а не более сильное. Фактические числа едут вместе с событием
+полями `closes` и `bodies`, поэтому ничего не прячется.
 
-⚠ Выбор внутри диапазона курсом НЕ решён и остаётся открытым до фазы сверки с корпусом.
+⚠ ЦЕНА ЭТОГО ВЫБОРА, названа 2026-08-19. При 3 из-под определения выпадает ловушка
+стр. 43, вариант 3 — «Цена одной свечой пробила уровень, второй закрепилась, третьей
+делает ретест уровня»: закреп там ровно ДВА закрытия, третья свеча уже возвращает цену к
+уровню. Порог 3 такому заходу подтверждения набрать не даёт, и при возврате вердиктом
+станет ПРОКОЛ, то есть ОТРАБОТКА вместо ловушки. Цена двойки обратная и меньшая: заход,
+закрывшийся за уровнем ровно дважды и после этого вернувшийся, зовётся пробоем, хотя
+стр. 6 засчитала бы реакцию.
 """
 
 RETURN_BARS = 2
@@ -68,10 +75,24 @@ class BreachKind(StrEnum):
     """Прокол (стр. 6). Уровень ОТРАБОТАН, реакция валидна."""
 
     BREAKOUT = "breakout"
-    """Пробой (стр. 7, 42). Ловушка: уровень не отработал и флипается (стр. 43)."""
+    """Пробой (стр. 7, 42). Ловушка: уровень не отработал и флипается (стр. 43).
+
+    ⚠ СВЕРКА С ОПИСАНИЕМ ЛОВУШКИ, 2026-08-19, и она нашла расхождение. Стр. 42 зовёт
+    базовым вариантом ловушки пробой, стр. 43 разбирает его тремя картинами; вариант 3 —
+    «Цена одной свечой пробила уровень, второй закрепилась, третьей делает ретест
+    уровня» — прежним кодом ловушкой НЕ признавался: подтверждение считалось по ПОЛНЫМ
+    телам за уровнем (`body_beyond`), а у свечи, которая «пробила уровень», тело за
+    уровнем не целиком — она открылась с ближней стороны. Закрытий за уровнем в этой
+    картине два, полных тел — одно, и вердиктом выходил ПРОКОЛ, то есть отработка.
+    Стр. 55 говорит именно о закрытиях («закрытия под/над уровнем ПП 2-3 полных тел
+    свечей ЭТОГО ТФ»), стр. 30 — «Важно чтобы цена не закрывалась свечами за уровнем –
+    иначе это уже будет пробой», стр. 46 отделяет «прокол тенью» от закрепления.
+    Считается `closed_beyond`; `bodies` остались рядом и печатаются, но вердикта не
+    решают.
+    """
 
     UNRESOLVED = "unresolved"
-    """Ушла за уровень, вернулась позже прокола и не закрепилась телами.
+    """Ушла за уровень, вернулась позже прокола и не закрепилась закрытиями.
 
     ⚠ Это НЕ третий вид события из курса. Курс такого случая не разбирает, и имя означает
     ровно «источник вердикта не даёт». Назвать его проколом или пробоем значило бы
@@ -100,6 +121,9 @@ class Breach(BaseModel):
     bodies: int = Field(ge=0)
     """Максимум подряд идущих ПОЛНЫХ тел за уровнем внутри захода."""
 
+    closes: int = Field(default=0, ge=0)
+    """Максимум подряд идущих ЗАКРЫТИЙ за уровнем — им и решается подтверждение (стр. 55)."""
+
     @property
     def worked_off(self) -> bool:
         """Отработал ли уровень. Стр. 6: прокол — это отработка, пробой — нет."""
@@ -107,10 +131,20 @@ class Breach(BaseModel):
 
 
 def body_beyond(bar: Bar, level: float, direction: Direction) -> bool:
-    """Тело свечи ЦЕЛИКОМ за уровнем. Стр. 55 говорит «полных тел», не «закрытий»."""
+    """Тело свечи ЦЕЛИКОМ за уровнем — выход из структуры полными телами (стр. 23).
+
+    Подтверждение пробоя считается НЕ этим, а `closed_beyond` (стр. 55; разбор — в
+    докстроке `BreachKind.BREAKOUT`).
+    """
     if direction is Direction.ABOVE:
         return min(bar.open, bar.close) > level
     return max(bar.open, bar.close) < level
+
+
+def closed_beyond(bar: Bar, level: float, direction: Direction) -> bool:
+    """Свеча ЗАКРЫЛАСЬ за уровнем. Стр. 55: «закрытия под/над уровнем ПП 2-3 полных тел
+    свечей ЭТОГО ТФ»; стр. 30: «Важно чтобы цена не закрывалась свечами за уровнем»."""
+    return bar.close > level if direction is Direction.ABOVE else bar.close < level
 
 
 def _beyond(bar: Bar, level: float, direction: Direction) -> bool:
@@ -178,13 +212,16 @@ def first_breach(
     """
     start: int | None = None
     extreme = 0.0
-    run = 0
-    best_run = 0
+    body_run = 0
+    close_run = 0
+    best_bodies = 0
+    best_closes = 0
 
     def made(kind: BreachKind, at: int | None) -> Breach:
         assert start is not None
         return Breach(kind=kind, direction=direction, level=level, start_index=start,
-                      resolved_index=at, extreme=extreme, bodies=best_run)
+                      resolved_index=at, extreme=extreme, bodies=best_bodies,
+                      closes=best_closes)
 
     # ⚠ `to_index` добавлен 2026-08-17 по живому стеку: pereprior ограничивал окно
     # поиска СРЕЗОМ `bars[:end]` — копией до 51 тыс. объектов на каждого кандидата
@@ -194,16 +231,19 @@ def first_breach(
     for i in range(from_index, stop):
         bar = bars[i]
         if i > from_index and steps_between(bars[i - 1], bar, timeframe) != 1:
-            run = 0  # дыра в ряду разрывает серию подряд идущих тел (стр. 55)
+            body_run = close_run = 0  # дыра в ряду разрывает серию подряд идущих свечей (стр. 55)
         if _beyond(bar, level, direction):
             edge = bar.high if direction is Direction.ABOVE else bar.low
             if start is None:
-                start, extreme, run, best_run = i, edge, 0, 0
+                start, extreme = i, edge
+                body_run = close_run = best_bodies = best_closes = 0
             extreme = (max(extreme, edge) if direction is Direction.ABOVE
                        else min(extreme, edge))
-            run = run + 1 if body_beyond(bar, level, direction) else 0
-            best_run = max(best_run, run)
-            if run >= confirm_bodies:
+            body_run = body_run + 1 if body_beyond(bar, level, direction) else 0
+            close_run = close_run + 1 if closed_beyond(bar, level, direction) else 0
+            best_bodies = max(best_bodies, body_run)
+            best_closes = max(best_closes, close_run)
+            if close_run >= confirm_bodies:
                 return made(BreachKind.BREAKOUT, i)
             continue
         if start is None:
@@ -222,9 +262,9 @@ def first_breach(
         #     случаях - цена не уходит за уровень целыми свечами" (М-15);
         #   * кодированные детекторы (LuxAlgo, vikprimus) строят градацию 1-бар / 2-бар /
         #     N-бар, а не бинарное «в срок или никогда».
-        # Отсюда: поздний возврат БЕЗ ЕДИНОГО полного тела за уровнем — прокол
+        # Отсюда: поздний возврат БЕЗ ЕДИНОГО ЗАКРЫТИЯ за уровнем — прокол
         # (ложный пробой по классике, условие схемы стр. 6 выполнено); поздний возврат,
-        # где тела за уровнем БЫЛИ (1..confirm-1), — по-прежнему UNRESOLVED: тут и
+        # где закрытия за уровнем БЫЛИ (1..confirm-1), — по-прежнему UNRESOLVED: тут и
         # классика расколота (Булковски счёл бы первый close пробоем, курс требует
         # 2-3 тел), и рисунок не помогает.
         #
@@ -237,9 +277,30 @@ def first_breach(
         back = steps_between(bars[start], bar, timeframe)
         if back <= return_bars:
             return made(BreachKind.PUNCTURE, i)
-        return made(BreachKind.PUNCTURE if best_run == 0 else BreachKind.UNRESOLVED, i)
+        return made(BreachKind.PUNCTURE if best_closes == 0 else BreachKind.UNRESOLVED, i)
 
     return made(BreachKind.OPEN, None) if start is not None else None
+
+
+def retest_after(
+    bars: list[Bar],
+    level: float,
+    from_index: int,
+    *,
+    to_index: int | None = None,
+) -> int | None:
+    """Первый бар, вернувшийся К УРОВНЮ после пробоя. `None` — ретеста ещё не было.
+
+    Стр. 42: «Как правило, Пробой сильных уровней цена подтверждает с обратной стороны»;
+    все три ловушки стр. 43 кончаются ретестом, и именно на нём курс велит действовать
+    («открываем позицию и ставим СТОП за накопление», «закрываем свою позицию в БУ»).
+    Ретестом считается касание линии уровня — бар, чей диапазон её накрывает.
+    """
+    stop = len(bars) if to_index is None else min(to_index, len(bars))
+    for i in range(max(from_index, 0), stop):
+        if bars[i].low <= level <= bars[i].high:
+            return i
+    return None
 
 
 def first_verdict(

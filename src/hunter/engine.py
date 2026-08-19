@@ -30,16 +30,16 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from . import absorption, emit, geometry, levels, pereprior, priority, swings
+from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
-from .accumulation import AccumulationScan
+from .accumulation import Accumulation, AccumulationScan, OpenStructure
 from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS
 from .geometry import Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
 from .pereprior import Pereprior, PPSide
-from .priority import Agreement, Priority
+from .priority import Agreement, CounterLevel, Priority
 from .swings import SwingSet, Trend
 
 # ⚠ Типы импортируются ИМЕНАМИ, а не через модуль. Поля моделей ниже называются `swings`
@@ -71,6 +71,41 @@ class SeriesRead(BaseModel):
     наступление слома система проверить не могла. Оператор получал инструкцию,
     исполнимость которой машина не отслеживала.
     """
+
+    all_perepriors: tuple[Pereprior, ...] = ()
+    """ВСЕ переприоры ряда, а не последний на сторону. Нужны стр. 51 и фигурам стр. 56-62.
+
+    `perepriors` выше — подмножество этого поля (последний ПП каждой стороны), поэтому
+    второго прохода по бару нет: оба берутся из одного `pereprior.detect_all`.
+    """
+
+    splits: tuple[pereprior.SplitEntry, ...] = ()
+    """Пары "истинный + ранний ПП" рядом — стр. 51: «закуп лучше делить на 2 части»."""
+
+    channels: tuple[figures.Channel, ...] = ()
+    """Флаги (стр. 56) и клинья (стр. 60) этого ряда."""
+
+    channel_notes: tuple[str, ...] = ()
+    """По одной строке на каждый коридор из `channels`, в том же порядке: ранний ПП,
+    на подтверждение которого стр. 56 разрешает вход, либо НАЗВАННАЯ причина, почему
+    его нет (§4.3)."""
+
+    pennants: tuple[figures.Pennant, ...] = ()
+    """Вымпелы/треугольники ЗАКРЫТЫХ структур (стр. 57, 58)."""
+
+    open_pennant: figures.Pennant | None = None
+    """Вымпел НЕЗАКРЫТОЙ структуры. Отдельным полем, потому что вход по стр. 57 берётся
+    на 6 касании ВНУТРИ структуры — то есть до того, как она закроется."""
+
+    open_pennant_missing: str = ""
+    """Почему у незакрытой структуры вымпела нет. Пусто — либо вымпел есть, либо самой
+    незакрытой структуры нет."""
+
+    multiple_bases: tuple[figures.MultipleBase, ...] = ()
+    """Двойные и тройные дно/вершина на закрытых накоплениях (стр. 62)."""
+
+    head_shoulders: tuple[figures.HeadShoulders, ...] = ()
+    """Голова и плечи — признак на переприорах этого ряда (стр. 61)."""
 
 
 class Decision(BaseModel):
@@ -105,6 +140,33 @@ class Decision(BaseModel):
     Заведено 2026-08-10 (реестр долга, строка 1). Пусто — прижатых структур нет; это
     штатный случай, а не отказ, поэтому пустота здесь законна. Найденное называется с
     правилом действия курса; эмиссию не порождает (как и слом на младшем ТФ)."""
+
+    tf_trap: str = ""
+    """Ловушка таймфрейма (стр. 40, 46, 47) — готовая строка `priority.counter_warning`.
+
+    Пусто — встречных уровней старшего ТФ в коробке базы нет. Считается ТОЛЬКО у
+    эмитируемых уровней, по тому же правилу, что и геометрия: предупреждение о сделке
+    имеет смысл там, где сделка есть.
+    """
+
+    stop_volume: geometry.StopVolumeSetup | None = None
+    """ОТДЕЛЬНАЯ сделка от уровня стопового объёма — стр. 35, 37, 39.
+
+    Не эмитируется (новый тип сигнала меняет состав леджера — тот же выбор, что у
+    `PPSetup`), но печатается: курс называет её самостоятельным трейдом.
+    """
+
+    stop_volume_missing: str = ""
+    """Почему сделки от стопового объёма нет (§4.3). Пусто — она есть либо не искалась."""
+
+    counters: tuple[CounterLevel, ...] = ()
+    """Те же встречные уровни, что описывает `tf_trap`, но ЧИСЛАМИ, ближайший первым.
+
+    Строка нужна карточке, числа — сообщению бота: предел Telegram 4096 знаков, и
+    пересказывать там весь текст правила курса нечем. Пересобирать строку разбором
+    `tf_trap` было бы двумя сущностями под одним именем — тем самым дефектом, из-за
+    которого зона вылезала за границы у половины уровней.
+    """
 
     @property
     def emitted(self) -> bool:
@@ -184,6 +246,15 @@ class SymbolDecision(BaseModel):
             for d in self.decisions if d.setup is not None
         )
 
+    @property
+    def tf_balance(self) -> emit.TFBalance:
+        """Сколько отложек по каждому ТФ и по каждой корзине стр. 48. Со знаменателем.
+
+        Проекция эмиссий, а не второй расчёт: складывается ровно то, что уже решено.
+        Отсева по этому счёту нет — стр. 48 требует баланса, но числа не называет.
+        """
+        return emit.tf_balance(self.emissions)
+
 
 def read_series(
     series: dict[str, list[Bar]], timeframes: tuple[str, ...]
@@ -204,10 +275,58 @@ def read_series(
         if isinstance(sw, NotReady):
             bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
             continue
-        reads[tf] = SeriesRead(timeframe=tf, swings=sw, trend=swings.trend(sw),
-                               scan=detect_accumulations(bars, sw, tf),
-                               perepriors=pereprior.detect(bars, sw, tf))
+        scan = detect_accumulations(bars, sw, tf)
+        every = pereprior.detect_all(bars, sw, tf)
+        # `detect` — это «последний ПП каждой стороны» из того же прохода; берём его
+        # отсюда, чтобы бары не сканировались дважды и чтобы два поля не разошлись.
+        last_side = tuple(seq[-1] for side in (PPSide.SHORT, PPSide.LONG)
+                          if (seq := [p for p in every if p.side is side]))
+        chans = figures.detect_channels(sw)
+        open_pennant, open_missing = _pennant_of(scan.open_tail)
+        reads[tf] = SeriesRead(
+            timeframe=tf, swings=sw, trend=swings.trend(sw), scan=scan,
+            perepriors=last_side,
+            all_perepriors=every,
+            splits=pereprior.split_entries(every),
+            channels=chans,
+            channel_notes=tuple(_channel_note(c, every) for c in chans),
+            pennants=tuple(pen for acc in scan.closed
+                           if (pen := _pennant_of(acc)[0]) is not None),
+            open_pennant=open_pennant,
+            open_pennant_missing=open_missing,
+            multiple_bases=tuple(
+                mb for acc in scan.closed
+                if not isinstance(mb := figures.multiple_base(acc, every), NotReady)),
+            head_shoulders=tuple(
+                hs for pp in every
+                if not isinstance(hs := figures.head_and_shoulders(pp, sw), NotReady)),
+        )
     return reads, tuple(bad)
+
+
+def _pennant_of(
+    structure: Accumulation | OpenStructure | None,
+) -> tuple[figures.Pennant | None, str]:
+    """Вымпел структуры (стр. 57, 58) вместе с причиной, если его нет.
+
+    Причина возвращается ОТДЕЛЬНОЙ строкой, а не подменяется пустотой: у незакрытой
+    структуры «сужения нет» и «структуры нет» — разные ответы (§4.3).
+    """
+    if structure is None:
+        return None, ""
+    got = figures.pennant(structure)
+    if isinstance(got, NotReady):
+        return None, got.reason
+    return got, ""
+
+
+def _channel_note(channel: figures.Channel, pps: tuple[Pereprior, ...]) -> str:
+    """Вход во флаг по стр. 56 — «подтверждение раннего ПереПриора» — либо причина."""
+    got = figures.channel_early_pp(channel, pps)
+    if isinstance(got, NotReady):
+        return got.reason
+    return (f"ранний ПП в {got.side.value} подтверждён на баре {got.confirmed_at_index}, "
+            f"зона {got.zone_lo:.8g}…{got.zone_hi:.8g} (стр. 56)")
 
 
 def foreign_borders(
@@ -265,13 +384,22 @@ def decide(
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans,
                                        {tf: r.swings for tf, r in reads.items()},
                                        frame_bars=frame_bars)
-    mapped = levels.map_levels(frozen, series)
+    # `scans` третьим аргументом — иначе `LevelStatus.playout` знает только картины 1,
+    # 3, 4 стр. 28 и закреп без ретеста: картины 2, 5, 6 и 7 требуют разбора структур
+    # того же ТФ, и без него страница читалась бы наполовину.
+    mapped = levels.map_levels(frozen, series, scans)
     trends = {tf: r.trend for tf, r in reads.items()}
 
     decisions: list[Decision] = []
     for m in mapped:
         pr = priority.resolve(trends, m.level.timeframe)
         hold = emit.hold_reason(m.status)
+        # Предупреждение о ловушке ТФ и сделка от стопового объёма считаются ТАМ ЖЕ, где
+        # геометрия, — у эмитируемых уровней. Оба обходят весь пул, и считать их для
+        # уровня, который система не торгует, значит платить квадратом за строку, которую
+        # никто не прочтёт.
+        sv: geometry.StopVolumeSetup | NotReady | None = (
+            None if hold else geometry.build_stop_volume_setup(m.level, mapped))
         decisions.append(Decision(
             level=m.level,
             status=m.status,
@@ -281,6 +409,10 @@ def decide(
             hold=hold,
             mtf_break=_mtf_break(m, series, reads, tfs),
             pressed=_pressed_note(m, reads),
+            tf_trap="" if hold else priority.counter_warning(m.level, mapped),
+            counters=() if hold else priority.counter_levels(m.level, mapped),
+            stop_volume=sv if isinstance(sv, geometry.StopVolumeSetup) else None,
+            stop_volume_missing=sv.reason if isinstance(sv, NotReady) else "",
         ))
     pp_signals: list[PPSignal] = []
     for tf in tfs:

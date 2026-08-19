@@ -27,6 +27,7 @@ from . import (
     breach,
     engine,
     factors,
+    figures,
     geometry,
     indicators,
     pereprior,
@@ -100,6 +101,66 @@ AGREE_LABEL = {"by_trend": "по тренду",
                "no_priority": "приоритет не определён"}
 PP_LABEL = {"true": "истинный", "early": "ранний"}
 
+TAKE_LABEL = {
+    "none": "цена в зону не заходила",
+    "zone": "забрала объёмную зону — вариант 1 (стр. 30)",
+    "poc": "дошла до самого ПОК — вариант 2 (стр. 30)",
+    "puncture": "проколом забрала уровень и все объёмы — вариант 3 (стр. 30)",
+    "beyond": "закрывалась свечами ЗА уровнем — это пробой, а не забор (стр. 30)",
+}
+"""Три варианта забора уровня стр. 30 плюс общее условие той же страницы. До 2026-08-19
+все три были одним словом «касание», и различить их владелец не мог."""
+
+PLAYOUT_LABEL = {
+    "none": "цена к уровню не приходила",
+    "in_progress": "цена у уровня, картина стр. 28 ещё не сложилась",
+    "taken": "1 — забрала уровень и дала реакцию (стр. 28)",
+    "base_near": "2 — новое накопление с ближней стороны, выход в сторону уровня (стр. 28)",
+    "stop_run_flip": "3 — пробила, выбила стоп, вернулась на ретест (стр. 28)",
+    "quiet_flip": "4 — закрепилась, стоп НЕ выбила, на ретесте переворот (стр. 28)",
+    "base_beyond": "5 — закрепилась и построила структуру ЗА уровнем (стр. 28)",
+    "traded_out": "6 — расторговала уровень и вышла в другую сторону (стр. 28)",
+    "saw": "7 — «пила» на уровне: выйти в б/у и дождаться выхода (стр. 28)",
+    "broken": "закреп за уровнем есть, ретеста с обратной стороны ещё не было (стр. 42)",
+}
+
+ENTRY_ORDER_LABEL = {"zone": "на зону", "poc": "на ПОК"}
+
+BREAKEVEN_LABEL = {
+    "reaction_inside_base": "реакция и уход внутрь базы (стр. 19)",
+    "partial_take_done": "частичный тейк взят (стр. 15)",
+    "level_breach_retest": "пробой уровня и ретест (стр. 44)",
+}
+
+ADD_ON_LABEL = {
+    "return_to_entry": "возврат к своему уровню после тейка (стр. 19)",
+    "new_level_after_take": "новый уровень, сформированный после взятия цели (стр. 24)",
+}
+
+FIGURE_KIND_LABEL = {"flag": "флаг (стр. 56)", "wedge": "клин (стр. 60)"}
+FIGURE_SIDE_LABEL = {"long": "в ЛОНГ", "short": "в ШОРТ"}
+PENNANT_LABEL = {
+    "equal": "треугольник с равными границами (стр. 58)",
+    "squeezed": "треугольник с поджатием (стр. 57)",
+}
+FIGURE_ENTRY_LABEL = {
+    "nearest_level": "от ближайшего уровня",
+    "early_pp": "на подтверждение раннего ПП",
+    "trend_break_test": "на тесте слома тенденции",
+    "touch_6": "на 6 касании",
+    "add_on": "доливка, если структура расширится",
+    "pp_test": "на тесте пробитого уровня ПП",
+}
+TRENDLINE_LABEL = {
+    "support_broken": "трендовая поддержки пробита ВНИЗ",
+    "resistance_broken": "трендовая сопротивления пробита ВВЕРХ",
+}
+
+FIGURES_SHOWN = 3
+"""Сколько фигур каждого вида печатать на ТФ. Печатаются ПОСЛЕДНИЕ по ряду — те, что
+ближе к текущему бару; число остальных называется строкой, а не замалчивается (§4.3).
+Это ограничение ПЕЧАТИ, а не расчёта: считаются все, и порог здесь не решает ничего."""
+
 
 def _pct(base: Decimal, other: Decimal) -> str:
     """Расстояние в процентах от цены входа — то, чем курс задаёт запас (стр. 18, 33)."""
@@ -144,8 +205,20 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if r is None:
             continue
         sc, tr = r.scan, r.trend
-        tail = ("нет" if sc.open_tail is None
-                else f"открыта {sc.open_tail.bars_open} баров, точек {sc.open_tail.points}")
+        ot = sc.open_tail
+        if ot is None:
+            tail = "нет"
+        else:
+            # Касания печатаются потому, что вход по стр. 57 берётся НА шестом касании,
+            # то есть внутри ещё не закрытой структуры: без этого числа правило страницы
+            # неисполнимо. Сквозная нумерация — схемы стр. 18, 21, 23.
+            tail = (f"открыта {ot.bars_open} баров, точек {ot.points}, "
+                    f"касаний {ot.touches} (верх {ot.upper_touches} / низ {ot.lower_touches}), "
+                    + ("чётко видна — 6+ точек (стр. 23)" if ot.is_clear
+                       else "6 точек не набрано, «чётко» по стр. 23 не сказать"))
+            if ot.is_extended:
+                tail += (f", расширенный диапазон до прокола (стр. 18) "
+                         f"{_num(ot.extended_lo)}…{_num(ot.extended_hi)}")
         # Форма найденных баз (§4.3). Курс различает базу с чёткими границами и базу
         # в сужении (стр. 34), а граница бывает не своя (стр. 40, 39, 46). В карточке
         # они выглядели одинаково, и оператор не мог их отличить.
@@ -158,6 +231,16 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                    f"в сужении {narrowing}  лесенка {ladder}  "
                    f"тренд {TREND_LABEL[tr.direction.value]} (держится на {tr.holds_for})  "
                    f"незакрытая структура: {tail}")
+        # ⚠ Вторая строка заведена 2026-08-19, когда у структуры появились «4+6+» точек
+        # (стр. 23), расширение проколом (стр. 18) и признак "границы по первым двум
+        # точкам" (стр. 18). Без печати эти три величины для владельца не существуют.
+        clear = sum(1 for a in sc.closed if a.is_clear)
+        extended = sum(1 for a in sc.closed if a.is_extended)
+        first_two = sum(1 for a in sc.closed
+                        if a.upper.from_first_two_points and a.lower.from_first_two_points)
+        out.append(f"       из них чётких (6+ точек, стр. 23) {clear}  "
+                   f"с расширением до прокола (стр. 18) {extended}  "
+                   f"обе границы по первым двум точкам (стр. 18) {first_two}")
 
     out.append("")
     out.append("УРОВНИ (ПОК накоплений)")
@@ -194,6 +277,17 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                f"держится на {pr.holds_for} экстремумах)" if pr.timeframe else "")
             + form
         )
+        # ⚠ ВЕРДИКТ ЗАХОДА И КАРТИНА ОТРАБОТКИ (2026-08-19). До этой правки любое
+        # пересечение бара с зоной звалось «касанием», а семь конфигураций стр. 28 не
+        # выходили наружу вовсе. Обе величины предъявляются здесь, потому что решение
+        # владельца — брать уровень или нет — стоит на них.
+        take = st.take
+        take_txt = ("не считался" if take is None else
+                    TAKE_LABEL[take.depth.value]
+                    + ("; реакция была (стр. 25, 31)" if take.reacted
+                       else "; реакции ещё не было"))
+        out.append(f"        заход: {take_txt}")
+        out.append(f"        картина отработки: {PLAYOUT_LABEL[st.playout.value]}")
         # ⚠ СИЛА ПО ОБЪЁМУ ПЕЧАТАЕТСЯ У КАЖДОГО УРОВНЯ (2026-08-19). До этой правки строка
         # композита стояла ВНУТРИ ветки «СДЕЛКИ НЕТ»: владелец видел силу по объёму ровно
         # у тех уровней, по которым система ничего не делает, и не видел ни у одного
@@ -255,6 +349,19 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             f"({_pct(s.entry, s.stop)} от входа)  "
             f"{'закуп дробим' if s.split_orders else 'один ордер'}{anchor_note}"
         )
+        # Лимитки входа ПОИМЁННО (стр. 30: «используем 2-3 ордера, на зону, и на уровень
+        # ПОК»). До 2026-08-19 печаталось только «дробим/один ордер», а цена была одна:
+        # половина правила страницы объявлялась и не исполнялась.
+        out.append("        лимитки входа (стр. 30): " + " · ".join(
+            f"{ENTRY_ORDER_LABEL[o.kind.value]} {_num(o.price)}" for o in s.entry_orders))
+        rules = "; ".join(f"{BREAKEVEN_LABEL[b.trigger.value]} — следить за "
+                          f"{_num(b.watch_price)}" for b in s.breakeven_rules)
+        out.append(f"        безубыток {_num(s.breakeven_price)} — точка открытия сделки "
+                   f"(стр. 14): " + (rules or "условий курс для этой сделки не называет"))
+        if dec.tf_trap:
+            # Стр. 40, 46, 47: встречный уровень старшего ТФ внутри нашей базы. Это
+            # предупреждение, а не отсев, — курс велит переключиться на старший график.
+            out.append(f"        ⚠ {dec.tf_trap}")
         if len(s.ladder) > 1:
             # Стр. 32: «лучше закуп делать на все уровни, что бы ваша средняя твх была
             # максимально безопасная». Средняя названа при равных долях — долей курс не
@@ -268,15 +375,35 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                 role = "цель" if t.role is geometry.TargetRole.PRIMARY else "промежуточная"
                 out.append(f"        {role} {_num(t.price)} "
                            f"({TF_LABEL.get(t.timeframe, t.timeframe)}, "
-                           f"{t.distance_pct:.2f}%)")
+                           f"{t.distance_pct:.2f}%) — {_take_share(t.take)}")
         else:
             out.append("        целей нет")
+        if s.add_ons:
+            out.append("        доливка (стр. 16, 19, 24): " + "; ".join(
+                f"{ADD_ON_LABEL[a.kind.value]}: "
+                + ("цены ещё нет" if a.price is None else f"по {_num(a.price)}")
+                + (f", {a.share_pct:.0f}% позиции" if a.share_pct is not None
+                   else ", доли курс не называет")
+                + (f", после {_num(a.trigger_price)}" if a.trigger_price is not None else "")
+                for a in s.add_ons))
         # РР по ВЫСТАВЛЯЕМОМУ стопу — единственное число, которое можно проверить.
         # Прежде печаталось два РР под два непоставленных стопа.
         rr = s.rr()
         golden = "" if rr is None or rr >= geometry.GOLDEN_RR else "  НИЖЕ стандарта"
         out.append(f"        РР {_rr(rr)} до первой цели "
                    f"(стандарт курса 1к{_num(geometry.GOLDEN_RR, 0)}){golden}")
+        # ОТДЕЛЬНЫЙ трейд от уровня стопового объёма — стр. 37 называет нижнее
+        # накопление «отдельный трейд», стр. 39 задаёт ТВХ, стоп и цель. В эмиссию не
+        # идёт (новый тип сигнала меняет состав леджера), но печатается.
+        sv = dec.stop_volume
+        if sv is not None:
+            out.append(f"        отдельная сделка от стопового объёма (стр. 35, 37, 39): "
+                       f"ТВХ {_num(sv.entry)}  стоп {_num(sv.stop)}  "
+                       f"цель {_num(sv.target.price)} — граница базы, "
+                       f"{_take_share(sv.target.take)}  РР {_rr(sv.rr)}  "
+                       f"б/у {_num(sv.breakeven_price)}")
+        elif dec.stop_volume_missing:
+            out.append(f"        сделки от стопового объёма нет: {dec.stop_volume_missing}")
         if st.event is not None:
             out.append(f"        событие: {_event(st.event)}")
 
@@ -347,6 +474,77 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             )
 
     out.append("")
+    out.append("БАЛАНС ОТЛОЖЕК ПО ТФ (стр. 48)")
+    bal = d.tf_balance
+    if not bal.total:
+        out.append("  отложек нет — балансировать нечего")
+    else:
+        out.append(f"  {bal.note}")
+
+    out.append("")
+    out.append("ФИГУРЫ (стр. 56-62)")
+    # ⚠ В корпусе разборов видео автор говорит, что фигуры классического теханализа не
+    # торгует, а курс отводит им семь страниц с правилами входа и стопа. Курс в иерархии
+    # выше корпуса, поэтому фигуры считаются и печатаются — и только по курсу.
+    any_fig = False
+    for tf in timeframes:
+        r = d.reads.get(tf)
+        if r is None:
+            continue
+        lab = f"{TF_LABEL.get(tf, tf):>3}"
+        shown_ch = r.channels[-FIGURES_SHOWN:]
+        for ch, note in zip(shown_ch, r.channel_notes[-FIGURES_SHOWN:], strict=True):
+            any_fig = True
+            out.append(f"  {lab}  {FIGURE_KIND_LABEL[ch.kind.value]} "
+                       f"{FIGURE_SIDE_LABEL[ch.side.value]}  бары {ch.first_index}…"
+                       f"{ch.last_index}  точек {ch.points}  "
+                       f"коридор {_num(ch.lo)}…{_num(ch.hi)}  вход: {_entries(ch.entries)}")
+            out.append(f"        {note}")
+        if len(r.channels) > len(shown_ch):
+            out.append(f"  {lab}  ещё {len(r.channels) - len(shown_ch)} коридоров раньше "
+                       f"по ряду — напечатаны последние {len(shown_ch)}")
+        shown_pen = r.pennants[-FIGURES_SHOWN:]
+        for pen in shown_pen:
+            any_fig = True
+            out.append(f"  {lab}  {_pennant(pen)}")
+        if len(r.pennants) > len(shown_pen):
+            out.append(f"  {lab}  ещё {len(r.pennants) - len(shown_pen)} вымпелов раньше "
+                       f"по ряду — напечатаны последние {len(shown_pen)}")
+        if r.open_pennant is not None:
+            any_fig = True
+            out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: {_pennant(r.open_pennant)}")
+        elif r.open_pennant_missing:
+            out.append(f"  {lab}  вымпела у незакрытой структуры нет: "
+                       f"{r.open_pennant_missing}")
+        shown_mb = r.multiple_bases[-FIGURES_SHOWN:]
+        for mb in shown_mb:
+            any_fig = True
+            name = (mb.course_name or f"{mb.base_touches} касаний противоположной "
+                                      f"границы — курс такую фигуру не именует")
+            out.append(f"  {lab}  {name} (стр. 62)  граница выхода {_num(mb.boundary_edge)} "
+                       f"внутри зоны ПП {_num(mb.pp_zone_lo)}…{_num(mb.pp_zone_hi)}  "
+                       f"второй закуп от {_num(mb.level_side_edge)}  "
+                       f"вход: {_entries(mb.entries)}")
+        if len(r.multiple_bases) > len(shown_mb):
+            out.append(f"  {lab}  ещё {len(r.multiple_bases) - len(shown_mb)} таких фигур "
+                       f"раньше по ряду")
+        shown_hs = r.head_shoulders[-FIGURES_SHOWN:]
+        for hs in shown_hs:
+            any_fig = True
+            out.append(f"  {lab}  голова и плечи {FIGURE_SIDE_LABEL[hs.side.value]} "
+                       f"(стр. 61)  плечо {hs.left_index} / голова {hs.head_index} "
+                       f"({_num(hs.head_price)}) / плечо {hs.right_index}  "
+                       f"линия шеи {_num(hs.neckline_lo)}…{_num(hs.neckline_hi)}  "
+                       + ("тест был" if hs.tested_at_index is not None
+                          else "теста ещё не было")
+                       + f"  вход: {_entries(hs.entries)}")
+        if len(r.head_shoulders) > len(shown_hs):
+            out.append(f"  {lab}  ещё {len(r.head_shoulders) - len(shown_hs)} ГИП раньше "
+                       f"по ряду")
+    if not any_fig:
+        out.append("  фигур стр. 56-62 не найдено")
+
+    out.append("")
     out.append("ПЕРЕПРИОР")
     any_pp = False
     for tf in timeframes:
@@ -390,6 +588,17 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             elif sig.absorption_missing:
                 out.append(f"        уторговка {beyond_word} зоны: не измерена — "
                            f"{sig.absorption_missing}")
+        for sp in r.splits:
+            # Стр. 51: «Иногда бывает истинный ПП и ранний ПП +- рядом, тогда закуп
+            # лучше делить на 2 части». Порога близости курс не даёт, поэтому печатается
+            # ИЗМЕРЕННЫЙ зазор, а решение остаётся читающему.
+            any_pp = True
+            near = ("зоны пересекаются" if sp.zones_overlap
+                    else f"зазор между зонами {sp.gap_pct:.3f}%")
+            out.append(f"  {TF_LABEL.get(tf, tf):>3}  истинный и ранний ПП в "
+                       f"{SIDE_LABEL[sp.side.value]} рядом (стр. 51): закуп делить на "
+                       f"{sp.parts} части; {near}, между подтверждениями баров: "
+                       f"{sp.bars_apart}")
         for fac in pereprior.failed_update(bars, sw):
             any_pp = True
             what = "хай" if fac.side.value == "short" else "лой"
@@ -440,10 +649,18 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             # Раньше эту работу молча делала затравка TA-Lib (null до N-го бара).
             if admission.check(quantity, len(bars), d.symbol, tf) is not None:
                 continue
-            for div in factors.divergences(bars, sw, _series(bars, expr), name):
+            vals = _series(bars, expr)
+            for div in factors.divergences(bars, sw, vals, name):
                 # М-16: видов четыре, не два — подпись берётся из словаря, а не выводится
                 # ветвлением «если не дивергенция, значит конвергенция».
                 parts.append(f"{DIV_LABEL[div.kind.value]} {name}")
+            if name == "RSI":
+                # Стр. 67: «Также можно смотреть трендовые линии… по RSI был пробой
+                # трендовой». Линия строится ПО САМОМУ индикатору, не по цене.
+                for tb in factors.trendline_breaks(vals, name):
+                    parts.append(f"{TRENDLINE_LABEL[tb.kind.value]} по {name}: линия "
+                                 f"{tb.line_value:.1f}, значение {tb.last_value:.1f} "
+                                 f"(стр. 67)")
         # ⚠ Отсутствие фактора называется ЧИСЛАМИ, а не словами «истории мало». Требования
         # к истории замерены (`admission.REQUIRED_BARS`), и `admission.check` умеет
         # сказать «нужно N, есть M» — до 2026-08-06 эта функция не звалась ниоткуда, а
@@ -452,13 +669,33 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # ⚠ Средняя линия — SMA20 (`bbands_middle`), не EMA20. До 2026-08-09 здесь
         # стояла `ema(20)`, и ширина полос делилась на чужую величину — расхождение
         # нашла сверка с первоисточниками (Боллинджер считает и σ, и середину по SMA).
-        sq = factors.squeeze(_series(bars, indicators.bbands_upper()),
-                             _series(bars, indicators.bbands_lower()),
-                             _series(bars, indicators.bbands_middle()))
-        parts.append(f"полосы {sq.width_pct:.2f}% (уже {sq.percentile:.0f}% истории)"
-                     if sq else _short("bb_upper", len(bars), d.symbol, tf, "полосы"))
+        bn = factors.band_narrowing(_series(bars, indicators.bbands_upper()),
+                                    _series(bars, indicators.bbands_lower()),
+                                    _series(bars, indicators.bbands_middle()),
+                                    [b.close for b in bars])
+        if bn is None:
+            parts.append(_short("bb_upper", len(bars), d.symbol, tf, "полосы"))
+        else:
+            # Стр. 68 спрашивает «как скоро будет выход», и ответ обязан быть В БАРАХ.
+            # Знаменатель печатается рядом: медиана по трём случаям и по тремстам —
+            # разные утверждения.
+            when = ("срок выхода не замерен: прошлых случаев нет"
+                    if bn.exit_bars_median is None else
+                    f"выход за полосу обычно через {bn.exit_bars_median:.0f} баров "
+                    f"(медиана по {bn.exit_cases} случаям)")
+            parts.append(f"полосы {bn.width_pct:.2f}% (уже {bn.percentile:.0f}% истории), "
+                         f"{when} (стр. 68)")
         # Стр. 69 называет ОБЕ скользящие — «этих скользящих ИЛИ ОДНОЙ ИЗ НИХ», — и на
         # скриншоте настроек показаны обе с длиной 200. Считалась только EMA (М-16/М-13).
+        # ⚠ СРАВНИВАЕТСЯ С ТВХ И ЦЕЛЬЮ, А НЕ С ПОСЛЕДНЕЙ ЦЕНОЙ (2026-08-19). Стр. 69
+        # говорит о совпадении скользящих «с нашей точкой входа/выхода», а вызов стоял
+        # с `bars[-1].close` — то есть отвечал не на тот вопрос. Сделка берётся ПЕРВАЯ
+        # эмитируемая на этом ТФ (порядок решений детерминирован); сделок на ТФ нет —
+        # это НАЗЫВАЕТСЯ, а не подменяется текущей ценой.
+        ref = next((x.setup for x in d.decisions
+                    if x.setup is not None and x.level.timeframe == tf), None)
+        goal = None if ref is None else next(
+            (t.price for t in ref.targets if t.role is geometry.TargetRole.PRIMARY), None)
         for name, expr200 in (("EMA200", indicators.ema(200)),
                               ("MA200", indicators.sma(200))):
             # Тот же явный допуск: ewm отдаёт числа с первого бара, но каноничны они
@@ -467,9 +704,19 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             if admission.check("ema200", len(bars), d.symbol, tf) is not None:
                 parts.append(_short("ema200", len(bars), d.symbol, tf, name))
                 continue
-            ma = factors.ma_touch(_series(bars, expr200), bars[-1].close)
-            parts.append(f"{name} в {ma.distance_pct:.2f}% от цены" if ma
-                         else _short("ema200", len(bars), d.symbol, tf, name))
+            if ref is None:
+                parts.append(f"{name}: сравнить не с чем — сделок на этом ТФ нет, а "
+                             f"стр. 69 сравнивает скользящую с ТВХ и целью")
+                continue
+            ma = factors.ma_touch(_series(bars, expr200), float(ref.entry),
+                                  None if goal is None else float(goal))
+            if ma is None:
+                parts.append(_short("ema200", len(bars), d.symbol, tf, name))
+                continue
+            parts.append(f"{name} в {ma.distance_entry_pct:.2f}% от ТВХ, "
+                         + ("цели нет" if ma.distance_target_pct is None
+                            else f"{ma.distance_target_pct:.2f}% от цели")
+                         + " (стр. 69)")
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  " + " · ".join(parts))
     return "\n".join(out) + "\n"
 
@@ -503,8 +750,36 @@ def _event(ev: breach.Breach) -> str:
     kind = {"puncture": "прокол", "breakout": "пробой",
             "unresolved": "курс вердикта не даёт", "open": "не разрешилось"}
     depth = abs(ev.extreme - ev.level) / ev.level * 100 if ev.level else 0.0
+    # Закрытия печатаются ПЕРВЫМИ: с 2026-08-19 вердикт пробоя решают именно они
+    # (стр. 30: цена не должна закрываться свечами за уровнем), а полные тела остались справкой.
     return (f"{kind[ev.kind.value]} с бара {ev.start_index}, глубина {depth:.2f}%, "
-            f"полных тел {ev.bodies}")
+            f"закрытий за уровнем {ev.closes}, полных тел {ev.bodies}")
+
+
+def _take_share(share: geometry.TakeShare) -> str:
+    """Какую часть позиции крыть на этой цели. Доли нет — печатается причина (§4.3)."""
+    if share.min_pct is None or share.max_pct is None:
+        return share.note
+    if share.min_pct == share.max_pct:
+        return f"крыть {share.min_pct:.0f}% — {share.note}"
+    return f"крыть {share.min_pct:.0f}-{share.max_pct:.0f}% — {share.note}"
+
+
+def _entries(entries: tuple[figures.FigureEntry, ...]) -> str:
+    """Входы, названные курсом для фигуры, в порядке самого курса."""
+    return ", ".join(FIGURE_ENTRY_LABEL[e.value] for e in entries)
+
+
+def _pennant(pen: figures.Pennant) -> str:
+    """Вымпел одной строкой: касания, шестое из них (ТВХ стр. 57) и якорь стопа."""
+    touch = (f"6-е на баре {pen.touch6_index}" if pen.touch6_index is not None
+             else "шестого касания ещё не было")
+    return (f"{PENNANT_LABEL[pen.borders.value]} {FIGURE_SIDE_LABEL[pen.side.value]}  "
+            f"касаний {pen.touches}, {touch}  "
+            f"границы {_num(pen.lower_edge)}…{_num(pen.upper_edge)}  "
+            f"стоп прячем за {_num(pen.stop_anchor)} (стр. 57)"
+            + ("  структура уже расширялась (стр. 18)" if pen.is_extended else "")
+            + f"  вход: {_entries(pen.entries)}")
 
 
 def _tf_ms(tf: str) -> int:
