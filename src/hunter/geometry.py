@@ -956,14 +956,32 @@ def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
     # Цель законна только ПО НАПРАВЛЕНИЮ сделки: противоположный ПП, стоящий позади
     # входа, целью не является — маршрут «от ПП до ПП» идёт вперёд, а не назад. Первая
     # редакция это не проверяла и печатала отрицательный РР — поймано первым же диффом.
+    # ⚠ СТОП ЗА ХАЙ/ЛОЙ, А НЕ НА НЁМ (2026-08-19, приказ владельца: «СТОП ВСЕГДА
+    # СТАВИТСЯ ЗА СТРУКТУРУ И НИКАК ИНАЧЕ»). Здесь стояло `stop = pp.zone_hi` — РОВНО
+    # край тени свечи слома, то есть «за» было превращено в «=», а запаса не было
+    # вовсе. Тот же дефект уже чинился у уровней 2026-08-18 и вернулся здесь.
+    #
+    # Стр. 50 дословно: «Торговля ПП – точкой входа является тест ПП, со стопом за
+    # хай/лой или базу в месте слома, если она есть». Запас — общий для всех стопов
+    # курса: стр. 58 «Стоп ВСЕГДА прячем за всю структуру с запасом 1-3%», и слово
+    # «всегда» там безусловное. Берётся `DEFAULT_MARGIN_PCT`, тот же, что у уровней:
+    # два разных запаса под одним правилом разошлись бы при первой правке.
+    #
+    # ⚠ Вторая ветвь стр. 50 — «или базу в месте слома, если она есть» — НЕ
+    # реализована: накопление в месте слома здесь неизвестно (`build_pp_setup` получает
+    # только сам ПП и встречный). Это названо, а не умолчано; ветвь ставит стоп ДАЛЬШЕ,
+    # значит нынешний стоп её не нарушает, а недобирает.
+    margin = DEFAULT_MARGIN_PCT / 100
     if pp.side is PPSide.SHORT:
-        entry, stop = pp.zone_lo, pp.zone_hi
+        entry = pp.zone_lo
+        stop = pp.zone_hi * (1 + margin)
         cand = opposite.zone_hi if opposite is not None else None
         target = cand if cand is not None and cand < entry else None
         risk = stop - entry
         rr = (entry - target) / risk if target is not None and risk > 0 else None
     else:
-        entry, stop = pp.zone_hi, pp.zone_lo
+        entry = pp.zone_hi
+        stop = pp.zone_lo * (1 - margin)
         cand = opposite.zone_lo if opposite is not None else None
         target = cand if cand is not None and cand > entry else None
         risk = entry - stop
