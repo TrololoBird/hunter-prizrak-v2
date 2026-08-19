@@ -2178,6 +2178,12 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры — чтобы назвать СТОП. Ноль — не записаны."""
 
+    agreement: str = ""
+    """Согласие со старшим ТФ: by_trend | against_trend | no_priority. Пусто — не считалось.
+
+    Стр. 47: встречную позицию курс разрешает только «имея позицию по тренду – в виде
+    хэджа и/или на уменьшенный объем риска»; стр. 11 — только под ПРИБЫЛЬНУЮ сделку."""
+
     mtf_break: int | None = None
     """Подтверждён ли слом структуры на младшем ТФ: 1 да, 0 нет, None неприменимо.
 
@@ -2253,10 +2259,12 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         # ровно это и случилось при вводе `mtf_break`: «no such column: mtf_break»,
         # уведомления молчали. Проект уже знал этот класс по `vrvp_density` в `read_map`
         # (строкой выше), и я его повторил.
-        mtf_col = ("mtf_break" if "mtf_break" in store.level_columns(conn) else "NULL")
+        have = store.level_columns(conn)
+        mtf_col = "mtf_break" if "mtf_break" in have else "NULL"
+        agr_col = "agreement" if "agreement" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
-            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}"
+            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}"
             f" FROM levels WHERE state='active' AND symbol IN ({marks})",
             symbols).fetchall()
     except sqlite3.DatabaseError as e:
@@ -2269,7 +2277,8 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             entry_rule=r[8] or "",
                             boundary_lo=float(r[9] or 0.0),
                             boundary_hi=float(r[10] or 0.0),
-                            mtf_break=None if r[11] is None else int(r[11]))
+                            mtf_break=None if r[11] is None else int(r[11]),
+                            agreement=r[12] or "")
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -2487,7 +2496,7 @@ class Notifier:
             return out
         now_ms = clock.now_ms()
         rank = {"far": 0, "near": 1, "inside": 2}
-        zone_lines: list[str] = []
+        hits: list[tuple[LevelRow, float, str]] = []
         seen: set[tuple[str, str, str, int, int]] = set()
         for lv in news.levels:
             t = tickers.get(lv.symbol)
@@ -2520,15 +2529,25 @@ class Notifier:
             # молча — они вернутся в уведомления, если снова станут торгуемыми.
             if lv.entry_rule != "limit":
                 continue
+            # ⚠ СТР. 43: цена по ту сторону ВСЕЙ структуры — уровень своей стороной уже
+            # не работает («Уровень лонг/шорт менятся для нас на противоположный»).
+            # Предикат в проекте есть с 2026-08-18 и применялся ТОЛЬКО к графику; звать
+            # ценой к лонгу, под который она провалилась, — приглашение купить
+            # сопротивление.
+            beyond = ((t.last < lv.boundary_lo) if lv.side == "long"
+                      else (t.last > lv.boundary_hi))
+            if lv.boundary_hi > lv.boundary_lo > 0 and beyond:
+                continue
             # Лимитка на покупку стоит НИЖЕ цены, на продажу — ВЫШЕ (стр. 30 «вход от
             # уровня»). Уровень по другую сторону — уже пройденное, а не вход.
             if (lv.price > t.last) if lv.side == "long" else (lv.price < t.last):
                 continue
-            zone_lines.append(_zone_alert(lv, t.last, pos))
+            hits.append((lv, t.last, pos))
         # Снятые с карты уровни выбывают из памяти состояний — иначе она росла бы вечно.
         for key in list(self._zone_state):
             if key not in seen:
                 del self._zone_state[key]
+        zone_lines = _merge_hits(hits)
         if zone_lines:
             self.sent_zone_events += len(zone_lines)
             out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
@@ -2543,7 +2562,50 @@ class Notifier:
 # но теперь оно РЕШАЕТ, звать ли вообще, а не печатается как справка.
 
 
-def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
+def _merge_hits(hits: list[tuple[LevelRow, float, str]]) -> list[str]:
+    """Склеить события ОДНОГО ценового района в одно сообщение.
+
+    ⚠ Заведено 2026-08-19 по живому архиву: ARPA дала два уведомления подряд, 19:37
+    (15м, вход 0.0085165) и 19:42 (5м, вход 0.0085075) — разница 0.1%, зоны
+    перекрываются. Это ОДИН район, увиденный на двух ТФ, а читатель видит два сигнала
+    и удваивает риск. Тот же приём уже есть в сводке («диапазон интереса», `spans`), и
+    критерий тот же — геометрический: зоны одной стороны пересекаются.
+
+    Из группы берётся САМЫЙ СИЛЬНЫЙ уровень (старший ТФ — стр. 22, 48), а перечисляются
+    все ТФ района: сила решает, а список говорит, что район виден на нескольких
+    графиках сразу.
+    """
+    order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
+    groups: list[list[tuple[LevelRow, float, str]]] = []
+    for hit in sorted(hits, key=lambda h: (h[0].symbol, h[0].side, h[0].zone_lo)):
+        lv = hit[0]
+        placed = False
+        for g in groups:
+            top = g[0][0]
+            if (top.symbol == lv.symbol and top.side == lv.side
+                    and lv.zone_lo <= max(x[0].zone_hi for x in g)
+                    and lv.zone_hi >= min(x[0].zone_lo for x in g)):
+                g.append(hit)
+                placed = True
+                break
+        if not placed:
+            groups.append([hit])
+    out: list[str] = []
+    for g in groups:
+        lead, price, pos = max(g, key=lambda h: order.get(h[0].timeframe, 0))
+        # «В зоне» перебивает «подходит»: если хоть один ТФ говорит, что цена уже
+        # внутри, правило стр. 44 действует для всего района.
+        if any(h[2] == "inside" for h in g):
+            pos = "inside"
+        tfs = tuple(dict.fromkeys(
+            h[0].timeframe
+            for h in sorted(g, key=lambda h: -order.get(h[0].timeframe, 0))))
+        out.append(_zone_alert(lead, price, pos, tfs))
+    return out
+
+
+def _zone_alert(lv: LevelRow, price: float, pos: str,
+                tf_list: tuple[str, ...] = ()) -> str:
     """Строка события «цена у зоны» — с ДЕЙСТВИЕМ, а не только с фактом.
 
     Было: «цена 64 313 подходит к лонг-зоне 62 750–63 195 (4ч, ПОК 63 036)» — сказано,
@@ -2552,11 +2614,19 @@ def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
     base = lv.symbol.split("/")[0]
     buy = lv.side == "long"
     act = "ПОКУПКА" if buy else "ПРОДАЖА"
-    where = "цена В ЗОНЕ" if pos == "inside" else "цена подходит"
-    out = [f"• {base} · {act} · {where} {_fmt_price(price)}",
+    tfs = "/".join(dict.fromkeys(TF_LABEL.get(x, x) for x in tf_list or [lv.timeframe]))
+    if pos == "inside":
+        # ⚠ СТР. 44: «Приоритет – не открывать позицию, если цена уже торгуется в зоне».
+        # Прежняя редакция печатала «цена В ЗОНЕ» и ТУТ ЖЕ предлагала лимитку — то есть
+        # звала в сделку ровно там, где курс велит не входить. Правило в проекте было и
+        # соблюдалось карточкой (`emit.hold_reason`), а наблюдатель его не спрашивал.
+        return (f"• {base} · цена ВОШЛА в зону {_fmt_price(lv.zone_lo)}–"
+                f"{_fmt_price(lv.zone_hi)} ({tfs})\n"
+                f"    вход отсюда НЕ приоритет (стр. 44) — ждать выхода из зоны либо "
+                f"быть готовым выйти в б/у на ретесте")
+    out = [f"• {base} · {act} · цена подходит {_fmt_price(price)}",
            f"    лимитка {_fmt_price(lv.price)}, зона "
-           f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} "
-           f"({TF_LABEL.get(lv.timeframe, lv.timeframe)})"]
+           f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} ({tfs})"]
     # СТОП — курсовой: за всю структуру с запасом (стр. 58 «Стоп ВСЕГДА прячем за всю
     # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
     edge = lv.boundary_lo if buy else lv.boundary_hi
@@ -2577,6 +2647,14 @@ def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
         # «ВСЕГДА»). Строка, обещавшая короткий стоп, противоречила бы этому правилу.
         out.append("    слом на младшем ТФ подтверждён — вход по нему безопаснее "
                    "(стр. 19); стоп там же, за структурой")
+    # ⚠ ВСТРЕЧНАЯ СДЕЛКА НАЗЫВАЕТСЯ. Стр. 47 её разрешает, но с двумя условиями сразу:
+    # «Локальную позицию можно рассматривать, имея позицию по тренду – в виде хэджа
+    # и/или на уменьшенный объем риска», а стр. 11 добавляет третье — «мы никогда не
+    # открываем хэдж под убыточную сделку». Карточка это печатала, уведомление молчало,
+    # и читатель мог купить против приоритета, не узнав об этом.
+    if lv.agreement == "against_trend":
+        out.append("    ⚠ ПРОТИВ старшего ТФ — курс разрешает только хеджем к открытой "
+                   "ПРИБЫЛЬНОЙ позиции по тренду и на уменьшенный объём (стр. 47, 11)")
     return "\n".join(out)
 
 

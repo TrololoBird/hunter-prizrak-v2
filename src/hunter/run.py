@@ -1599,10 +1599,19 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 k = (one.level.timeframe, one.level.structure_from_ms,
                      one.level.structure_to_ms)
                 broke[k] = 1 if "подтверждён" in note else 0
+            # Шестым — СОГЛАСИЕ СО СТАРШИМ ТФ (схема 12): доставке нужно сказать, что
+            # сделка встречная (стр. 47), а тренды наблюдателю недоступны.
+            agree: dict[tuple[str, int, int], str] = {}
+            for one in d.decisions:
+                k = (one.level.timeframe, one.level.structure_from_ms,
+                     one.level.structure_to_ms)
+                agree[k] = one.agreement.value
             seen = [(m.level, m.status.state, m.status.entry_rule,
                      m.status.resolved_at_ms,
                      broke.get((m.level.timeframe, m.level.structure_from_ms,
-                                m.level.structure_to_ms)))
+                                m.level.structure_to_ms)),
+                     agree.get((m.level.timeframe, m.level.structure_from_ms,
+                                m.level.structure_to_ms), ""))
                     for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
