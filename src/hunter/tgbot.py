@@ -862,7 +862,7 @@ def tradable_counts(
     одном ответе. `now_ms` обязателен по той же причине: забытый фильтр в одном из двух
     путей вернул бы это расхождение.
     """
-    _, unique, _ = live_unique(zones, price, now_ms)
+    _, unique, _, _ = live_unique(zones, price, now_ms)
     t = [z for z in unique if not _passed(z, price)]
     return (len([z for z in t if z.side == "long"]),
             len([z for z in t if z.side == "short"]))
@@ -885,7 +885,7 @@ def _strength(z: ZoneSpec, order: dict[str, int]) -> tuple[int, float]:
 
 def live_unique(
     zones: tuple[ZoneSpec, ...], price: float, now_ms: int,
-) -> tuple[list[ZoneSpec], list[ZoneSpec], list[ZoneSpec]]:
+) -> tuple[list[ZoneSpec], list[ZoneSpec], list[ZoneSpec], list[ZoneSpec]]:
     """ЖИВЫЕ уровни и их дедубликация по цене — ОДНА на текст и подпись графика.
 
     С 2026-08-17 `read_map` отдаёт и снятые уровни (графику нужны значки судьбы), и
@@ -897,10 +897,44 @@ def live_unique(
 
     С фильтром «уровень у структуры» (`near_structure`, 2026-08-17): скрытые им уровни
     возвращаются ТРЕТЬИМ списком — сводка обязана назвать их числом, а не растворить.
+
+    ⚠ ЧЕТВЁРТЫЙ СПИСОК — ФЛИПНУТЫЕ, и заведён он 2026-08-19 потому, что до этого дня
+    целый торгуемый класс исчезал из сообщения МОЛЧА. Отбор `state == "active"`
+    выбрасывает `flipped`, а курс на стр. 43 говорит о них прямо: «Уровень лонг/шорт
+    менятся для нас на противоположный. По возврату цены на ретест уровня -
+    открываем позицию и ставим СТОП за накопление». Расчёт это знает и пишет
+    `entry_rule=retest_flipped`; карточка такой уровень печатает — а бот не печатал
+    даже их числа. Сам модуль уже требует обратного: два других скрытых класса
+    (слипшиеся по зоне, старше кадра) называются числом, и это записано двумя абзацами
+    выше как правило, а не как украшение.
+
+    ⚠ ПОКАЗЫВАТЬ их списком здесь НЕ СТАЛ, и причина — замер, а не осторожность. На
+    боевом леджере 2026-08-19 флипнутых 20374 против 5177 активных; впуск их со сменой
+    стороны поднимает перечень BTC со 124 строк до 282, а по восьми символам даёт
+    +1270 (зонд `docs/audit/evidence/E-flipped-hidden-2026-08-19/probe_flipped.py`).
+    Число в сводке — ПОСЛЕ той же склейки, что у показанных: сырых пробитых у структуры
+    973, разных 259.
+    Сообщение и без того режется по пределу Telegram. Как отбирать флипнутые —
+    решение о ЦЕЛЯХ, оно владельца; молчание о них решением не было вовсе.
     """
     alive = [z for z in zones if z.state == "active"]
     live = [z for z in alive if near_structure(z, now_ms)]
     off_struct = [z for z in alive if not near_structure(z, now_ms)]
+    # Рамка та же, что у живых: флипнутый уровень с давно ушедшей структурой читателю
+    # не нужен ровно по той же причине, по какой не нужен активный (`near_structure`).
+    flipped = [z for z in zones
+               if z.state == "flipped" and near_structure(z, now_ms)]
+    return live, _dedupe(live, price), off_struct, _dedupe(flipped, price)
+
+
+def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
+    """Свернуть уровни, которые для читателя ОДИН, — по цене и по перекрытию зон.
+
+    ⚠ Вынесено из `live_unique` 2026-08-19, когда той же мерой понадобилось считать
+    скрытый класс пробитых. Считать его сырым числом было бы враньём в другую сторону:
+    у BTC пробитых у структуры 973, а РАЗНЫХ среди них 259 — читателю называют то, что
+    он увидел бы списком, а не длину внутреннего массива.
+    """
     order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
     best: dict[tuple[str, str], ZoneSpec] = {}
     # ⚠ СИЛА ПО ОБЪЁМУ РЕШАЕТ ПРИ РАВНОМ ТФ (2026-08-19, приказ владельца: "примени
@@ -912,7 +946,7 @@ def live_unique(
     # Измерения остаются РАЗДЕЛЬНЫМИ, в одно число не сворачиваются: ТФ старше — сильнее
     # (стр. 48), и объём его не перебивает. Курс единой шкалы «ТФ + объём» не даёт, а
     # выдуманный вес одного против другого был бы придумкой из головы.
-    for z in live:
+    for z in rows:
         key = (z.side, _fmt_price(z.price))
         kept = best.get(key)
         if kept is None or _strength(z, order) > _strength(kept, order):
@@ -942,8 +976,7 @@ def live_unique(
                for k in kept_zones):
             continue
         kept_zones.append(z)
-    unique = sorted(kept_zones, key=lambda z: _away(z, price))
-    return live, unique, off_struct
+    return sorted(kept_zones, key=lambda z: _away(z, price))
 
 
 def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
@@ -986,7 +1019,7 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     доминации как отдельный шаг разбора.
     """
     base = symbol.split("/")[0]
-    live, unique, off_struct = live_unique(zones, price, now_ms)
+    live, unique, off_struct, flipped = live_unique(zones, price, now_ms)
     hidden_dupes = len(live) - len(unique)
 
     # Шапка — как в посте автора 17.08.2026: «🪙#BTC …», цена рядом.
@@ -1221,6 +1254,12 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                      f"объём ×{top_hidden.vrvp_density:.1f} к среднему против "
                      f"×{shown_max:.1f} у показанных)")
         notes.append(note)
+    if flipped:
+        # ⚠ Курс на стр. 43 этот класс торгует: «По возврату цены на ретест уровня -
+        # открываем позицию и ставим СТОП за накопление». Значит «их нет в списке» и
+        # «их не показывают» для читателя разные ответы, и второй обязан быть назван.
+        notes.append(f"{len(flipped)} пробитых не в списке — по стр. 43 они торгуются "
+                     f"ретестом с обратной стороны")
     service = ("⚙ " + " · ".join(notes)) if notes else ""
     tail = [x for x in (service, origin,
                         "Это карта уровней, а не торговая рекомендация.") if x]
