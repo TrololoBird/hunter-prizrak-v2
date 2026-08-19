@@ -88,8 +88,6 @@ def check_setup(s: Setup) -> list[str]:
     if not (s.entry_zone_lo <= s.entry <= s.entry_zone_hi):
         bad.append(f"вход {s.entry} вне своей зоны "
                    f"[{s.entry_zone_lo}, {s.entry_zone_hi}]")
-    if s.entry not in s.ladder:
-        bad.append(f"вход {s.entry} не входит в лестницу закупа {s.ladder}")
     for t in s.targets:
         if up and t.price <= s.entry:
             bad.append(f"лонг: цель {t.price} ({t.timeframe}) не выше входа {s.entry}")

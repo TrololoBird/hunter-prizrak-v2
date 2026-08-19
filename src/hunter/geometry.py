@@ -42,7 +42,6 @@ from .levels import (
     MappedLevel,
     StopAnchorSource,
 )
-from .levels import nested as nested_levels
 from .models import NotReady
 from .pereprior import Pereprior, PPSide
 from .render import BARS_ON_CHART
@@ -199,39 +198,12 @@ class Target(BaseModel):
     """Доля фиксации ИМЕННО НА ЭТОЙ цели — `take_share(role)`."""
 
 
-class EntryOrderKind(StrEnum):
-    """Куда ставится лимитка входа. Стр. 30 называет ровно два адреса."""
-
-    ZONE = "zone"
-    """На объёмную зону уровня — ближний её край по ходу цены.
-
-    Стр. 30: «используем 2-3 ордера, на зону, и на уровень ПОК» — и делается это,
-    словами той же строки, чтобы ордер точно забрало.
-    Ближний край, а не дальний, потому что смысл ордера — быть забранным
-    даже если до ПОК цена не дошла; там же стр. 30 про ПОК: «немного выше/ниже, т.к.
-    идеально может не доходить».
-    """
-
-    POC = "poc"
-    """На уровень ПОК — стр. 30: «надежнее всего брать от уровня ПОК»."""
-
-
-class EntryOrder(BaseModel):
-    """Одна лимитка входа. Заведено 2026-08-19 ВМЕСТО булева флага `split_orders`.
-
-    Флаг сообщал «дробим/не дробим», а вход всё равно оставался одной ценой: ордера НА
-    ЗОНУ не существовало ни в карточке, ни в сигнале, то есть половина правила стр. 30
-    была объявлена, но не исполнена. Здесь список цен, и `split_orders` стал его видом
-    сверху, а не отдельной сущностью.
-
-    Долей МЕЖДУ ордерами курс не даёт (стр. 30 говорит «2-3 ордера» и не делит объём),
-    поэтому поля доли здесь нет: пустое поле выглядело бы как известная величина.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    kind: EntryOrderKind
-    price: Decimal
+# ⚠ `EntryOrderKind`, `EntryOrder` и `build_entry_orders` УДАЛЕНЫ 2026-08-19.
+# Владелец: "не надо писать где именно ордера ставить, пользователь сам решит на
+# основе зоны и ПОК". Раскладка входа на «зону» и «ПОК» подменяла его решение
+# нашим, а обе величины он видит и так. Вместе с ними ушли `Setup.entry_orders`,
+# `split_orders`, `ladder` и `average_entry_equal_shares`: читателей у них не
+# осталось, а мёртвое поле в этом проекте либо подключается, либо удаляется.
 
 
 class BreakevenTrigger(StrEnum):
@@ -320,36 +292,6 @@ class Setup(BaseModel):
 
     entry_zone_lo: Decimal
     entry_zone_hi: Decimal
-
-    entry_orders: tuple[EntryOrder, ...]
-    """Лимитки входа, В ПОРЯДКЕ ВСТРЕЧИ ЦЕНОЙ (стр. 30). Пустым не бывает."""
-
-    @property
-    def split_orders(self) -> bool:
-        """Дробится ли закуп — стр. 30. Теперь это ВИД на `entry_orders`, а не поле.
-
-        Пока флаг был отдельным полем, он говорил «дробим», а печаталась одна цена
-        входа: сущностей было две, и расходиться они могли молча.
-        """
-        return len(self.entry_orders) > 1
-
-    ladder: tuple[Decimal, ...]
-    """Все уровни внутри большой структуры, снизу вверх (стр. 32).
-
-    Первым элементом всегда идёт `entry` — основной ПОК; дальше ПОК вложенных структур
-    младшего ТФ. Пустой лестницы не бывает: одиночный уровень — это лестница из одного.
-    Стр. 32: «лучше закуп делать на все уровни».
-    """
-
-    @property
-    def average_entry_equal_shares(self) -> Decimal:
-        """Средняя ТВХ при РАВНЫХ долях на каждый уровень лестницы.
-
-        Стр. 32 называет цель — «что бы ваша средняя твх была максимально безопасная», —
-        но долей НЕ задаёт. Поэтому равные доли названы прямо в имени: это допущение
-        читателя, а не правило курса, и молча зашивать его в поле `entry` нельзя.
-        """
-        return sum(self.ladder, Decimal(0)) / Decimal(len(self.ladder))
 
     stop_safe_near: Decimal
     stop_safe_far: Decimal
@@ -538,28 +480,6 @@ def risk_reward(setup: Setup) -> float | None:
     return float(abs(primary[0].price - setup.entry) / risk)
 
 
-def build_entry_orders(level: Level) -> tuple[EntryOrder, ...]:
-    """Лимитки входа по стр. 30 — конкретные цены, а не признак «дробим».
-
-    Мелкое накопление — один ордер на ПОК. Крупное (`BIG_STRUCTURE_TFS`) — два: на
-    ближний по ходу цены край объёмной зоны и на ПОК. Порядок — тот, в котором цена
-    их встретит: для лонга она подходит сверху, для шорта снизу.
-
-    Курс говорит «2-3 ордера», а адресов называет два — «на зону, и на уровень ПОК»
-    (стр. 30). Третьей цены здесь нет: её курс не называет, и придумывать её нельзя.
-
-    Совпадение края зоны с ПОК (зона выродилась в точку) даёт один ордер, а не два
-    одинаковых.
-    """
-    poc = EntryOrder(kind=EntryOrderKind.POC, price=level.price)
-    if level.timeframe not in BIG_STRUCTURE_TFS:
-        return (poc,)
-    near = level.zone_hi if level.side is LevelSide.LONG else level.zone_lo
-    if near == level.price:
-        return (poc,)
-    return (EntryOrder(kind=EntryOrderKind.ZONE, price=near), poc)
-
-
 def build_breakeven_rules(
     *, inside_base: Decimal, level_price: Decimal, first_take: Decimal | None,
 ) -> tuple[BreakevenRule, ...]:
@@ -678,8 +598,6 @@ def build_setup(
         raw = edge * Decimal(str(pct)) / Decimal(100)
         return edge + sign * raw
 
-    alive = tuple(m.level for m in pool if m.alive_at(level.created_at_ms))
-    inner = nested_levels(level, alive)
     # Якорь считается в `levels.build_all` — там есть ряды баров младшего ТФ. Сюда он
     # приходит на уровне; параметр оставлен для зондов, подающих якорь вручную.
     anchor = structural_anchor if structural_anchor is not None else level.stop_anchor
@@ -762,8 +680,6 @@ def build_setup(
         entry=level.price,
         entry_zone_lo=level.zone_lo,
         entry_zone_hi=level.zone_hi,
-        entry_orders=build_entry_orders(level),
-        ladder=tuple(sorted({level.price, *(x.price for x in inner)})),
         stop_safe_near=with_margin(margin_min_pct),
         stop_safe_far=with_margin(margin_max_pct),
         stop_risky=edge,
@@ -816,7 +732,6 @@ class StopVolumeSetup(BaseModel):
 
     side: LevelSide
     entry: Decimal
-    entry_orders: tuple[EntryOrder, ...]
     stop: Decimal
     stop_basis: StopBasis
     target: Target
@@ -908,7 +823,6 @@ def build_stop_volume_setup(
         level=found,
         side=base.side,
         entry=entry,
-        entry_orders=build_entry_orders(found),
         stop=stop,
         stop_basis=StopBasis.MARGIN,
         target=target,

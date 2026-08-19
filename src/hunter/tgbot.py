@@ -1052,12 +1052,13 @@ def trade_notes(decision: engine.SymbolDecision) -> tuple[TradeNote, ...]:
         setup = dec.setup
         if setup is None:
             continue
-        limits = " · ".join(
-            ("зона" if o.kind is geometry.EntryOrderKind.ZONE else "ПОК")
-            + f" {_fmt_price(float(o.price))}" for o in setup.entry_orders)
+        # ⚠ РАСКЛАДКА ОРДЕРОВ УБРАНА (2026-08-19). Владелец: "не надо писать где именно
+        # ордера ставить, пользователь сам решит на основе зоны и ПОК". Обе величины у
+        # него уже есть строкой выше, а список «зона X · ПОК Y» подменял его решение
+        # нашим. Зона и ПОК остаются, раскладка — нет.
         takes = "; ".join(f"{_fmt_price(float(t.price))} — {_take_words(t.take)}"
                           for t in setup.targets) or "целей нет"
-        text = (f"лимитки: {limits} · б/у {_fmt_price(float(setup.breakeven_price))}"
+        text = (f"б/у {_fmt_price(float(setup.breakeven_price))}"
                 f" (стр. 14) · тейк: {takes}")
         if dec.counters:
             # Числами, а не пересказом строки `tf_trap`: полный текст правила стр. 46

@@ -344,16 +344,15 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             anchor_note = f"  якорь: {ANCHOR_LABEL[lvl.stop_anchor_source.value]}"
             if lvl.stop_anchor_narrowed:
                 anchor_note += " в сужении (стр. 34)"
+        # ⚠ ГДЕ СТАВИТЬ ОРДЕРА — НЕ НАША РАБОТА (2026-08-19, приказ владельца: «не надо
+        # писать где именно ордера ставить, пользователь сам решит на основе зоны и
+        # ПОК»). Отсюда убраны три вещи разом: подпись «закуп дробим / один ордер»,
+        # поимённый список лимиток входа и лестница вложенных уровней. Всё, что нужно
+        # читателю для собственного решения, он уже видит строкой выше: ЗОНА и ПОК.
         out.append(
             f"        стоп {_num(s.stop)} — {STOP_BASIS_LABEL[s.stop_basis.value]}  "
-            f"({_pct(s.entry, s.stop)} от входа)  "
-            f"{'закуп дробим' if s.split_orders else 'один ордер'}{anchor_note}"
+            f"({_pct(s.entry, s.stop)} от входа){anchor_note}"
         )
-        # Лимитки входа ПОИМЁННО (стр. 30: «используем 2-3 ордера, на зону, и на уровень
-        # ПОК»). До 2026-08-19 печаталось только «дробим/один ордер», а цена была одна:
-        # половина правила страницы объявлялась и не исполнялась.
-        out.append("        лимитки входа (стр. 30): " + " · ".join(
-            f"{ENTRY_ORDER_LABEL[o.kind.value]} {_num(o.price)}" for o in s.entry_orders))
         rules = "; ".join(f"{BREAKEVEN_LABEL[b.trigger.value]} — следить за "
                           f"{_num(b.watch_price)}" for b in s.breakeven_rules)
         out.append(f"        безубыток {_num(s.breakeven_price)} — точка открытия сделки "
@@ -362,14 +361,6 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             # Стр. 40, 46, 47: встречный уровень старшего ТФ внутри нашей базы. Это
             # предупреждение, а не отсев, — курс велит переключиться на старший график.
             out.append(f"        ⚠ {dec.tf_trap}")
-        if len(s.ladder) > 1:
-            # Стр. 32: «лучше закуп делать на все уровни, что бы ваша средняя твх была
-            # максимально безопасная». Средняя названа при равных долях — долей курс не
-            # задаёт, и подпись об этом говорит прямо.
-            out.append(
-                f"        лестница {' · '.join(_num(x) for x in s.ladder)}  "
-                f"средняя при равных долях {_num(s.average_entry_equal_shares)}"
-            )
         if s.targets:
             for t in s.targets:
                 role = "цель" if t.role is geometry.TargetRole.PRIMARY else "промежуточная"
