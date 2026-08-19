@@ -310,16 +310,40 @@ class Level(BaseModel):
         return self.model_copy(update={"side": other})
 
 
+def structure_bars(acc: Accumulation, bars: list[Bar]) -> list[Bar]:
+    """Бары СТРУКТУРЫ и только они. Одна функция на всех потребителей.
+
+    Стр. 23: «Пока цена не вышла из структуры - у нас нет уровня, уровень появляется
+    когда цена полноценно выходит из структуры»; стр. 26: «Натягивая профиль на
+    структуру – важно захватить ВСЕ свечи структуры». Свечи ВЫХОДА в структуру не
+    входят: тела выхода это уже не накопление.
+
+    ⚠ ЗАВЕДЕНА 2026-08-19, и вот зачем. В `build_all` границы уровня брались срезом
+    `bars[first_index:last_index + 1]`, где `last_index` — бар ПОДТВЕРЖДЕНИЯ выхода,
+    то есть в коробку входили ОБА тела выхода. А `structure_window_ms` в той же
+    цепочке вызовов резала окно профиля по первому телу выхода — с докстрокой,
+    прямо объясняющей, почему выход не считается. Две несовместимые границы структуры
+    в одной функции, 195 строк друг от друга.
+
+    Цена расхождения замерена: коробка шире окна профиля у 63.1% структур (6168 из
+    9780), раздутие высоты медиана ×1.064, p90 ×1.415, максимум ×6.56. Разобранный
+    пример: BCH 1ч — свечи окна 436.22…441.95, напечатанные «границы» 424.64…441.95,
+    и низ 424.64 это ЛОЙ второй свечи ВЫХОДА.
+
+    Следствие тяжелее самой коробки: гистограмма профиля собиралась по окну БЕЗ
+    выхода, а сетка натягивалась на размах СО выходом — верхние и нижние строки не
+    получали ни одной сделки и бесплатно попадали в область стоимости. ПОК сдвигался
+    у 40.9% уровней, зона — у 40.4%.
+    """
+    return bars[acc.first_index:acc.exit.first_body_index]
+
+
 def structure_window_ms(
     acc: Accumulation, bars: list[Bar], timeframe_ms: int
 ) -> tuple[int, int]:
-    """Окно `[от, до)` для профиля: все бары структуры и только они (стр. 26).
-
-    Свечи ВЫХОДА в окно не входят: по стр. 23 структура кончается там, где цена из неё
-    вышла, — тела выхода это уже не накопление. Граница проводится по первому телу
-    выхода, а не по бару подтверждения.
-    """
-    last_inside = acc.exit.first_body_index - 1
+    """Окно `[от, до)` для профиля — по тем же барам, что и границы (`structure_bars`)."""
+    seg = structure_bars(acc, bars)
+    last_inside = acc.first_index + len(seg) - 1
     return bars[acc.first_index].open_ms, bars[last_inside].open_ms + timeframe_ms
 
 
@@ -514,7 +538,9 @@ def build_all(
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=hist.reason))
                 continue
-            seg = bars[acc.first_index:acc.last_index + 1]
+            # Те же бары, что ушли в гистограмму профиля: иначе сетка натягивается
+            # на диапазон, в котором нет объёма (`structure_bars`).
+            seg = structure_bars(acc, bars)
             lvl = build_level(acc, hist, symbol, (lo, hi),
                               created_at_ms(acc, bars, TIMEFRAME_MS[tf]),
                               (Decimal(str(min(b.low for b in seg))),
@@ -532,13 +558,29 @@ def build_all(
             # Это осознанно и безвредно ровно потому, что ранг не читает НИКТО — обзор
             # 2026-08-09 это и нашёл. Когда ранг понадобится, склейку придётся заменить
             # одним вызовом на объединённый набор.
+            #
+            # ⚠⚠ ЗАГЛЯДЫВАНИЕ ВПЕРЁД, ЗАКРЫТОЕ 2026-08-19. Сюда шли ВСЕ закрытые
+            # накопления младших ТФ и ВСЕ свинги ряда — без единого условия на время.
+            # Стоп ставится в момент сделки, значит якорь обязан существовать НА МОМЕНТ
+            # РОЖДЕНИЯ УРОВНЯ; структура младшего ТФ, закрывшаяся позже, якорем быть не
+            # может. Тот же класс дефекта проект уже ловил у ЦЕЛЕЙ (196 из 366 целей
+            # появлялись ПОЗЖЕ своего уровня) и завёл ради него `MappedLevel.alive_at`;
+            # к стопу ту же мерку не приложили. Замер по кадрам: якорь становился
+            # известен позже рождения уровня у 1649 из 4677 (35.3%) — свинг 51.1%,
+            # стоповый объём 45.5%.
+            born_ms = created_at_ms(acc, bars, TIMEFRAME_MS[tf])
             collected: list[StopVolume] = []
             for y in younger:
                 y_scan = scans.get(y)
                 y_bars = series.get(y)
-                if y_scan is not None and y_bars:
-                    collected.extend(classify_stop_volume(
-                        y_scan.closed, y_bars, acc, bars, tf, symbol=symbol).items)
+                if y_scan is None or not y_bars:
+                    continue
+                y_step = TIMEFRAME_MS[y]
+                known = tuple(
+                    a for a in y_scan.closed
+                    if y_bars[a.exit.confirmed_at_index].open_ms + y_step <= born_ms)
+                collected.extend(classify_stop_volume(
+                    known, y_bars, acc, bars, tf, symbol=symbol).items)
             svs: tuple[StopVolume, ...] = tuple(collected)
             down = lvl.side is LevelSide.LONG
             # Лои своего ТФ и ТФ−1 для лонга, хаи для шорта — вторая половина фразы
@@ -547,8 +589,17 @@ def build_all(
             sw_prices: list[float] = []
             for stf in (tf, *younger[:1]):
                 sw = sw_by_tf.get(stf)
-                if sw is not None:
-                    sw_prices.extend(s.price for s in sw.swings if s.kind is kind)
+                s_bars = series.get(stf)
+                if sw is None or not s_bars:
+                    continue
+                # Свинг известен не в момент своего экстремума, а когда ПОДТВЕРЖДЁН
+                # (фрактал закрывается двумя барами позже, `confirmed_at_index`).
+                s_step = TIMEFRAME_MS[stf]
+                sw_prices.extend(
+                    s.price for s in sw.swings
+                    if s.kind is kind
+                    and s.confirmed_at_index < len(s_bars)
+                    and s_bars[s.confirmed_at_index].open_ms + s_step <= born_ms)
             anchor = stop_anchor(lvl.side, float(lvl.boundary_lo if down else lvl.boundary_hi),
                                  acc.lower if down else acc.upper, svs, tuple(sw_prices),
                                  base_height=float(lvl.boundary_hi - lvl.boundary_lo))
@@ -799,7 +850,19 @@ def stop_anchor(
         # не ищутся вовсе, остаётся прокол либо запас — он сам ограничен высотой.
 
     found: list[tuple[float, StopAnchorSource, bool]] = []
-    if zone.puncture is not None:
+    if zone.puncture is not None and (zone.puncture < boundary if down
+                                      else zone.puncture > boundary):
+        # ⚠ ПРОКОЛ ПРИНИМАЕТСЯ, ТОЛЬКО ЕСЛИ ОН ЗА ГРАНИЦЕЙ (2026-08-19). Раньше он шёл
+        # в кандидаты безусловно, и это соединяло две РАЗНЫЕ величины: `zone.puncture`
+        # меряется от `zone.edge` — линии по первым двум точкам стороны, — а `boundary`
+        # здесь коробка ХАЙ…ЛОЙ всех баров структуры, и она шире линии. Прокол линии
+        # сплошь и рядом лежит ВНУТРИ коробки: замер по кадрам дал 74% таких случаев.
+        # Стоп «за прокол» тогда оказывался ВНУТРИ структуры — против стр. 58 «Стоп
+        # всегда прячем за ВСЮ структуру», а карточка при этом печатала ярлык «якорь:
+        # прокол за границу», то есть утверждала неправду о собственном числе.
+        #
+        # Прокол за коробкой остаётся безусловным императивом стр. 18 («стоп всегда
+        # ставится за этот прокол») и потолку высоты по-прежнему не подчинён.
         found.append((zone.puncture, StopAnchorSource.PUNCTURE, False))
     for sv in stop_volumes:
         acc = sv.accumulation

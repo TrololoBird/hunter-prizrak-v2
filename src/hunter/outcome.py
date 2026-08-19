@@ -75,8 +75,20 @@ class Outcome(BaseModel):
     """
 
 
-def _touched(bar: Bar, price: Decimal) -> bool:
-    return bar.low <= float(price) <= bar.high
+def _filled(bar: Bar, price: Decimal, *, long: bool) -> bool:
+    """Исполнилась ли лимитка входа на этом баре. Условие ОДНОСТОРОННЕЕ.
+
+    ⚠ Было `bar.low <= price <= bar.high` — ДВУСТОРОННЕЕ касание диапазона, и это
+    приписывало бирже поведение, которого у неё нет. Лимитка на покупку исполняется,
+    как только цена опустилась ДО НЕЁ ИЛИ НИЖЕ; на продажу — как только поднялась до
+    неё или выше. Цена, ПЕРЕПРЫГНУВШАЯ вход гэпом (открытие бара уже за лимиткой),
+    двусторонним тестом не ловилась вовсе, и сделка получала исход «цена не дошла до
+    входа» там, где ордер на бирже давно бы исполнился.
+
+    Стоп и цель в этой же функции всегда проверялись односторонне (`bar.low <= stop`,
+    `bar.high >= target`) — вход был единственным местом с другой меркой.
+    """
+    return (bar.low <= float(price)) if long else (bar.high >= float(price))
 
 
 def resolve(
@@ -116,7 +128,7 @@ def resolve(
     for i in range(from_index, len(bars)):
         bar = bars[i]
         if filled is None:
-            if _touched(bar, entry):
+            if _filled(bar, entry, long=long):
                 filled = i
             else:
                 continue
