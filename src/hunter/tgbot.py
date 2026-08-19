@@ -2074,10 +2074,18 @@ async def publish_loop(delivery: Delivery, bot: Bot) -> None:
 # к зоне или сигнал активирован и так далее». Закрывает и находку №3 самоаудита
 # 2026-08-18 (журнал исходов есть — уведомлений о них не было).
 
-WATCH_EVERY_S = float(service.CYCLE_SECONDS)
-"""Такт наблюдателя = такту службы. Сигналы, исходы и карту пишет служба своим циклом —
-чаще леджер проверять не о чем; живая цена берётся тем же тактом ОДНИМ запросом
-`fetch_tickers` (вес 40 за все рынки — дешевле, чем свечи по каждому символу)."""
+WATCH_EVERY_S = float(TIMEFRAME_MS["5m"]) / 1000 / 5
+"""Такт наблюдателя — ПЯТАЯ ЧАСТЬ МЛАДШЕГО БАРА, то есть 60 секунд.
+
+⚠ Было `service.CYCLE_SECONDS` (300 с), и это ровно длина бара 5м: цена успевала
+подойти к зоне и уйти из неё ЦЕЛИКОМ между двумя тактами, а владелец получал
+уведомление, когда оно уже неверно («уведомления приходят с опозданием, цена уже ушла
+давно»). Такт службы сюда не годится по смыслу: служба пересчитывает КАРТУ (уровни
+меняются медленно), наблюдатель следит за ЦЕНОЙ.
+
+Число выведено, а не выбрано: единица наблюдения — самый младший ТФ проекта (5м), и
+пятая часть бара даёт пять замеров на бар. Цена такта — один `fetch_tickers` на все
+рынки, вес 40; при лимите 2400 в минуту это 1.7% бюджета."""
 
 SIDE_WORD = {"long": "лонг", "short": "шорт"}
 OUTCOME_WORD = {"stop": "🟥 стоп", "target": "🟩 цель",
@@ -2101,6 +2109,17 @@ class LevelRow:
     zone_hi: float
     from_ms: int
     to_ms: int
+    entry_rule: str = ""
+    """limit | confirmation | retest_flipped. Пусто — карта записана до схемы 6.
+
+    ⚠ Заведено 2026-08-19. Без него уведомление могло сказать только «цена подошла к
+    зоне» и молчало о главном — МОЖНО ЛИ ВХОДИТЬ. Курс на стр. 25 и 31 разрешает вход
+    со второго касания только по слому структуры на младшем ТФ, а на стр. 43 у
+    пробитого уровня вход вообще с обратной стороны."""
+
+    boundary_lo: float = 0.0
+    boundary_hi: float = 0.0
+    """Границы структуры — чтобы назвать СТОП. Ноль — не записаны."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2164,7 +2183,8 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                 " ORDER BY st.signal_id")]
         marks = ",".join("?" * len(symbols))
         lvl_rows = conn.execute(
-            f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms"
+            f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
+            f" entry_rule, boundary_lo, boundary_hi"
             f" FROM levels WHERE state='active' AND symbol IN ({marks})",
             symbols).fetchall()
     except sqlite3.DatabaseError as e:
@@ -2173,7 +2193,10 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         conn.close()
     levels = tuple(LevelRow(symbol=r[0], timeframe=r[1], side=r[2], price=float(r[3]),
                             zone_lo=float(r[4]), zone_hi=float(r[5]),
-                            from_ms=int(r[6]), to_ms=int(r[7])) for r in lvl_rows)
+                            from_ms=int(r[6]), to_ms=int(r[7]),
+                            entry_rule=r[8] or "",
+                            boundary_lo=float(r[9] or 0.0),
+                            boundary_hi=float(r[10] or 0.0)) for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
                       max_signal_id=max_id, max_closed_ms=max_closed)
@@ -2415,15 +2438,7 @@ class Notifier:
             if lv.to_ms > 0 and step is not None and (
                     lv.to_ms < now_ms - BARS_ON_CHART * step):
                 continue
-            base = lv.symbol.split("/")[0]
-            side = SIDE_WORD.get(lv.side, lv.side)
-            what = (f"вошла в {side}-зону" if pos == "inside"
-                    else f"подходит к {side}-зоне")
-            zone_lines.append(
-                f"• {base}: цена {_fmt_price(t.last)} {what} "
-                f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} "
-                f"({TF_LABEL.get(lv.timeframe, lv.timeframe)}, "
-                f"ПОК {_fmt_price(lv.price)})")
+            zone_lines.append(_zone_alert(lv, t.last, pos))
         # Снятые с карты уровни выбывают из памяти состояний — иначе она росла бы вечно.
         for key in list(self._zone_state):
             if key not in seen:
@@ -2432,6 +2447,46 @@ class Notifier:
             self.sent_zone_events += len(zone_lines)
             out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
         return out
+
+
+ENTRY_WORD = {
+    "limit": "вход лимиткой можно ставить сейчас",
+    "confirmation": "лимитками НЕ входим — уровень уже отработан; вход только по слому"
+                    " структуры на младшем ТФ (стр. 25, 31)",
+    "retest_flipped": "уровень пробит и сменил сторону — вход по ретесту с ОБРАТНОЙ"
+                      " стороны (стр. 43)",
+    "": "правило входа у этой строки карты не записано",
+}
+"""Ответ на вопрос «можно ли входить», словами, а не кодом правила.
+
+⚠ Заведено 2026-08-19 по вопросу владельца: «когда цена достигает зоны, бот находит
+подтверждение входа в сделку или нет?». До этого уведомление сообщало только факт
+сближения, и подтверждение входа читателю приходилось искать самому."""
+
+
+def _zone_alert(lv: LevelRow, price: float, pos: str) -> str:
+    """Строка события «цена у зоны» — с ДЕЙСТВИЕМ, а не только с фактом.
+
+    Было: «цена 64 313 подходит к лонг-зоне 62 750–63 195 (4ч, ПОК 63 036)» — сказано,
+    что цена подошла, и не сказано ни что делать, ни где стоп, ни можно ли входить.
+    """
+    base = lv.symbol.split("/")[0]
+    buy = lv.side == "long"
+    act = "ПОКУПКА" if buy else "ПРОДАЖА"
+    where = "цена В ЗОНЕ" if pos == "inside" else "цена подходит"
+    out = [f"• {base} · {act} · {where} {_fmt_price(price)}",
+           f"    зона {_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)}, "
+           f"вход {_fmt_price(lv.price)} ({TF_LABEL.get(lv.timeframe, lv.timeframe)})"]
+    # СТОП — курсовой: за всю структуру с запасом (стр. 58 «Стоп ВСЕГДА прячем за всю
+    # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
+    edge = lv.boundary_lo if buy else lv.boundary_hi
+    if edge > 0:
+        margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
+        stop = edge - margin if buy else edge + margin
+        out.append(f"    стоп {_fmt_price(stop)} — за структуру с запасом "
+                   f"{geometry.DEFAULT_MARGIN_PCT:.0f}%")
+    out.append(f"    {ENTRY_WORD.get(lv.entry_rule, ENTRY_WORD[''])}")
+    return "\n".join(out)
 
 
 async def notify_loop(delivery: Delivery, bot: Bot, notifier: Notifier) -> None:
