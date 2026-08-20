@@ -2263,6 +2263,17 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры. Ноль — не записаны."""
 
+    priority_tf: str = ""
+    priority_depth: int | None = None
+    """ЧЕЙ приоритет старшего ТФ и на скольких экстремумах он держится (схема 14).
+
+    ⚠ Заведено 2026-08-20. Уведомление печатало «⚠ ПРОТИВ старшего ТФ» и не говорило, о
+    каком ТФ речь и насколько тот тренд обоснован; карточка того же прогона писала
+    «держится на N экстремумах». Замер по 15 символам: приоритет берётся с НЕДЕЛЬНОГО ТФ
+    в 32 случаях из 50 (64%), а держится он на ДВУХ экстремумах у 28% — то есть на
+    минимуме, допустимом по стр. 12. Разница между трендом из двух точек и из пяти для
+    читателя решающая."""
+
     stop_price: float | None = None
     """ЦЕНА СТОПА, посчитанная расчётом (схема 13). None — строка карты старее схемы.
 
@@ -2371,10 +2382,12 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         mtf_col = "mtf_break" if "mtf_break" in have else "NULL"
         agr_col = "agreement" if "agreement" in have else "NULL"
         stop_col = "stop_price" if "stop_price" in have else "NULL"
+        ptf_col = "priority_tf" if "priority_tf" in have else "NULL"
+        pdp_col = "priority_depth" if "priority_depth" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
             f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state,"
-            f" {stop_col}"
+            f" {stop_col}, {ptf_col}, {pdp_col}"
             # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
             # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
             # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
@@ -2408,7 +2421,9 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             boundary_hi=float(r[10] or 0.0),
                             mtf_break=None if r[11] is None else int(r[11]),
                             agreement=r[12] or "", state=r[13] or "active",
-                            stop_price=None if r[14] is None else float(r[14]))
+                            stop_price=None if r[14] is None else float(r[14]),
+                            priority_tf=r[15] or "",
+                            priority_depth=None if r[16] is None else int(r[16]))
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -2967,8 +2982,17 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     # открываем хэдж под убыточную сделку». Карточка это печатала, уведомление молчало,
     # и читатель мог купить против приоритета, не узнав об этом.
     if lv.agreement == "against_trend":
-        out.append("    ⚠ ПРОТИВ старшего ТФ — курс разрешает только хеджем к открытой "
-                   "ПРИБЫЛЬНОЙ позиции по тренду и на уменьшенный объём (стр. 47, 11)")
+        # ЧЕЙ приоритет и НАСКОЛЬКО он обоснован — часть предупреждения, а не украшение:
+        # тренд из двух экстремумов и тренд из пяти читаются по-разному, а стр. 12 даёт
+        # минимум два. Карточка это печатала с самого начала, уведомление — нет.
+        whose = ""
+        if lv.priority_tf:
+            d = (f", держится на {lv.priority_depth} экстремумах"
+                 if lv.priority_depth else "")
+            whose = f" ({TF_LABEL.get(lv.priority_tf, lv.priority_tf)}{d})"
+        out.append(f"    ⚠ ПРОТИВ старшего ТФ{whose} — курс разрешает только хеджем к "
+                   "открытой ПРИБЫЛЬНОЙ позиции по тренду и на уменьшенный объём "
+                   "(стр. 47, 11)")
     return "\n".join(out)
 
 

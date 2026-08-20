@@ -1620,6 +1620,16 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 k = (one.level.timeframe, one.level.structure_from_ms,
                      one.level.structure_to_ms)
                 stops[k] = float(one.setup.stop)
+            # Восьмым и девятым — ЧЕЙ приоритет и на скольких экстремумах он держится
+            # (схема 14). Уведомление печатало «против старшего ТФ» и молчало о том,
+            # чьего и насколько тот тренд обоснован, — карточка того же прогона это
+            # писала. Числа: приоритет с недельного ТФ в 64% случаев, держится на ДВУХ
+            # экстремумах у 28% (замер 2026-08-20).
+            prio: dict[tuple[str, int, int], tuple[str | None, int | None]] = {}
+            for one in d.decisions:
+                k = (one.level.timeframe, one.level.structure_from_ms,
+                     one.level.structure_to_ms)
+                prio[k] = (one.priority.timeframe, one.priority.holds_for)
             seen = [(m.level, m.status.state, m.status.entry_rule,
                      m.status.resolved_at_ms,
                      broke.get((m.level.timeframe, m.level.structure_from_ms,
@@ -1627,7 +1637,9 @@ def record(run_id: str, report: RunReport, uni: Universe,
                      agree.get((m.level.timeframe, m.level.structure_from_ms,
                                 m.level.structure_to_ms), ""),
                      stops.get((m.level.timeframe, m.level.structure_from_ms,
-                                m.level.structure_to_ms)))
+                                m.level.structure_to_ms)),
+                     *prio.get((m.level.timeframe, m.level.structure_from_ms,
+                                m.level.structure_to_ms), (None, None)))
                     for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)

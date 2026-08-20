@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
@@ -646,6 +646,8 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "11"
     if lvl_cols and "stop_price" not in lvl_cols:
         return "12"
+    if lvl_cols and "priority_tf" not in lvl_cols:
+        return "13"
     return SCHEMA_VERSION
 
 
@@ -830,6 +832,23 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # которую видит владелец»: величина считается ОДИН раз, записывается и печатается
         # обоими.
         conn.execute("ALTER TABLE levels ADD COLUMN stop_price REAL")
+        conn.commit()
+    if _schema_version(conn) == "13":
+        # 13 → 14: ЧЕЙ приоритет и на скольких экстремумах он держится. NULLABLE на месте.
+        #
+        # ⚠ ЗАЧЕМ. Уведомление печатало «⚠ ПРОТИВ старшего ТФ» и молчало о том, ЧЬЕГО
+        # старшего и насколько тот тренд обоснован, — а карточка того же прогона писала
+        # «держится на N экстремумах». Опять одна величина в двух местах, и бедным
+        # оказалось уведомление.
+        #
+        # Числа, ради которых это нужно (15 символов, замер 2026-08-20): приоритет берётся
+        # с НЕДЕЛЬНОГО ТФ в 32 случаях из 50 (64%), и держится он на ДВУХ экстремумах у
+        # 28% — то есть на минимуме, который вообще допускает стр. 12 («каждый следующий
+        # ЛОЙ выше предыдущего»). Разница между «тренд из двух точек» и «из пяти» для
+        # читателя решающая, и сам модуль `swings.Trend` заведён с оговоркой: «сообщается
+        # ЗАМЕРЕННАЯ глубина, читающий видит, тренд это из двух точек или из десяти».
+        conn.execute("ALTER TABLE levels ADD COLUMN priority_tf TEXT")
+        conn.execute("ALTER TABLE levels ADD COLUMN priority_depth INTEGER")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -1054,7 +1073,7 @@ def sync_levels(
     conn: sqlite3.Connection,
     symbol: str,
     seen: list[tuple[Level, LevelState, EntryRule, int | None, int | None, str,
-                     float | None]],
+                     float | None, str | None, int | None]],
     now_ms: int,
 ) -> MapSync:
     """Слить свежепосчитанную карту с накопленной.
@@ -1086,7 +1105,7 @@ def sync_levels(
     """
     added = updated = retired = 0
     rejected: list[str] = []
-    for lvl, state, rule, resolved, mtf, agree, stop_px in seen:
+    for lvl, state, rule, resolved, mtf, agree, stop_px, pr_tf, pr_depth in seen:
         key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
         row = conn.execute(
             "SELECT state, retired_at FROM levels WHERE symbol=? AND timeframe=? AND"
@@ -1099,14 +1118,15 @@ def sync_levels(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
                     " last_seen, state, retired_at, entry_rule, resolved_at,"
-                    " vrvp_density, mtf_break, agreement, stop_price)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " vrvp_density, mtf_break, agreement, stop_price, priority_tf,"
+                    " priority_depth)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
                      None if active else now_ms, rule.value, resolved,
-                     lvl.vrvp_density, mtf, agree, stop_px),
+                     lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth),
                 )
                 added += 1
                 retired += not active
@@ -1137,14 +1157,14 @@ def sync_levels(
                 "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
                 " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
                 " retired_at=?, entry_rule=?, resolved_at=?, mtf_break=?,"
-                " agreement=?, stop_price=?"
+                " agreement=?, stop_price=?, priority_tf=?, priority_depth=?"
                 " WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
                 (now_ms, lvl.side.value, float(lvl.price),
                  float(lvl.zone_lo), float(lvl.zone_hi),
                  float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
                  lvl.vrvp_density,
                  state.value, retired_at, rule.value, resolved, mtf, agree,
-                 stop_px, *key),
+                 stop_px, pr_tf, pr_depth, *key),
             )
             updated += 1
             retired += was_active and not active
