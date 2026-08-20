@@ -2587,7 +2587,7 @@ class Notifier:
             inst = ex.instrument(sym)
             if not isinstance(inst, NotReady):
                 ticks[sym] = inst.tick_size
-        zone_lines = _merge_hits(hits, ticks)
+        zone_lines = _merge_hits(hits, ticks, list(news.levels))
         if zone_lines:
             self.sent_zone_events += len(zone_lines)
             out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
@@ -2603,7 +2603,8 @@ class Notifier:
 
 
 def _merge_hits(hits: list[tuple[LevelRow, float, str]],
-                ticks: dict[str, Decimal] | None = None) -> list[str]:
+                ticks: dict[str, Decimal] | None = None,
+                pool: list[LevelRow] | None = None) -> list[str]:
     """Склеить события ОДНОГО ценового района в одно сообщение.
 
     ⚠ Заведено 2026-08-19 по живому архиву: ARPA дала два уведомления подряд, 19:37
@@ -2642,13 +2643,65 @@ def _merge_hits(hits: list[tuple[LevelRow, float, str]],
             h[0].timeframe
             for h in sorted(g, key=lambda h: -order.get(h[0].timeframe, 0))))
         out.append(_zone_alert(lead, price, pos, tfs,
-                               (ticks or {}).get(lead.symbol)))
+                               (ticks or {}).get(lead.symbol), pool))
     return out
+
+
+def _target_by_course(lv: LevelRow, pool: list[LevelRow]) -> tuple[float, str] | None:
+    """Ближайшая ЦЕЛЬ по стр. 24 или `None`, если её нет. Цель НЕ выдумывается.
+
+    Стр. 24 дословно: «Целью позиции от уровня 4ч ТФ - должен быть в первую очередь
+    другой сопоставимый уровень 4ч ТФ, либо уровень 1Д тф, если он ближайший. Уровни ТФ-1
+    (т.е. 1ч ТФ для 4-часовика) могут быть взяты как промежуточные цели с небольшими
+    тейками, Уровни ТФ-2 (15м и ниже) обычно не берутся в расчет, т.к. на старшем ТФ их
+    вообще "нет”».
+
+    Отсюда три правила, и все три исполняются, а не пересказываются:
+      * цель — уровень ПРОТИВОПОЛОЖНОЙ стороны (пример страницы: от лонг-уровня целью
+        служит шорт-уровень), лежащий по ходу сделки;
+      * свой ТФ и СТАРШИЕ дают основную цель; берётся ближайшая из них;
+      * ТФ−1 даёт промежуточную и называется таковой; ТФ−2 и ниже не берутся ВООБЩЕ.
+
+    ⚠ Цели нет — строки нет. Подставить сюда «ближайший любой уровень» значило бы
+    нарушить последнее правило страницы ради непустого поля.
+    """
+    order = list(TIMEFRAME_MS)
+    if lv.timeframe not in order:
+        return None
+    own = order.index(lv.timeframe)
+    long = lv.side == "long"
+    best_main: tuple[float, float] | None = None
+    best_mid: tuple[float, float] | None = None
+    for other in pool:
+        if other.symbol != lv.symbol or other.side == lv.side:
+            continue
+        if other.timeframe not in order:
+            continue
+        rank = order.index(other.timeframe)
+        if rank < own - 1:
+            continue                      # ТФ−2 и ниже: «не берутся в расчет»
+        goal = other.price
+        dist = (goal - lv.price) if long else (lv.price - goal)
+        if dist <= 0:
+            continue                      # цель обязана лежать ПО ХОДУ сделки
+        slot = "main" if rank >= own else "mid"
+        cur = best_main if slot == "main" else best_mid
+        if cur is None or dist < cur[1]:
+            if slot == "main":
+                best_main = (goal, dist)
+            else:
+                best_mid = (goal, dist)
+    if best_main is not None:
+        return best_main[0], "цель"
+    if best_mid is not None:
+        return best_mid[0], "промежуточная цель"
+    return None
 
 
 def _zone_alert(lv: LevelRow, price: float, pos: str,
                 tf_list: tuple[str, ...] = (),
-                tick: Decimal | None = None) -> str:
+                tick: Decimal | None = None,
+                pool: list[LevelRow] | None = None) -> str:
     """Строка события «цена у зоны» — с ДЕЙСТВИЕМ, а не только с фактом.
 
     Было: «цена 64 313 подходит к лонг-зоне 62 750–63 195 (4ч, ПОК 63 036)» — сказано,
@@ -2677,6 +2730,19 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
         stop = edge - margin if buy else edge + margin
         out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}")
+        # ЦЕЛЬ И РР — стр. 24 и стр. 9. Без них сообщение не даёт посчитать сделку:
+        # стр. 9 определяет РР как отношение профита к риску и называет «"Золотым
+        # стандартом" считаются сделки с РР 1к3 и выше», а решать это читателю нечем,
+        # если цель не названа. Цель берётся ТОЛЬКО по правилу стр. 24 и только из уже
+        # построенных уровней; выдуманных целей здесь нет, и её отсутствие — молчание,
+        # а не подстановка.
+        goal = _target_by_course(lv, pool or [])
+        if goal is not None:
+            price_t, word = goal
+            risk = abs(lv.price - stop)
+            reward = abs(price_t - lv.price)
+            rr = f" · РР 1к{reward / risk:.1f}" if risk > 0 else ""
+            out.append(f"    {word} {_fmt_price(price_t, tick)}{rr}")
     # ВТОРАЯ СТРОКА про слом — только когда он ЕСТЬ. Стр. 19 называет вход по слому
     # более безопасным при том же уровне: «также можно смотреть слом структуры на мтф,
     # и брать более безопасную позицию с хорошим соотношением РР». Отсутствие слома НЕ
