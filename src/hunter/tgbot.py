@@ -1134,9 +1134,13 @@ def balance_line(rows: list[ZoneSpec]) -> str:
             unlisted += 1
             continue
         counts[bucket] = counts.get(bucket, 0) + 1
-    parts = [f"{_BUCKET_WORD[b]} {counts[b]}"
-             for b in (emit.TFBucket.JUNIOR, emit.TFBucket.LOCAL, emit.TFBucket.SENIOR)
-             if b in counts]
+    # ⚠ ПЕЧАТАЮТСЯ ВСЕ ТРИ КОРЗИНЫ, ВКЛЮЧАЯ НУЛЕВЫЕ. До 2026-08-20 пустая корзина
+    # молча пропадала, и строка получалась такой: «локальные (15м-1ч) 1 · СТФ 3 — курс
+    # велит… не набирать много отложек по МТФ». Про МТФ сказано, а МТФ в строке НЕТ —
+    # читатель не может проверить, к нему ли относится предупреждение. Найдено владельцем
+    # на карточке BOME 2026-08-20. Ноль — это ответ, а не отсутствие ответа.
+    parts = [f"{_BUCKET_WORD[b]} {counts.get(b, 0)}"
+             for b in (emit.TFBucket.JUNIOR, emit.TFBucket.LOCAL, emit.TFBucket.SENIOR)]
     if unlisted:
         parts.append(f"вне шкалы стр. 48 — {unlisted}")
     return ("⚖ Баланс уровней этой карты (стр. 48): " + " · ".join(parts)
@@ -1305,7 +1309,14 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
             core = (f"— {_fmt_price(z.price)} ({tfs}), зона "
                     f"{_fmt_price(z.zone_lo)}–{_fmt_price(z.zone_hi)}")
         marks = ""
-        if g_lo <= price <= g_hi:
+        # ⚠ Метка "цена уже здесь" НЕ ставится, когда о том же говорит роль зоны
+        # (её строка про вход не в приоритет по стр. 44): это ОДИН факт, и печатать его
+        # дважды в одной строке — мусор. Регрессия внесена мной же 2026-08-20 вместе с
+        # ролью и в тот же день найдена владельцем на карточке BOME.
+        # Ёлочки здесь не ставятся намеренно: они зарезервированы за дословными цитатами
+        # курса, и гейт course_citations поймал ровно это нарушение при первой редакции.
+        inside_now = g_lo <= price <= g_hi
+        if inside_now and "цена внутри" not in role(g, inside_now):
             marks += " · цена уже здесь"
         # Метка встречной — только когда УРОВЕНЬ (ПОК) одной стороны лежит в ЗОНЕ
         # другой, а не при любом касании зон (исправлено 2026-08-18: касание в
