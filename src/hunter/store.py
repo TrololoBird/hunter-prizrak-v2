@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
@@ -644,6 +644,8 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "10"
     if lvl_cols and "agreement" not in lvl_cols:
         return "11"
+    if lvl_cols and "stop_price" not in lvl_cols:
+        return "12"
     return SCHEMA_VERSION
 
 
@@ -812,6 +814,22 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # 11 → 12: NULLABLE на месте. У прежних строк согласие не считалось — NULL
         # означает «не спрашивали», а не «согласия нет».
         conn.execute("ALTER TABLE levels ADD COLUMN agreement TEXT")
+        conn.commit()
+    if _schema_version(conn) == "12":
+        # 12 → 13: ЦЕНА СТОПА, посчитанная расчётом. NULLABLE на месте: у прежних строк
+        # её не спрашивали.
+        #
+        # ⚠ ЗАЧЕМ. До этой колонки бот считал стоп САМ — по простой формуле «граница ±
+        # запас», — тогда как карточка брала его из `geometry.build_setup`, где действует
+        # ещё и ЯКОРЬ (стр. 18: «стоп всегда ставится за этот прокол» и «идеально стоп
+        # прятать за них»). Замер 2026-08-20 на 68 сделках: якорь решает в 36 случаях из
+        # 68 и уводит стоп ДАЛЬШЕ пола на 1.52% медианно, до 2.06%. То есть по одному и
+        # тому же уровню два рта проекта называли РАЗНЫЕ цены стопа.
+        #
+        # Это ровно то, что запрещает раздел «прибор обязан смотреть на ТУ ЖЕ величину,
+        # которую видит владелец»: величина считается ОДИН раз, записывается и печатается
+        # обоими.
+        conn.execute("ALTER TABLE levels ADD COLUMN stop_price REAL")
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
@@ -1035,7 +1053,8 @@ class MapSync(BaseModel):
 def sync_levels(
     conn: sqlite3.Connection,
     symbol: str,
-    seen: list[tuple[Level, LevelState, EntryRule, int | None, int | None, str]],
+    seen: list[tuple[Level, LevelState, EntryRule, int | None, int | None, str,
+                     float | None]],
     now_ms: int,
 ) -> MapSync:
     """Слить свежепосчитанную карту с накопленной.
@@ -1067,7 +1086,7 @@ def sync_levels(
     """
     added = updated = retired = 0
     rejected: list[str] = []
-    for lvl, state, rule, resolved, mtf, agree in seen:
+    for lvl, state, rule, resolved, mtf, agree, stop_px in seen:
         key = (symbol, lvl.timeframe, lvl.structure_from_ms, lvl.structure_to_ms)
         row = conn.execute(
             "SELECT state, retired_at FROM levels WHERE symbol=? AND timeframe=? AND"
@@ -1080,14 +1099,14 @@ def sync_levels(
                     "INSERT INTO levels (symbol, timeframe, side, price, zone_lo, zone_hi,"
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
                     " last_seen, state, retired_at, entry_rule, resolved_at,"
-                    " vrvp_density, mtf_break, agreement)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " vrvp_density, mtf_break, agreement, stop_price)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
                      None if active else now_ms, rule.value, resolved,
-                     lvl.vrvp_density, mtf, agree),
+                     lvl.vrvp_density, mtf, agree, stop_px),
                 )
                 added += 1
                 retired += not active
@@ -1118,12 +1137,14 @@ def sync_levels(
                 "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
                 " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
                 " retired_at=?, entry_rule=?, resolved_at=?, mtf_break=?,"
-                " agreement=? WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
+                " agreement=?, stop_price=?"
+                " WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
                 (now_ms, lvl.side.value, float(lvl.price),
                  float(lvl.zone_lo), float(lvl.zone_hi),
                  float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
                  lvl.vrvp_density,
-                 state.value, retired_at, rule.value, resolved, mtf, agree, *key),
+                 state.value, retired_at, rule.value, resolved, mtf, agree,
+                 stop_px, *key),
             )
             updated += 1
             retired += was_active and not active

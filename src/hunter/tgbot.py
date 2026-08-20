@@ -2261,7 +2261,21 @@ class LevelRow:
 
     boundary_lo: float = 0.0
     boundary_hi: float = 0.0
-    """Границы структуры — чтобы назвать СТОП. Ноль — не записаны."""
+    """Границы структуры. Ноль — не записаны."""
+
+    stop_price: float | None = None
+    """ЦЕНА СТОПА, посчитанная расчётом (схема 13). None — строка карты старее схемы.
+
+    ⚠ Заведено 2026-08-20. До него бот считал стоп САМ: «граница ± запас». Карточка же
+    берёт его из `geometry.build_setup`, где сверх запаса действует ЯКОРЬ — стр. 18
+    называет два: «стоп всегда ставится за этот прокол» и «идеально стоп прятать за них»
+    (стоповый объём). Замер на 68 сделках: якорь решает в 36 случаях из 68 и уводит стоп
+    ДАЛЬШЕ курсового пола на 1.52% медианно, до 2.06%. То есть по одному уровню карточка
+    и уведомление называли РАЗНЫЕ цены стопа.
+
+    ⚠ Якорь при этом НИКОГДА не придвигает стоп ближе правила «за структуру с запасом»:
+    в `build_setup` под любым стопом стоит пол `with_margin(DEFAULT_MARGIN_PCT)`, и берётся
+    то из двух, что ДАЛЬШЕ. Замер это подтвердил: стопов ближе курсового запаса — 0 из 68."""
 
     state: str = "active"
     """active | worked_off | flipped. Нужно, чтобы бот мог СКАЗАТЬ об отмене сигнала.
@@ -2356,9 +2370,11 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         have = store.level_columns(conn)
         mtf_col = "mtf_break" if "mtf_break" in have else "NULL"
         agr_col = "agreement" if "agreement" in have else "NULL"
+        stop_col = "stop_price" if "stop_price" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
-            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state"
+            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state,"
+            f" {stop_col}"
             # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
             # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
             # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
@@ -2391,7 +2407,8 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             boundary_lo=float(r[9] or 0.0),
                             boundary_hi=float(r[10] or 0.0),
                             mtf_break=None if r[11] is None else int(r[11]),
-                            agreement=r[12] or "", state=r[13] or "active")
+                            agreement=r[12] or "", state=r[13] or "active",
+                            stop_price=None if r[14] is None else float(r[14]))
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -2895,8 +2912,12 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
     edge = lv.boundary_lo if buy else lv.boundary_hi
     if edge > 0:
+        # СТОП БЕРЁТСЯ ИЗ РАСЧЁТА, а своя формула остаётся только запасным путём для
+        # строк карты старее схемы 13. Своя формула знает лишь курсовой пол (стр. 58) и
+        # не знает ЯКОРЯ (стр. 18) — а якорь решает в половине сделок и уводит стоп
+        # дальше. Пояснение и числа — в докстроке `LevelRow.stop_price`.
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
-        stop = edge - margin if buy else edge + margin
+        stop = lv.stop_price if lv.stop_price else (edge - margin if buy else edge + margin)
         # РИСК В ПРОЦЕНТАХ — не новая величина, а то же расстояние вход↔стоп, названное
         # так, как его использует читатель. Стр. 9 определяет Р как «один Риск» и
         # единицу измерения сделки; проценты дают посчитать объём позиции, не зная

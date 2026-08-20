@@ -1606,12 +1606,28 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 k = (one.level.timeframe, one.level.structure_from_ms,
                      one.level.structure_to_ms)
                 agree[k] = one.agreement.value
+            # Седьмым — ЦЕНА СТОПА, посчитанная геометрией (схема 13). До неё бот считал
+            # стоп САМ по простой формуле «граница ± запас», а карточка брала его из
+            # `geometry.build_setup`, где действует ещё и ЯКОРЬ (стр. 18). Замер
+            # 2026-08-20 на 68 сделках: якорь решает в 36 случаях и уводит стоп ДАЛЬШЕ
+            # пола на 1.52% медианно, до 2.06% — то есть два рта проекта называли по
+            # одному уровню РАЗНЫЕ цены стопа. Величина считается один раз и печатается
+            # обоими («прибор обязан смотреть на ТУ ЖЕ величину, которую видит владелец»).
+            stops: dict[tuple[str, int, int], float] = {}
+            for one in d.decisions:
+                if one.setup is None:
+                    continue
+                k = (one.level.timeframe, one.level.structure_from_ms,
+                     one.level.structure_to_ms)
+                stops[k] = float(one.setup.stop)
             seen = [(m.level, m.status.state, m.status.entry_rule,
                      m.status.resolved_at_ms,
                      broke.get((m.level.timeframe, m.level.structure_from_ms,
                                 m.level.structure_to_ms)),
                      agree.get((m.level.timeframe, m.level.structure_from_ms,
-                                m.level.structure_to_ms), ""))
+                                m.level.structure_to_ms), ""),
+                     stops.get((m.level.timeframe, m.level.structure_from_ms,
+                                m.level.structure_to_ms)))
                     for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
