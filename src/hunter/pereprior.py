@@ -83,7 +83,8 @@ def _shadow_zone(bar: Bar, kind: SwingKind) -> tuple[float, float]:
     return max(bar.open, bar.close), bar.high
 
 
-def _test_index(bars: list[Bar], lo: float, hi: float, from_index: int) -> int | None:
+def _test_index(bars: list[Bar], lo: float, hi: float, from_index: int,
+                *, from_above: bool) -> int | None:
     """Возврат в зону ПП — по ЗАКРЫТИЮ внутри зоны, а не по касанию тенью.
 
     ⚠ Так стало 2026-08-07, решение владельца по обзору чужих реализаций
@@ -95,10 +96,31 @@ def _test_index(bars: list[Bar], lo: float, hi: float, from_index: int) -> int |
     точка входа.
 
     Шесть чужих проектов из десяти требуют закрытия за уровнем, а не касания.
+
+    ⚠⚠ ОКНО ПОИСКА ОГРАНИЧЕНО С 2026-08-20, И ДО ЭТОГО ДНЯ ЕГО НЕ БЫЛО ВОВСЕ. Цикл шёл
+    до конца ряда, поэтому «тестом» засчитывалось закрытие в зоне хоть через тысячу
+    баров — в том числе такое, которое случилось уже ПОСЛЕ того, как ПП перестал
+    существовать. А тест по стр. 50 — это ТОЧКА ВХОДА («Торговля ПП – точкой входа
+    является тест ПП»), то есть вход выставлялся по событию, которого на момент события
+    уже не было.
+
+    Граница взята из СОБСТВЕННОГО определения проекта, а не придумана числом: тестом
+    считается закрытие ВНУТРИ зоны, значит закрытие ЗА зоной с дальней стороны означает,
+    что цена прошла зону насквозь, не тестируя её. Дальше искать нечего — сломанный
+    уровень к этому моменту сменил сторону, и ровно так же рассуждает стр. 43 про уровни:
+    «Уровень лонг/шорт менятся для нас на противоположный».
+
+    Дальняя сторона — та, откуда пришла цена: для шорта (слом лоя, тест «снизу») это верх
+    зоны, для лонга — низ. `from_above` — откуда пришла цена: True у лонга (слом хая,
+    цена ушла ВВЕРХ и возвращается вниз), поиск обрывается закрытием ниже `lo`; False у
+    шорта — закрытием выше `hi`.
     """
     for i in range(from_index, len(bars)):
-        if lo <= bars[i].close <= hi:
+        c = bars[i].close
+        if lo <= c <= hi:
             return i
+        if (c < lo) if from_above else (c > hi):
+            return None
     return None
 
 
@@ -238,7 +260,8 @@ def _detect_side(
             broken_index=broken.index, broken_price=broken.price,
             zone_lo=lo, zone_hi=hi,
             confirmed_at_index=ev.resolved_index,
-            tested_at_index=_test_index(bars, lo, hi, ev.resolved_index + 1),
+            tested_at_index=_test_index(bars, lo, hi, ev.resolved_index + 1,
+                                        from_above=side is PPSide.LONG),
         ))
     return found
 
