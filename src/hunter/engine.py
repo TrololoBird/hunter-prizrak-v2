@@ -408,7 +408,7 @@ def decide(
             setup=None if hold else geometry.build_setup(m.level, mapped),
             hold=hold,
             mtf_break=_mtf_break(m, series, reads, tfs),
-            pressed=_pressed_note(m, reads),
+            pressed=_pressed_note(m, reads, series),
             tf_trap="" if hold else priority.counter_warning(m.level, mapped),
             counters=() if hold else priority.counter_levels(m.level, mapped),
             stop_volume=sv if isinstance(sv, geometry.StopVolumeSetup) else None,
@@ -462,12 +462,16 @@ _PRESSED_RULE = {
 }
 
 
-def _pressed_note(m: MappedLevel, reads: dict[str, SeriesRead]) -> str:
+def _pressed_note(m: MappedLevel, reads: dict[str, SeriesRead],
+                  series: dict[str, list[Bar]]) -> str:
     """Конфигурации 2/5/7 стр. 28 у этого уровня — сгруппированы по виду для карточки."""
     r = reads.get(m.level.timeframe)
     if r is None:
         return ""
-    found = levels.pressed_structures(m.level, r.scan)
+    bars = series.get(m.level.timeframe)
+    if not bars:
+        return ""
+    found = levels.pressed_structures(m.level, r.scan, bars)
     parts: list[str] = []
     for kind in (levels.PressedKind.BELOW, levels.PressedKind.ABOVE,
                  levels.PressedKind.ASTRIDE):

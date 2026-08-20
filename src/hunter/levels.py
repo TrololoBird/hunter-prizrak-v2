@@ -26,7 +26,13 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .accumulation import Accumulation, AccumulationScan, BorderSource, BoundaryZone
+from .accumulation import (
+    Accumulation,
+    AccumulationScan,
+    BorderSource,
+    BoundaryZone,
+    structure_bars,
+)
 from .bars import TIMEFRAME_MS, tf_ms
 from .breach import (
     CONFIRM_BODIES,
@@ -309,33 +315,6 @@ class Level(BaseModel):
         other = LevelSide.SHORT if self.side is LevelSide.LONG else LevelSide.LONG
         return self.model_copy(update={"side": other})
 
-
-def structure_bars(acc: Accumulation, bars: list[Bar]) -> list[Bar]:
-    """Бары СТРУКТУРЫ и только они. Одна функция на всех потребителей.
-
-    Стр. 23: «Пока цена не вышла из структуры - у нас нет уровня, уровень появляется
-    когда цена полноценно выходит из структуры»; стр. 26: «Натягивая профиль на
-    структуру – важно захватить ВСЕ свечи структуры». Свечи ВЫХОДА в структуру не
-    входят: тела выхода это уже не накопление.
-
-    ⚠ ЗАВЕДЕНА 2026-08-19, и вот зачем. В `build_all` границы уровня брались срезом
-    `bars[first_index:last_index + 1]`, где `last_index` — бар ПОДТВЕРЖДЕНИЯ выхода,
-    то есть в коробку входили ОБА тела выхода. А `structure_window_ms` в той же
-    цепочке вызовов резала окно профиля по первому телу выхода — с докстрокой,
-    прямо объясняющей, почему выход не считается. Две несовместимые границы структуры
-    в одной функции, 195 строк друг от друга.
-
-    Цена расхождения замерена: коробка шире окна профиля у 63.1% структур (6168 из
-    9780), раздутие высоты медиана ×1.064, p90 ×1.415, максимум ×6.56. Разобранный
-    пример: BCH 1ч — свечи окна 436.22…441.95, напечатанные «границы» 424.64…441.95,
-    и низ 424.64 это ЛОЙ второй свечи ВЫХОДА.
-
-    Следствие тяжелее самой коробки: гистограмма профиля собиралась по окну БЕЗ
-    выхода, а сетка натягивалась на размах СО выходом — верхние и нижние строки не
-    получали ни одной сделки и бесплатно попадали в область стоимости. ПОК сдвигался
-    у 40.9% уровней, зона — у 40.4%.
-    """
-    return bars[acc.first_index:acc.exit.first_body_index]
 
 
 def structure_window_ms(
@@ -921,7 +900,12 @@ def stop_anchor(
         found.append((zone.puncture, StopAnchorSource.PUNCTURE, False))
     for sv in stop_volumes:
         acc = sv.accumulation
-        edge = acc.lower.edge if down else acc.upper.edge
+        # ⚠ КРАЙ СВЕЧЕЙ, А НЕ ЛИНИЯ ДЕТЕКТОРА (правка 2026-08-20). Стр. 18: «идеально
+        # стоп прятать за них» — за стоповый объём, то есть за КРАЙ его свечей. Линия
+        # детекции проходит по первым двум точкам границ, и свечи за неё выходят у 85.4%
+        # структур (замер того же дня, BTC+ETH+SOL, 417 структур, медиана превышения
+        # 0.703%, максимум 22.42%) — стоп за линию попадал бы ВНУТРЬ малой базы.
+        edge = sv.box_lo if down else sv.box_hi
         if band_lo <= edge <= band_hi:
             narrow = bool(acc.upper.narrowed or acc.lower.narrowed)
             found.append((edge, StopAnchorSource.STOP_VOLUME, narrow))
@@ -1404,7 +1388,7 @@ def status(
     take = take_depth(level, bars, confirm_bodies=confirm_bodies)
     took = take.reacted and take.depth in (
         TakeDepth.ZONE, TakeDepth.POC, TakeDepth.PUNCTURE)
-    pressed = pressed_structures(level, scan) if scan is not None else ()
+    pressed = pressed_structures(level, scan, bars) if scan is not None else ()
     play = playout(level, bars, event=ev, take=take, pressed=pressed)
     if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
         if beyond or took:
@@ -1467,7 +1451,8 @@ class PressedStructure(BaseModel):
     геометрия у них одна — база с ближней стороны уровня, — а выход противоположный."""
 
 
-def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStructure, ...]:
+def pressed_structures(level: Level, scan: AccumulationScan,
+                       bars: list[Bar]) -> tuple[PressedStructure, ...]:
     """Закрытые накопления ТОГО ЖЕ ТФ, закрывшиеся после появления уровня и прижатые
     к его зоне (пересечение коробки с [zone_lo, zone_hi]).
 
@@ -1475,6 +1460,22 @@ def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStr
     ПОД уровнем; целиком выше — НАД; ПОК внутри коробки — «пила». Открытая структура
     у уровня сюда не входит: она видна в `open_tail`, а стр. 28 рисует исходы по
     ЗАКРЫТЫМ (стр. 23: пока цена не вышла, структуры-события нет).
+
+    ⚠⚠ КОРОБКА — ЭКСТРЕМУМЫ СВЕЧЕЙ, А НЕ ЛИНИИ ДЕТЕКТОРА. Правка 2026-08-20, и это тот
+    же класс дефекта, что владелец нашёл глазами 2026-08-18: две разные величины под
+    одним человеческим именем «коробка». До этой правки сюда шли `acc.lower.edge` и
+    `acc.upper.edge` — линии по первым двум точкам границ, — а `Level.boundary_lo/hi`,
+    которые карточка печатает словом «границы» у САМОГО уровня, с 2026-08-18 берутся по
+    экстремумам баров структуры. Карточка печатала обе как «коробку», и совпадать они
+    не обязаны: замер 2026-08-20 на BTC+ETH+SOL, 417 структур — свечи выходят за линии
+    детектора у 85.4% из них, медиана превышения 0.703%, максимум 22.42%.
+
+    Стр. 26 требует ровно того, что теперь и делается: «Натягивая» профиль на структуру
+    – важно захватить все свечи структуры!
+
+    ⚠ `bars` подаются аргументом, а не читаются: модуль чистый (§10.3), и ряд ему
+    неоткуда взять. Отрезок структуры считает `structure_bars` — одна функция на всех
+    потребителей, чтобы вторая копия не разошлась с первой.
     """
     lo_z, hi_z = float(level.zone_lo), float(level.zone_hi)
     price = float(level.price)
@@ -1482,7 +1483,10 @@ def pressed_structures(level: Level, scan: AccumulationScan) -> tuple[PressedStr
     for acc in scan.closed:
         if acc.last_index <= level.created_at_index:
             continue
-        lo, hi = acc.lower.edge, acc.upper.edge
+        seg = structure_bars(acc, bars)
+        if not seg:
+            continue
+        lo, hi = min(b.low for b in seg), max(b.high for b in seg)
         if hi < lo_z or lo > hi_z:
             continue
         kind = (PressedKind.ASTRIDE if lo <= price <= hi

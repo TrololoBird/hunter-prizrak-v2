@@ -32,7 +32,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .accumulation import Accumulation
+from .accumulation import Accumulation, structure_bars
 from .models import Bar
 
 
@@ -63,6 +63,21 @@ class StopVolume(BaseModel):
 
     price_range: float = Field(gt=0)
     """Высота структуры: верх верхней границы минус низ нижней."""
+
+    box_lo: float
+    box_hi: float
+    """Коробка стопового объёма ПО СВЕЧАМ его структуры, а не по линиям детектора.
+
+    ⚠ Заведены 2026-08-20. Стр. 18 говорит про стоповый объём «идеально стоп прятать за
+    них», и «за них» — это за КРАЙ их свечей: стоп, поставленный на линию детекции,
+    оказывается ВНУТРИ малой базы, потому что свечи за эту линию выходят. Замер того же
+    дня на BTC+ETH+SOL (417 структур): свечи выходят за линии детектора у 85.4%, медиана
+    превышения 0.703%, максимум 22.42%.
+
+    Это тот же класс дефекта, что владелец нашёл глазами 2026-08-18, — две величины под
+    одним именем «граница», и наружу шла непроверенная. Отрезок считает
+    `accumulation.structure_bars`, одна функция на всех потребителей.
+    """
 
     bar_volume: float = Field(ge=0)
     """Сумма объёма БАРОВ структуры.
@@ -146,6 +161,10 @@ def classify(
         # выровнены одним окном бэкфилла — первый/последний open_ms и длина у них
         # совпадают, индексы накоплений пересекаются, и без символа кэш отдавал бы
         # объём спана ЧУЖОГО символа как свой.
+        seg = structure_bars(a, small_bars)
+        if not seg:
+            continue
+        box_lo, box_hi = min(b.low for b in seg), max(b.high for b in seg)
         memo_key = (symbol, small_bars[0].open_ms, small_bars[-1].open_ms,
                     len(small_bars), a.first_index, a.last_index)
         vol = _VOL_MEMO.get(memo_key)
@@ -161,6 +180,8 @@ def classify(
                 placement=_placement(a, host, small_bars, host_bars),
                 price_range=rng,
                 bar_volume=vol,
+                box_lo=box_lo,
+                box_hi=box_hi,
             )
         )
     return StopVolumeSet(
