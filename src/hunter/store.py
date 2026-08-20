@@ -1149,6 +1149,12 @@ class CarriedLevel(BaseModel):
     price: Decimal
     zone_lo: Decimal
     zone_hi: Decimal
+    boundary_lo: Decimal
+    boundary_hi: Decimal
+    """Коробка структуры. Нужна, чтобы перенесённый уровень МОЖНО БЫЛО ОЦЕНИТЬ по свежим
+    барам: пробой за коробку — флип (стр. 43), заход в зону с реакцией — отработка
+    (стр. 25). Без неё перенесённый уровень оставался активным вечно."""
+
     from_ms: int
     to_ms: int
     first_seen: int
@@ -1166,7 +1172,8 @@ def carried_levels(
     """
     rows = conn.execute(
         "SELECT timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms, first_seen,"
-        " last_seen FROM levels WHERE symbol=? AND state='active' AND last_seen < ?"
+        " last_seen, boundary_lo, boundary_hi"
+        " FROM levels WHERE symbol=? AND state='active' AND last_seen < ?"
         " ORDER BY price", (symbol, now_ms),
     ).fetchall()
     return tuple(
@@ -1174,9 +1181,46 @@ def carried_levels(
             timeframe=r[0], side=r[1], price=Decimal(str(r[2])),
             zone_lo=Decimal(str(r[3])), zone_hi=Decimal(str(r[4])),
             from_ms=r[5], to_ms=r[6], first_seen=r[7], last_seen=r[8],
+            boundary_lo=Decimal(str(r[9] if r[9] is not None else r[3])),
+            boundary_hi=Decimal(str(r[10] if r[10] is not None else r[4])),
         )
         for r in rows
     )
+
+
+def retire_levels(conn: sqlite3.Connection, symbol: str,
+                  keys: list[tuple[str, int, int, str]], now_ms: int) -> int:
+    """Снять с карты перенесённые уровни, которые свежие бары УЖЕ разрешили.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-20 ПО НАЙДЕННОМУ ДЕФЕКТУ, и дефект был крупный. `carried_levels`
+    возвращала непересчитанные уровни как есть и НИЧЕГО с ними не делала, поэтому уровень,
+    чья структура вышла из рамки построения (`frame_bars`, 180 баров с 2026-08-18),
+    больше не оценивался НИКОГДА и оставался `active` вечно.
+
+    Замер на живом леджере 2026-08-20 (отпечаток: 3476 активных уровней, 25 символов):
+    у 2317 из них (67%) структура старше 30 суток, в том числе 1142 ПЯТИМИНУТНЫХ. Прямое
+    следствие — 4205 пар встречных уровней с ПЕРЕСЕЧЕНИЕМ зон, у многих ПОК совпадает до
+    последнего знака. Это ровно то «НАСЛОЕНИЕ противоположных зон», которое владелец
+    нашёл глазами и которое не поймал ни один гейт.
+
+    Разобранный пример (ADA, все три активны, ПОК у всех 0.18685):
+      5м лонг,  структура 03.08 08:45…12:45
+      15м шорт, структура 11.08 22:30…12.08 06:00
+      5м шорт,  структура 12.08 09:30…11:15
+    Пятиминутный лонг от 3 августа держался живым 17 суток — за это время цена дважды
+    построила на том же месте новые структуры.
+
+    `keys` — (timeframe, from_ms, to_ms, state); состояние называет ПРИЧИНУ снятия по
+    курсу: `worked_off` — стр. 25, `flipped` — стр. 43. Возвращается число снятых строк.
+    """
+    n = 0
+    for tf, from_ms, to_ms, state in keys:
+        cur = conn.execute(
+            "UPDATE levels SET state=?, retired_at=? WHERE symbol=? AND timeframe=?"
+            " AND from_ms=? AND to_ms=? AND state='active'",
+            (state, now_ms, symbol, tf, from_ms, to_ms))
+        n += cur.rowcount
+    return n
 
 
 class OutcomeCell(BaseModel):

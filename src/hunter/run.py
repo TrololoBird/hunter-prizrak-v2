@@ -1615,6 +1615,33 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     for m in d.mapped]
             sync = store.sync_levels(conn, sym, seen, stamp_ms)
             carried = store.carried_levels(conn, sym, stamp_ms)
+            # ⚠⚠ ПЕРЕНЕСЁННЫЕ ОЦЕНИВАЮТСЯ, А НЕ ПРОСТО ПЕРЕНОСЯТСЯ (2026-08-20).
+            # `carried_levels` отдаёт уровни, которых этот прогон не считал: их структура
+            # вышла из рамки построения (`frame_bars`). До этой правки с ними НЕ ДЕЛАЛОСЬ
+            # НИЧЕГО, поэтому такой уровень не оценивался больше никогда и оставался
+            # активным вечно. Замер на живом леджере в тот день: 2317 активных из 3476
+            # (67%) имели структуру старше 30 суток, из них 1142 пятиминутных, и это
+            # давало 4205 пар ВСТРЕЧНЫХ уровней с пересечением зон.
+            #
+            # Свежие бары у нас есть — значит правила стр. 43 (пробой → флип) и стр. 25
+            # (заход в зону с уходом → отработка) применимы и к ним. Берутся бары ПОСЛЕ
+            # конца структуры: то, что было до, уровень уже пережил.
+            resolved: list[tuple[str, int, int, str]] = []
+            for cl in carried:
+                cbars = series.get(cl.timeframe)
+                if not cbars:
+                    continue
+                after = [b for b in cbars if b.open_ms > cl.to_ms]
+                verdict = levels.resolve_carried(
+                    cl.side, float(cl.zone_lo), float(cl.zone_hi),
+                    float(cl.boundary_lo), float(cl.boundary_hi), after)
+                if verdict is not None:
+                    resolved.append((cl.timeframe, cl.from_ms, cl.to_ms, verdict))
+            if resolved:
+                report.map_retired += store.retire_levels(conn, sym, resolved, stamp_ms)
+                done = {(t, f, u) for t, f, u, _ in resolved}
+                carried = tuple(c for c in carried
+                                if (c.timeframe, c.from_ms, c.to_ms) not in done)
             report.map_added += sync.added
             report.map_updated += sync.updated
             report.map_retired += sync.retired
