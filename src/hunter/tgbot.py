@@ -2729,7 +2729,14 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     if edge > 0:
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
         stop = edge - margin if buy else edge + margin
-        out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}")
+        # РИСК В ПРОЦЕНТАХ — не новая величина, а то же расстояние вход↔стоп, названное
+        # так, как его использует читатель. Стр. 9 определяет Р как «один Риск» и
+        # единицу измерения сделки; проценты дают посчитать объём позиции, не зная
+        # депозита. Печатается рядом со стопом, чтобы не разводить одну величину по
+        # двум строкам.
+        risk_pct = abs(lv.price - stop) / lv.price * 100 if lv.price > 0 else 0.0
+        out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}"
+                   + (f" · риск {risk_pct:.1f}%" if risk_pct > 0 else ""))
         # ЦЕЛЬ И РР — стр. 24 и стр. 9. Без них сообщение не даёт посчитать сделку:
         # стр. 9 определяет РР как отношение профита к риску и называет «"Золотым
         # стандартом" считаются сделки с РР 1к3 и выше», а решать это читателю нечем,
@@ -2743,6 +2750,15 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
             reward = abs(price_t - lv.price)
             rr = f" · РР 1к{reward / risk:.1f}" if risk > 0 else ""
             out.append(f"    {word} {_fmt_price(price_t, tick)}{rr}")
+        # БЕЗУБЫТОК — стр. 19 дословно: «Цена показала реакцию и ушла внутрь базы –
+        # ставите стоп в б/у». Цена, по которой это видно, берётся ТА ЖЕ, что и в
+        # карточке (`geometry.build_breakeven_rules`, аргумент `inside_base`): дальний
+        # по ходу сделки край объёмной зоны. Вторая величина под тем же именем была бы
+        # дефектом по построению — одна из двух осталась бы непроверенной.
+        inside = lv.zone_hi if buy else lv.zone_lo
+        if inside > 0 and ((inside > lv.price) if buy else (inside < lv.price)):
+            out.append(f"    стоп в б/у, когда цена уйдёт за {_fmt_price(inside, tick)}"
+                       " (стр. 19)")
     # ВТОРАЯ СТРОКА про слом — только когда он ЕСТЬ. Стр. 19 называет вход по слому
     # более безопасным при том же уровне: «также можно смотреть слом структуры на мтф,
     # и брать более безопасную позицию с хорошим соотношением РР». Отсутствие слома НЕ
