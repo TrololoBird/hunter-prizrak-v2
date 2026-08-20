@@ -34,7 +34,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .models import Bar
-from .swings import FRACTAL_BARS, SwingKind, SwingSet
+from .swings import SwingKind, SwingSet
 
 
 def _absent(x: float | None) -> bool:
@@ -265,9 +265,10 @@ class TrendlineBreak(BaseModel):
     Две точки — минимум по источнику, и именно он здесь взят: третьего касания курс не
     требует, а требовать его значило бы ужесточить правило автора.
 
-    Экстремумы индикатора ищутся ТЕМ ЖЕ фрактальным определением, что и свинги цены
-    (`swings.FRACTAL_BARS`, пять баров, экстремум на среднем) — другая конвенция на том
-    же графике означала бы две сущности под одним именем «экстремум».
+    Экстремумы индикатора ищутся пятибарным фракталом (`INDICATOR_FRACTAL_BARS`) — это
+    СВОЙ объект на своём ряду, а не свинг цены: с 2026-08-20 цену размечает зигзаг с
+    окном `swings.ZIGZAG_DEPTH`, и довод в пользу его ширины (видно ли СТРУКТУРУ на
+    своём ТФ, стр. 23) к ряду RSI не относится.
 
     Про «закрытие за линией» здесь нет отдельного условия и не может быть: RSI считается
     ПО ЗАКРЫТИЮ, у него нет тени, и значение бара — уже закрытие.
@@ -425,14 +426,28 @@ def ma_touch(ma: list[float | None], entry: float,
     )
 
 
-def _fractal_pivots(values: list[float | None], lows: bool) -> list[int]:
-    """Индексы фрактальных экстремумов РЯДА ИНДИКАТОРА (та же конвенция, что у свингов).
+INDICATOR_FRACTAL_BARS = 5
+"""Окно экстремума НА РЯДУ ИНДИКАТОРА: пять баров, экстремум на среднем.
 
-    Пять баров, экстремум на среднем, соседи строго слабее — `swings.FRACTAL_BARS` и
-    три источника в шапке `swings.py`. Бар с неизвестным значением в окне экстремума не
-    даёт: сравнивать с NaN значит молча получить «экстремума нет» (`_absent`).
+⚠ Это НЕ окно зигзага цены (`swings.ZIGZAG_DEPTH`), и с 2026-08-20 числа разошлись
+намеренно. Зигзаг размечает СТРУКТУРУ — там ширина окна отвечает за то, видно ли
+структуру на своём ТФ (стр. 23), и владелец сменил примитив ради этого. Здесь же
+экстремум ищется на RSI ради трендовой линии по стр. 67: это другой объект на другом
+ряду, и переносить на него ширину структурного окна значило бы взять чужой довод.
+
+Пятёрка осталась той же, что была у обоих до разделения, — три источника в шапке
+`swings.py` (MetaTrader, thinkorswim, TradingView).
+"""
+
+
+def _fractal_pivots(values: list[float | None], lows: bool) -> list[int]:
+    """Индексы фрактальных экстремумов РЯДА ИНДИКАТОРА.
+
+    Пять баров, экстремум на среднем, соседи строго слабее — `INDICATOR_FRACTAL_BARS`.
+    Бар с неизвестным значением в окне экстремума не даёт: сравнивать с NaN значит молча
+    получить «экстремума нет» (`_absent`).
     """
-    wing = FRACTAL_BARS // 2
+    wing = INDICATOR_FRACTAL_BARS // 2
     out: list[int] = []
     for i in range(wing, len(values) - wing):
         window = values[i - wing:i + wing + 1]
@@ -456,7 +471,7 @@ def trendline_breaks(values: list[float | None], name: str) -> tuple[TrendlineBr
     стороны, — иначе «пробой» на последнем баре был бы не первым.
     """
     out: list[TrendlineBreak] = []
-    if len(values) < FRACTAL_BARS + 1:
+    if len(values) < INDICATOR_FRACTAL_BARS + 1:
         return ()
     last = values[-1]
     if _absent(last):

@@ -608,9 +608,64 @@ def build_all(
                 "stop_anchor_source": None if anchor is None else anchor.source,
                 "stop_anchor_narrowed": bool(anchor is not None and anchor.narrowed),
             }))
+    built = _one_level_per_accumulation(built, timeframes, unbuilt)
     last_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
     built = _with_vrvp(built, trades, last_ms)
     return tuple(built), tuple(unbuilt)
+
+
+def _one_level_per_accumulation(
+    built: list[Level], timeframes: tuple[str, ...], unbuilt: list[Unbuilt],
+) -> list[Level]:
+    """Одно накопление — ОДИН уровень, на старшем ТФ. Стр. 23 и 24.
+
+    ⚠ ЗАВЕДЕНО 2026-08-19 по возражению владельца: "почему ты вообще склеиваешь уровни
+    и зоны?! у призрака никогда не было склееных зон или уровней... значит зоны,
+    структуры и ПОК определяются не правильно". Довод верен, и он архитектурный.
+
+    Детектор ищет накопления на КАЖДОМ ТФ независимо, и одно и то же скопление баров
+    даёт структуру и на 5м, и на 15м; профиль обеим строится из одних минуток по почти
+    одному окну — отсюда почти один ПОК. Формально два объекта, по курсу ОДИН уровень.
+
+    Курс говорит это прямо. Стр. 23: «Уровень накопления относятся к тому ТФ, на котором
+    четко видно его структуру (4+6+ точки границ) и работают на этом ТФ». Стр. 24:
+    «Все уровни накопления относятся к тому ТФ, на котором четко видно их структуру
+    (4+ точки границ) и работают на этом ТФ, а так же на младших по отношению к нему».
+    То есть уровень принадлежит ОДНОМУ таймфрейму и оттуда работает вниз — он не
+    существует отдельно на каждом младшем.
+
+    Замер до правки (BTC, живые уровни): 66 уровней и 126 пар с перекрывающимися зонами
+    одной стороны — почти по два перекрытия на уровень. После: 22 уровня и 5 пар, то
+    есть 44 из 66 были копиями. Оставшиеся пять — соседние накопления ОДНОГО ТФ, это
+    другой вопрос и здесь не решается.
+
+    Критерии геометрические, порогов не вводится:
+      * окна структур ПЕРЕСЕКАЮТСЯ во времени — значит это одно и то же скопление;
+      * ПОК младшего лежит В ЗОНЕ старшего — значит это тот же ценовой уровень.
+
+    Отброшенное НАЗЫВАЕТСЯ через `unbuilt` (§4.3): молча исчезнувший уровень
+    неотличим от ненайденного.
+    """
+    order = {tf: i for i, tf in enumerate(timeframes)}
+    keep: list[Level] = []
+    for lvl in sorted(built, key=lambda x: -order.get(x.timeframe, 0)):
+        senior = next(
+            (k for k in keep
+             if k.side is lvl.side
+             and k.symbol == lvl.symbol
+             and lvl.structure_from_ms < k.structure_to_ms
+             and k.structure_from_ms < lvl.structure_to_ms
+             and k.zone_lo <= lvl.price <= k.zone_hi),
+            None)
+        if senior is None:
+            keep.append(lvl)
+            continue
+        unbuilt.append(Unbuilt(
+            timeframe=lvl.timeframe, index=lvl.structure_first_index,
+            reason=(f"то же накопление уже дало уровень на {senior.timeframe} "
+                    f"(ПОК {senior.price:.8g}): стр. 23 — уровень относится к ТФ, где "
+                    f"структуру видно чётко, и работает на младших (стр. 24)")))
+    return sorted(keep, key=lambda x: (x.timeframe, x.structure_from_ms))
 
 
 def _with_vrvp(built: list[Level], trades: TradeWindows | None,

@@ -518,11 +518,15 @@ def detect(
     lo_source = BorderSource.OWN
     ladder_up: float | None = None
     ladder_lo: float | None = None
+    box_checked = False
+    """Прошла ли ретропроверка коробки для ТЕКУЩЕЙ структуры. Один раз на структуру:
+    границы после заморозки не двигаются наружу, поэтому второй проход того же отрезка
+    дал бы тот же ответ и стоил бы O(n²) на длинном ряду."""
 
     def reset() -> None:
         nonlocal run_dir, run_from, hi_punct, lo_punct, resets, last_kind
         nonlocal up_edge, lo_edge, up_narrowed, lo_narrowed
-        nonlocal up_source, lo_source, ordinal, up_ord0, lo_ord0
+        nonlocal up_source, lo_source, ordinal, up_ord0, lo_ord0, box_checked
         hi_px.clear()
         hi_idx.clear()
         lo_px.clear()
@@ -536,6 +540,7 @@ def detect(
         up_source = lo_source = BorderSource.OWN
         ordinal = 0
         up_ord0 = lo_ord0 = 0
+        box_checked = False
 
     def upper_zone() -> tuple[float, float]:
         return min(hi_px[:2]), max(hi_px[:2])
@@ -570,6 +575,42 @@ def detect(
                 # ⚠ Правило взято с РИСУНКА: словами курс его не формулирует. Оно всё равно
                 # обязательно — рисунок в этом курсе такой же источник, как абзац.
                 # Обзор: docs/audit/accumulation-projects-2026-08-07.md
+                #
+                # ⚠⚠ НО ОТБРАСЫВАТЬ ТАКОЙ СВИНГ ЦЕЛИКОМ БЫЛО ДЕФЕКТОМ, и до 2026-08-20
+                # здесь стоял голый `continue`. Ненумерованная точка — не пустое место:
+                # она принадлежит ТОЙ ЖЕ стороне базы, и стр. 18 называет границей
+                # «Границы базы (хай и лой) чаще всего определяются первыми 2-мя точками»,
+                # то есть ХАЙ базы, а не ту из её вершин, что пришла первой. Пока сторона
+                # не набрала двух точек, более высокий хай (более низкий лой) УТОЧНЯЕТ
+                # ожидающую точку; после заморозки границы он становится проколом, и
+                # стр. 18 продолжает: «Но если на 3++ точках были проколы за границы -
+                # стоп всегда ставится за этот прокол, т.к. это может быть расширением
+                # базы и в будущем цена может ходить уже в этом расширенном диапазоне».
+                #
+                # Замер на BTC, 3000 баров каждого ТФ (свежий кэш, 2026-08-20): отброшено
+                # одноимённых 175/176/150/192/20 на 5м/15м/1ч/4ч/1Д, и из них ЭКСТРЕМАЛЬНЕЕ
+                # уже принятой точки были 57%/60%/60%/64%/55%. Медиана потерянной высоты —
+                # 0.060%/0.105%/0.338%/1.028%/2.957%, максимум 22.90% (4ч). То есть коробка
+                # структуры систематически не доставала до собственных свечей — дефект,
+                # который владелец нашёл глазами 2026-08-18 («структуры не захватывают
+                # полностью свечи»), а ни один гейт не поймал.
+                #
+                # Схлопывание подряд идущих одноимённых точек в экстремум — то же, что
+                # делает любой зигзаг; из прочитанных чужих реализаций это явным циклом
+                # выписано в smart-money-concepts (swing_highs_lows: из двух хаёв подряд
+                # остаётся высший, из двух лоёв — низший).
+                if kind is SwingKind.HIGH and hi_px:
+                    if len(hi_px) < 2:
+                        if price > hi_px[-1]:
+                            hi_px[-1], hi_idx[-1] = price, index
+                    elif up_edge is not None and price > up_edge:
+                        hi_punct = price if hi_punct is None else max(hi_punct, price)
+                elif kind is SwingKind.LOW and lo_px:
+                    if len(lo_px) < 2:
+                        if price < lo_px[-1]:
+                            lo_px[-1], lo_idx[-1] = price, index
+                    elif lo_edge is not None and price < lo_edge:
+                        lo_punct = price if lo_punct is None else min(lo_punct, price)
                 continue
             if kind is SwingKind.HIGH:
                 if len(hi_px) < 2:
@@ -694,6 +735,50 @@ def detect(
 
         if len(hi_px) < 2 or len(lo_px) < 2:
             continue
+
+        if not box_checked:
+            # ⚠⚠ РЕТРОПРОВЕРКА КОРОБКИ. Пока сторона не набрала двух точек, её границы
+            # НЕ СУЩЕСТВУЕТ, и выход через неё детектировать нечем: цикл до проверки
+            # выхода не доходит (строка выше). Значит бары между первой точкой структуры
+            # и моментом заморозки обеих границ не проверялись НИКОГДА, и цена могла уйти
+            # из «накопления» целиком, не закрыв его.
+            #
+            # Стр. 18 определяет флэт как «движение цены в горизонтальном ценовом
+            # диапазоне» и добавляет «Цена ходит от одной границы к другой». Ряд, вышедший
+            # за коробку телами, этому определению не отвечает — базой он не был.
+            #
+            # Найдено 2026-08-20 замером после смены примитива на зигзаг. Дефект СТАРЫЙ:
+            # у фрактала окно уязвимости было коротким (точки приходили каждые 3-4 бара),
+            # у зигзага оно длиннее, и дефект стал видимым. Разобранный случай — SOL 4ч,
+            # бары 1866..1917: объявленные границы 183.3…215.6 при свечах 79.57…215.6,
+            # то есть цена ушла на 57% ниже «нижней границы» и структура не закрылась.
+            # В карточку это выходило зоной шириной 61% (замер на закреплённом окне
+            # 19.08: один уровень из 71).
+            #
+            # Проверяется ТЕМ ЖЕ правилом выхода, что и дальше по коду (`confirm_bodies`
+            # подряд идущих тел за границей) — второй меркой мерить одно и то же нельзя.
+            box_checked = True
+            edge_hi, edge_lo = up_edge, lo_edge
+            assert edge_hi is not None and edge_lo is not None
+            start = min(hi_idx + lo_idx)
+            gone = None
+            streak = 0
+            for j in range(start, k):
+                if body_beyond(bars[j], edge_hi, Direction.ABOVE):
+                    d: Direction | None = Direction.ABOVE
+                elif body_beyond(bars[j], edge_lo, Direction.BELOW):
+                    d = Direction.BELOW
+                else:
+                    streak, gone = 0, None
+                    continue
+                broke = j > start and steps_between(bars[j - 1], bars[j], timeframe) != 1
+                streak = 1 if (d is not gone or broke) else streak + 1
+                gone = d
+                if streak >= confirm_bodies:
+                    break
+            if streak >= confirm_bodies:
+                reset()
+                continue
 
         upper_lo, upper_hi = upper_zone()
         lower_lo, lower_hi = lower_zone()
