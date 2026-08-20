@@ -1260,8 +1260,24 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                 groups.append([z])
         return groups + [[z] for z in containing]
 
-    def role(g: list[ZoneSpec]) -> str:
-        """Роль СЛОВАМИ — как у автора («лимитками заранее», «работать по факту»)."""
+    def role(g: list[ZoneSpec], inside: bool = False) -> str:
+        """Роль СЛОВАМИ — как у автора («лимитками заранее», «работать по факту»).
+
+        ⚠ ЦЕНА УЖЕ В ЗОНЕ — ОТДЕЛЬНЫЙ СЛУЧАЙ, и до 2026-08-20 карточка его теряла.
+        Она печатала «лимитки заранее · цена уже здесь» — два указания, противоречащих
+        друг другу в одной строке, — тогда как уведомление на то же состояние говорит
+        «вход отсюда НЕ приоритет (стр. 44)». Один рот проекта спорил с другим.
+
+        Стр. 44 дословно: «Приоритет – выйти в б/у на тесте уровня с обратной стороны».
+        То есть когда цена уже внутри, задача не «ставить лимитки заранее», а выйти в
+        безубыток на тесте. Ставить лимитку туда, где цена стоит, нечего: она исполнится
+        мгновенно и без структуры под ней.
+
+        Найдено владельцем 2026-08-20 на карточке BOME: «0.0020062 (1Н), зона
+        0.000364–0.007402 · лимитки заранее · 77% от цены · цена уже здесь».
+        """
+        if inside:
+            return "цена внутри — вход НЕ приоритет (стр. 44)"
         waiting = [z for z in g if _waiting_break(z)]
         if not waiting:
             return "лимитки заранее"
@@ -1318,7 +1334,7 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         # считалось» (карта до схемы 8), и тогда строки нет: печатать «×0» значило бы
         # назвать пустым непосчитанное.
         strength = f" · объём ×{vol:.1f} к среднему" if vol >= 1.2 else ""
-        return f"{core} · {role(g)}{strength}{far}{marks}"
+        return f"{core} · {role(g, g_lo <= price <= g_hi)}{strength}{far}{marks}"
 
     def block(side: str, title: str) -> list[str]:
         """Зоны ОДНОЙ стороны, склеенные в диапазоны, от ближнего к дальнему.
@@ -1877,13 +1893,26 @@ class Delivery:
             # Подпись — той же функцией, по той же ЦЕНЕ и тому же МОМЕНТУ, что текст
             # сводки (см. докстроку `tradable_counts` и комментарий у сбора `fetched`).
             longs, shorts = tradable_counts(got.zones, price, now_ms)
+            # ⚠ СКОЛЬКО НЕ ВЛЕЗЛО — НАЗЫВАЕТСЯ ЧИСЛОМ. До 2026-08-20 подпись говорила
+            # «на графике — ближайшие», и читатель, увидев «1 шорт», не находил на
+            # картинке ни одного: зона того шорта лежала выше кадра цены и молча
+            # отбрасывалась. Найдено владельцем на карточке BOME: «шорт уровня нет на
+            # карте и нет из-за этого всей картины».
+            #
+            # Молчаливое усечение — тот же класс дефекта, что молчаливая деградация:
+            # число «1 шорт» без оговорки читается как «он на рисунке».
+            drawn = {(z.side, z.timeframe, z.price) for z in shown}
+            _, uniq_all, _, _ = live_unique(got.zones, price, now_ms)
+            missed = [z for z in uniq_all if not _passed(z, price)
+                      and (z.side, z.timeframe, z.price) not in drawn]
+            gap = (f"; вне кадра цены {len(missed)}" if missed else "")
             png = chart_png(got.symbol, timeframe, bars, shown + tf_pps,
                             tmp / f"{timeframe}.png",
                             # «по карте», потому что на графике лишь ближайшие
                             # (кап `zones_for_chart`): число всей карты при усечённом
                             # рисунке без оговорки — расхождение текста с картинкой.
                             caption=f"торгуемых уровней по карте: {longs} лонг /"
-                                    f" {shorts} шорт; на графике — ближайшие",
+                                    f" {shorts} шорт; на графике — ближайшие{gap}",
                             price=price)
             return png, tf_pps
 
@@ -2774,6 +2803,10 @@ def _target_by_course(lv: LevelRow, pool: list[LevelRow]) -> tuple[float, str] |
         rank = order.index(other.timeframe)
         if rank < own - 1:
             continue                      # ТФ−2 и ниже: «не берутся в расчет»
+        if rank > own + 1:
+            # ТФ+2 и выше: то же ограничение, что в `geometry.build_targets` (вывод из
+            # стр. 24 и стр. 48 — см. пояснение там). Правится ВМЕСТЕ с ним.
+            continue
         goal = other.price
         dist = (goal - lv.price) if long else (lv.price - goal)
         if dist <= 0:
