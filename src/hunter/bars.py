@@ -309,7 +309,33 @@ def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
 
     Неполные КРАЙНИЕ корзины (начало ряда, форминг-хвост) возвращаются как есть —
     отрезать их обязан вызывающий по своим часам (`is_closed`), как и для нативных
-    рядов; функция времени не знает (§10.3)."""
+    рядов; функция времени не знает (§10.3).
+
+    ⚠⚠ КОРЗИНА С ДЫРОЙ ВНУТРИ РЯДА ТЕПЕРЬ ПРОПУСКАЕТСЯ (2026-08-20). До этого дня она
+    возвращалась как обычный бар, и отличить её от полной было НЕЧЕМ — молчаливая
+    деградация, запрещённая §4.3.
+
+    Найдено сверкой с барами САМОЙ БИРЖИ (6 символов, четыре ТФ, 50 895 корзин):
+
+        корзина     результат      штук
+        полная      сходится      50857
+        НЕПОЛНАЯ    расходится       38
+
+    Полных корзин с расхождением — НОЛЬ, то есть формула точна, а все 38 расхождений
+    объясняются потерянными минутами. Худшее: ANKR 5м, объём меньше биржевого на 84%;
+    1000RATS 4ч — на 98%. Такой бар портит и профиль объёма, и границы структуры.
+
+    Правило совпадает с уже принятым здесь для полностью неторговавшей корзины: «Дыра в
+    ряду честнее выдуманного бара». Различить потерянную минуту и фантомную можно счётом:
+    хранилище держит и минуты с нулевым объёмом (иначе полных корзин не было бы 50 857 из
+    50 895), значит недобор минут означает именно потерю данных.
+
+    ⚠ ЭТА ФУНКЦИЯ В БОЮ НЕ ВЫЗЫВАЕТСЯ. Единственный её потребитель — гейт
+    `gates/resample_agrees.py`. То есть гейт зелёный, функция сверена, а к продукту это
+    отношения не имеет — тот же класс, что и находка Н-5 про `plta.atr` («гейты звали
+    библиотеку напрямую, минуя обёртку, то есть проверяли библиотеку, а не проект»).
+    Место, где она нужна, названо: символ, чей ряд старшего ТФ биржа не отдала (за цикл
+    2026-08-20 таких рядов 57), сейчас теряется целиком, хотя минутки для него есть."""
     if not m1:
         return []
     step = tf_ms(timeframe)
@@ -319,16 +345,23 @@ def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
     traded = False
     o = h = lo_ = c = 0.0
     vol = 0.0
+    need = step // 60_000
+    minutes = 0
+    first_bucket = (m1[0].open_ms - anchor) // step * step + anchor
+    last_bucket = (max(b.open_ms for b in m1) - anchor) // step * step + anchor
     for b in sorted(m1, key=lambda x: x.open_ms):
         bucket = (b.open_ms - anchor) // step * step + anchor
         if bucket != cur_bucket:
-            if cur_bucket is not None and traded:
+            edge = cur_bucket in (first_bucket, last_bucket)
+            if cur_bucket is not None and traded and (edge or minutes >= need):
                 out.append(Bar(open_ms=cur_bucket, open=o, high=h, low=lo_,
                                close=c, volume=vol))
             cur_bucket = bucket
             traded = False
             vol = 0.0
+            minutes = 0
         vol += b.volume
+        minutes += 1
         if b.volume > 0:
             if not traded:
                 o, h, lo_, c = b.open, b.high, b.low, b.close
@@ -337,7 +370,8 @@ def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
                 h = max(h, b.high)
                 lo_ = min(lo_, b.low)
                 c = b.close
-    if cur_bucket is not None and traded:
+    if cur_bucket is not None and traded and (
+            cur_bucket in (first_bucket, last_bucket) or minutes >= need):
         out.append(Bar(open_ms=cur_bucket, open=o, high=h, low=lo_,
                        close=c, volume=vol))
     return out
