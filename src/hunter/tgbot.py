@@ -2733,6 +2733,13 @@ def _target_by_course(lv: LevelRow, pool: list[LevelRow]) -> tuple[float, str] |
         dist = (goal - lv.price) if long else (lv.price - goal)
         if dist <= 0:
             continue                      # цель обязана лежать ПО ХОДУ сделки
+        if lv.zone_lo <= goal <= lv.zone_hi:
+            # Цель ВНУТРИ ЗОНЫ ВХОДА — не цель. То же правило и по тому же основанию,
+            # что в `geometry.build_targets`: лимитки входа стоят на ПОК и зону (стр. 30),
+            # и одно касание исполняло бы вход и «тейк» разом. Здесь оно повторено, а не
+            # вызвано, потому что у бота на руках строки леджера, а не объекты уровня;
+            # разойтись им нельзя — при правке править ОБА места.
+            continue
         slot = "main" if rank >= own else "mid"
         cur = best_main if slot == "main" else best_mid
         if cur is None or dist < cur[1]:
