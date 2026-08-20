@@ -68,6 +68,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import ccxt
@@ -396,7 +397,7 @@ def parse_request(text: str, *, is_private: bool, bot_name: str) -> Request | No
 # `docs/audit/bot-review-2026-08-17.md`.
 
 
-def _fmt_price(x: float) -> str:
+def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     """Цена так, как её читает человек: 63 460, 3.691, 0.00385.
 
     Знаков после запятой — по величине самой цены, а не константой: у BTC дробная часть
@@ -408,11 +409,39 @@ def _fmt_price(x: float) -> str:
     микро-стопом показывал вход и стоп ОДНИМ числом — по такому сообщению стоп
     не выставить. Печать не обязана различать всё (это не карточка), но вход и
     стоп одного сигнала обязана.
+
+    ⚠⚠ `tick` — ШАГ ЦЕНЫ ИНСТРУМЕНТА, и с ним число становится ВЫСТАВИМЫМ (2026-08-20).
+    Без него печаталось, например, 0.00817225 — восемь знаков там, где биржа принимает
+    пять: такую лимитку не поставить, читателю приходится округлять её самому, и
+    округляет он как придётся. `None` — тик неизвестен (вызов без доступа к рынку),
+    поведение прежнее; молчаливой подстановки «какого-нибудь» шага здесь нет (§4.3).
+
+    ⚠ `away` — В КАКУЮ СТОРОНУ округлять, и это НЕ косметика. Стоп по стр. 58 стоит
+    «ВСЕГДА» за структурой; округление к ближайшему тику может внести его ВНУТРЬ
+    структуры, то есть нарушить безусловное правило ради красоты числа. Поэтому стоп
+    печатается с `away="down"` для лонга и `away="up"` для шорта — всегда наружу.
+    Вход и текущая цена такого требования не несут и округляются к ближайшему.
     """
+    if tick is not None and tick > 0:
+        d = Decimal(str(x)) / tick
+        if away == "down":
+            q = d.to_integral_value(rounding=ROUND_FLOOR)
+        elif away == "up":
+            q = d.to_integral_value(rounding=ROUND_CEILING)
+        else:
+            q = d.to_integral_value(rounding=ROUND_HALF_UP)
+        exact = q * tick
+        if exact >= 10_000:
+            return f"{float(exact):,.0f}".replace(",", " ")
+        # Знаков ровно столько, сколько их у тика: лишние — обещание точности, которой
+        # у инструмента нет, недостающие — снова невыставимое число.
+        head, _, tail = format(exact, "f").partition(".")
+        head = f"{int(head):,}".replace(",", " ")
+        return f"{head}.{tail}" if tail else head
     if x >= 10_000:
-        return f"{x:,.0f}".replace(",", " ")
+        return f"{x:,.0f}".replace(",", " ")
     if x >= 1000:
-        return f"{x:,.1f}".replace(",", " ")
+        return f"{x:,.1f}".replace(",", " ")
     if x >= 1:
         return f"{x:.5g}"
     return f"{x:.8f}".rstrip("0")
@@ -2547,7 +2576,18 @@ class Notifier:
         for key in list(self._zone_state):
             if key not in seen:
                 del self._zone_state[key]
-        zone_lines = _merge_hits(hits)
+        # ⚠ ШАГ ЦЕНЫ БЕРЁТСЯ У БИРЖИ, а не угадывается по величине числа. Инструмент,
+        # которого нет в рынках, просто не получает тика — печать останется прежней, но
+        # молчаливой подстановки чужого шага не будет (§4.3).
+        ticks: dict[str, Decimal] = {}
+        for h in hits:
+            sym = h[0].symbol
+            if sym in ticks:
+                continue
+            inst = ex.instrument(sym)
+            if not isinstance(inst, NotReady):
+                ticks[sym] = inst.tick_size
+        zone_lines = _merge_hits(hits, ticks)
         if zone_lines:
             self.sent_zone_events += len(zone_lines)
             out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
@@ -2562,7 +2602,8 @@ class Notifier:
 # но теперь оно РЕШАЕТ, звать ли вообще, а не печатается как справка.
 
 
-def _merge_hits(hits: list[tuple[LevelRow, float, str]]) -> list[str]:
+def _merge_hits(hits: list[tuple[LevelRow, float, str]],
+                ticks: dict[str, Decimal] | None = None) -> list[str]:
     """Склеить события ОДНОГО ценового района в одно сообщение.
 
     ⚠ Заведено 2026-08-19 по живому архиву: ARPA дала два уведомления подряд, 19:37
@@ -2600,12 +2641,14 @@ def _merge_hits(hits: list[tuple[LevelRow, float, str]]) -> list[str]:
         tfs = tuple(dict.fromkeys(
             h[0].timeframe
             for h in sorted(g, key=lambda h: -order.get(h[0].timeframe, 0))))
-        out.append(_zone_alert(lead, price, pos, tfs))
+        out.append(_zone_alert(lead, price, pos, tfs,
+                               (ticks or {}).get(lead.symbol)))
     return out
 
 
 def _zone_alert(lv: LevelRow, price: float, pos: str,
-                tf_list: tuple[str, ...] = ()) -> str:
+                tf_list: tuple[str, ...] = (),
+                tick: Decimal | None = None) -> str:
     """Строка события «цена у зоны» — с ДЕЙСТВИЕМ, а не только с фактом.
 
     Было: «цена 64 313 подходит к лонг-зоне 62 750–63 195 (4ч, ПОК 63 036)» — сказано,
@@ -2620,20 +2663,20 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         # Прежняя редакция печатала «цена В ЗОНЕ» и ТУТ ЖЕ предлагала лимитку — то есть
         # звала в сделку ровно там, где курс велит не входить. Правило в проекте было и
         # соблюдалось карточкой (`emit.hold_reason`), а наблюдатель его не спрашивал.
-        return (f"• {base} · цена ВОШЛА в зону {_fmt_price(lv.zone_lo)}–"
-                f"{_fmt_price(lv.zone_hi)} ({tfs})\n"
+        return (f"• {base} · цена ВОШЛА в зону {_fmt_price(lv.zone_lo, tick)}–"
+                f"{_fmt_price(lv.zone_hi, tick)} ({tfs})\n"
                 f"    вход отсюда НЕ приоритет (стр. 44) — ждать выхода из зоны либо "
                 f"быть готовым выйти в б/у на ретесте")
-    out = [f"• {base} · {act} · цена подходит {_fmt_price(price)}",
-           f"    лимитка {_fmt_price(lv.price)}, зона "
-           f"{_fmt_price(lv.zone_lo)}–{_fmt_price(lv.zone_hi)} ({tfs})"]
+    out = [f"• {base} · {act} · цена подходит {_fmt_price(price, tick)}",
+           f"    лимитка {_fmt_price(lv.price, tick)}, зона "
+           f"{_fmt_price(lv.zone_lo, tick)}–{_fmt_price(lv.zone_hi, tick)} ({tfs})"]
     # СТОП — курсовой: за всю структуру с запасом (стр. 58 «Стоп ВСЕГДА прячем за всю
     # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
     edge = lv.boundary_lo if buy else lv.boundary_hi
     if edge > 0:
         margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
         stop = edge - margin if buy else edge + margin
-        out.append(f"    стоп {_fmt_price(stop)}")
+        out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}")
     # ВТОРАЯ СТРОКА про слом — только когда он ЕСТЬ. Стр. 19 называет вход по слому
     # более безопасным при том же уровне: «также можно смотреть слом структуры на мтф,
     # и брать более безопасную позицию с хорошим соотношением РР». Отсутствие слома НЕ
