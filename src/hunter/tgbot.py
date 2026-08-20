@@ -1418,9 +1418,20 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     lines += block("long", "🟢 Лонги:")
 
     if pps:
+        # ⚠ ЗОНА ПП БЫВАЕТ ТОЧКОЙ, и печатать её как «X–X» нельзя. Зона ПП по стр. 55 —
+        # это ТЕНЬ свечи, образовавшей экстремум; у свечи, закрывшейся ровно на своём
+        # экстремуме, тени с этой стороны нет, и зона схлопывается в одну цену.
+        # Замер 2026-08-20 (10 символов, пять ТФ, 3128 переприоров): таких 30, то есть
+        # 0.96%; ПЕРЕВЁРНУТЫХ (lo > hi) — НОЛЬ, то есть арифметика верна и чинить в
+        # расчёте нечего. Чинится только печать: «0.1849–0.1849» читается как ошибка.
+        def pp_zone(p: ZoneSpec) -> str:
+            if p.zone_lo == p.zone_hi:
+                return f"{_fmt_price(p.zone_lo)} (свеча без тени — зона в одну цену)"
+            return f"{_fmt_price(p.zone_lo)}–{_fmt_price(p.zone_hi)}"
+
         lines.append("🟣 Переприор по свежим барам: " + ", ".join(
-            f"{'лонг' if p.side == 'long' else 'шорт'} {_fmt_price(p.zone_lo)}–"
-            f"{_fmt_price(p.zone_hi)} ({TF_LABEL.get(p.timeframe, p.timeframe)})"
+            f"{'лонг' if p.side == 'long' else 'шорт'} {pp_zone(p)}"
+            f" ({TF_LABEL.get(p.timeframe, p.timeframe)})"
             for p in pps))
         lines.append("")
     if charts_missing:
