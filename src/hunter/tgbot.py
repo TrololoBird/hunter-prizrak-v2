@@ -2132,6 +2132,7 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_сигналы=notifier.sent_signals,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
+                 уведомлений_отмены=notifier.sent_cancels,
                  тактов_наблюдателя_с_отказом=notifier.ticks_failed)
         watch.note_recovery()
 
@@ -2206,6 +2207,15 @@ class LevelRow:
     boundary_lo: float = 0.0
     boundary_hi: float = 0.0
     """Границы структуры — чтобы назвать СТОП. Ноль — не записаны."""
+
+    state: str = "active"
+    """active | worked_off | flipped. Нужно, чтобы бот мог СКАЗАТЬ об отмене сигнала.
+
+    ⚠ Заведено 2026-08-20. До этого снятый уровень просто пропадал из выборки, и читатель,
+    которого бот позвал в сделку, ни разу не узнавал, что звать больше не к чему. Причина
+    у снятия есть и она курсовая: `worked_off` — стр. 25 (уровень отработан на касание),
+    `flipped` — стр. 43 (пробит и сменил сторону), — значит её можно НАЗВАТЬ, а не
+    промолчать."""
 
     agreement: str = ""
     """Согласие со старшим ТФ: by_trend | against_trend | no_priority. Пусто — не считалось.
@@ -2293,9 +2303,10 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         agr_col = "agreement" if "agreement" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
-            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}"
-            f" FROM levels WHERE state='active' AND symbol IN ({marks})",
-            symbols).fetchall()
+            f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state"
+            f" FROM levels WHERE (state='active' OR retired_at >= ?)"
+            f" AND symbol IN ({marks})",
+            (clock.now_ms() - RETIRED_WINDOW_MS, *symbols)).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
     finally:
@@ -2307,7 +2318,7 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             boundary_lo=float(r[9] or 0.0),
                             boundary_hi=float(r[10] or 0.0),
                             mtf_break=None if r[11] is None else int(r[11]),
-                            agreement=r[12] or "")
+                            agreement=r[12] or "", state=r[13] or "active")
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -2454,6 +2465,8 @@ class Notifier:
         self.sent_entries = 0
         self.sent_zone_events = 0
         self.ticks_failed = 0
+        self._alerted: set[tuple[str, str, str, int, int]] = set()
+        self.sent_cancels = 0
 
     def _cap(self, lines: list[str]) -> list[str]:
         if len(lines) <= NOTIFY_LINES_MAX:
@@ -2527,7 +2540,8 @@ class Notifier:
         rank = {"far": 0, "near": 1, "inside": 2}
         hits: list[tuple[LevelRow, float, str]] = []
         seen: set[tuple[str, str, str, int, int]] = set()
-        for lv in news.levels:
+        live = [x for x in news.levels if x.state == 'active']
+        for lv in live:
             t = tickers.get(lv.symbol)
             if t is None:
                 continue
@@ -2576,6 +2590,37 @@ class Notifier:
         for key in list(self._zone_state):
             if key not in seen:
                 del self._zone_state[key]
+        # ⚠ ОТМЕНА СИГНАЛА. Бот звал в сделку и молчал, когда звать становилось не к чему:
+        # уровень уходил из выборки, а читатель оставался с лимиткой. Причина снятия
+        # курсовая и потому НАЗЫВАЕТСЯ: `worked_off` — стр. 25 «уровень был отработан на
+        # 1 касание», `flipped` — стр. 43 «Уровень лонг/шорт менятся для нас на
+        # противоположный». Говорится только о тех уровнях, о которых бот ДЕЙСТВИТЕЛЬНО
+        # звал: сообщать о снятии того, о чём не предупреждали, — шум.
+        gone: list[str] = []
+        retired = {(x.symbol, x.timeframe, x.side, x.from_ms, x.to_ms): x
+                   for x in news.levels if x.state != "active"}
+        for key in list(self._alerted):
+            dead = retired.get(key)
+            if key in seen and dead is None:
+                continue
+            self._alerted.discard(key)
+            if dead is None:
+                continue
+            base = dead.symbol.split("/")[0]
+            word = ("отработан (стр. 25)" if dead.state == "worked_off"
+                    else "пробит, сторона сменилась (стр. 43)" if dead.state == "flipped"
+                    else f"снят ({dead.state})")
+            tick_: Decimal | None = None
+            inst_ = ex.instrument(dead.symbol)
+            if not isinstance(inst_, NotReady):
+                tick_ = inst_.tick_size
+            side_word = "покупка" if dead.side == "long" else "продажа"
+            gone.append(f"• {base} · {side_word} {_fmt_price(dead.price, tick_)} "
+                        f"({TF_LABEL.get(dead.timeframe, dead.timeframe)}) "
+                        f"— отменяется: {word}")
+        if gone:
+            self.sent_cancels += len(gone)
+            out.append("\n".join(["🚫 Снято:", *self._cap(gone)]))
         # ⚠ ШАГ ЦЕНЫ БЕРЁТСЯ У БИРЖИ, а не угадывается по величине числа. Инструмент,
         # которого нет в рынках, просто не получает тика — печать останется прежней, но
         # молчаливой подстановки чужого шага не будет (§4.3).
@@ -2587,8 +2632,12 @@ class Notifier:
             inst = ex.instrument(sym)
             if not isinstance(inst, NotReady):
                 ticks[sym] = inst.tick_size
-        zone_lines = _merge_hits(hits, ticks, list(news.levels))
+        zone_lines = _merge_hits(hits, ticks, live)
         if zone_lines:
+            # Запоминаем ИМЕННО то, о чём позвали: отмена шлётся только по этим уровням.
+            for h in hits:
+                self._alerted.add((h[0].symbol, h[0].timeframe, h[0].side,
+                                   h[0].from_ms, h[0].to_ms))
             self.sent_zone_events += len(zone_lines)
             out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
         return out
