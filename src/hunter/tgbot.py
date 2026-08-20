@@ -504,8 +504,12 @@ def read_map(symbol: str) -> MapRead | NotReady:
             "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen,"
             " boundary_lo, boundary_hi, from_ms, to_ms, state,"
             " COALESCE(resolved_at, 0), " + dens_col +
-            " FROM levels WHERE symbol=? AND (state='active' OR retired_at >= ?)"
-            " ORDER BY price", (symbol, clock.now_ms() - RETIRED_WINDOW_MS),
+            # Та же отсечка свежести, что у наблюдателя (см. пояснение в `ledger_news`):
+            # на график не идут уровни, которых последний расчёт символа не подтвердил.
+            " FROM levels WHERE symbol=? AND ((state='active' AND last_seen = ("
+            "     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = ?"
+            " )) OR retired_at >= ?)"
+            " ORDER BY price", (symbol, symbol, clock.now_ms() - RETIRED_WINDOW_MS),
         ).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
@@ -2304,7 +2308,25 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
             f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state"
-            f" FROM levels WHERE (state='active' OR retired_at >= ?)"
+            # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
+            # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
+            # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
+            # НЕ покрывает случай, когда изменился САМ РАСЧЁТ: 2026-08-20 сменён примитив
+            # разметки (фрактал → зигзаг), и уровни, построенные прежним методом, новым
+            # не строятся вовсе — а в таблице продолжают числиться активными.
+            #
+            # Замер того дня: активных строк 2374, подтверждались за час 110, за 1–3 часа
+            # 8, за 3–12 часов 178, за 12–48 часов 1919, старше двух суток 159. То есть
+            # 88% карты, по которой бот звал ценой к зонам, расчёт больше не порождает.
+            #
+            # Отсечка берётся БЕЗ КОНСТАНТЫ: `sync_levels` проставляет всем уровням
+            # символа один и тот же `last_seen`, поэтому максимум по символу И ЕСТЬ момент
+            # его последнего расчёта. Уровень, не обновлённый тогда, этим расчётом не
+            # порождён. Снятые уровни (`retired_at`) под правило не попадают — они нужны
+            # графику как история и заново не синхронизируются.
+            f" FROM levels WHERE ((state='active' AND last_seen = ("
+            f"     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = levels.symbol"
+            f" )) OR retired_at >= ?)"
             f" AND symbol IN ({marks})",
             (clock.now_ms() - RETIRED_WINDOW_MS, *symbols)).fetchall()
     except sqlite3.DatabaseError as e:
