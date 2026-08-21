@@ -435,7 +435,7 @@ higher highs **И** higher lows; "losing either condition signals the trend is w
 сторону. Ближайший методологический аналог — **торговый диапазон Вайкоффа**: горизонтальная
 фаза, где «smart money accumulates», с границами по значимым поддержке и сопротивлению.
 
-**В коде:** `src/hunter/accumulation.py` — `MIN_BOUNDARY_POINTS = 4`.
+**В коде:** `src/hunter/trading_range.py` — `MIN_BOUNDARY_POINTS = 4`.
 
 **Статус:** СОВПАДАЕТ по числу точек. **Признак стр. 13 «повторяются и не меняются»
 реализован как ЗАМОРОЗКА границы** — граница, назначенная первыми точками, дальше не
@@ -540,7 +540,7 @@ higher highs **И** higher lows; "losing either condition signals the trend is w
 внутренний край пары. **Внешние источники поддерживают прочтение Б.** Но классика и не
 знает правила "первыми 2-мя точками": там граница уточняется всей историей диапазона.
 
-**В коде:** `src/hunter/accumulation.py` — `up_edge = max(hi_px)`, `lo_edge = min(lo_px)`.
+**В коде:** `src/hunter/trading_range.py` — `up_edge = max(hi_px)`, `lo_edge = min(lo_px)`.
 ⚠ **Докстрока `BoundaryZone` в этом же файле до сих пор описывает прочтение А** и приводит
 доводы против нынешнего кода. Расхождение кода и его собственной докстроки — ровно то, от
 чего предостерегает CLAUDE.md: докстрока не истина.

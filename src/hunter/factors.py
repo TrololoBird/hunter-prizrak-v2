@@ -440,7 +440,7 @@ INDICATOR_FRACTAL_BARS = 5
 """
 
 
-def _fractal_pivots(values: list[float | None], lows: bool) -> list[int]:
+def _fractal_extremes(values: list[float | None], lows: bool) -> list[int]:
     """Индексы фрактальных экстремумов РЯДА ИНДИКАТОРА.
 
     Пять баров, экстремум на среднем, соседи строго слабее — `INDICATOR_FRACTAL_BARS`.
@@ -480,7 +480,7 @@ def trendline_breaks(values: list[float | None], name: str) -> tuple[TrendlineBr
     n = len(values)
     for kind in (TrendlineKind.SUPPORT_BROKEN, TrendlineKind.RESISTANCE_BROKEN):
         on_lows = kind is TrendlineKind.SUPPORT_BROKEN
-        piv = _fractal_pivots(values, lows=on_lows)
+        piv = _fractal_extremes(values, lows=on_lows)
         if len(piv) < 2:
             continue
         i1, i2 = piv[-2], piv[-1]

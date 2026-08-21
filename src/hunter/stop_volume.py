@@ -32,8 +32,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .accumulation import Accumulation, structure_bars
 from .models import Bar
+from .trading_range import TradingRange, structure_bars
 
 
 class Placement(StrEnum):
@@ -57,7 +57,7 @@ class StopVolume(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    accumulation: Accumulation
+    trading_range: TradingRange
     host_timeframe: str = Field(min_length=1)
     placement: Placement
 
@@ -82,7 +82,7 @@ class StopVolume(BaseModel):
 
     Это тот же класс дефекта, что владелец нашёл глазами 2026-08-18, — две величины под
     одним именем «граница», и наружу шла непроверенная. Отрезок считает
-    `accumulation.structure_bars`, одна функция на всех потребителей.
+    `range.structure_bars`, одна функция на всех потребителей.
     """
 
     bar_volume: float = Field(ge=0)
@@ -151,7 +151,7 @@ _VOL_MEMO: dict[tuple[str, int, int, int, int, int], float] = {}
 """Суммы объёма спанов младших накоплений: см. комментарий при использовании."""
 
 
-def _placement(small: Accumulation, host: Accumulation,
+def _placement(small: TradingRange, host: TradingRange,
                small_bars: list[Bar], host_bars: list[Bar]) -> Placement:
     if small_bars[small.last_index].open_ms < host_bars[host.first_index].open_ms:
         return Placement.BEFORE
@@ -164,9 +164,9 @@ def _placement(small: Accumulation, host: Accumulation,
 
 
 def classify(
-    small: tuple[Accumulation, ...],
+    small: tuple[TradingRange, ...],
     small_bars: list[Bar],
-    host: Accumulation,
+    host: TradingRange,
     host_bars: list[Bar],
     host_timeframe: str,
     *,
@@ -228,7 +228,7 @@ def classify(
             _VOL_MEMO[memo_key] = vol
         items.append(
             StopVolume(
-                accumulation=a,
+                trading_range=a,
                 host_timeframe=host_timeframe,
                 placement=_placement(a, host, small_bars, host_bars),
                 price_range=rng,

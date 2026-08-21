@@ -33,9 +33,9 @@ from . import (
     pereprior,
     swings,
 )
-from .accumulation import BorderSource
 from .bars import TIMEFRAME_MS, continuous_tail
 from .models import Bar, NotReady
+from .trading_range import BorderSource
 
 TF_LABEL = {"5m": "5м", "15m": "15м", "1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
 SIDE_LABEL = {"long": "ЛОНГ", "short": "ШОРТ"}
@@ -179,7 +179,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
     """Карточка символа: ПЕЧАТЬ готового решения. Ничего не считает.
 
     ⚠ Так стало 2026-08-06. Раньше карточка сама звала `swings.detect`,
-    `accumulation.detect`, `levels.build_all`, `map_levels`, `priority.resolve`,
+    `range.detect`, `levels.build_all`, `map_levels`, `priority.resolve`,
     `priority.agreement` и `geometry.build_setup` — то есть считала сигнал заново, вторым
     экземпляром рядом с тем, что уходил в леджер. Замер на кадрах прогона `a1`: карточка
     печатала геометрию для 94 уровней, леджер эмитировал 33, и из 31 флипнутого уровня

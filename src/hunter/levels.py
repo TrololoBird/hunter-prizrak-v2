@@ -26,14 +26,6 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .accumulation import (
-    Accumulation,
-    AccumulationScan,
-    BorderSource,
-    BoundaryZone,
-    atr14,
-    structure_bars,
-)
 from .bars import TIMEFRAME_MS, tf_ms
 from .breach import (
     CONFIRM_BODIES,
@@ -49,6 +41,13 @@ from .models import Bar, NotReady, TradeHistogram, TradeWindows
 from .stop_volume import StopVolume
 from .stop_volume import classify as classify_stop_volume
 from .swings import SwingKind, SwingSet
+from .trading_range import (
+    BorderSource,
+    BoundaryZone,
+    RangeScan,
+    TradingRange,
+    structure_bars,
+)
 from .volume_profile import TV_ROWS, TVProfile, build_tv
 
 
@@ -274,7 +273,7 @@ class Level(BaseModel):
     Скриншоты канала автора рисуют структуры так же — прямоугольники вокруг
     консолидаций целиком (docs/audit/tg-prizrak-2026-08.md, стиль А).
 
-    ЛИНИИ по точкам свингов остаются в ДЕТЕКТОРЕ (`Accumulation.lower/upper.edge`): ими
+    ЛИНИИ по точкам свингов остаются в ДЕТЕКТОРЕ (`TradingRange.lower/upper.edge`): ими
     считаются касания (стр. 22: «понятные 4 и более точек»), сужение и выход из
     структуры. В уровень они НЕ попадают: потребителя, которому после закрытия
     структуры нужна линия, а не коробка, не нашлось ни одного — стоп, якорь,
@@ -296,7 +295,7 @@ class Level(BaseModel):
     а не этой.
 
     ⚠ Признака «граница с другого ТФ» здесь БОЛЬШЕ НЕТ: механизм внесён и откачен
-    2026-08-08, причина — в докстроке `accumulation.BorderSource`."""
+    2026-08-08, причина — в докстроке `range.BorderSource`."""
 
     @property
     def breach_direction(self) -> Direction:
@@ -319,7 +318,7 @@ class Level(BaseModel):
 
 
 def structure_window_ms(
-    acc: Accumulation, bars: list[Bar], timeframe_ms: int
+    acc: TradingRange, bars: list[Bar], timeframe_ms: int
 ) -> tuple[int, int]:
     """Окно `[от, до)` для профиля — по тем же барам, что и границы (`structure_bars`)."""
     seg = structure_bars(acc, bars)
@@ -327,7 +326,7 @@ def structure_window_ms(
     return bars[acc.first_index].open_ms, bars[last_inside].open_ms + timeframe_ms
 
 
-def created_at_ms(acc: Accumulation, bars: list[Bar], timeframe_ms: int) -> int:
+def created_at_ms(acc: TradingRange, bars: list[Bar], timeframe_ms: int) -> int:
     """Момент, с которого уровень существует: ЗАКРЫТИЕ бара подтверждения (стр. 23).
 
     Выделено в функцию, потому что число нужно двоим — `build_all` и любому зонду, — а
@@ -337,7 +336,7 @@ def created_at_ms(acc: Accumulation, bars: list[Bar], timeframe_ms: int) -> int:
 
 
 def build_level(
-    acc: Accumulation,
+    acc: TradingRange,
     hist: TradeHistogram,
     symbol: str,
     window_ms: tuple[int, int],
@@ -453,90 +452,12 @@ LevelBuild = tuple[tuple["Level", ...], tuple["Unbuilt", ...]]
 """
 
 
-MAX_BASE_ATR = 100.0
-"""Потолок высоты базы в ATR СВОЕГО ТФ. Выше — это не флэт, и уровень не строится.
-
-⚠ ЧИСЛО НАШЕ, А НЕ КУРСА. Курс определяет флэт как «движение цены в горизонтальном
-ценовом диапазоне» (стр. 18) и добавляет «Цена ходит от одной границы к другой», но высоты
-не ограничивает нигде; стр. 30 наоборот называет «накопление очень большое ТФ 1Д-1Н-1М»
-штатным случаем. Признак, отличающий очень большое накопление от ВСЕЙ ИСТОРИИ АКТИВА,
-взят замером.
-
-ЧТО ЗАМЕРЕНО (весь кэш баров: 25 символов, 4252 закрытых структуры). Высота коробки,
-делённая на ATR(14) на первом баре структуры, почти не зависит от ТФ — то есть это
-свойство МЕТОДА, а не таймфрейма:
-
-    ТФ    структур   медиана   p90    p99     макс
-    5м       953       6.8     14.6   39.2     62.1
-    15м     1081       6.4     12.2   30.8     76.6
-    1ч      1229       6.3     12.0   31.4    123.5
-    4ч       911       6.2     11.3   30.6     55.3
-    1Д       184       6.0     12.7   25.5     28.0
-    1Н        72       5.9     17.0  107.3    107.3
-
-⚠ Пересняты 2026-08-20 второй раз — после исправления самого `atr14`, который до того дня
-считал не ATR, а простое среднее истинного диапазона (разбор в его докстроке). Числа
-сдвинулись в третьем знаке: единица измерения изменилась, а свойство «медиана около шести
-ATR на любом ТФ» устояло, и это само по себе довод в пользу того, что мерилось явление, а
-не артефакт формулы
-
-База ростом в шесть своих ATR — это метод.
-
-⚠⚠ ТАБЛИЦА ПЕРЕСНЯТА 2026-08-20 ПОСЛЕ ПРАВКИ КОРНЯ, и прежние числа отозваны. До правила
-повтора пары (`accumulation.MAX_PAIR_ATR`) у 1Н стояло p99 = 2493.8 и максимум 2493.8 —
-из-за одной структуры SOL длиной 267 недель, чью нижнюю границу задали точки 1.069
-(декабрь 2020) и 75.25 (февраль 2022). После починки корня хвост 1Н упал до 107.3, то
-есть НИЖЕ максимума 1ч. Оставлять здесь старые числа значило бы держать в коде
-опровергнутый замер.
-
-ЦЕНА ОТСЕЧКИ ПОСЛЕ ПРАВКИ КОРНЯ (структур выше порога из 4252):
-
-    порог    5м  15м  1ч  4ч  1Д  1Н   всего
-      40      6    6   5   2   0   2     21
-      60      1    3   1   0   0   2      7
-     100      0    0   1   0   0   1      2   ← стоит
-     150      0    0   0   0   0   0      0
-
-Сотня оставлена: она отбрасывает ДВЕ структуры из 4252 (0.05%) — по одной на 1ч и 1Н, —
-и обе четырёхкратные выбросы против p99 своего ТФ (30.4 и 17.2). Ниже сотни не
-выбрасывается ничего ни на одном ТФ.
-
-⚠ ЭТО ВТОРАЯ ЛИНИЯ, А НЕ ПЕРВАЯ. Корень чинит `accumulation.MAX_PAIR_ATR` — правило
-повтора точек границы (стр. 13). Здесь остаётся проверка ОПРЕДЕЛЕНИЯ на тот случай, если
-коробка выросла иным путём: объект, не отвечающий определению флэта, флэтом не считается.
-Отказ ИМЕНУЕТСЯ и уходит в `unbuilt` — молча не исчезает ничего.
-
-⚠ ЭТО НЕ «ФИЛЬТР ПЛОХИХ СИГНАЛОВ» — такие запрещены правилом 2026-08-17 («порог на выходе
-не лечит расчёт на входе»).
-
-ПОВОД. Найдено чтением сообщений бота глазами на живых данных: при цене BTC около 69 000
-уведомление предлагало «ПРОДАЖА, лимитка 111 066, зона 106 905–119 222 (1Н), стоп 129 995,
-риск 17.0%, цель 26 846».
-"""
-
-
-def _base_too_tall(acc: Accumulation, bars: list[Bar]) -> str | None:
-    """Названная причина отказа, если коробка выше `MAX_BASE_ATR` своих ATR. Иначе `None`."""
-    seg = structure_bars(acc, bars)
-    if not seg:
-        return None
-    height = max(b.high for b in seg) - min(b.low for b in seg)
-    ref = atr14(bars, acc.first_index)
-    if ref <= 0:
-        return None
-    ratio = height / ref
-    if ratio <= MAX_BASE_ATR:
-        return None
-    return (f"коробка выше {MAX_BASE_ATR:.0f} ATR своего ТФ ({ratio:.0f}) — это не "
-            f"горизонтальный диапазон (стр. 18), а размах истории")
-
-
 def build_all(
     symbol: str,
     series: dict[str, list[Bar]],
     trades: TradeWindows | None,
     timeframes: tuple[str, ...],
-    scans: dict[str, AccumulationScan],
+    scans: dict[str, RangeScan],
     swings: dict[str, SwingSet] | None = None,
     frame_bars: int | None = None,
 ) -> LevelBuild:
@@ -558,7 +479,7 @@ def build_all(
     (леджер и исходы считаются по полной карте, а не по кадру ответа).
 
     ⚠ `scans` подаётся ГОТОВЫМ и обязателен с 2026-08-06. До этого функция звала
-    `swings.detect` и `accumulation.detect` сама — и звала их ВТОРОЙ раз: первый делала
+    `swings.detect` и `range.detect` сама — и звала их ВТОРОЙ раз: первый делала
     карточка по тем же барам. Разбор ряда теперь один на весь конвейер и живёт в
     `engine.read_series`; ТФ, не давшие разбора, туда просто не попадают, и причина
     называется там же (§4.3).
@@ -590,11 +511,6 @@ def build_all(
                     timeframe=tf, index=acc.first_index,
                     reason=f"вне кадра ответа: конец структуры старше {frame_bars} "
                            f"баров {tf} — уровень скрыл бы фильтр «у структуры»"))
-                continue
-            too_tall = _base_too_tall(acc, bars)
-            if too_tall is not None:
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
-                                       reason=too_tall))
                 continue
             hist = trades.window(lo, hi)
             if isinstance(hist, NotReady):
@@ -671,13 +587,13 @@ def build_all(
                 "stop_anchor_source": None if anchor is None else anchor.source,
                 "stop_anchor_narrowed": bool(anchor is not None and anchor.narrowed),
             }))
-    built = _one_level_per_accumulation(built, timeframes, unbuilt)
+    built = _one_level_per_range(built, timeframes, unbuilt)
     last_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
     built = _with_vrvp(built, trades, last_ms)
     return tuple(built), tuple(unbuilt)
 
 
-def _one_level_per_accumulation(
+def _one_level_per_range(
     built: list[Level], timeframes: tuple[str, ...], unbuilt: list[Unbuilt],
 ) -> list[Level]:
     """Одно накопление — ОДИН уровень, на старшем ТФ. Стр. 23 и 24.
@@ -873,7 +789,7 @@ STOP_ANCHOR_BAND_MAX_PCT = 5.0
 точка любой стороны имеет сквозной номер 3 или 4 и под «3++ точках» уже подпадает, а порог
 её отбрасывал: замер на 324 рядах дал 7570 сторон из 11288, где прокол существовал, но в
 стоп не шёл. Сквозного номера зона одной стороны не содержит, поэтому отбор перенесён
-туда, где номер известен, — `accumulation.MIN_PUNCTURE_ORDINAL`. Сюда `puncture` приходит
+туда, где номер известен, — `range.MIN_PUNCTURE_ORDINAL`. Сюда `puncture` приходит
 уже отобранным, и второй проверки быть не должно."""
 
 
@@ -983,7 +899,7 @@ def stop_anchor(
         # ставится за этот прокол») и потолку высоты по-прежнему не подчинён.
         found.append((zone.puncture, StopAnchorSource.PUNCTURE, False))
     for sv in stop_volumes:
-        acc = sv.accumulation
+        acc = sv.trading_range
         # ⚠ КРАЙ СВЕЧЕЙ, А НЕ ЛИНИЯ ДЕТЕКТОРА (правка 2026-08-20). Стр. 18: «идеально
         # стоп прятать за них» — за стоповый объём, то есть за КРАЙ его свечей. Линия
         # детекции проходит по первым двум точкам границ, и свечи за неё выходят у 85.4%
@@ -1370,7 +1286,7 @@ class MappedLevel(BaseModel):
 def map_levels(
     built: tuple[Level, ...],
     series: dict[str, list[Bar]],
-    scans: dict[str, AccumulationScan] | None = None,
+    scans: dict[str, RangeScan] | None = None,
 ) -> tuple[MappedLevel, ...]:
     """Уровни со свежепосчитанной судьбой. Одно место, где `status` зовётся по всему пулу.
 
@@ -1444,7 +1360,7 @@ def status(
     level: Level,
     bars: list[Bar],
     *,
-    scan: AccumulationScan | None = None,
+    scan: RangeScan | None = None,
     confirm_bodies: int = CONFIRM_BODIES,
     return_bars: int = RETURN_BARS,
 ) -> LevelStatus:
@@ -1586,7 +1502,7 @@ class PressedStructure(BaseModel):
     геометрия у них одна — база с ближней стороны уровня, — а выход противоположный."""
 
 
-def pressed_structures(level: Level, scan: AccumulationScan,
+def pressed_structures(level: Level, scan: RangeScan,
                        bars: list[Bar]) -> tuple[PressedStructure, ...]:
     """Закрытые накопления ТОГО ЖЕ ТФ, закрывшиеся после появления уровня и прижатые
     к его зоне (пересечение коробки с [zone_lo, zone_hi]).

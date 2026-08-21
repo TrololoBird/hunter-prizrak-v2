@@ -16,7 +16,7 @@
     говорит «Уровень лонг/шорт менятся для нас на противоположный». То есть карточка
     показывала стоп и цели сделки, которую курс велит брать в другую сторону;
   * свинги и структуры считались по два-три раза на ТФ: `card.render` звал
-    `swings.detect`/`accumulation.detect`, и `levels.build_all` звал их же внутри.
+    `swings.detect`/`range.detect`, и `levels.build_all` звал их же внутри.
 
 Отсюда устройство: **`decide` считает всё один раз, а карточка и леджер — два потребителя
 одного результата.** Карточка ничего не пересчитывает; леджер ничего не пересчитывает.
@@ -32,8 +32,6 @@ from pydantic import BaseModel, ConfigDict
 
 from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
-from .accumulation import Accumulation, AccumulationScan, OpenStructure
-from .accumulation import detect as detect_accumulations
 from .bars import TIMEFRAME_MS
 from .geometry import Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
@@ -41,6 +39,8 @@ from .models import Bar, NotReady, TradeWindows
 from .pereprior import Pereprior, PPSide
 from .priority import Agreement, CounterLevel, Priority
 from .swings import SwingSet, Trend
+from .trading_range import OpenStructure, RangeScan, TradingRange
+from .trading_range import detect as detect_ranges
 
 # ⚠ Типы импортируются ИМЕНАМИ, а не через модуль. Поля моделей ниже называются `swings`
 # и `priority` — по смыслу, — и внутри тела класса эти имена перекрывают одноимённые
@@ -59,7 +59,7 @@ class SeriesRead(BaseModel):
 
     timeframe: str
     swings: SwingSet
-    scan: AccumulationScan
+    scan: RangeScan
     trend: Trend
     perepriors: tuple[Pereprior, ...] = ()
     """Переприоры этого ряда. §2.5.
@@ -275,7 +275,7 @@ def read_series(
         if isinstance(sw, NotReady):
             bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
             continue
-        scan = detect_accumulations(bars, sw, tf)
+        scan = detect_ranges(bars, sw, tf)
         every = pereprior.detect_all(bars, sw, tf)
         # `detect` — это «последний ПП каждой стороны» из того же прохода; берём его
         # отсюда, чтобы бары не сканировались дважды и чтобы два поля не разошлись.
@@ -305,7 +305,7 @@ def read_series(
 
 
 def _pennant_of(
-    structure: Accumulation | OpenStructure | None,
+    structure: TradingRange | OpenStructure | None,
 ) -> tuple[figures.Pennant | None, str]:
     """Вымпел структуры (стр. 57, 58) вместе с причиной, если его нет.
 
@@ -372,7 +372,7 @@ def decide(
 
     ⚠ Второй проход за чужой границей (стр. 39, 46, 54) был внесён и ОТКАЧЕН
     2026-08-08: критерий не прошёл контроль на заведомо неверных анкерах. Причина
-    записана в `accumulation.BorderSource`. Проход снова ОДИН.
+    записана в `range.BorderSource`. Проход снова ОДИН.
 
     Каждый шаг зовётся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
     """
@@ -437,7 +437,7 @@ def decide(
 
 
 
-def _pp_structure_note(pp: Pereprior, scan: AccumulationScan) -> str:
+def _pp_structure_note(pp: Pereprior, scan: RangeScan) -> str:
     """Подтверждение ПП структурой — стр. 53 (реестр, строка 5): закрытое накопление
     того же ТФ, сформированное ПОСЛЕ слома и опирающееся на зону ПП (лонг — над зоной,
     шорт — под). Пусто — не найдено."""

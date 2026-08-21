@@ -41,7 +41,8 @@ def main() -> int:
     df = pl.read_parquet(SLICE)
     computed = {
         "adx14": plta.adx(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
-        "atr14": plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14),
+        # ⚠ atr14 снят 2026-08-21: ATR удалён из проекта, объявленной затравки
+        # у него больше нет (см. `hunter.trading_range.MAX_PAIR_PCT`).
         # ⚠ Правка аудита 2026-08-06 (М-06 = Н-5): `rsi14` и `ema200` брались прямо из
         # `plta`, минуя обёртку проекта, и подмена периода в hunter/indicators.py
         # проезжала мимо гейта (evidence/E-020-gate-probes).

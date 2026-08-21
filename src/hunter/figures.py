@@ -11,13 +11,13 @@
 Своих проходов по барам у ГИП и у двойного дна тут НЕТ, и это требование самого курса.
 Стр. 61: «фактически частный случай "Переприора - слома структуры"»; стр. 62: «это просто
 накопление, но граница накопления являлась сломом структуры». Значит обе — признаки на
-уже построенных `Pereprior` и `Accumulation`, а не отдельные детекторы.
+уже построенных `Pereprior` и `TradingRange`, а не отдельные детекторы.
 
 Уровень входа сюда не импортируется: `FigureEntry.NEAREST_LEVEL` называет ПРАВИЛО курса
 («ближайший уровень… "если он есть"»), а какой именно уровень — разрешает вызывающий по
 `levels.Level`. Так модуль остаётся без зависимости от профиля объёма и стопа.
 
-Цены здесь `float`, как в `swings`, `accumulation` и `pereprior`: все они приходят из
+Цены здесь `float`, как в `swings`, `range` и `pereprior`: все они приходят из
 `Bar`, где цена float. Decimal живёт на границе с `Level`, а `Level` сюда не приходит.
 
 Запаса за структуру (стр. 33, 58: 1-3%) этот модуль не считает — он уже есть в
@@ -32,21 +32,21 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .accumulation import (
-    MIN_BOUNDARY_POINTS,
-    MIN_BOUNDARY_POINTS_PER_SIDE,
-    Accumulation,
-    OpenStructure,
-)
 from .models import NotReady
 from .pereprior import Pereprior, PPKind, PPSide
 from .swings import Swing, SwingKind, SwingSet
+from .trading_range import (
+    MIN_BOUNDARY_POINTS,
+    MIN_BOUNDARY_POINTS_PER_SIDE,
+    OpenStructure,
+    TradingRange,
+)
 
 TOUCH_FOR_ENTRY = 6
 """Стр. 57: «ждем 6 касание и берем на 6 касании». Стр. 58 повторяет: «берем на 6 касании».
 
 Номер СКВОЗНОЙ, через обе стороны: схема стр. 57 нумерует 1, 3, 5, 7 по одной границе и
-2, 4, 6, 8 по другой. Так же считает `Accumulation.touches`, поэтому касания берутся у
+2, 4, 6, 8 по другой. Так же считает `TradingRange.touches`, поэтому касания берутся у
 структуры, а не пересчитываются здесь.
 """
 
@@ -135,7 +135,7 @@ class Channel(BaseModel):
 
 
 def _alternating(swings: SwingSet) -> list[Swing]:
-    """Точки, ЧЕРЕДУЮЩИЕ сторону, — то же правило схем, что в `accumulation.detect`.
+    """Точки, ЧЕРЕДУЮЩИЕ сторону, — то же правило схем, что в `range.detect`.
 
     ⚠ Порядок двух свингов ОДНОГО бара (внешний бар даёт и хай, и лой) наследуется от
     `swings.detect`, где сначала идёт HIGH: сортировка устойчива. Из OHLC «что было
@@ -277,7 +277,7 @@ class Pennant(BaseModel):
     first_index: int
     last_point_index: int
     touches: int
-    """Сквозной счёт касаний обеих границ — `Accumulation.touches` (стр. 57, схема)."""
+    """Сквозной счёт касаний обеих границ — `TradingRange.touches` (стр. 57, схема)."""
 
     touch6_index: int | None
     """Бар ШЕСТОГО касания — ТВХ по стр. 57. `None` — касаний ещё меньше шести."""
@@ -312,11 +312,11 @@ class Pennant(BaseModel):
         return (FigureEntry.NEAREST_LEVEL, FigureEntry.TOUCH_6, FigureEntry.ADD_ON)
 
 
-def pennant(structure: Accumulation | OpenStructure) -> Pennant | NotReady:
+def pennant(structure: TradingRange | OpenStructure) -> Pennant | NotReady:
     """Вымпел из готовой структуры накопления (стр. 57, 58).
 
     Сужение читается по счётчикам `BoundaryZone.narrowed`, которые ведёт сама
-    `accumulation.detect`: сошлись обе стороны — треугольник «с равными границами»
+    `range.detect`: сошлись обе стороны — треугольник «с равными границами»
     (стр. 58), сошлась одна — «с поджатием» (стр. 57).
 
     Сторона берётся у курса дословно и без замера: стр. 58 «если тренд лонговый, первая
@@ -466,7 +466,7 @@ class MultipleBase(BaseModel):
         return (FigureEntry.PP_TEST, FigureEntry.NEAREST_LEVEL)
 
 
-def multiple_base(acc: Accumulation, pps: Sequence[Pereprior]) -> MultipleBase | NotReady:
+def multiple_base(acc: TradingRange, pps: Sequence[Pereprior]) -> MultipleBase | NotReady:
     """Признак двойного/тройного дна или вершины на закрытом накоплении (стр. 62).
 
     Условие ровно одно и оно из курса: граница, ЧЕРЕЗ которую цена вышла, лежит внутри

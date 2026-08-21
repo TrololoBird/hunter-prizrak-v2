@@ -212,8 +212,10 @@ def main() -> int:
     h, lo, c = df["high"].to_list(), df["low"].to_list(), df["close"].to_list()
 
     cases: list[tuple[str, list[float | None], pl.Expr]] = [
-        ("atr14", atr(h, lo, c, 14),
-         plta.atr(pl.col("high"), pl.col("low"), pl.col("close"), timeperiod=14)),
+        # ⚠ ATR УДАЛЁН ИЗ ПРОЕКТА 2026-08-21 (приказ владельца), поэтому и сверять
+        # его больше не с чем: величины, которую считает `src`, не существует. Он
+        # служил единицей двум порогам геометрии, оба сняты — разбор в докстроке
+        # `hunter.trading_range.MAX_PAIR_PCT`. В курсе ATR не встречается ни разу.
         # ⚠ Правка аудита 2026-08-06 (М-06 = Н-5): здесь стояли прямые вызовы `plta.*`,
         # то есть гейт сверял с формулой БИБЛИОТЕКУ, а не обёртку проекта. Подмена
         # периода в hunter/indicators.py проезжала мимо (evidence/E-020-gate-probes).

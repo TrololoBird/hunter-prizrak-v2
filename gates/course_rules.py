@@ -29,8 +29,6 @@ import sys
 from collections.abc import Callable
 from decimal import Decimal
 
-from hunter.accumulation import MIN_BOUNDARY_POINTS, BoundaryZone
-from hunter.accumulation import detect as detect_accumulations
 from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
@@ -49,6 +47,8 @@ from hunter.models import Bar
 from hunter.outcome import OutcomeKind, resolve
 from hunter.swings import ZIGZAG_DEPTH
 from hunter.swings import detect as detect_swings
+from hunter.trading_range import MIN_BOUNDARY_POINTS, BoundaryZone
+from hunter.trading_range import detect as detect_ranges
 
 TF = "1h"
 STEP = TIMEFRAME_MS[TF]
@@ -221,7 +221,7 @@ def c_structure_needs_exit() -> tuple[object, object]:
         seq.append((100.0, 108.0, 99.0, 104.0))    # локальный хай
         seq += fill
         seq.append((104.0, 105.0, 92.0, 100.0))    # локальный лой
-    sc = detect_accumulations(seq_bars := bars(*seq), detect_swings(seq_bars), TF)  # type: ignore[arg-type]
+    sc = detect_ranges(seq_bars := bars(*seq), detect_swings(seq_bars), TF)  # type: ignore[arg-type]
     return (len(sc.closed), sc.open_tail is not None), (0, True)
 
 
@@ -295,7 +295,7 @@ def c_puncture_needs_third_point() -> tuple[object, object]:
     without = _pair_structure(107.0, 108.0, 93.0, 92.0, hi3=106.0, lo3=94.0)
     got: list[object] = []
     for b in (with_punct, without):
-        sc = detect_accumulations(b, detect_swings(b), TF)  # type: ignore[arg-type]
+        sc = detect_ranges(b, detect_swings(b), TF)  # type: ignore[arg-type]
         if not sc.closed:
             got.append("структуры нет")
             continue
@@ -322,11 +322,11 @@ def c_min_points_threshold_bites() -> tuple[object, object]:
     """
     b = _four_point_structure()
     sw = detect_swings(b)
-    base = detect_accumulations(b, sw, TF)  # type: ignore[arg-type]
+    base = detect_ranges(b, sw, TF)  # type: ignore[arg-type]
     if not base.closed:
         return "структур не найдено вовсе", "одна структура при умолчании"
     points = base.closed[0].points
-    strict = detect_accumulations(b, sw, TF, min_points=points + 1)  # type: ignore[arg-type]
+    strict = detect_ranges(b, sw, TF, min_points=points + 1)  # type: ignore[arg-type]
     return (
         (len(base.closed), points >= MIN_BOUNDARY_POINTS, len(strict.closed), strict.resets > 0),
         (1, True, 0, True),

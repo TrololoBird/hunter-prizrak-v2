@@ -25,7 +25,7 @@ PURE_MODULES = [
     "src/hunter/volume_profile.py",
     "src/hunter/profile_source.py",
     "src/hunter/swings.py",
-    "src/hunter/accumulation.py",
+    "src/hunter/trading_range.py",
     "src/hunter/levels.py",
     "src/hunter/stop_volume.py",
     "src/hunter/breach.py",
@@ -47,7 +47,7 @@ PURE_MODULES = [
 # формы `from . import X`, модуль числился чистым и печатался как проверенный, импортируя
 # `archive` и `store` — оба в собственном списке запрещённых этого гейта.
 
-# Список выше ведётся руками, и 2026-08-03 он отстал: accumulation.py объявил себя
+# Список выше ведётся руками, и 2026-08-03 он отстал: range.py объявил себя
 # чистым в докстроке, в список не попал, и гейт напечатал «нарушений 0», ни разу его не
 # открыв. Охват проверки сам является утверждением — поэтому расхождение между «модуль
 # объявил себя чистым» и «модуль в списке» теперь провал, а не тишина.

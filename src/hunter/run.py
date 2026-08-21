@@ -20,7 +20,6 @@ import ccxt
 import polars as pl
 
 from . import archive, barstore, card, clock, emit, engine, geometry, levels, log, store
-from .accumulation import detect as detect_accumulations
 from .bars import (
     TIMEFRAME_MS,
     bars_needed,
@@ -56,6 +55,7 @@ from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
 from .profile_source import PROFILE_LADDER, TVWindows, intrabar_timeframe
 from .swings import detect as detect_swings
+from .trading_range import detect as detect_ranges
 
 
 def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
@@ -677,7 +677,7 @@ def needed_days(
         sw = detect_swings(bars)
         if isinstance(sw, NotReady):
             continue
-        for acc in detect_accumulations(bars, sw, tf).closed:
+        for acc in detect_ranges(bars, sw, tf).closed:
             lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
             if hi < cut:
                 dropped += 1
@@ -738,7 +738,7 @@ def profile_windows(
             continue
         frame_lo = (bars[-1].open_ms - frame_bars * TIMEFRAME_MS[tf]
                     if frame_bars is not None else None)
-        for acc in detect_accumulations(bars, sw, tf).closed:
+        for acc in detect_ranges(bars, sw, tf).closed:
             lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
             if hi < cut:
                 dropped += 1
@@ -907,7 +907,7 @@ async def backfill_trades(
 
     ⚠ 2026-08-06, при переходе на службу (А-1), выяснилось, что правка Д-8 была НЕПОЛНОЙ.
     В поток уходила только закачка, а `needed_days` остался на цикле событий — и это не
-    мелочь: он гоняет `detect_swings` и `detect_accumulations` по каждому ТФ каждого
+    мелочь: он гоняет `detect_swings` и `detect_ranges` по каждому ТФ каждого
     символа, то есть настоящий расчёт, а не разбор ответа. Пакетному прогону это было
     безразлично по той же причине, по которой была безразлична закачка: наблюдение уже
     остановлено. Служба считает НЕ ПРЕРЫВАЯ сбора, и здесь пакетная привычка стоила бы
