@@ -22,7 +22,8 @@ from .bars import expected_last_closed_open_ms, tf_ms
 from .config import Universe
 from .exchange import POLL_OFFSET_S, Exchange
 from .models import NotReady, RunReport
-from .run import arrival_lag_survey, collect, explained_gaps
+from .profile_source import PROFILE_LADDER
+from .run import WATCH_TRADES, arrival_lag_survey, collect, explained_gaps
 
 
 def _verdict(lines: list[tuple[str, bool, str]]) -> int:
@@ -153,6 +154,13 @@ def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:
     late = sum(s.poll_late for s in r.series.values())
     requests = sum(s.poll_requests for s in r.series.values())
     trades = sum(h.trades_seen for h in r.histograms.values())
+    # Бары ПРОФИЛЯ — те ступени лестницы, из которых `TVWindows` строит гистограмму.
+    # Считаются по рядам прогона: хранилище `barstore` подмешивается позже, в
+    # `trade_source`, и его наличие проверяет уже расчёт, а не приёмка данных.
+    prof = [s_ for (sym, tf), s_ in r.series.items()
+            if tf in PROFILE_LADDER and s_.not_ready is None]
+    profile_bars = sum(len(s_.bars) for s_ in prof)
+    profile_series = len(prof)
     runs = store.saved_runs()
     frames_on_disk = (sum(1 for _ in store.FRAMES_DIR.rglob("*.parquet"))
                       if store.FRAMES_DIR.is_dir() else 0)
@@ -183,11 +191,24 @@ def _report_live(r: RunReport) -> list[tuple[str, bool, str]]:
          f"битых баров в принятых рядах {bad_kept} из {kept_bars}; "
          f"отклонено на приёме {len(rejected)} " +
          (f"— {rejected[0][:90]}…" if rejected else "(ни одного за этот прогон)")),
-        ("Сделки принимаются",
-         trades > 0,
-         f"принято {trades} сделок по {len(r.histograms)} символам; "
-         f"расхождение агрегации "
-         f"{max((h.reconciliation_error() for h in r.histograms.values()), default=0):.1e}"),
+        # ⚠⚠ СТРОКА ПЕРЕПИСАНА 2026-08-21 (Т-1), И ЭТО НЕ ОСЛАБЛЕНИЕ ПРОВЕРКИ.
+        # Стояло «Сделки принимаются» с условием `trades > 0`. Поток сделок выключен
+        # (`run.WATCH_TRADES`), потому что расчёт его не читает с 2026-08-12 — профиль
+        # объёма и уторговка идут по свечам. Оставить прежнее условие значило бы завести
+        # строку, КРАСНУЮ ПО ПОСТРОЕНИЮ, — зеркало дефекта Д-1 и такая же ложь, только
+        # наоборот: владелец с исправной системой видел бы «ПЛОХО» вечно.
+        #
+        # Проверяется теперь ТО, ЧТО РАСЧЁТ ДЕЙСТВИТЕЛЬНО ЧИТАЕТ: собраны ли бары
+        # профиля. Условие способно стать красным (пустое хранилище, отказ приёма) и
+        # относится к величине, от которой зависит ПОК в карточке.
+        ("Бары профиля собраны — по ним считается ПОК",
+         profile_bars > 0,
+         f"баров профиля в рядах прогона {profile_bars} на {profile_series} рядах "
+         f"(лестница {', '.join(PROFILE_LADDER)}); поток сделок "
+         + ("ВКЛЮЧЕН, принято "
+            f"{trades} сделок по {len(r.histograms)} символам"
+            if WATCH_TRADES else
+            "выключен решением Т-1 — расчёт его не читает")),
         # ⚠ Спрашивается СОСТОЯНИЕ ДИСКА, а не работа этой команды. Прежняя редакция
         # требовала `r.frames_written > 0` — а `check` кадров не пишет с тех пор, как
         # конвейер разделили на четыре шага: она только собирает (см. `run_check`).
