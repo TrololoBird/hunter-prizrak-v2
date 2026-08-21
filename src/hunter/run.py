@@ -89,6 +89,33 @@ def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
     return bars_needed(timeframe, horizon_days, floor)
 
 
+SEED_CASCADE_AT = 5
+"""Сколько отказов ПОДРЯД считать каскадом, а не совпадением.
+
+Довод не в величине числа, а в том, что засев на каждом шаге трогает ДРУГОЙ ряд —
+другой символ либо другой таймфрейм. Один отказ объясняется этим рынком, два — ещё
+совпадение; пять подряд по пяти разным рядам свойством рынка не объясняются вовсе и
+означают, что плохо НАМ: насыщение канала, техработы биржи или лимит, пришедший в чужой
+одежде (см. `exchange.RATE_LIMIT_ERRORS`: `ExchangeNotAvailable` в список глобальной
+паузы сознательно НЕ входит, и цена этого выбора названа там же — «попадание в лимит,
+пришедшее под видом `ExchangeNotAvailable`, паузы не вызовет»).
+
+⚠ Прогон полной доски 2026-08-21 показал этот сценарий целиком: 410 отказов подряд
+(`RequestTimeout` перешёл в `ExchangeNotAvailable`), засев прошёл сквозь них на полном
+ходу и бросил 63 ряда, а каскад через несколько минут прошёл САМ — последние строки того
+же лога успешные. Нужна была пауза, а не отказ от рядов.
+"""
+
+SEED_BACKOFF_S = (15.0, 30.0, 60.0)
+"""Паузы перед повторами каскада. Три шага, последний накрывает ЦЕЛОЕ окно веса.
+
+Окно лимита у Binance — одна минута (`fapiPublicGetExchangeInfo` отдаёт 2400 на 60 с),
+поэтому шаг в 60 с гарантирует, что третий повтор начнётся с чистого окна: если причина
+была в весе, к нему её уже нет. Первые два шага короче ради случая, когда причина
+сетевая и проходит сама, — таким и оказался каскад 2026-08-21.
+"""
+
+
 async def expand_board(ex: Exchange, uni: Universe) -> Universe:
     """Вселенная = ВСЯ ДОСКА площадки, если так велит `universe.board`.
 
@@ -165,7 +192,7 @@ def _capped(uni: Universe) -> Universe:
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
-               horizon_days: int = 0) -> None:
+               horizon_days: int = 0, stop: asyncio.Event | None = None) -> None:
     """Засев рядов: хранилище на диске плюс добор хвоста у биржи.
 
     ⚠ ДО 2026-08-11 БАРЫ НЕ СОХРАНЯЛИСЬ ВОВСЕ, и каждый прогон качал все 162 ряда заново.
@@ -180,18 +207,45 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
     если биржа отдала по той же метке другие числа, это её правка задним числом либо наша
     ошибка склейки, и оба случая обязаны быть видны числом, а не расхождением карточки.
     """
+    halt = stop if stop is not None else asyncio.Event()
+    """⚠ Сигнал остановки нужен ИМЕННО из-за пауз каскада: без него Ctrl+C во время
+    шестидесятисекундного ожидания повтора не отвечал бы минуту. Необязателен, чтобы
+    `seed` оставался вызываемым из проверок, где остановки нет."""
+    streak = cascades = retried = recovered = skipped = 0
+    # ⚠ ИНСТРУМЕНТЫ БЕРУТСЯ ОДИН РАЗ, ДО ПРОХОДОВ: проходов два, и второй не обязан
+    # заново спрашивать площадку про те же рынки.
+    insts: dict[str, str | None] = {}
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
             log.degraded("инструмент недоступен", причина=inst.reason)
-        market_id = None if isinstance(inst, NotReady) else inst.market_id
-        # ⚠ ЛЕСТНИЦА СПРАШИВАЕТСЯ У СИМВОЛА, А НЕ У ВСЕЛЕННОЙ. При включённой доске
-        # `uni.timeframes` вернула бы полную лестницу всем 696 рынкам — 52.1 млн баров
-        # вместо 4.0 млн, то есть засев на 116 минут вместо девяти.
-        for tf in uni.ladder(sym):
+        insts[sym] = None if isinstance(inst, NotReady) else inst.market_id
+
+    # ⚠ ЛЕСТНИЦА СПРАШИВАЕТСЯ У СИМВОЛА, А НЕ У ВСЕЛЕННОЙ. При включённой доске
+    # `uni.timeframes` вернула бы полную лестницу всем 529 рынкам — 39.6 млн баров
+    # вместо 4.8 млн, то есть засев на 88 минут вместо одиннадцати.
+    todo = [(s, tf) for s in uni.symbols for tf in uni.ladder(s)]
+
+    # ⚠⚠ ПРОХОДА ДВА, И ВТОРОЙ ЗАВЕДЁН ИЗ-ЗА ДЫРЫ, НАЙДЕННОЙ КОНТРОЛЕМ, А НЕ ПРО ЗАПАС.
+    # Тормоз каскада включается на пятом отказе подряд — значит ЧЕТЫРЕ первых ряда
+    # каскада успевают быть брошенными до него. Контроль 2026-08-21 («каскад из шести
+    # отказов, потом успех») показал это числом: засеяно 4 из 8, брошено 4, тогда как
+    # без каскада засевается 8 из 8. Один тормоз лечит ХВОСТ каскада и не лечит его
+    # ГОЛОВУ. Второй проход идёт только по брошенным рядам и только если каскад был:
+    # у по-настоящему мёртвого рынка повторять нечего.
+    for seed_pass in (1, 2):
+        if seed_pass == 2:
+            todo = [k for k, s in report.series.items() if s.not_ready is not None]
+            if not cascades or not todo:
+                break
+            log.warn("ВТОРОЙ ПРОХОД ЗАСЕВА — голова каскада", рядов=len(todo),
+                     каскадов=cascades)
+        for sym, tf in todo:
+            market_id = insts[sym]
             st = SeriesState(symbol=sym, timeframe=tf)
             report.series[(sym, tf)] = st
-            report.seed_checked += 1
+            if seed_pass == 1:
+                report.seed_checked += 1
 
             # Глубина решается ЗДЕСЬ и по каждому ТФ отдельно: одна цифра на все ТФ
             # делала карту несопоставимой самой с собой (см. `seed_depth`).
@@ -220,10 +274,43 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                 behind = max(0, clock.now_ms() - since_ms) // tf_ms(tf)
                 ask = min(depth, int(behind) + 2)  # +2: текущий незакрытый и запас на край
             got = await ex.fetch_closed_ohlcv(sym, tf, limit=ask, since_ms=since_ms)
+            # ⚠ КАСКАД ОТКАЗОВ ТОРМОЗИТ ЗАСЕВ, А НЕ ПРОЛИСТЫВАЕТСЯ ПО ОДНОМУ. Цена
+            # ошибки здесь выше обычной: ЗАСЕВ ОТРАБАТЫВАЕТ ОДИН РАЗ, второй попытки у
+            # ряда нет — брошенный ряд остаётся пустым до перезапуска службы. Разбор
+            # каскада 2026-08-21 — в докстроке `SEED_CASCADE_AT`.
+            if isinstance(got, NotReady):
+                streak += 1
+                for attempt, pause in enumerate(SEED_BACKOFF_S, start=1):
+                    if streak < SEED_CASCADE_AT:
+                        break
+                    if attempt == 1:
+                        cascades += 1
+                        log.warn("КАСКАД ОТКАЗОВ ЗАСЕВА — пауза и повтор",
+                                 отказов_подряд=streak, символ=sym, тф=tf,
+                                 повторов=len(SEED_BACKOFF_S), причина=got.reason)
+                    if await sleep_or_stopped(halt, pause):
+                        break
+                    retried += 1
+                    got = await ex.fetch_closed_ohlcv(
+                        sym, tf, limit=ask, since_ms=since_ms)
+                    if not isinstance(got, NotReady):
+                        recovered += 1
+                        streak = 0
+                        log.info("каскад пройден — ряд добран повтором",
+                                 символ=sym, тф=tf, попытка=attempt, пауза_с=pause)
+                        break
+            else:
+                streak = 0
             if isinstance(got, NotReady):
                 if not stored:
                     st.not_ready = got
-                    log.degraded("засев пропущен", причина=got.reason)
+                    # ⚠ ПОИМЁННО В ЛОГ — ТОЛЬКО ПЕРВЫЕ. Четыреста десять одинаковых
+                    # строк не сводка, а шум, в котором тонет всё остальное. Точный
+                    # счёт ведёт сводка в конце засева, а сами ряды видны в приёмке
+                    # как «рядов без данных».
+                    skipped += 1
+                    if skipped <= SEED_CASCADE_AT:
+                        log.degraded("засев пропущен", причина=got.reason)
                     continue
                 # Хранилище есть, хвост не пришёл: ряд стар, но не пуст. Молчать нельзя —
                 # иначе «данные есть» неотличимо от «данные свежие».
@@ -265,6 +352,19 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             if st.gaps:
                 log.warn("разрыв сетки", символ=sym, тф=tf, разрывов=len(st.gaps),
                          первый_после=st.gaps[0][0])
+
+    # ⚠ СВОДКА ОТКАЗОВ — ОДНОЙ СТРОКОЙ И ВСЕГДА, даже когда всё нулевое. Правило «у
+    # отказов обязана быть сводка по измерению, вдоль которого возможен перекос»
+    # (docs/audit/backfill-window-2026-08-04.md): четыреста десять отказов подряд — это
+    # ОДНО событие, а не четыреста десять, и поштучные строки его ПРЯТАЛИ: каждая
+    # выглядела единичной невезучестью конкретного рынка.
+    dead = sum(1 for s in report.series.values() if s.not_ready is not None)
+    if cascades or dead:
+        log.warn("засев: сводка отказов", каскадов=cascades, повторов=retried,
+                 добрано_повтором=recovered, пропусков_за_проходы=skipped,
+                 рядов_без_данных=dead, из_рядов=report.seed_checked)
+    else:
+        log.info("засев без каскадов", рядов=report.seed_checked)
 
 
 def _merge_bars(stored: list[Bar], fresh: list[Bar]) -> list[Bar]:
@@ -2276,7 +2376,7 @@ class Collector:
                  ядро=len(self.uni.core) if self.uni.board else len(self.uni.symbols),
                  баров_на_ряд=self.seed_limit)
         await seed(self.ex, self.uni, self.report, self.seed_limit,
-                   self.horizon_days)
+                   self.horizon_days, self.stop)
         log.info("засеяно", баров=self.report.seeded_bars,
                  запросов=self.report.seed_checked)
         self._launch()
