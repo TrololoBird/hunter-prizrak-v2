@@ -191,6 +191,68 @@ def _capped(uni: Universe) -> Universe:
     return replace(uni, symbols=kept, core=uni.core & set(kept))
 
 
+async def _fill_seed_gaps(
+    ex: Exchange, uni: Universe, report: RunReport, symbol: str, timeframe: str,
+    market_id: str, want_from_ms: int, depth: int,
+) -> int:
+    """Добрать у биржи участки окна засева, которых нет в хранилище. Вернуть число баров.
+
+    ⚠ ЗАЧЕМ ЭТО ЗАВЕДЕНО (2026-08-21, разбор досье `Documents/Prizzrak`). Засев спрашивал
+    только хвост — `missing_tail_since` отвечает «после последнего сохранённого бара», —
+    и дыра ВНУТРИ окна не добиралась никогда. Тот же дефект уже был найден 2026-08-18 на
+    ACE и починен, но только в профильном пути (`backfill_profile_bars` считает бары в
+    самом окне); засев остался со старым критерием. Два пути добора спрашивали о РАЗНЫХ
+    величинах, и слепым оказался тот, что кормит детектор структур.
+
+    Замер, на котором правка стоит (`data/bars`, 2026-08-21): 144 рабочих ряда из 150
+    (96%) уже перешли на хвостовой курсор — их хранилище начинается раньше окна, — то
+    есть слепота включена почти везде. Дыр в рабочих рядах при этом НОЛЬ: правка ставится
+    не на ущерб, который уже случился, а на прибор, который его не увидел бы. Что дыры
+    возникают, показано соседними рядами того же диска: 204 дыры в 183 рядах, 655 602
+    бара, из них 613 693 внутри окна засева.
+
+    ⚠ Незакрытая свеча в окно не входит: правый край — `expected_last_closed_open_ms`.
+    Иначе последний участок всегда оставался бы «незакрытым» и просился каждый прогон.
+
+    ⚠ Участок, оставшийся открытым, СЧИТАЕТСЯ и называется. Причин ровно две — отказ сети
+    и отсутствие торгов у самой биржи, — и они требуют разного, поэтому одним числом их
+    сводить нельзя; различить их без живого запроса нельзя тоже, поэтому здесь считается
+    факт, а не диагноз.
+    """
+    upto = expected_last_closed_open_ms(timeframe, clock.now_ms())
+    spans = barstore.missing_spans(uni.venue, market_id, timeframe, want_from_ms, upto)
+    step = tf_ms(timeframe)
+    # Хвостовой участок добирается общим путём засева ниже — здесь только ВНУТРЕННИЕ.
+    inner = [(lo, hi) for lo, hi in spans if hi <= upto]
+    if not inner:
+        return 0
+    report.seed_gaps_found += len(inner)
+    added_total = 0
+    for lo, hi in inner:
+        want = max(1, (hi - lo) // step)
+        got = await ex.fetch_closed_ohlcv(
+            symbol, timeframe, limit=int(min(want, depth) + 2), since_ms=lo)
+        if isinstance(got, NotReady):
+            report.seed_gaps_left += 1
+            log.degraded("дыра ряда НЕ закрыта — биржа не ответила", символ=symbol,
+                         тф=timeframe, от=lo, до=hi, баров_в_дыре=want,
+                         причина=got.reason)
+            continue
+        inside = [b for b in got.bars if lo <= b.open_ms < hi]
+        added, rewritten = barstore.append(uni.venue, market_id, timeframe, inside)
+        added_total += added
+        report.seed_gap_bars += added
+        report.bars_rewritten += rewritten
+        if added >= want:
+            report.seed_gaps_filled += 1
+        else:
+            report.seed_gaps_left += 1
+            log.degraded("дыра ряда закрыта НЕ ЦЕЛИКОМ — у биржи столько баров нет",
+                         символ=symbol, тф=timeframe, от=lo, до=hi,
+                         баров_в_дыре=want, добрано=added)
+    return added_total
+
+
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                horizon_days: int = 0, stop: asyncio.Event | None = None) -> None:
     """Засев рядов: хранилище на диске плюс добор хвоста у биржи.
@@ -253,11 +315,22 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             want_from = clock.now_ms() - depth * tf_ms(tf)
             stored: list[Bar] = []
             since_ms: int | None = None
+            repaired = 0
             if market_id is not None:
                 stored = barstore.load(uni.venue, market_id, tf, since_ms=want_from)
                 since_ms = barstore.missing_tail_since(
                     uni.venue, market_id, tf, want_from)
                 report.bars_from_store += len(stored)
+                # ⚠ ДЫРА ВНУТРИ ОКНА ДОБИРАЕТСЯ ОТДЕЛЬНО, потому что хвостовой курсор к
+                # ней слеп по построению (`barstore.missing_spans`). Только когда курсор
+                # НЕ `None`: при `None` окно и так просится целиком, и повторный запрос
+                # тех же баров был бы платой ни за что.
+                if since_ms is not None:
+                    repaired = await _fill_seed_gaps(
+                        ex, uni, report, sym, tf, market_id, want_from, depth)
+                    if repaired:
+                        stored = barstore.load(
+                            uni.venue, market_id, tf, since_ms=want_from)
 
             # Размер хвоста считается ПО РАЗРЫВУ, а не берётся константой.
             #
@@ -324,7 +397,11 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                 st.rejected_bars = got.rejected
                 st.rejected_at_ms = got.rejected_at_ms
 
-            if market_id is not None and fresh:
+            # ⚠ `repaired` в условии — не украшение: добор дыр уже ЗАПИСАЛ бары в
+            # хранилище, а `stored` мог быть прочитан до него. Без этой ветви ряд с
+            # закрытой дырой, но не пришедшим хвостом, ушёл бы в расчёт по старому
+            # списку — то есть дыра осталась бы в ПАМЯТИ, будучи закрытой на диске.
+            if market_id is not None and (fresh or repaired):
                 added, rewritten = barstore.append(uni.venue, market_id, tf, fresh)
                 report.bars_stored += added
                 report.bars_rewritten += rewritten
@@ -365,6 +442,13 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                  рядов_без_данных=dead, из_рядов=report.seed_checked)
     else:
         log.info("засев без каскадов", рядов=report.seed_checked)
+
+    # ⚠ СВОДКА ДЫР ПЕЧАТАЕТСЯ ВСЕГДА, В ТОМ ЧИСЛЕ НУЛЕВАЯ, и знаменатель стоит в той же
+    # строке. Без него «дыр 0» неотличимо от «дыры не искали»: ровно та форма молчания,
+    # из-за которой хвостовой курсор и прожил слепым до 2026-08-21.
+    log.info("засев: дыры внутри окна", найдено=report.seed_gaps_found,
+             закрыто=report.seed_gaps_filled, осталось=report.seed_gaps_left,
+             баров_добрано=report.seed_gap_bars, из_рядов=report.seed_checked)
 
 
 def _merge_bars(stored: list[Bar], fresh: list[Bar]) -> list[Bar]:

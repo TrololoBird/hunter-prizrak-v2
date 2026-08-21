@@ -28,7 +28,7 @@ from pathlib import Path
 import polars as pl
 
 from . import log
-from .bars import tf_ms
+from .bars import grid_anchor_ms, tf_ms
 from .models import Bar
 
 BARS_DIR = Path("data/bars")
@@ -309,6 +309,11 @@ def missing_tail_since(
     ⚠ Если хранилище начинается ПОЗЖЕ, чем просят, дописать середину нечем: курсор идёт
     вперёд, а дыра позади. Тогда возвращается `None` — просить всё окно заново, и слияние
     в `append` уложит его вокруг имеющегося.
+
+    ⚠⚠ ОТВЕЧАЕТ ТОЛЬКО ПРО ХВОСТ и слеп к дыре ВНУТРИ окна: `coverage` считает покрытие
+    по min/max, а между ними может не быть ничего. Для добора пользуйтесь
+    `missing_spans` — она отвечает на тот же вопрос без этой слепоты. Функция оставлена,
+    потому что вопрос «докуда ряд доведён» законен сам по себе.
     """
     got = coverage(venue, market_id, timeframe)
     if got is None:
@@ -317,3 +322,75 @@ def missing_tail_since(
     if first > want_from_ms:
         return None
     return last + tf_ms(timeframe)
+
+
+def _grid_up(ms: int, step: int, anchor: int) -> int:
+    """Первый слот сетки не раньше `ms`."""
+    return ((ms - anchor + step - 1) // step) * step + anchor
+
+
+def _grid_down(ms: int, step: int, anchor: int) -> int:
+    """Последний слот сетки не позже `ms`."""
+    return ((ms - anchor) // step) * step + anchor
+
+
+def missing_spans(
+    venue: str, market_id: str, timeframe: str, want_from_ms: int, upto_ms: int
+) -> list[tuple[int, int]]:
+    """Участки окна, которых в хранилище НЕТ: полуинтервалы `[lo, hi)` на сетке ТФ.
+
+    Пустое хранилище даёт один участок на всё окно; целый ряд — пустой список; ряд с
+    дырой — участок на дыру и участок на хвост.
+
+    ⚠ ЗАЧЕМ ОТДЕЛЬНО ОТ `missing_tail_since`. Тот отвечает курсором «после последнего
+    сохранённого бара», то есть НИКОГДА не просит середину: `coverage` знает только
+    min и max, а дыра лежит между ними. Пока хранилище начиналось позже запрошенного
+    окна, слепота не проявлялась — курсор возвращал `None`, и окно просилось целиком.
+    Замер 2026-08-21 по `data/bars`: у 144 рабочих рядов из 150 (96%) хранилище уже
+    начинается РАНЬШЕ окна, то есть все они перешли на хвостовой курсор, и всякая дыра,
+    возникшая в окне, осталась бы в нём навсегда. На соседних рядах того же диска дыры
+    и лежат — 204 штуки в 183 рядах, 655 602 бара; контроль живым запросом к бирже дал
+    бары во всех восьми проверенных дырах (100 из 100), то есть это НАША потеря, а не
+    отсутствие торгов.
+
+    Критерий здесь тот же, что у читателя окна профиля (`run.backfill_profile_bars`:
+    «полных баров меньше слотов окна — участок перекачать»), и это не совпадение: два
+    пути добора обязаны спрашивать об одной и той же величине, иначе один из них
+    окажется слепым — ровно то, что и произошло. Разбор дыры внутри окна, найденной на
+    ACE: docs/audit/plan-2026-08-21-geometry-transport.md
+
+    Границы выравниваются на сетку ТФ НАШИМ якорем (`bars.grid_anchor_ms`), а не эпохой:
+    у недельного бара эпоха даёт четверг вместо понедельника.
+    """
+    step = tf_ms(timeframe)
+    anchor = grid_anchor_ms(timeframe)
+    start = _grid_up(want_from_ms, step, anchor)
+    end = _grid_down(upto_ms, step, anchor)
+    if end < start:
+        return []
+    lazy = _scan(store_path(venue, market_id, timeframe))
+    if lazy is None:
+        return [(start, end + step)]
+    try:
+        frame = (
+            lazy.filter((pl.col("open_ms") >= start) & (pl.col("open_ms") <= end))
+            .select("open_ms")
+            .sort("open_ms")
+            .collect()
+        )
+    except Exception as e:  # тот же разбор, что в `load`: битый файл не роняет прогон
+        log.error("файл хранилища баров не прочитан (участки)",
+                  файл=str(store_path(venue, market_id, timeframe)),
+                  причина=f"{type(e).__name__} {e}")
+        return [(start, end + step)]
+    spans: list[tuple[int, int]] = []
+    cursor = start
+    for raw in frame["open_ms"]:
+        have = int(raw)
+        if have > cursor:
+            spans.append((cursor, have))
+        if have >= cursor:
+            cursor = have + step
+    if cursor <= end:
+        spans.append((cursor, end + step))
+    return spans
