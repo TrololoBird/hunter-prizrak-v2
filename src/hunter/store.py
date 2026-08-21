@@ -19,7 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import log
 from .bars import tf_ms
@@ -1634,6 +1634,126 @@ def format_win_rate(w: WinRate) -> list[str]:
                + ", ".join(f"{c.timeframe} {100 / c.trades:.1f} п.п."
                            for c in w.by_timeframe if c.trades)
                + (f"; по всем {100 / w.total.trades:.1f} п.п."))
+    return out
+
+
+class SymbolFreshness(BaseModel):
+    """Свежесть карты ОДНОГО символа: сколько активных уровней и когда их видели.
+
+    ⚠ Порога «протухло» здесь нет умышленно. Ни курс, ни классика числа для него не
+    дают, а придуманная отсечка спрятала бы от владельца ровно те строки, ради которых
+    сводка и заводится. Печатается ВОЗРАСТ, вывод делает читающий.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: str
+    active: int = Field(ge=0)
+    last_seen_ms: int = Field(ge=0)
+    """Момент последнего среза, в который символ участвовал. 0 — активных строк нет."""
+
+    in_universe: bool
+    """Стоит ли символ в `config/universe.toml` СЕЙЧАС."""
+
+    def age_hours(self, as_of_ms: int) -> float | None:
+        if self.last_seen_ms <= 0:
+            return None
+        return (as_of_ms - self.last_seen_ms) / 3_600_000.0
+
+
+class LevelFreshness(BaseModel):
+    """Сводка свежести активной карты по символам — знаменатель для всякой аналитики.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-21 ПО НАЙДЕННОМУ ПЕРЕКОСУ, и перекос был крупный: 1422
+    `active`-уровня девяти символов, которых во вселенной УЖЕ НЕТ (HYPE, DOGE, BNB, ADA,
+    BLESS, BICO, 1000RATS, BTW, BEAT), не обновлялись от 39.5 до 237.4 часа. Их
+    геометрия относится к версиям расчёта, которых больше не существует, — у BEAT ПОК
+    лежит вне коробки. При этом активных строк ВСЕЙ текущей вселенной было 898, то есть
+    больше 60% активной карты принадлежало мёртвым эпохам, и ни одно число леджера об
+    этом не говорило.
+
+    Это ровно урок `docs/audit/backfill-window-2026-08-04.md`: один отказ — данные, сто
+    отказов вдоль одного измерения — дефект. Здесь измерение — принадлежность символа
+    вселенной, и без разреза вдоль него любая сводка считается по подвыборке, которую
+    никто не называл (`docs/audit/outcome-survey-2026-08-10.md`).
+
+    ⚠ ЧЕГО ЗДЕСЬ НАМЕРЕННО НЕТ — снятия таких строк с карты. Состояние уровня в схеме
+    отвечает на РЫНОЧНЫЙ вопрос: `worked_off` — стр. 25, `flipped` — стр. 43. "Символ
+    выбыл из вселенной" — факт про НАС, а не про рынок; записать его в то же поле
+    значило бы завести две сущности под одним именем — дефект, разобранный в CLAUDE.md
+    («прибор обязан смотреть на ТУ ЖЕ величину»). Поэтому строки остаются как есть, а
+    подвыборка НАЗЫВАЕТСЯ.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    rows: tuple[SymbolFreshness, ...]
+    as_of_ms: int
+    universe_size: int = Field(ge=0)
+
+    @property
+    def outside(self) -> tuple[SymbolFreshness, ...]:
+        return tuple(r for r in self.rows if not r.in_universe and r.active)
+
+    @property
+    def inside_active(self) -> int:
+        return sum(r.active for r in self.rows if r.in_universe)
+
+    @property
+    def outside_active(self) -> int:
+        return sum(r.active for r in self.outside)
+
+
+def level_freshness(conn: sqlite3.Connection, symbols: tuple[str, ...],
+                    as_of_ms: int) -> LevelFreshness:
+    """Активные уровни по символам с возрастом последнего среза.
+
+    `symbols` — вселенная НА МОМЕНТ ВЫЗОВА, а не список из базы: вопрос ровно в том,
+    расходятся ли они.
+    """
+    uni = set(symbols)
+    rows = [
+        SymbolFreshness(symbol=sym, active=int(n), last_seen_ms=int(last or 0),
+                        in_universe=sym in uni)
+        for sym, n, last in conn.execute(
+            "SELECT symbol, COUNT(*), MAX(last_seen) FROM levels"
+            " WHERE state='active' GROUP BY symbol")
+    ]
+    # Символ вселенной БЕЗ активных строк тоже строка сводки: его отсутствие — такой же
+    # ответ, как большое число, и молчать о нём значит печатать долю без знаменателя.
+    have = {r.symbol for r in rows}
+    rows.extend(SymbolFreshness(symbol=sym, active=0, last_seen_ms=0, in_universe=True)
+                for sym in symbols if sym not in have)
+    rows.sort(key=lambda r: (r.in_universe, -r.active, r.symbol))
+    return LevelFreshness(rows=tuple(rows), as_of_ms=as_of_ms,
+                          universe_size=len(symbols))
+
+
+def format_level_freshness(f: LevelFreshness) -> list[str]:
+    """Сводка свежести словами для владельца (§7.5)."""
+    out = [f"СВЕЖЕСТЬ АКТИВНОЙ КАРТЫ — {len(f.rows)} символов, вселенная {f.universe_size}"]
+    if f.outside:
+        out.append("   ВНЕ ВСЕЛЕННОЙ (геометрия прежних эпох расчёта, в сводки не годится):")
+        for r in f.outside:
+            age = r.age_hours(f.as_of_ms)
+            when = "среза нет" if age is None else f"срез {age:.1f} ч назад"
+            out.append(f"      {r.symbol:<20} {r.active:5} активных, {when}")
+        out.append(f"      ИТОГО вне вселенной {f.outside_active} из "
+                   f"{f.outside_active + f.inside_active} активных строк")
+    else:
+        out.append("   вне вселенной активных строк нет")
+    # Порога «протухло» нет (см. докстроку SymbolFreshness): печатается РАЗБРОС
+    # возрастов по вселенной и самый старый срез поимённо. Читающий видит, идёт ли
+    # карта одним прогоном или часть символов отстала, и делает вывод сам.
+    aged = sorted((r.age_hours(f.as_of_ms) or 0.0, r.symbol, r.active)
+                  for r in f.rows if r.in_universe and r.active)
+    if aged:
+        out.append(f"   вселенная: срез от {aged[0][0]:.1f} до {aged[-1][0]:.1f} ч назад; "
+                   f"старший — {aged[-1][1]} ({aged[-1][2]} активных)")
+    empty = [r.symbol for r in f.rows if r.in_universe and not r.active]
+    if empty:
+        out.append(f"   без активных уровней {len(empty)} из {f.universe_size}: "
+                   + ", ".join(s.split("/")[0] for s in empty))
     return out
 
 

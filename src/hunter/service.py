@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from collections.abc import Callable
 from typing import Any
 
 from . import clock, log, run
@@ -133,7 +134,18 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
         if (src := run.trade_source(c.ex, sym, report, uni)) is not None
     }
 
-    await asyncio.to_thread(run.persist_frames, run_id, report)
+    # ⚠ СТАДИИ РАЗМЕЧЕНЫ ПО ЧАСАМ 2026-08-21 (Т-0). `cycle_seconds` отвечал только
+    # «сколько шёл цикл целиком» — по нему нельзя было решить, ускорять транспорт или
+    # расчёт. Часы монотонные, те же, что у `cycle_seconds`.
+    async def stage(name: str, fn: Callable[..., object], *a: object) -> object:
+        t0 = clock.monotonic_ns()
+        try:
+            return await asyncio.to_thread(fn, *a)
+        finally:
+            report.stage_ms[name] = int((clock.monotonic_ns() - t0) / 1e6)
+
+    report.stage_ms["backfill"] = int((clock.monotonic_ns() - started) / 1e6)
+    await stage("frames", run.persist_frames, run_id, report)
     # ⚠ РАМКА КАДРА (2026-08-19). Служба строила уровни ЗА ВЕСЬ ГОРИЗОНТ, а сборка по
     # запросу в боте — только в кадре ответа. Две карты одного символа по разным
     # правилам: замер BTC — служба 1987 уровней, ответ по запросу 29. Из 1987 читатель
@@ -143,11 +155,13 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
     # баров своего ТФ), ни цели (`geometry.TARGET_STRUCTURE_FRAME_BARS`, те же 180), ни
     # лестница стр. 32 — вложенность идёт ровно на одну ступень ТФ (`NESTED_MAX_STEPS`),
     # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
+    t_decide = clock.monotonic_ns()
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
                                       frame_bars=BARS_ON_CHART)
-    await asyncio.to_thread(run.produce_cards, run_id, report, uni, decided)
-    await asyncio.to_thread(run.persist_source, run_id, report, sources)
-    await asyncio.to_thread(run.record, run_id, report, uni, decided)
+    report.stage_ms["decide"] = int((clock.monotonic_ns() - t_decide) / 1e6)
+    await stage("cards", run.produce_cards, run_id, report, uni, decided)
+    await stage("source", run.persist_source, run_id, report, sources)
+    await stage("record", run.record, run_id, report, uni, decided)
 
     spent = (clock.monotonic_ns() - started) / 1e9
     report.cycle_seconds = spent

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 import statistics
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,7 @@ from decimal import Decimal
 
 import ccxt
 import polars as pl
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import archive, barstore, card, clock, emit, engine, geometry, levels, log, store
 from .bars import (
@@ -348,6 +350,64 @@ async def sleep_or_stopped(stop: asyncio.Event, seconds: float) -> bool:
     return True
 
 
+def percentile(values: list[int], q: float) -> int:
+    """Перцентиль БЕЗ интерполяции: ближайший ранг, как считает большинство приборов.
+
+    Своя реализация, а не `statistics.quantiles`, по одной причине: та интерполирует
+    между соседями и на выборке из двух-трёх значений выдаёт число, которого в замере
+    не было. Здесь всякое напечатанное число — настоящая наблюдённая задержка.
+    """
+    if not values:
+        raise ValueError("перцентиль пустой выборки не определён")
+    ordered = sorted(values)
+    k = max(0, min(len(ordered) - 1, math.ceil(q * len(ordered)) - 1))
+    return ordered[k]
+
+
+class LagCell(BaseModel):
+    """Задержка прихода баров ОДНОГО ТФ: сколько и какие (Т-0)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    bars: int = Field(gt=0)
+    """ЗНАМЕНАТЕЛЬ. Перцентиль по трём барам и по тысяче — разные утверждения, и без
+    этого числа их не различить."""
+
+    p50_ms: int
+    p95_ms: int
+    max_ms: int
+
+
+def arrival_lag_survey(r: RunReport) -> tuple[LagCell, ...]:
+    """Задержка «закрытие бара → бар в ряду» по ТФ (задание Т-0).
+
+    ⚠⚠ ЧТО ЭТО ЧИСЛО ЗНАЧИТ И ЧЕГО НЕ ЗНАЧИТ. Владелец назвал жалобу так: «у нас
+    сигналы приходят с западанием, а сбор и обработка данных проходит слишком долго».
+    До 2026-08-21 западание не измерялось НИЧЕМ: `poll_late` считает случаи «биржа не
+    успела к нашему отступу», а миллисекунды пути не считал никто.
+
+    В величину входят ДВА слагаемых, и их нельзя путать:
+      * НАШ ОТСТУП `POLL_OFFSET_S` — мы сами не спрашиваем свечу раньше него. Это нижняя
+        граница ответа ПО ПОСТРОЕНИЮ, и прибор не может выдать значение меньше;
+      * всё, что сверх отступа, — ответ биржи, сеть и очередь наших задач.
+    Поэтому приёмка печатает отступ рядом с перцентилем: без него p50 читается как
+    «транспорт медленный», хотя это может быть целиком наша собственная пауза.
+
+    ⚠ Вторая половина пути (расчёт) здесь НЕ учитывается: у неё другая единица
+    наблюдения — прогон, а не бар. Она в `RunReport.stage_ms`.
+    """
+    by_tf: dict[str, list[int]] = {}
+    for st in r.series.values():
+        if st.arrival_lags_ms:
+            by_tf.setdefault(st.timeframe, []).extend(st.arrival_lags_ms)
+    return tuple(
+        LagCell(timeframe=tf, bars=len(v), p50_ms=percentile(v, 0.50),
+                p95_ms=percentile(v, 0.95), max_ms=max(v))
+        for tf, v in sorted(by_tf.items(), key=lambda kv: TIMEFRAME_MS.get(kv[0], 0))
+    )
+
+
 async def _poll_bars_impl(ex: Exchange, st: SeriesState, report: RunReport,
                           stop: asyncio.Event, keep_bars: int = 0) -> None:
     """Добор баров REST-опросом по границам ТФ. Заменил WS-поток 2026-08-05.
@@ -420,11 +480,20 @@ async def _poll_bars_impl(ex: Exchange, st: SeriesState, report: RunReport,
         # (просим POLL_LIMIT баров), и без курсора ряд получал бы дубликаты.
         last = st.bars[-1].open_ms if st.bars else None
         added = 0
+        # Часы снимаются ОДИН раз на ответ, а не на бар: бары одного ответа пришли
+        # вместе, и разные метки у них означали бы длительность нашего цикла, а не
+        # задержку биржи.
+        arrived_ms = clock.now_ms()
+        step_ms = tf_ms(st.timeframe)
         for bar in got.bars:
             if last is not None and bar.open_ms <= last:
                 continue
             st.bars.append(bar)
             st.polled_bars += 1
+            # Т-0: задержка прихода — от ЗАКРЫТИЯ бара до его принятия в ряд.
+            st.arrival_lags_ms.append(arrived_ms - (bar.open_ms + step_ms))
+            if len(st.arrival_lags_ms) > ARRIVAL_LAGS_KEPT:
+                del st.arrival_lags_ms[:-ARRIVAL_LAGS_KEPT]
             added += 1
         # Продвинулись ли — решает СОДЕРЖИМОЕ ответа, а не его успешность. Ответ без
         # единого нового бара означает, что биржа его ещё не отдала, и следующая попытка
@@ -587,6 +656,18 @@ async def _heartbeat_impl(report: RunReport, stop: asyncio.Event) -> None:
 
 WATCH_FAILURES_KEPT = 50
 """Сколько текстов смертей хранить как примеры. Точный счёт ведёт `watch_deaths`."""
+
+ARRIVAL_LAGS_KEPT = 500
+"""Сколько последних задержек прихода хранить на ряд (Т-0, `SeriesState.arrival_lags_ms`).
+
+⚠ Число выбрано, а не замерено, и оно НЕ порог: обрезается только длина хранимого
+списка, ни одна задержка при этом не объявляется нормальной или чрезмерной. Пятьсот —
+это больше суток пятиминутных баров (288 в сутки) и годы дневных, то есть перцентиль
+считается по окну, покрывающему хотя бы полный суточный цикл на самом частом ТФ.
+Пакетный прогон живёт минуты и до обрезки не доходит вовсе; ограничение существует ради
+службы 24/7, где неограниченный список — утечка памяти того же класса, что и ряд без
+`keep_bars`.
+"""
 
 RESTART_PAUSE_S = 5.0
 """Пауза перед подъёмом умершей задачи. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО.
@@ -2365,6 +2446,27 @@ def print_report(r: RunReport) -> int:
     print(f"   опрос не дал ряда (пусто/битый бар/вне сетки): {not_ready}")
     print(f"   отступ опроса POLL_OFFSET_S = {POLL_OFFSET_S} с — НЕ ЗАМЕРЕН, "
           f"верхняя оценка; строка «биржа опоздала» и есть его замер (Ж-1)")
+
+    print("\n4б. ЗАПАДАНИЕ: СКОЛЬКО БАР ИДЁТ ДО РАСЧЁТА (Т-0)")
+    lags = arrival_lag_survey(r)
+    if not lags:
+        print("   баров опросом не добрано — задержку мерить не на чем "
+              "(прогон короче шага младшего ТФ)")
+    else:
+        floor_ms = int(POLL_OFFSET_S * 1000)
+        print(f"   отсчёт от ЗАКРЫТИЯ бара до его принятия в ряд. Нижняя граница по "
+              f"построению — наш отступ {floor_ms} мс: раньше него мы не спрашиваем")
+        print("   ТФ     баров    p50        p95        максимум   сверх отступа (p50)")
+        for c in lags:
+            print(f"   {c.timeframe:6} {c.bars:6} {c.p50_ms:8} мс {c.p95_ms:8} мс "
+                  f"{c.max_ms:8} мс {c.p50_ms - floor_ms:8} мс")
+    if r.stage_ms:
+        total = sum(r.stage_ms.values())
+        print("   стадии конвейера: "
+              + ", ".join(f"{k} {v} мс" for k, v in r.stage_ms.items())
+              + f"; всего {total} мс")
+    else:
+        print("   стадии конвейера не замерены: этот путь их не размечает")
 
     if requests == 0:
         print("   ⚠ ОПРОСОВ НЕ БЫЛО: прогон короче одного шага младшего ТФ — "

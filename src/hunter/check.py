@@ -20,9 +20,9 @@ from . import log, store
 from .admission import REQUIRED_BARS, USED_BY_2_9, strictest_requirement
 from .bars import expected_last_closed_open_ms, tf_ms
 from .config import Universe
-from .exchange import Exchange
+from .exchange import POLL_OFFSET_S, Exchange
 from .models import NotReady, RunReport
-from .run import collect, explained_gaps
+from .run import arrival_lag_survey, collect, explained_gaps
 
 
 def _verdict(lines: list[tuple[str, bool, str]]) -> int:
@@ -233,6 +233,25 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     report, _sources = asyncio.run(collect(uni, seconds, seed_limit, horizon_days=0))
     lines = _report_live(report)
 
+    # ⚠ ЗАПАДАНИЕ ПЕЧАТАЕТСЯ ЗДЕСЬ ЖЕ (2026-08-21, задание Т-0). Жалоба владельца — «у
+    # нас сигналы приходят с западанием» — до этого дня не имела ни одного числа. Строка
+    # вердикта НЕ заводится: порога «допустимой задержки» не даёт ни курс, ни классика,
+    # а придуманный порог был бы ровно тем «фильтром на выходе», который в этом проекте
+    # запрещён. Печатается замер со знаменателем и с нижней границей по построению.
+    lags = arrival_lag_survey(report)
+    if lags:
+        floor_ms = int(POLL_OFFSET_S * 1000)
+        print()
+        print("1а. ЗАПАДАНИЕ ДАННЫХ (Т-0): от закрытия бара до принятия в ряд")
+        print(f"   нижняя граница по построению — наш отступ опроса {floor_ms} мс")
+        for c in lags:
+            print(f"   {c.timeframe:5} баров {c.bars:5}: p50 {c.p50_ms:7} мс, "
+                  f"p95 {c.p95_ms:7} мс, максимум {c.max_ms:7} мс "
+                  f"(сверх отступа p50: {c.p50_ms - floor_ms} мс)")
+    if report.stage_ms:
+        print("   стадии расчёта: "
+              + ", ".join(f"{k} {v} мс" for k, v in report.stage_ms.items()))
+
     # Порог берётся у `admission`, а не пересчитывается здесь. Строка была дословной
     # копией тела `strictest_requirement()`: две копии одной формулы разошлись бы на
     # первой же правке `USED_BY_2_9`, и заметить это было бы нечем.
@@ -324,6 +343,28 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
              "у остальных NULL — карта записана до схемы 8, отбор по ним идёт "
              "прежним ключом (ТФ, ширина зоны)")
             if v_total else "активных уровней в карте нет — мерить нечего",
+        ))
+        # ⚠ СВЕЖЕСТЬ КАРТЫ ПЕЧАТАЕТСЯ ПЕРЕД ЛЮБОЙ СВОДКОЙ (2026-08-21), потому что она
+        # и есть знаменатель всех остальных чисел этого раздела. Замер того дня: 1422
+        # активных уровня принадлежали девяти символам, выбывшим из вселенной, при 898
+        # активных строках у всей текущей вселенной. То есть больше 60% активной карты
+        # относилось к версиям расчёта, которых уже нет, а «средний R», «винрейт» и
+        # «зоны шире 39%» считались по этой смеси молча — ровно случай
+        # docs/audit/outcome-survey-2026-08-10.md.
+        fresh = store.level_freshness(conn, uni.symbols, report.taken_at_ms)
+        for row in store.format_level_freshness(fresh):
+            print(f"   {row}" if not row.startswith(" ") else row)
+        lines.append((
+            "Активная карта состоит из символов вселенной",
+            not fresh.outside,
+            (f"вне вселенной {fresh.outside_active} активных строк у "
+             f"{len(fresh.outside)} символов "
+             f"({', '.join(r.symbol.split('/')[0] for r in fresh.outside)}); "
+             f"у вселенной {fresh.inside_active}. Их геометрия относится к прежним "
+             "эпохам расчёта и в сводки ниже входит наравне со свежей")
+            if fresh.outside else
+            f"все {fresh.inside_active} активных строк принадлежат "
+            f"{fresh.universe_size} символам вселенной",
         ))
         for row in store.format_outcome_survey(survey):
             print(f"   {row}" if not row.startswith(" ") else row)

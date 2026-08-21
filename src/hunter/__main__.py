@@ -6,14 +6,20 @@ import argparse
 import asyncio
 import sqlite3
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import TypeVar
 
 from . import log, replay, service, store
 from .config import DEFAULT_PATH, Universe, load_universe
 from .models import NotReady
+
+T = TypeVar("T")
+"""Возврат стадии конвейера — разметка Т-0 не меняет тип того, что оборачивает."""
 
 HORIZON_DAYS = 180
 """Структуры, вышедшие раньше этого срока, в карту не идут. ⚠ ЧИСЛО ИЗ ЗАМЕРА ЦЕНЫ.
@@ -106,19 +112,34 @@ def _run(args: argparse.Namespace) -> int:
     # делал всё, причём карточку строил ВНУТРИ `persist` — сбор данных и производство
     # сигнала в одном вызове. Именно из такой слипшейся точки в прошлом проекте вырос
     # orchestrator.py на 2894 строки; разделено до реализации §2.4-2.7, пока дёшево.
+    # ⚠ СТАДИИ РАЗМЕЧЕНЫ ПО ЧАСАМ 2026-08-21 (задание Т-0). Владелец сказал, что «сбор
+    # и обработка данных проходит слишком долго», и до этого дня НИ ОДНА стадия не была
+    # замерена: было известно только, сколько всего шёл прогон. Разметка отвечает, куда
+    # именно уходит время, — без неё выбор между «ускорять транспорт» и «ускорять
+    # расчёт» делался бы гаданием. Часы монотонные (`perf_counter`): настенные при
+    # переводе времени дали бы отрицательную длительность.
+    def _stage(name: str, fn: Callable[[], T]) -> T:
+        t0 = time.perf_counter()
+        try:
+            return fn()
+        finally:
+            report.stage_ms[name] = int((time.perf_counter() - t0) * 1000)
+
+    t_collect = time.perf_counter()
     report, sources = asyncio.run(
         collect(uni, args.seconds, args.seed_limit, args.horizon_days)
     )
-    persist_frames(args.run_id, report)
+    report.stage_ms["collect"] = int((time.perf_counter() - t_collect) * 1000)
+    _stage("frames", lambda: persist_frames(args.run_id, report))
     # СИГНАЛ СЧИТАЕТСЯ ОДИН РАЗ и отдаётся обоим потребителям — карточке и леджеру.
     # До 2026-08-06 каждый считал его сам, и они расходились: карточка печатала
     # геометрию для 94 уровней, леджер эмитировал 33 (замер на кадрах прогона `a1`).
-    decided = decide_once(report, uni, sources)
-    produce_cards(args.run_id, report, uni, decided)
+    decided = _stage("decide", lambda: decide_once(report, uni, sources))
+    _stage("cards", lambda: produce_cards(args.run_id, report, uni, decided))
     # Данные источника профиля кладутся ПОСЛЕ карточек. Без них повтор читает общее
     # хранилище и объявляет «расчёт изменился» на доливке (Н-6, рецидив 2026-08-18).
-    persist_source(args.run_id, report, sources)
-    record(args.run_id, report, uni, decided)
+    _stage("source", lambda: persist_source(args.run_id, report, sources))
+    _stage("record", lambda: record(args.run_id, report, uni, decided))
     log.info("кадры сохранены", файлов=report.frames_written,
              карточек=report.cards_written,
              рядов_профиля=report.profile_series_written)
