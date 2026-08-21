@@ -828,9 +828,57 @@ async def _heartbeat_impl(report: RunReport, stop: asyncio.Event) -> None:
         before = clock.monotonic_ns()
         if await sleep_or_stopped(stop, HEARTBEAT_S):
             return
-        late_ms = int((clock.monotonic_ns() - before) / 1e6 - HEARTBEAT_S * 1000)
+        woke_ns = clock.monotonic_ns()
+        late_ms = int((woke_ns - before) / 1e6 - HEARTBEAT_S * 1000)
         report.heartbeats += 1
         report.loop_stall_max_ms = max(report.loop_stall_max_ms, late_ms)
+        # ⚠ СУММА И СОБЫТИЕ, А НЕ ТОЛЬКО МАКСИМУМ (2026-08-21). По максимуму нельзя
+        # сказать, КТО держал цикл. Событие несёт своё время пробуждения — по нему
+        # заминка приписывается шагу расчёта ПОТОМ, сверкой чисел, а не по порядку
+        # выполнения: разбор трёх неверных редакций — в `RunReport.loop_late_events`.
+        if late_ms > 0:
+            report.loop_late_total_ms += late_ms
+            report.loop_late_events.append((woke_ns, late_ms))
+
+
+def _print_stage_stalls(r: RunReport) -> None:
+    """РАЗБИВКА ЗАМИНКИ ПО ШАГАМ РАСЧЁТА. Без неё число «сколько» не ведёт ни к чему.
+
+    ⚠ ОСТАТОК ПЕЧАТАЕТСЯ ВСЕГДА: сумма по шагам меньше общей ровно на то, что цикл
+    простоял вне размеченных шагов (пауза между циклами, засев, остановка). Молчаливый
+    остаток читался бы как «всё объяснено».
+
+    ⚠ Доля «% его времени» берётся из `stage_windows_ns`, а НЕ из `stage_ms`, и это
+    важно: `stage_ms` лежит в снимке за ТЕКУЩИЙ цикл, а заминка и окна — за прошлый
+    (перенос тот же, что у `loop_stall_max_ms`). Делить одно на другое значило бы
+    смешать два цикла под одной строкой — тот самый дефект «две сущности под одним
+    именем», из-за которого проект уже держал две пары границ уровня.
+    """
+    if not r.loop_late_events or not r.stage_windows_ns:
+        return
+    by_stage: dict[str, int] = {name: 0 for name in r.stage_windows_ns}
+    rest = 0
+    for woke_ns, late_ms in r.loop_late_events:
+        # ⚠ ОСТАНОВКА ЗАНИМАЕТ ОТРЕЗОК, А НЕ ТОЧКУ: она началась `late_ms` назад и
+        # кончилась пробуждением. Шаг ищется по СЕРЕДИНЕ отрезка — правило простое и
+        # названное; заминка ровно на границе двух шагов достанется одному из них, и
+        # это единственная неточность приписывания.
+        mid = woke_ns - int(late_ms * 1e6 / 2)
+        hit = next((n for n, (a, b) in r.stage_windows_ns.items() if a <= mid <= b), "")
+        if hit:
+            by_stage[hit] += late_ms
+        else:
+            rest += late_ms
+    total = max(1, sum(by_stage.values()) + rest)
+    print(f"     на каком шаге цикл стоял (событий {len(r.loop_late_events)}, "
+          f"шаг ищется по середине остановки):")
+    for name, ms in sorted(by_stage.items(), key=lambda kv: -kv[1]):
+        held = r.stage_windows_ns.get(name)
+        span = (held[1] - held[0]) / 1e6 if held else 0.0
+        of_stage = f", это {ms * 100 / span:.0f}% его времени" if span > 0 else ""
+        print(f"       {name:9} {ms:8} мс ({ms * 100 / total:4.1f}% заминки{of_stage})")
+    print(f"       {'вне шагов':9} {rest:8} мс ({rest * 100 / total:4.1f}%) — пауза "
+          f"между циклами, засев, остановка")
 
 
 WATCH_FAILURES_KEPT = 50
@@ -2560,6 +2608,9 @@ class Collector:
         # от заминки расчёта — а именно это и надо было решить.
         # Такты не сбрасываются: они знаменатель и должны расти монотонно.
         rep.loop_stall_max_ms = 0
+        rep.loop_late_total_ms = 0
+        rep.loop_late_events = []
+        rep.stage_windows_ns = {}
         snap.series = {k: _copy_series(st) for k, st in rep.series.items()}
         snap.histograms = cycle_hist
         snap.binned = self.binned
@@ -2866,8 +2917,10 @@ def print_report(r: RunReport) -> int:
         for c in lags:
             print(f"   {c.timeframe:6} {c.bars:6} {c.p50_ms:8} мс {c.p95_ms:8} мс "
                   f"{c.max_ms:8} мс {c.p50_ms - floor_ms:8} мс")
-    print(f"   ЗАМИНКА ЦИКЛА СОБЫТИЙ за прошлый цикл: {r.loop_stall_max_ms} мс "
+    print(f"   ЗАМИНКА ЦИКЛА СОБЫТИЙ за прошлый цикл: наибольшая одиночная "
+          f"{r.loop_stall_max_ms} мс, суммарно {r.loop_late_total_ms} мс "
           f"(тактов {r.heartbeats} по {HEARTBEAT_S} с)")
+    _print_stage_stalls(r)
     print("     это время, когда задачи опроса баров НЕ РАБОТАЛИ — прямая причина "
           "хвоста прихода выше; всякий синхронный вызов на цикле держит его 1:1")
     if r.stage_ms:

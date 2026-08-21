@@ -129,9 +129,18 @@ async def cycle(c: run.Collector, run_id: str,
     # управление, задачи наблюдения выполниться не могут, и срез получается из одного
     # момента. Уведи его в поток — и он станет смесью двух. Поэтому он ЗАМЕРЯЕТСЯ, а не
     # переносится: если окажется дорогим, чинить придётся сам снимок.
+    # ⚠ ЗАМИНКА ПРИПИСЫВАЕТСЯ ШАГУ ПО ВРЕМЕНИ, А НЕ ПО ПОРЯДКУ ВЫПОЛНЕНИЯ (2026-08-21).
+    # Шаг записывает своё окно, сердцебиение — время каждого опоздания; сводит их
+    # `run._print_stage_stalls` потом. Три редакции «по порядку» были неверны ПО
+    # КОНСТРУКЦИИ — разбор в докстроке `RunReport.loop_late_events`.
+    def _window(name: str, start_ns: int) -> None:
+        c.report.stage_windows_ns[name] = (start_ns, clock.monotonic_ns())
+
     t_snap = clock.monotonic_ns()
+    snap_t0 = clock.monotonic_ns()
     report = c.snapshot()
     report.stage_ms["snapshot"] = int((clock.monotonic_ns() - t_snap) / 1e6)
+    _window("snapshot", snap_t0)
 
     # Долив архива — до сборки карточки: без него окна исторических структур не покрыты
     # и уровней не бывает вовсе.
@@ -167,6 +176,7 @@ async def cycle(c: run.Collector, run_id: str,
     # decide 1323297 мс`, из них около 460 с на цикл вселенной уходило ровно на второй
     # разбор. Переносчик живёт РОВНО этот цикл и умирает вместе с ним.
     detections = engine.Detections()
+    back_t0 = clock.monotonic_ns()
     await run.backfill_profile_bars(c.ex, uni, report, horizon_days,
                                     frame_bars=BARS_ON_CHART,
                                     detections=detections)
@@ -194,21 +204,26 @@ async def cycle(c: run.Collector, run_id: str,
     t_src = clock.monotonic_ns()
     insts = {sym: inst for sym in uni.symbols
              if not isinstance(inst := c.ex.instrument(sym), NotReady)}
+    src_t0 = clock.monotonic_ns()
     sources: dict[str, TradeWindows] = await asyncio.to_thread(
         run.build_sources, insts, report, uni)
     report.stage_ms["sources"] = int((clock.monotonic_ns() - t_src) / 1e6)
+    _window("sources", src_t0)
 
     # ⚠ СТАДИИ РАЗМЕЧЕНЫ ПО ЧАСАМ 2026-08-21 (Т-0). `cycle_seconds` отвечал только
     # «сколько шёл цикл целиком» — по нему нельзя было решить, ускорять транспорт или
     # расчёт. Часы монотонные, те же, что у `cycle_seconds`.
     async def stage(name: str, fn: Callable[..., object], *a: object) -> object:
         t0 = clock.monotonic_ns()
+        st0 = clock.monotonic_ns()
         try:
             return await asyncio.to_thread(fn, *a)
         finally:
             report.stage_ms[name] = int((clock.monotonic_ns() - t0) / 1e6)
+            _window(name, st0)
 
     report.stage_ms["backfill"] = int((clock.monotonic_ns() - started) / 1e6)
+    _window("backfill", back_t0)
     await stage("frames", run.persist_frames, run_id, report)
     # ⚠ РАМКА КАДРА (2026-08-19). Служба строила уровни ЗА ВЕСЬ ГОРИЗОНТ, а сборка по
     # запросу в боте — только в кадре ответа. Две карты одного символа по разным
@@ -223,9 +238,11 @@ async def cycle(c: run.Collector, run_id: str,
     # лестница стр. 32 — вложенность идёт ровно на одну ступень ТФ (`NESTED_MAX_STEPS`),
     # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
     t_decide = clock.monotonic_ns()
+    dec_t0 = clock.monotonic_ns()
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
                                       BARS_ON_CHART, detections, horizon_days)
     report.stage_ms["decide"] = int((clock.monotonic_ns() - t_decide) / 1e6)
+    _window("decide", dec_t0)
     log.info("разбор рядов переиспользован", попаданий=detections.hits,
              посчитано=detections.misses)
     await stage("cards", run.produce_cards, run_id, report, uni, decided)
