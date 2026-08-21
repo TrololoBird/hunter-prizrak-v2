@@ -321,10 +321,27 @@ class Level(BaseModel):
 def structure_window_ms(
     acc: TradingRange, bars: list[Bar], timeframe_ms: int
 ) -> tuple[int, int]:
-    """Окно `[от, до)` для профиля — по тем же барам, что и границы (`structure_bars`)."""
+    """Окно `[от, до)` для профиля — по тем же барам, что и границы (`structure_bars`).
+
+    ⚠ ОКНО БЕРЁТСЯ У САМОГО ОТРЕЗКА, а не считается по `first_index`. Так стояло до
+    2026-08-21: `last_inside = acc.first_index + len(seg) - 1`, то есть левый край брался
+    из `first_index`, а длина — из `structure_bars`. Пока оба конца совпадали, арифметика
+    была верна; как только `structure_bars` начала продлевать отрезок ВЛЕВО
+    (`_structure_start`), правый край уехал бы вправо ровно на длину продления, и окно
+    профиля захватило бы свечи ВЫХОДА. Это тот же дефект «две границы структуры в одной
+    цепочке вызовов», который уже стоил 63.1% расхождения коробки с окном, — поэтому
+    индексная арифметика убрана совсем: концы спрашиваются у отрезка.
+
+    Пустой отрезок отдаёт вырожденное окно нулевой длины. Потребитель всё равно обязан
+    различать пустоту (`TradingRange.box` вернёт `None` и `build_all` назовёт причину),
+    а прежняя формула на пустом отрезке молча возвращала окно, кончающееся РАНЬШЕ, чем
+    началось.
+    """
     seg = structure_bars(acc, bars)
-    last_inside = acc.first_index + len(seg) - 1
-    return bars[acc.first_index].open_ms, bars[last_inside].open_ms + timeframe_ms
+    if not seg:
+        edge = bars[acc.first_index].open_ms
+        return edge, edge
+    return seg[0].open_ms, seg[-1].open_ms + timeframe_ms
 
 
 def created_at_ms(acc: TradingRange, bars: list[Bar], timeframe_ms: int) -> int:
