@@ -1669,7 +1669,8 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
 
 
 def record(run_id: str, report: RunReport, uni: Universe,
-           decided: dict[str, engine.SymbolDecision]) -> None:
+           decided: dict[str, engine.SymbolDecision],
+           detections: engine.Detections | None = None) -> None:
     """ШАГ 4 из четырёх: записать эмиссии и их исходы в боевой леджер (§8 этап 7).
 
     Единственное место в проекте, которое пишет сигналы. Открытые и несостоявшиеся
@@ -1779,10 +1780,64 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # Свежие бары у нас есть — значит правила стр. 43 (пробой → флип) и стр. 25
             # (заход в зону с уходом → отработка) применимы и к ним. Берутся бары ПОСЛЕ
             # конца структуры: то, что было до, уровень уже пережил.
+            # ⚠⚠ ПЕРЕНЕСЁННЫЙ РАЗБИРАЕТСЯ НА ТРИ СЛУЧАЯ, А НЕ НА ОДИН (2026-08-21).
+            #
+            # Прежде всякий непересчитанный уровень шёл в `resolve_carried` — правило
+            # СЛАБЕЕ обычного (стр. 43 и стр. 25 без глубины захода и без ПОК-профиля).
+            # Замер живого леджера 2026-08-21: активных уровней вселенной 1203, из них
+            # пересчитано свежим прогоном 391, а 812 (67.5%) судились слабым правилом.
+            # То есть две трети живой карты оценивал НЕ ТОТ прибор, которым проект
+            # считает уровень, — ровно «две сущности под одним именем».
+            #
+            # Почему их так много, ПРОВЕРЕНО, а не предположено. Разбор BTC (52 активные
+            # строки, 38 отставших): структуры с таким окном НЕТ в свежем разборе у
+            # ВСЕХ 38, при этом 37 из 38 лежат ВНУТРИ собранного ряда. Значит дело не в
+            # глубине ряда и не в отказе профиля — изменился САМ РАЗБОР. Личность уровня
+            # это `(ТФ, начало структуры, конец структуры)`, и любая правка детектора
+            # свингов её меняет: 2026-08-21 равные хаи/лои стали давать экстремум
+            # (стр. 13), границы структур сдвинулись, и вся прежняя карта осиротела.
+            #
+            # Отсюда три РАЗНЫХ случая, и смешивать их нельзя:
+            #   1. окно структуры ЕСТЬ в свежем разборе, а уровня нет — структура жива,
+            #      не построился профиль. Судим `resolve_carried`: это честно слабее;
+            #   2. конец структуры ЗА пределами собранного ряда — переразобрать нечем,
+            #      тоже `resolve_carried`;
+            #   3. структура ВНУТРИ ряда, но в свежем разборе её НЕТ — уровень порождён
+            #      расчётом, которого больше не существует. Рыночного вердикта у него
+            #      нет и быть не может: ни цена его не отработала (стр. 25), ни пробила
+            #      (стр. 43). Снимается с причиной `stale_calc`, и причина названа
+            #      СВОИМ именем, а не подогнана под курсовую.
+            #
+            # ⚠ Случай 3 НЕ выдумка про рынок. Стр. 23 говорит, откуда берётся уровень:
+            # «Пока цена не вышла из структуры - у нас нет уровня, уровень появляется
+            # когда цена полноценно выходит из структуры». Нет структуры в разборе —
+            # нет и уровня. Меняется не рынок, а наше чтение рынка, и запись об этом
+            # обязана говорить именно так.
+            fresh_windows: dict[str, set[tuple[int, int]]] = {}
+            first_bar_ms: dict[str, int] = {}
+            for ctf, cbars_all in series.items():
+                if not cbars_all or ctf not in TIMEFRAME_MS:
+                    continue
+                first_bar_ms[ctf] = cbars_all[0].open_ms
+                if detections is None:
+                    continue
+                csw, cscan = detections.get(sym, ctf, cbars_all)
+                if isinstance(csw, NotReady) or cscan is None:
+                    continue
+                fresh_windows[ctf] = {
+                    levels.structure_window_ms(a, cbars_all, TIMEFRAME_MS[ctf])
+                    for a in cscan.closed}
+
             resolved: list[tuple[str, int, int, str]] = []
             for cl in carried:
                 cbars = series.get(cl.timeframe)
                 if not cbars:
+                    continue
+                known = fresh_windows.get(cl.timeframe)
+                inside = cl.to_ms >= first_bar_ms.get(cl.timeframe, cl.to_ms + 1)
+                if known is not None and inside and (cl.from_ms, cl.to_ms) not in known:
+                    resolved.append((cl.timeframe, cl.from_ms, cl.to_ms, "stale_calc"))
+                    report.map_stale_calc += 1
                     continue
                 after = [b for b in cbars if b.open_ms > cl.to_ms]
                 verdict = levels.resolve_carried(
@@ -1945,6 +2000,7 @@ CYCLE_FIELDS = (
     "pending_no_target", "pending_no_bars", "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
+    "map_stale_calc",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
@@ -2707,7 +2763,12 @@ def print_report(r: RunReport) -> int:
     carried = sum(len(v) for v in r.map_carried.values())
     print("\n7б. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
     print(f"   новых уровней: {r.map_added}, подтверждено прежних: {r.map_updated}")
-    print(f"   снято по курсу (отработан/пробит): {r.map_retired}")
+    print(f"   снято по курсу (отработан/пробит): "
+          f"{r.map_retired - r.map_stale_calc}")
+    print(f"   снято как порождённые ПРЕЖНИМ расчётом: {r.map_stale_calc}"
+          + ("  — структуры под ними в свежем разборе НЕТ, хотя её время внутри "
+             "собранного ряда; это про НАС, а не про рынок"
+             if r.map_stale_calc else "  (ноль: карта построена тем же расчётом)"))
     print(f"   отклонено схемой карты: {len(r.map_rejected)}")
     for why in r.map_rejected[:5]:
         print(f"     ОТКЛОНЕНО {why}")

@@ -102,7 +102,20 @@ CREATE TABLE IF NOT EXISTS levels (
     to_ms        INTEGER NOT NULL,
     first_seen   INTEGER NOT NULL,
     last_seen    INTEGER NOT NULL,
-    state        TEXT    NOT NULL CHECK (state IN ('active', 'worked_off', 'flipped')),
+    -- ⚠ ТРЕТЬЕ СОСТОЯНИЕ `stale_calc` ЗАВЕДЕНО 2026-08-21 (схема 15), и оно ОТЛИЧАЕТСЯ
+    -- ОТ ДВУХ ПЕРВЫХ ПО РОДУ. `worked_off` (стр. 25) и `flipped` (стр. 43) говорят, что
+    -- сделала ЦЕНА. `stale_calc` говорит, что сделали МЫ: структура, из которой уровень
+    -- построен, в свежем разборе не находится, хотя её время лежит внутри собранного
+    -- ряда. Личность уровня есть (ТФ, начало структуры, конец структуры), и она меняется
+    -- вместе с детектором свингов — правка стр. 13 о равных хаях/лоях сдвинула границы
+    -- структур и осиротила всю прежнюю карту.
+    -- Замер, ради которого это заведено: активных уровней вселенной 1203, пересчитано
+    -- свежим прогоном 391, а 812 (67.5%) судились правилом `resolve_carried`, которое
+    -- СЛАБЕЕ обычного. Две трети живой карты оценивал не тот прибор.
+    -- Писать им `worked_off` было бы враньём про рынок; оставлять `active` — враньём про
+    -- нас. Поэтому третье имя, и оно называет ровно то, что произошло.
+    state        TEXT    NOT NULL CHECK (state IN ('active', 'worked_off', 'flipped',
+                                                   'stale_calc')),
     retired_at   INTEGER,
     -- ЧЕМ уровень торгуется. NULL — строка записана до схемы 6, правило не сохранялось.
     -- ⚠ Заведено 2026-08-11: `state='active'` НЕ означает «цена не касалась». Курс
@@ -147,6 +160,22 @@ CREATE TABLE IF NOT EXISTS levels (
     -- Плотность безразмерна, сравнима между символами и от ширины не зависит по
     -- построению. Разбор — докстрока `levels.Level.vrvp_zone_bins`.
     vrvp_density REAL,
+    -- ⚠⚠ ТРИ КОЛОНКИ НИЖЕ ДОБАВЛЕНЫ В ТЕКСТ СХЕМЫ 2026-08-21, И ЭТО ПОЧИНКА, А НЕ
+    -- НОВОВВЕДЕНИЕ. Они заводились миграциями 12→13 и 13→14 через `ALTER TABLE ADD
+    -- COLUMN`, а в этот текст вписаны не были. Следствие: СВЕЖАЯ база создавалась БЕЗ
+    -- них — `CREATE TABLE` берётся отсюда, а лестница миграций на пустой базе не
+    -- срабатывает ни разу (её первая же проверка отвечает «базы ещё нет»).
+    -- Проверено прямым замером: новая база получала 20 колонок из 23 и штамповалась
+    -- версией 14; первая же запись уровня упала бы на `no such column: stop_price`.
+    -- Это ровно та ловушка, о которой предупреждает комментарий у `_schema_version`,
+    -- только на шаг дальше: там следят за подъёмом константы, а здесь разошлись
+    -- ТЕКСТ схемы и ЛЕСТНИЦА миграций.
+    -- ⚠ Порядок именно такой (`stop_price`, `priority_tf`, `priority_depth`) — тот же,
+    -- в каком их дописывал `ALTER TABLE`, чтобы у свежей и у мигрированной базы состав
+    -- совпадал не только по именам.
+    stop_price   REAL,
+    priority_tf  TEXT,
+    priority_depth INTEGER,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     CHECK (to_ms > from_ms),
@@ -189,7 +218,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
@@ -648,6 +677,17 @@ def _schema_version(conn: sqlite3.Connection) -> str:
         return "12"
     if lvl_cols and "priority_tf" not in lvl_cols:
         return "13"
+    # 14 → 15 не видно по колонкам: меняется ОГРАНИЧЕНИЕ `CHECK` на `state`, а не состав
+    # полей. Спрашивается сам текст `CREATE TABLE` — тот же приём, что у ступени 8 → 9.
+    # Без этой ступени последняя строка вернула бы `SCHEMA_VERSION`, база версии 14
+    # назвала бы себя пятнадцатой, миграция не сработала бы ни разу, а `schema_meta` в
+    # конце всё равно проштамповалась бы новым числом. Ловушка описана абзацем ниже, и
+    # она уже срабатывала однажды.
+    lvl_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='levels'"
+    ).fetchone()
+    if lvl_sql is not None and "stale_calc" not in (lvl_sql[0] or ""):
+        return "14"
     return SCHEMA_VERSION
 
 
@@ -849,6 +889,61 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         # ЗАМЕРЕННАЯ глубина, читающий видит, тренд это из двух точек или из десяти».
         conn.execute("ALTER TABLE levels ADD COLUMN priority_tf TEXT")
         conn.execute("ALTER TABLE levels ADD COLUMN priority_depth INTEGER")
+        conn.commit()
+    if _schema_version(conn) == "14":
+        # 14 → 15: ТРЕТЬЕ СОСТОЯНИЕ УРОВНЯ — `stale_calc`.
+        #
+        # ⚠ ЭТО ЕДИНСТВЕННАЯ МИГРАЦИЯ, КОТОРУЮ НЕЛЬЗЯ СДЕЛАТЬ `ALTER TABLE ADD COLUMN`.
+        # Меняется не набор колонок, а ОГРАНИЧЕНИЕ `CHECK` на `state`, а SQLite менять
+        # ограничения не умеет — только пересоздать таблицу и перелить строки. Поэтому
+        # ниже полный цикл, и порядок в нём не декоративный: `PRAGMA foreign_keys` у
+        # этой базы не включён, но переименование делается ПОСЛЕ копирования и внутри
+        # одной транзакции, чтобы обрыв не оставил базу с половиной строк.
+        #
+        # ⚠ ЗАЧЕМ. Замер живого леджера 2026-08-21: активных уровней вселенной 1203, из
+        # них пересчитано свежим прогоном 391, а 812 (67.5%) — нет, и судило их
+        # `resolve_carried`, правило СЛАБЕЕ обычного (стр. 43 и стр. 25 без глубины
+        # захода и без ПОК-профиля). Разбор BTC показал причину: у ВСЕХ 38 отставших
+        # строк структуры с таким окном нет в свежем разборе, при этом 37 из 38 лежат
+        # ВНУТРИ собранного ряда. То есть дело не в глубине ряда и не в отказе профиля —
+        # изменился САМ РАЗБОР, и прежняя карта осиротела.
+        #
+        # Существующие строки переносятся КАК ЕСТЬ: ни одна не переписывается в
+        # `stale_calc` этой миграцией. Задним числом объявлять, каким расчётом была
+        # построена запись прошлой недели, значит выдумывать — новое состояние
+        # проставляет только свежий прогон, которому есть с чем сравнить.
+        # Определение новой таблицы берётся ИЗ `SCHEMA`, а не пишется здесь второй
+        # копией: две копии определения — тот самый дефект «одна величина в двух
+        # местах», из-за которого этот леджер уже разъезжался (текст схемы против
+        # лестницы миграций, см. комментарий у `stop_price`).
+        head = "CREATE TABLE IF NOT EXISTS levels ("
+        start = SCHEMA.index(head)
+        tail = chr(10) + ");"
+        end = SCHEMA.index(tail, start) + len(tail)
+        create_v15 = SCHEMA[start:end].replace(head, "CREATE TABLE levels_v15 (", 1)
+        # Колонки перечисляются ПОИМЁННО и берутся у ЖИВОЙ таблицы. `SELECT *` здесь
+        # был бы тихой порчей данных: у базы, выросшей миграциями, порядок колонок
+        # (…, resolved_at, vrvp_density, mtf_break, agreement, …) НЕ совпадает с
+        # порядком в тексте схемы (…, mtf_break, agreement, resolved_at, vrvp_density),
+        # и позиционная вставка разложила бы значения по чужим полям.
+        live = [r[1] for r in conn.execute("PRAGMA table_info(levels)")]
+        names = ", ".join(live)
+        conn.execute("BEGIN")
+        try:
+            conn.execute(create_v15)
+            conn.execute(f"INSERT INTO levels_v15 ({names}) SELECT {names} FROM levels")
+            moved = conn.execute("SELECT COUNT(*) FROM levels_v15").fetchone()[0]
+            had = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+            if moved != had:
+                raise RuntimeError(
+                    f"миграция 14→15: перелито {moved} строк из {had} — таблица НЕ "
+                    f"заменена, база осталась прежней")
+            conn.execute("DROP TABLE levels")
+            conn.execute("ALTER TABLE levels_v15 RENAME TO levels")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(

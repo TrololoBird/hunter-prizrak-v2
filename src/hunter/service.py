@@ -189,7 +189,7 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
              посчитано=detections.misses)
     await stage("cards", run.produce_cards, run_id, report, uni, decided)
     await stage("source", run.persist_source, run_id, report, sources)
-    await stage("record", run.record, run_id, report, uni, decided)
+    await stage("record", run.record, run_id, report, uni, decided, detections)
 
     spent = (clock.monotonic_ns() - started) / 1e9
     report.cycle_seconds = spent
