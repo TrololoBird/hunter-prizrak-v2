@@ -808,7 +808,7 @@ def needed_days(
 def profile_windows(
     series: dict[str, list[Bar]], horizon_days: int,
     intrabar_tf: str | None = None, frame_bars: int | None = None,
-    *, symbol: str = "", detections: engine.Detections | None = None,
+    symbol: str = "", detections: engine.Detections | None = None,
 ) -> tuple[list[tuple[int, int]], int, int, int, int]:
     """Окна структур, под которые нужен профиль.
     Возвращает (окна, взято, отброшено, окон_старшего_ТФ, окон_вне_кадра).
@@ -937,9 +937,17 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                          причина=inst.reason)
             continue
         series = bars_of(report, sym)
-        wins, used, dropped, _senior, out_of_frame = profile_windows(
-            series, horizon_days, frame_bars=frame_bars,
-            symbol=sym, detections=detections)
+        # ⚠⚠ РАЗБОР ОКОН — В ПОТОК (2026-08-21). Здесь он стоял синхронно на цикле
+        # событий, а внутри — `swings.detect` и `trading_range.detect` по каждому ТФ.
+        # Пока такой вызов идёт, цикл СТОИТ и задачи опроса баров не работают: замер
+        # показал опоздание сердцебиения ровно в длину синхронной работы (5 с → 4998 мс),
+        # тогда как та же работа в потоке даёт 47 мс.
+        #
+        # ⚠ Комментарий в `service.cycle` до сегодняшнего дня утверждал, что «внутри —
+        # свой to_thread». Это было НЕВЕРНО: `to_thread` в этом модуле принадлежит
+        # `backfill_from_archive` (старый добор сделок), а сюда его никто не ставил.
+        wins, used, dropped, _senior, out_of_frame = await asyncio.to_thread(
+            profile_windows, series, horizon_days, None, frame_bars, sym, detections)
         report.profile_windows_out_of_frame += out_of_frame
         if not wins:
             # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
@@ -982,8 +990,10 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                 # слияние в `append` уложит его вокруг имеющегося. Пустое хранилище
                 # отдельно не различается: ноль баров — тоже «меньше, чем нужно».
                 want = max(1, (hi - lo) // step)
-                have = len(barstore.load(uni.venue, inst.market_id, tf,
-                                         since_ms=lo, upto_ms=hi - 1))
+                # Счёт, а не построение баров (2026-08-21): нужен ОДИН int, а `load`
+                # строил на него весь список. Ответ тот же — см. `barstore.count`.
+                have = barstore.count(uni.venue, inst.market_id, tf,
+                                      since_ms=lo, upto_ms=hi - 1)
                 if have >= want:
                     report.profile_spans_cached += 1
                     continue
@@ -1384,9 +1394,25 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
     замер и цена — в докстроке модуля `profile_source` и в
     `docs/audit/poc-candles-vs-ticks-2026-08-12.md`.
 
-    ⚠ Бары читаются НА ВЫЗОВ и не удерживаются: минутный ряд за девяносто суток — это
-    около 130 тысяч баров на символ, и держать их для всех двадцати семи разом значило бы
-    вернуть ту самую `MemoryError`, ради которой источник когда-то и стал ленивым.
+    ⚠⚠ ЗДЕСЬ СТОЯЛО НЕВЕРНОЕ УТВЕРЖДЕНИЕ, СНЯТО 2026-08-21. Дословно было: «Бары
+    читаются НА ВЫЗОВ и не удерживаются… держать их для всех двадцати семи разом значило
+    бы вернуть ту самую `MemoryError`». Ни одна половина этой фразы не описывает код:
+    функция ниже читает ряд ЦЕЛИКОМ (`barstore.load` без границ) по каждой ступени
+    лестницы, а служба строит `sources` для ВСЕХ символов вселенной сразу и держит их
+    весь цикл. То есть делается ровно то, что докстрока называла недопустимым.
+
+    ЦЕНА ИЗМЕРЕНА (3 символа, все шесть ступеней, замер с диска):
+        BTC 494 977 баров за 8.2 с, ETH 865 022 за 12.4 с, SOL 386 420 за 5.4 с
+    — 26.0 с на три символа, то есть около 216 с на вселенную из 25 ЗА КАЖДЫЙ ЦИКЛ.
+    Держится это в памяти одновременно: `Bar` весит 121 байт (срезовый класс), и на
+    вселенную выходит порядка гигабайта — наблюдаемый расход службы это подтверждает.
+
+    ⚠ ПОЧЕМУ НЕ ИСПРАВЛЕНО ЗДЕСЬ ЖЕ. Развилка не техническая, а о цене: держать ряды
+    МЕЖДУ циклами (память постоянно занята, зато 216 с не платятся) против строить
+    источник НА СИМВОЛ внутри цикла (память падает в разы, время то же). Первое — риск
+    для службы 24/7, ради которого этот проект уже ловил `MemoryError` (2026-08-04),
+    второе — не ускоряет. Решение о таком размене принимает владелец, а не докстрока;
+    здесь названо число, чтобы решать было по чему.
 
     Один на оба пути — печать карточки и запись в леджер.
 
@@ -1415,6 +1441,35 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
     if not series:
         return None
     return TVWindows(sym, inst.tick_size, series)
+
+
+def build_sources(insts: dict[str, Instrument], report: RunReport,
+                  uni: Universe) -> dict[str, TradeWindows]:
+    """Источники профиля для всех символов сразу — ЧИСТАЯ функция для рабочего потока.
+
+    ⚠ ЗАВЕДЕНА 2026-08-21, чтобы снять эту работу с цикла событий. Прежде служба
+    строила источники словарным литералом прямо в `cycle()`, то есть синхронно: чтение
+    хранилища по шести ступеням лестницы на каждый из 25 символов плюс слияние рядов —
+    125.6 с и 6.3 с по замеру с диска. Всё это время цикл событий СТОЯЛ, и задачи
+    опроса баров не получали управления.
+
+    Сюда НЕ передаётся объект биржи, и это условие: карту рынков переписывает задача
+    перечитывания состава, которая живёт на цикле событий, а функция работает в потоке.
+    Инструменты добываются ВЫЗЫВАЮЩИМ на цикле и приходят готовыми — читать из потока
+    словарь, который в это же время меняют, значит однажды получить полуобновлённый.
+    """
+    out: dict[str, TradeWindows] = {}
+    for sym, inst in insts.items():
+        series: dict[str, list[Bar]] = dict(bars_of(report, sym))
+        for tf in PROFILE_LADDER:
+            stored = barstore.load(uni.venue, inst.market_id, tf)
+            if not stored:
+                continue
+            have = series.get(tf)
+            series[tf] = _merge_bars(stored, have) if have else stored
+        if series:
+            out[sym] = TVWindows(sym, inst.tick_size, series)
+    return out
 
 
 def bars_of(report: RunReport, sym: str) -> dict[str, list[Bar]]:

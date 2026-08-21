@@ -130,6 +130,41 @@ def load(
     ]
 
 
+def count(
+    venue: str, market_id: str, timeframe: str,
+    since_ms: int | None = None, upto_ms: int | None = None,
+) -> int:
+    """СКОЛЬКО баров в диапазоне — без построения самих баров.
+
+    ⚠ ЗАВЕДЕНА 2026-08-21 ПО ЗАМЕРУ. `backfill_profile_bars` спрашивал покрытие участка
+    как `len(load(...))`, то есть строил каждый бар окна ради одного числа. Замер на
+    минутном ряде BTC: окно в 1500 баров стоит 0.153 с через `load` и 0.017 с через
+    счёт — девятикратно, и это на каждом участке каждого символа каждого цикла.
+
+    Ответ ТОТ ЖЕ по построению: `load` создаёт ровно один `Bar` на строку и ни одной не
+    отбрасывает, значит длина его списка есть число строк в том же диапазоне.
+
+    ⚠ Битый файл ведёт себя как в `load` — ноль и НАЗВАННАЯ причина в журнале, а не
+    исключение: непрочитанный файл означает «покрытия нет», и участок будет перекачан.
+    Молчаливый ноль здесь читался бы как «данных нет», и это тот же ответ, но по другой
+    причине; поэтому причина печатается.
+    """
+    lazy = _scan(store_path(venue, market_id, timeframe))
+    if lazy is None:
+        return 0
+    if since_ms is not None:
+        lazy = lazy.filter(pl.col("open_ms") >= since_ms)
+    if upto_ms is not None:
+        lazy = lazy.filter(pl.col("open_ms") <= upto_ms)
+    try:
+        return int(lazy.select(pl.len()).collect().item())
+    except Exception as e:  # тот же разбор, что в `load`
+        log.error("файл хранилища баров не прочитан (счёт)",
+                  файл=str(store_path(venue, market_id, timeframe)),
+                  причина=f"{type(e).__name__} {e}")
+        return 0
+
+
 def append(
     venue: str, market_id: str, timeframe: str, bars: list[Bar]
 ) -> tuple[int, int]:
