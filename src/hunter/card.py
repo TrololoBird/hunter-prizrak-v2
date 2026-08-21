@@ -35,6 +35,7 @@ from . import (
 )
 from .bars import continuous_tail
 from .models import Bar, NotReady
+from .priority import Agreement
 from .swings import TrendDirection
 from .trading_range import BorderSource, flat_trades
 
@@ -549,7 +550,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"по ряду — напечатаны последние {len(shown_pen)}")
         if r.pennants_no_trend:
             out.append(f"  {lab}  ещё {r.pennants_no_trend} сужений вымпелом НЕ стали: "
-                       f"тренда перед ними нет, а стр. 57 велит «Торгуем по тренду»")
+                       f"тренда нет ни своего, ни на старших ТФ, "
+                       f"а стр. 57 велит «Торгуем по тренду»")
         if r.open_pennant is not None:
             any_fig = True
             out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: {_pennant(r.open_pennant)}")
@@ -811,13 +813,25 @@ def _entries(entries: tuple[figures.FigureEntry, ...]) -> str:
 
 
 def _pennant(pen: figures.Pennant) -> str:
-    """Вымпел одной строкой: касания, шестое из них (ТВХ стр. 57) и якорь стопа."""
+    """Вымпел одной строкой: касания, шестое из них (ТВХ стр. 57) и якорь стопа.
+
+    Источник стороны печатается ВСЕГДА, а не только когда он необычен: сторона, взятая с
+    1Д для вымпела на 5м, — другое утверждение, чем сторона со своего ряда, и по строке
+    должно быть видно, какое из двух перед владельцем (стр. 47).
+    """
     touch = (f"6-е на баре {pen.touch6_index}" if pen.touch6_index is not None
              else "шестого касания ещё не было")
+    where = ("тренд свой" if pen.side_source == figures.OWN_TF_SOURCE
+             else f"тренд со старшего {TF_LABEL.get(pen.side_source, pen.side_source)} "
+                  f"(стр. 47)")
+    against = ("  ⚠ ПРОТИВ старшего ТФ — стр. 47: только хеджем и/или на уменьшенный риск"
+               if pen.agreement is Agreement.AGAINST_TREND else "")
     return (f"{PENNANT_LABEL[pen.borders.value]} {FIGURE_SIDE_LABEL[pen.side.value]}  "
+            f"({where})  "
             f"касаний {pen.touches}, {touch}  "
             f"границы {_num(pen.lower_edge)}…{_num(pen.upper_edge)}  "
             f"стоп прячем за {_num(pen.stop_anchor)} (стр. 57)"
             + ("  структура уже расширялась (стр. 18)" if pen.is_extended else "")
+            + against
             + f"  вход: {_entries(pen.entries)}")
 

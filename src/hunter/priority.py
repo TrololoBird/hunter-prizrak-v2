@@ -6,8 +6,8 @@
   стр. 27  «Если структура 4ч тф  - отработку смотрим на 4ч тф / Если 1д - отработка
            будет на 1д»
   стр. 47  «ПРИОРИТЕТ СТАРШИЙ ТАЙМФРЕЙМ»: локальная позиция против старшего ТФ выносится
-           по стопу; её можно брать «имея позицию по тренду — в виде хэджа и/или на
-           уменьшенный объём риска»
+           по стопу; её можно брать «имея позицию по тренду – в виде хэджа и/или на
+           уменьшенный объем риска»
   стр. 18  «Если тренд восходящий, то флет торгуем от нижней границы до верхней (Лонг)…
            Можно торговать в обе стороны, но ПЕРВАЯ ПОЗИЦИЯ ВСЕГДА БЕРЁТСЯ ПО ТРЕНДУ»
   стр. 46  ловушка ТФ: структура на 1-4ч под уровнем 1д — это может быть просто тест или
@@ -75,13 +75,24 @@ def resolve(trends: dict[str, Trend], above: str) -> Priority:
     return Priority(timeframe=None, direction=TrendDirection.NONE, holds_for=0)
 
 
+def agreement_of(direction: TrendDirection, priority: Priority) -> Agreement:
+    """То же правило стр. 18 и 47, но по НАПРАВЛЕНИЮ, а не по стороне уровня.
+
+    Заведено 2026-08-22 для вымпела: `figures.pennant` берёт сторону из тренда (стр. 57
+    «Торгуем по тренду»), и своего `LevelSide` у фигуры нет. Правило остаётся ОДНИМ и в
+    одном месте — иначе через месяц их станет два и они разойдутся, а разойдутся они
+    молча: обе ветки вернут законный `Agreement`, и ни один инвариант не порвётся.
+    """
+    if priority.direction is TrendDirection.NONE or direction is TrendDirection.NONE:
+        return Agreement.NO_PRIORITY
+    return (Agreement.BY_TREND if direction is priority.direction
+            else Agreement.AGAINST_TREND)
+
+
 def agreement(side: LevelSide, priority: Priority) -> Agreement:
     """Согласуется ли сторона сделки с приоритетом старшего ТФ (стр. 18, 47)."""
-    if priority.direction is TrendDirection.NONE:
-        return Agreement.NO_PRIORITY
-    by_trend = ((side is LevelSide.LONG and priority.direction is TrendDirection.UP)
-                or (side is LevelSide.SHORT and priority.direction is TrendDirection.DOWN))
-    return Agreement.BY_TREND if by_trend else Agreement.AGAINST_TREND
+    return agreement_of(
+        TrendDirection.UP if side is LevelSide.LONG else TrendDirection.DOWN, priority)
 
 
 class CounterPlacement(StrEnum):

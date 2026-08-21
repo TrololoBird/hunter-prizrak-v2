@@ -33,12 +33,12 @@ from pydantic import BaseModel, ConfigDict
 from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
 from .bars import TIMEFRAME_MS
-from .geometry import Setup
+from .geometry import TF_ORDER, Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
 from .pereprior import Pereprior, PPSide
 from .priority import Agreement, CounterLevel, Priority
-from .swings import SwingSet, Trend
+from .swings import SwingSet, Trend, TrendDirection
 from .trading_range import OpenStructure, RangeScan, TradingRange
 from .trading_range import detect as detect_ranges
 
@@ -94,11 +94,12 @@ class SeriesRead(BaseModel):
     """Вымпелы/треугольники ЗАКРЫТЫХ структур (стр. 57, 58)."""
 
     pennants_no_trend: int = 0
-    """Сколько СУЖАЮЩИХСЯ закрытых структур вымпелом не стали: тренда перед ними нет.
+    """Сужающихся закрытых структур, не ставших вымпелом: тренда нет НИ СВОЕГО, НИ СТАРШЕГО.
 
-    Считается отдельно от «структура не сужается» (это просто не вымпел) и печатается в
-    карточке: отказ по стр. 57 «Торгуем по тренду» задевает ДЕСЯТКИ ПРОЦЕНТОВ сужений
-    (замер 2026-08-22: 602 из 1390 на 10 символах × 5 ТФ), и молча он исчезать не должен.
+    Считается отдельно от "структура не сужается" (это просто не вымпел) и печатается в
+    карточке: отказ по стр. 57 «Торгуем по тренду» молча исчезать не должен (§4.3). До
+    привлечения старшего ТФ (стр. 47) он задевал 602 сужения из 1390 — замер 2026-08-22
+    на 10 символах × 5 ТФ; сколько осталось после — см. доклад той же смены.
     """
 
     open_pennant: figures.Pennant | None = None
@@ -364,8 +365,6 @@ def read_series(
         last_side = tuple(seq[-1] for side in (PPSide.SHORT, PPSide.LONG)
                           if (seq := [p for p in every if p.side is side]))
         chans = figures.detect_channels(sw)
-        open_pennant, open_missing = _pennant_of(scan.open_tail, sw)
-        closed_pen = [_pennant_of(acc, sw) for acc in scan.closed]
         reads[tf] = SeriesRead(
             timeframe=tf, swings=sw, trend=swings.trend(sw), scan=scan,
             perepriors=last_side,
@@ -373,11 +372,6 @@ def read_series(
             splits=pereprior.split_entries(every),
             channels=chans,
             channel_notes=tuple(_channel_note(c, every) for c in chans),
-            pennants=tuple(pen for pen, _ in closed_pen if pen is not None),
-            pennants_no_trend=sum(1 for pen, reason in closed_pen
-                                  if pen is None and reason == figures.NO_TREND_REASON),
-            open_pennant=open_pennant,
-            open_pennant_missing=open_missing,
             multiple_bases=tuple(
                 mb for acc in scan.closed
                 if not isinstance(mb := figures.multiple_base(acc, every), NotReady)),
@@ -385,12 +379,16 @@ def read_series(
                 hs for pp in every
                 if not isinstance(hs := figures.head_and_shoulders(pp, sw), NotReady)),
         )
+    # Вымпелы — ВТОРЫМ проходом: их сторона может прийти со старшего ТФ (стр. 47), а в
+    # первом проходе старшие ряды ещё не разобраны. См. `_fill_pennants`.
+    _fill_pennants(reads, series)
     return reads, tuple(bad)
 
 
 def _pennant_of(
     structure: TradingRange | OpenStructure | None,
     swings: SwingSet,
+    senior: priority.Priority | None = None,
 ) -> tuple[figures.Pennant | None, str]:
     """Вымпел структуры (стр. 57, 58) вместе с причиной, если его нет.
 
@@ -398,14 +396,106 @@ def _pennant_of(
     структуры «сужения нет» и «структуры нет» — разные ответы (§4.3).
 
     Свинги нужны для СТОРОНЫ: стр. 57 «Торгуем по тренду», и тренд берётся из них по
-    экстремумам до начала структуры — см. `figures.pennant`.
+    экстремумам до начала структуры — см. `figures.pennant`. `senior` — приоритет
+    старшего ТФ на тот же момент, когда свой ряд тренда не даёт (стр. 47).
     """
     if structure is None:
         return None, ""
-    got = figures.pennant(structure, swings)
+    got = figures.pennant(structure, swings, senior)
     if isinstance(got, NotReady):
         return None, got.reason
     return got, ""
+
+
+def _trend_as_of(read: SeriesRead, bars: list[Bar], upto_ms: int) -> Trend:
+    """Тренд ряда НА МОМЕНТ `upto_ms` — по экстремумам, подтверждённым не позже него.
+
+    Существует ровно ради причинности: `SeriesRead.trend` — это тренд СЕЙЧАС, на полном
+    наборе свингов, и для решения, принимаемого сейчас, он верен. Но вымпелы печатаются и
+    ПРОШЛЫЕ, а «тренд сейчас» для структуры, закрывшейся месяц назад, есть заглядывание
+    вперёд — тот самый класс, который досье нашло у `smartmoneyconcepts` тремя
+    недокументированными утечками.
+
+    Рез идёт по `confirmed_at_index`, а не по `index`: фрактал становится известен на два
+    бара позже своей вершины, и берётся именно момент ИЗВЕСТНОСТИ.
+    """
+    sw = read.swings
+    cut = tuple(s for s in sw.swings
+                if s.confirmed_at_index < len(bars)
+                and bars[s.confirmed_at_index].open_ms <= upto_ms)
+    if len(cut) < 2:
+        return Trend(direction=TrendDirection.NONE, holds_for=0)
+    return swings.trend(SwingSet(
+        swings=cut,
+        bars_scanned=sw.bars_scanned,
+        confirmed_until_index=cut[-1].confirmed_at_index,
+    ))
+
+
+def _senior_priority(
+    tf: str,
+    structure: TradingRange | OpenStructure,
+    bars: list[Bar],
+    reads: dict[str, SeriesRead],
+    series: dict[str, list[Bar]],
+    higher: list[str],
+) -> priority.Priority | None:
+    """Приоритет старшего ТФ (стр. 47) НА МОМЕНТ начала структуры.
+
+    `None` — старших рядов нет вовсе; тогда вымпел остаётся при своём ТФ и отказывает,
+    если тот молчит. Это не то же, что «приоритета нет»: `priority.resolve` вернул бы
+    `NO_PRIORITY`, и отличать нечем было бы (§4.3).
+    """
+    if not higher or not (0 <= structure.first_index < len(bars)):
+        return None
+    at = bars[structure.first_index].open_ms
+    # ⚠ Тренды считаются СВЕРХУ ВНИЗ и до первого определившегося, а не все разом. Ответ
+    # от этого НЕ меняется: `resolve` сама идёт `reversed(higher)` и берёт первый
+    # определившийся, значит ряды ниже найденного она бы и не спросила. Меняется цена —
+    # `_trend_as_of` линеен по числу экстремумов ряда, а младший из старших (15м для 5м)
+    # их имеет тысячи. Замер 2026-08-22 на 10 символах × 6 ТФ: 2 м 20 с → 59 с, и все
+    # выходные числа совпали до единицы — это и есть доказательство, что ответ тот же.
+    trends: dict[str, Trend] = {}
+    for s in reversed(higher):
+        trends[s] = _trend_as_of(reads[s], series[s], at)
+        if trends[s].direction is not TrendDirection.NONE:
+            break
+    return priority.resolve(trends, tf)
+
+
+def _fill_pennants(
+    reads: dict[str, SeriesRead], series: dict[str, list[Bar]]
+) -> None:
+    """Вымпелы ВТОРЫМ проходом: сторона может прийти со СТАРШЕГО ТФ (стр. 47).
+
+    Первым проходом это невозможно по построению — ТФ разбираются по возрастанию, и на
+    5м старшие ряды ещё не прочитаны. Отдельный проход дешевле, чем разбор в два круга:
+    старший ТФ спрашивается ТОЛЬКО у сужающихся структур, чей собственный ряд тренда не
+    дал, а таких по замеру 2026-08-22 около 43% сужений и порядка процента всех структур.
+    """
+    for tf, read in list(reads.items()):
+        if tf not in TF_ORDER:
+            continue
+        bars = series.get(tf) or []
+        higher = [s for s in TF_ORDER[TF_ORDER.index(tf) + 1:]
+                  if s in reads and series.get(s)]
+        closed = [
+            _pennant_of(acc, read.swings,
+                        _senior_priority(tf, acc, bars, reads, series, higher))
+            for acc in read.scan.closed
+        ]
+        tail = read.scan.open_tail
+        open_pen, open_missing = _pennant_of(
+            tail, read.swings,
+            None if tail is None
+            else _senior_priority(tf, tail, bars, reads, series, higher))
+        reads[tf] = read.model_copy(update={
+            "pennants": tuple(pen for pen, _ in closed if pen is not None),
+            "pennants_no_trend": sum(1 for pen, reason in closed
+                                     if pen is None and reason == figures.NO_TREND_REASON),
+            "open_pennant": open_pen,
+            "open_pennant_missing": open_missing,
+        })
 
 
 def _channel_note(channel: figures.Channel, pps: tuple[Pereprior, ...]) -> str:
