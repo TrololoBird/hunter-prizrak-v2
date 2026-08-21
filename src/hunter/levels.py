@@ -1554,13 +1554,20 @@ def pressed_structures(level: Level, scan: RangeScan,
     lo_z, hi_z = float(level.zone_lo), float(level.zone_hi)
     price = float(level.price)
     out: list[PressedStructure] = []
-    for acc in scan.closed:
+    # ⚠ КОРОБКИ БЕРУТСЯ ИЗ ПАМЯТИ СКАНА С 2026-08-21 — тот же расчёт, но по разу на
+    # структуру, а не на пару (уровень, структура). Прежде здесь стояло
+    # `seg = structure_bars(acc, bars)` и `min/max` по нему, и это был самый дорогой
+    # участок расчёта: 68.5 с из 206 на символ, генератор вызван 12 099 220 раз.
+    # Значения тождественны по построению — считает их та же `structure_bars` теми же
+    # `min`/`max`, только один раз (см. `RangeScan.boxes`). `None` означает пустой
+    # отрезок и даёт тот же `continue`, что и прежнее `if not seg`.
+    boxes = scan.boxes(bars)
+    for acc, box in zip(scan.closed, boxes, strict=True):
         if acc.last_index <= level.created_at_index:
             continue
-        seg = structure_bars(acc, bars)
-        if not seg:
+        if box is None:
             continue
-        lo, hi = min(b.low for b in seg), max(b.high for b in seg)
+        lo, hi = box
         if hi < lo_z or lo > hi_z:
             continue
         kind = (PressedKind.ASTRIDE if lo <= price <= hi

@@ -129,7 +129,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .bars import steps_between
 from .breach import CONFIRM_BODIES, Direction, body_beyond
@@ -571,6 +571,41 @@ class RangeScan(BaseModel):
     bars_scanned: int
     resets: int
     """Сколько раз структура распалась, не дав уровня (зоны сошлись либо точек не хватило)."""
+
+    _boxes: dict[tuple[int, int, int], tuple[tuple[float, float] | None, ...]] = (
+        PrivateAttr(default_factory=dict))
+    """Память `boxes()`: отпечаток ряда → коробки всех закрытых структур. НЕ поле."""
+
+    def boxes(self, bars: list[Bar]) -> tuple[tuple[float, float] | None, ...]:
+        """Коробка ХАЙ…ЛОЙ каждой закрытой структуры, в порядке `closed`.
+
+        `None` там, где отрезок структуры пуст, — это НЕ то же самое, что коробка
+        нулевой высоты, и потребитель обязан различать (`structure_bars` может вернуть
+        пустой список, и прежний код на этом делал `continue`).
+
+        ⚠⚠ ЗАВЕДЕНО 2026-08-21 ПО ЗАМЕРУ, а не «для красоты». Коробка структуры от
+        уровня НЕ ЗАВИСИТ — это `min(low)`/`max(high)` по `structure_bars`, — но
+        `levels.pressed_structures` считала её заново для КАЖДОЙ пары (уровень,
+        структура). Профиль BTC на боевых глубинах (`cProfile`): 736 уровней × ~1400
+        структур, генератор `min/max` вызван 12 099 220 раз, вся функция — 44.8 с из
+        164 с расчёта, то есть 27%. Здесь тот же ответ считается по разу на структуру.
+
+        ⚠ ОТПЕЧАТОК РЯДА В КЛЮЧЕ — не перестраховка. `RangeScan` родился из `detect(bars)`
+        и по смыслу принадлежит именно тому ряду, но НИЧТО в типах этого не держит:
+        потребитель волен подать другой список, и тогда молчаливая память вернула бы
+        коробки чужого ряда. Отпечаток (длина, первая и последняя метки) делает такую
+        подмену видимой — память просто пересчитается, а не соврёт.
+        """
+        key = (len(bars), bars[0].open_ms if bars else 0,
+               bars[-1].open_ms if bars else 0)
+        if (got := self._boxes.get(key)) is None:
+            out: list[tuple[float, float] | None] = []
+            for acc in self.closed:
+                seg = structure_bars(acc, bars)
+                out.append((min(b.low for b in seg), max(b.high for b in seg))
+                           if seg else None)
+            got = self._boxes[key] = tuple(out)
+        return got
 
 
 def structure_bars(acc: TradingRange, bars: list[Bar]) -> list[Bar]:

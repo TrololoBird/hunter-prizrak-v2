@@ -147,7 +147,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .models import Bar, NotReady
 
@@ -226,8 +226,72 @@ class SwingSet(BaseModel):
     confirmed_until_index: int
     """Дальше этого индекса фракталы ещё не могут быть подтверждены."""
 
+    _by_kind: dict[SwingKind, tuple[Swing, ...]] = PrivateAttr(default_factory=dict)
+    """Память `of()`. НЕ поле модели: в сравнение, хэш и сериализацию не входит."""
+
+    _confirmed_of: dict[SwingKind, tuple[int, ...]] = PrivateAttr(default_factory=dict)
+    """Память `confirmed_of()` — та же причина."""
+
+    @model_validator(mode="after")
+    def _ordered(self) -> SwingSet:
+        """Экстремумы обязаны идти слева направо — это условие, а не совпадение.
+
+        ⚠ Проверка ЗАВЕДЕНА 2026-08-21 вместе с памятью `of()` и двоичным поиском в
+        `figures.head_and_shoulders`. Оба опираются на порядок: поиск по отсортированному
+        ряду на неотсортированном молча вернёт НЕ ТО, без исключения и без следа. Порядок
+        обеспечивает `local_extremes` (проход по возрастанию `i`), но обеспечивает его
+        КОД, а код меняется. Значит условие держит проверка при рождении объекта, а не
+        докстрока у потребителя.
+
+        Стоит она один проход на ряд — шесть раз на символ, — тогда как опора на неё
+        экономит миллионы сравнений (замер в `of()`).
+
+        `confirmed_at_index` проверяется ОТДЕЛЬНО от `index`, а не выводится из него:
+        сейчас это `index + depth` при постоянном `depth`, но зависимость эта —
+        свойство сегодняшнего `local_extremes`, а опирается поиск именно на
+        `confirmed_at_index`. Проверяется то, чем пользуются.
+        """
+        prev_i = prev_c = -1
+        for sw in self.swings:
+            if sw.index < prev_i:
+                raise ValueError(
+                    f"экстремумы не по возрастанию индекса: {sw.index} после {prev_i}")
+            if sw.confirmed_at_index < prev_c:
+                raise ValueError(
+                    f"экстремумы не по возрастанию подтверждения: "
+                    f"{sw.confirmed_at_index} после {prev_c}")
+            prev_i, prev_c = sw.index, sw.confirmed_at_index
+        return self
+
+    def confirmed_of(self, kind: SwingKind) -> tuple[int, ...]:
+        """Метки подтверждения экстремумов одной стороны — ряд для двоичного поиска.
+
+        Неубывающий по построению (проверено `_ordered`), поэтому `bisect_right` по нему
+        даёт ЧИСЛО экстремумов, подтверждённых не позже заданного бара. Ровно это и
+        нужно правилу «заглядывать вперёд нельзя» (I-5).
+        """
+        if (got := self._confirmed_of.get(kind)) is None:
+            got = self._confirmed_of[kind] = tuple(
+                sw.confirmed_at_index for sw in self.of(kind))
+        return got
+
     def of(self, kind: SwingKind) -> tuple[Swing, ...]:
-        return tuple(s for s in self.swings if s.kind is kind)
+        """Экстремумы одной стороны, в порядке появления.
+
+        ⚠ ЗАПОМИНАЕТСЯ С 2026-08-21, и это не преждевременная оптимизация, а замер.
+        Профиль расчёта BTC на боевых глубинах рядов (51840 баров 5м, `cProfile`,
+        178 с на символ): этот метод вызывался 3208 раз, и его генератор — 8 181 291
+        раз, 7.8 с. Зовёт его `figures.head_and_shoulders` на КАЖДОМ переприоре, а
+        набор экстремумов от переприора не зависит вовсе — пересчитывался один и тот
+        же ответ.
+
+        Ответ ТОТ ЖЕ: `self.swings` заморожен (`tuple` в замороженной модели), значит
+        второй вызов не может увидеть другой набор. Это условие правильности памяти, и
+        держит его не докстрока, а `frozen=True` на модели.
+        """
+        if (got := self._by_kind.get(kind)) is None:
+            got = self._by_kind[kind] = tuple(s for s in self.swings if s.kind is kind)
+        return got
 
 
 class TrendDirection(StrEnum):
