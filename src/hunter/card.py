@@ -35,7 +35,8 @@ from . import (
 )
 from .bars import TIMEFRAME_MS, continuous_tail
 from .models import Bar, NotReady
-from .trading_range import BorderSource
+from .swings import TrendDirection
+from .trading_range import BorderSource, flat_trades
 
 TF_LABEL = {"5m": "5м", "15m": "15м", "1h": "1ч", "4h": "4ч", "1d": "1Д", "1w": "1Н"}
 SIDE_LABEL = {"long": "ЛОНГ", "short": "ШОРТ"}
@@ -241,6 +242,51 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         out.append(f"       из них чётких (6+ точек, стр. 23) {clear}  "
                    f"с расширением до прокола (стр. 18) {extended}  "
                    f"обе границы по первым двум точкам (стр. 18) {first_two}")
+
+    # ⚠⚠ РАЗДЕЛ ЗАВЕДЁН 2026-08-21: ВТОРАЯ ПОЛОВИНА СТР. 18, КОТОРОЙ В ПРОЕКТЕ НЕ БЫЛО.
+    # Страница называет базу дважды. Из ЗАКРЫТОЙ строится уровень (стр. 23) — это ниже.
+    # А пока цена ВНУТРИ базы, страница даёт прямое торговое правило: «Цена ходит от
+    # одной границы к другой… - Если тренд восходящий, то флет торгуем от нижней границы
+    # до верхней ( Лонг ). - Если тренд нисходящий, то флет торгуем от верхней границы до
+    # нижней ( Шорт ). - Можно торговать в обе стороны, но первая позиция всегда берется
+    # по тренду.» Незакрытая структура жила в проекте одним потребителем — проверкой
+    # вымпела, — и это правило не исполнялось ничем.
+    out.append("")
+    out.append("ТОРГОВЛЯ ВО ФЛЭТЕ — база, из которой цена ЕЩЁ НЕ ВЫШЛА (стр. 18)")
+    flat_rows = 0
+    for tf in timeframes:
+        r = d.reads.get(tf)
+        if r is None or r.scan.open_tail is None:
+            continue
+        flat = r.scan.open_tail
+        tr = r.trend
+        trades = flat_trades(flat, tr.direction is TrendDirection.UP,
+                             tr.direction is TrendDirection.DOWN, tr.holds_for)
+        label = TF_LABEL.get(tf, tf)
+        if not trades:
+            # Молчание с НАЗВАННОЙ причиной (§4.3): своего правила для флэта без тренда
+            # стр. 18 не даёт, и выдумывать направление нельзя.
+            out.append(f"  {label:>3}  тренда нет — направление стр. 18 не задаёт, "
+                       f"границы {_num(flat.lower.edge)}…{_num(flat.upper.edge)}")
+            flat_rows += 1
+            continue
+        first, second = trades
+        out.append(
+            f"  {label:>3}  ПЕРВАЯ ПОЗИЦИЯ ПО ТРЕНДУ: {SIDE_LABEL[first.side.value]} "
+            f"от {_num(first.from_edge)} до {_num(first.to_edge)}"
+            f"  (тренд держится на {first.trend_holds_for})")
+        out.append(
+            f"       обратная сторона разрешена, но только ВТОРОЙ: "
+            f"{SIDE_LABEL[second.side.value]} от {_num(second.from_edge)} "
+            f"до {_num(second.to_edge)}")
+        out.append(
+            f"       база открыта {flat.bars_open} баров, касаний {flat.touches} "
+            f"(верх {flat.upper_touches} / низ {flat.lower_touches})"
+            + ("" if flat.is_clear else " — 6 точек не набрано, «чётко» по стр. 23 "
+                                        "не сказать"))
+        flat_rows += 1
+    if not flat_rows:
+        out.append("  незакрытых баз нет ни на одном ТФ — торговать во флэте нечего")
 
     out.append("")
     out.append("УРОВНИ (ПОК накоплений)")
