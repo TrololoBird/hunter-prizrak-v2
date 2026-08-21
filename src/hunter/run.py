@@ -1061,11 +1061,11 @@ def needed_days(
 
 def profile_windows(
     series: dict[str, list[Bar]], horizon_days: int,
-    intrabar_tf: str | None = None, frame_bars: int | None = None,
+    intrabar_tf: str | None = None, per_side: int = 0,
     symbol: str = "", detections: engine.Detections | None = None,
 ) -> tuple[list[tuple[int, int]], int, int, int, int]:
     """Окна структур, под которые нужен профиль.
-    Возвращает (окна, взято, отброшено, окон_старшего_ТФ, окон_вне_кадра).
+    Возвращает (окна, взято, отброшено_горизонтом, окон_старшего_ТФ, окон_далеко).
 
     ⚠ ОКНА, А НЕ СУТКИ. Прежний источник профиля (сделки) хранился суточными файлами,
     поэтому `find_gaps` отвечал множеством ДАТ. Свечи хранятся рядом по таймфрейму, и
@@ -1080,24 +1080,41 @@ def profile_windows(
     ступеней лестницы читают ряды, уже собранные засевом, — качать под них минутки
     значило платить за то, что профиль не прочитает; они СЧИТАЮТСЯ отдельно, а не молчат.
 
-    ⚠ `frame_bars` (там же, сборка по запросу): окно, чей конец старше `frame_bars`
-    баров своего ТФ, принадлежит структуре, чей уровень скрыл бы фильтр «у структуры», —
-    его профиль не прочитает никто. Тоже считается, а не молчит.
+    ⚠⚠ РАМКА ПОКАЗА (`frame_bars`) СНЯТА 2026-08-21, И ЭТО САМАЯ ДОРОГАЯ ПРАВКА СМЕНЫ.
+    Отбор окон шёл по ВОЗРАСТУ: окно, чей конец старше `frame_bars` баров своего ТФ,
+    отбрасывалось. Живой прогон доски напечатал `окон=1255, вне кадра=31639` — то есть
+    96.2% структур не получали свечей под профиль НИКОГДА. На 4ч рамка в 180 баров это
+    30 суток, на 1ч — 7.5, на 5м — пятнадцать ЧАСОВ.
 
-    ⚠ При заданном `frame_bars` отсечка ГОРИЗОНТОМ НЕ применяется (2026-08-18, разбор
-    ACE). Горизонт меряется СУТКАМИ и один на все ТФ, рамка — БАРАМИ СВОЕГО ТФ; для 1Н
-    180 суток — это 25 баров, а рамка ответа — 180. Двойная отсечка означала: уровни
-    строятся по рамке, а свечи под них качаются по горизонту, и недельные структуры
-    возрастом 26–180 недель честно отказывали «не покрыто свечами» — систематически и
-    только на старших ТФ. Потребитель у окон один (`levels` с той же рамкой), и резать
-    закачку вторым, более узким критерием значило кормить его отказами. Боевой прогон
-    (`frame_bars is None`) по-прежнему режется горизонтом: его охват — решение владельца
-    о цене, и менять его отсюда нельзя.
+    Сломано это было тем, что рамка отвечает на вопрос «что РИСОВАТЬ», а её применили к
+    вопросу «что СЧИТАТЬ» — две сущности под одним именем, тот самый дефект.
+
+    ЧЕМ ЭТО ИЗМЕРЕНО СНАРУЖИ КОДА. Владелец прислал разбор BTC от автора курса
+    (кадр 4ч, 21.08.2026): на нём 17 линий. Наша карточка того же часа давала 20, но
+    АКТИВНЫХ из них четыре — остальные отработаны или флипнуты. Четырёх линий автора
+    СВЕРХУ цены (79099.3, 79900.2, 80780.0, 82866.4) у нас не было ни одной: все они с
+    майской коробки, которая РЯДОМ С ЦЕНОЙ (79–82к при цене 77.4к), но СТАРАЯ, — и
+    рамка выбрасывала её по возрасту.
+
+    ⚠ ОТБОР ТЕПЕРЬ ПО БЛИЗОСТИ К ЦЕНЕ (`per_side`), и это тот же критерий, по которому
+    карту режет `levels._nearest_by_side`: приказ владельца 2026-08-21 «нам нужны лонг и
+    шорт уровни наиближайшие к текущей цене». Один критерий на закачку и на показ —
+    иначе качается одно, а показывается другое.
+
+    Расстояние меряется до БЛИЖНЕГО КРАЯ коробки структуры (`_box_gap`) — нижняя оценка
+    расстояния до будущего ПОК. Отбор от неё ПЕРЕбирает, но не НЕДОбирает.
+
+    ⚠ ОТСЕЧКА ГОРИЗОНТОМ теперь применяется ВСЕГДА, а не только в боевом прогоне: она
+    отвечает на другой вопрос (сколько истории вообще держим) и с близостью к цене не
+    конфликтует. Прежнее исключение существовало ради рамки, которой больше нет.
     """
     out: list[tuple[int, int]] = []
-    used = dropped = senior = out_of_frame = 0
+    used = dropped = senior = far = 0
     now = max((b[-1].open_ms for b in series.values() if b), default=0)
-    cut = now - horizon_days * 86_400_000 if frame_bars is None else 0
+    cut = now - horizon_days * 86_400_000 if horizon_days > 0 else 0
+    youngest = min((tf for tf in series if series.get(tf)),
+                   key=lambda tf: TIMEFRAME_MS[tf], default="")
+    price = series[youngest][-1].close if youngest else 0.0
     for tf, bars in series.items():
         if not bars:
             continue
@@ -1111,22 +1128,30 @@ def profile_windows(
             sw, scan = detections.get(symbol, tf, bars)
         if isinstance(sw, NotReady) or scan is None:
             continue
-        frame_lo = (bars[-1].open_ms - frame_bars * TIMEFRAME_MS[tf]
-                    if frame_bars is not None else None)
-        for acc in scan.closed:
+        boxes = scan.boxes(bars)
+        cand: list[tuple[float, int, tuple[int, int]]] = []
+        for i, acc in enumerate(scan.closed):
             lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
-            if hi < cut:
+            if cut and hi < cut:
                 dropped += 1
-                continue
-            if frame_lo is not None and hi < frame_lo:
-                out_of_frame += 1
                 continue
             if intrabar_tf is not None and intrabar_timeframe(hi - lo) != intrabar_tf:
                 senior += 1
                 continue
-            used += 1
-            out.append((lo, hi))
-    return out, used, dropped, senior, out_of_frame
+            box = boxes[i] if i < len(boxes) else None
+            cand.append((*_box_gap(box, price), (lo, hi)))
+        if per_side <= 0 or not price:
+            used += len(cand)
+            out.extend(w for _, _, w in cand)
+            continue
+        above = sorted((c for c in cand if c[1] > 0), key=lambda c: c[0])
+        below = sorted((c for c in cand if c[1] < 0), key=lambda c: c[0])
+        inside = [c for c in cand if c[1] == 0]
+        keep = inside + above[:per_side] + below[:per_side]
+        far += len(cand) - len(keep)
+        used += len(keep)
+        out.extend(w for _, _, w in keep)
+    return out, used, dropped, senior, far
 
 
 def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, int]]:
@@ -1146,9 +1171,33 @@ def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, 
     return out
 
 
+def _box_gap(box: tuple[float, float] | None, price: float) -> tuple[float, int]:
+    """Расстояние от цены до КОРОБКИ структуры и сторона: (зазор, +1/0/-1).
+
+    Зазор считается до БЛИЖНЕГО КРАЯ коробки, и это НИЖНЯЯ ОЦЕНКА расстояния до
+    будущего ПОК: ПОК лежит внутри коробки, значит он не ближе её края. Отбор по такой
+    оценке ПЕРЕбирает (оставит коробку, чей ПОК окажется дальше), но не может НЕДОбрать
+    — а недобор здесь означал бы молча потерянный уровень.
+
+    Коробка, внутри которой стоит цена, получает сторону 0 и не отбирается вовсе:
+    структура, где цена сейчас, нужна обеим сторонам.
+
+    Коробки нет (пустой отрезок структуры) — зазор бесконечный: такая структура уйдёт
+    в хвост отбора, а не притворится ближайшей.
+    """
+    if box is None:
+        return float("inf"), 1
+    lo, hi = box
+    if lo <= price <= hi:
+        return 0.0, 0
+    if lo > price:
+        return lo - price, 1
+    return price - hi, -1
+
+
 async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                                 horizon_days: int,
-                                frame_bars: int | None = None,
+                                per_side: int = 0,
                                 detections: engine.Detections | None = None) -> None:
     """Долить СВЕЧИ ПРОФИЛЯ под окна исторических структур.
 
@@ -1200,9 +1249,9 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
         # ⚠ Комментарий в `service.cycle` до сегодняшнего дня утверждал, что «внутри —
         # свой to_thread». Это было НЕВЕРНО: `to_thread` в этом модуле принадлежит
         # `backfill_from_archive` (старый добор сделок), а сюда его никто не ставил.
-        wins, used, dropped, _senior, out_of_frame = await asyncio.to_thread(
-            profile_windows, series, horizon_days, None, frame_bars, sym, detections)
-        report.profile_windows_out_of_frame += out_of_frame
+        wins, used, dropped, _senior, far = await asyncio.to_thread(
+            profile_windows, series, horizon_days, None, per_side, sym, detections)
+        report.profile_windows_far += far
         if not wins:
             # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
             # свечей, а без свечей — ни одного уровня; при этом в отчёте не оставалось
@@ -1211,9 +1260,9 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             # пропущенных было нечем. Причина у пустых окон ровно две, и они РАЗНЫЕ —
             # рядов нет вовсе против «структуры есть, но все вне кадра/горизонта», —
             # поэтому печатаются обе.
-            if out_of_frame:
-                log.info("профиль: все окна символа вне кадра ответа",
-                         символ=sym, окон_вне_кадра=out_of_frame)
+            if far:
+                log.info("профиль: все окна символа далеко от цены",
+                         символ=sym, окон_далеко=far)
                 continue
             report.profile_symbols_no_windows += 1
             log.degraded("профиль: окон структур нет — уровней у символа не будет",
@@ -1273,7 +1322,7 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
              символов_без_окон=report.profile_symbols_no_windows,
              символов_без_инструмента=report.profile_symbols_skipped,
              окон=report.profile_windows, отброшено_по_горизонту=report.profile_windows_dropped,
-             окон_вне_кадра=report.profile_windows_out_of_frame,
+             окон_далеко=report.profile_windows_far,
              участков_добрано=report.profile_spans_filled,
              добрано_по_тф=dict(sorted(report.profile_spans_by_tf.items())),
              участков_из_хранилища=report.profile_spans_cached,
@@ -2320,7 +2369,7 @@ CYCLE_FIELDS = (
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
     "backfill_missing_by_symbol",
     "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
-    "profile_windows_out_of_frame", "profile_spans_filled",
+    "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
 )
@@ -2678,7 +2727,7 @@ class Collector:
 
 async def collect(uni: Universe, seconds: int, seed_limit: int,
                   horizon_days: int = 90,
-                  frame_bars: int | None = None,
+                  per_side: int = 0,
                   ) -> tuple[RunReport, dict[str, TradeWindows], engine.Detections]:
     """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
 
@@ -2716,8 +2765,8 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         report = c.snapshot()
         # Долив архива — ПОСЛЕ наблюдения и до сборки карточки: без него окна
         # исторических структур не покрыты и уровней не бывает вовсе.
-        # `frame_bars` — кадр ответа сборки по запросу (2026-08-18): окна структур вне
-        # кадра не качаются, их уровни не строятся — фильтр «у структуры» их скрыл бы.
+        # `per_side` — сколько окон на сторону от цены качать (2026-08-21, замена
+        # рамки показа): тот же критерий, по которому режется карта уровней.
         detections = engine.Detections()
         # ⚠ ВСЕЛЕННАЯ БЕРЁТСЯ У СБОРЩИКА, А НЕ ИЗ АРГУМЕНТА. Раскрытие доски
         # (`expand_board`) происходит внутри `Collector.start`, и до 2026-08-21 здесь
@@ -2727,7 +2776,7 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         # есть 25 символов × 6 ТФ. Две вселенные под одним именем `uni`.
         uni = c.uni
         await backfill_profile_bars(c.ex, uni, report, horizon_days,
-                                    frame_bars=frame_bars, detections=detections)
+                                    per_side=per_side, detections=detections)
         # Источники строятся ДО закрытия соединения: им нужен `market_id` инструмента.
         # Сеть после этого не трогается — читается только хранилище баров на диске.
         sources = {sym: src for sym in uni.symbols
@@ -3039,7 +3088,8 @@ def print_report(r: RunReport) -> int:
     print(f"   окон структур: {r.profile_windows}, "
           f"старше горизонта отброшено: {r.profile_windows_dropped}, "
           f"символов пропущено: {r.profile_symbols_skipped}")
-    print(f"   окон вне кадра ответа: {r.profile_windows_out_of_frame}")
+    print(f"   окон далеко от цены (дальше {levels.LEVELS_PER_SIDE}-го по стороне): "
+          f"{r.profile_windows_far}")
     print(f"   участков: добрано у биржи {r.profile_spans_filled}, "
           f"взято из хранилища {r.profile_spans_cached}, "
           f"с отказом {r.profile_spans_failed}")

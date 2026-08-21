@@ -41,7 +41,7 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
-from . import clock, engine, log, run
+from . import clock, engine, levels, log, run
 from .config import Universe
 from .models import NotReady, RunReport, TradeWindows
 from .render import BARS_ON_CHART
@@ -178,7 +178,7 @@ async def cycle(c: run.Collector, run_id: str,
     detections = engine.Detections()
     back_t0 = clock.monotonic_ns()
     await run.backfill_profile_bars(c.ex, uni, report, horizon_days,
-                                    frame_bars=BARS_ON_CHART,
+                                    per_side=levels.LEVELS_PER_SIDE,
                                     detections=detections)
     # Источники строятся на цикле: им нужен `market_id` инструмента, а рынки живут на
     # объекте биржи, который задача перечитывания меняет именно здесь.

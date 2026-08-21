@@ -76,7 +76,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import FSInputFile, Message
 
-from . import clock, emit, engine, geometry, log, pereprior, run, service, store, swings
+from . import clock, emit, engine, geometry, levels, log, pereprior, run, service, store, swings
 from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, tf_ms
 from .card import TF_LABEL
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
@@ -674,14 +674,14 @@ class OnDemand:
         one = replace(self.uni, symbols=(symbol,))
         log.info("сборка по запросу начата", символ=symbol, горизонт_суток=self.horizon_days)
         try:
-            # ⚠ `frame_bars=BARS_ON_CHART` (2026-08-18, п. 3 приказа владельца): сборка
-            # по запросу не качает минутки и не строит уровни структур, чей конец старше
-            # кадра графика своего ТФ. ⚠ ФИЛЬТР ВОЗРАСТА СНЯТ 2026-08-21
-            # (основание — комментарий в `live_unique`). Прежний текст (та же
-            # рамка 180) всё равно скрыл бы их из ответа. Боевой прогон рамки не передаёт
-            # и строит всё: леджер считается по полной карте, а не по кадру ответа.
+            # ⚠ ОТБОР ОКОН ПРОФИЛЯ — ПО БЛИЗОСТИ К ЦЕНЕ, а не по возрасту (2026-08-21).
+            # Здесь стояло `frame_bars=BARS_ON_CHART`: сборка по запросу не качала свечи
+            # под структуры, чей конец старше кадра графика своего ТФ. Рамка отвечает на
+            # вопрос «что рисовать», а её применяли к «что считать» — разбор и числа в
+            # докстроке `run.profile_windows`. Ответ на запрос теперь берёт те же окна,
+            # что и боевой прогон, и расходиться им нечем.
             report, sources, detections = await run.collect(
-                one, 0, 0, self.horizon_days, frame_bars=BARS_ON_CHART)
+                one, 0, 0, self.horizon_days, per_side=levels.LEVELS_PER_SIDE)
         except (ccxt.BaseError, CapabilityMissing) as e:
             self.failed += 1
             log.degraded("сборка по запросу не удалась", символ=symbol,
