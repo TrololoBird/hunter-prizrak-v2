@@ -100,7 +100,7 @@ def _install_stop_handlers(stop: asyncio.Event) -> tuple[str, ...]:
     return tuple(installed)
 
 
-async def cycle(c: run.Collector, run_id: str, uni: Universe,
+async def cycle(c: run.Collector, run_id: str,
                 horizon_days: int) -> tuple[RunReport, int]:
     """Один цикл расчёта на снимке. Возвращает отчёт цикла и число нарушений.
 
@@ -114,6 +114,14 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
 
     Все шаги работают на СНИМКЕ (`report`, `sources`), а не на живых структурах сбора.
     """
+    # ⚠ ВСЕЛЕННАЯ У ЦИКЛА ОДНА, И ЕЁ ХОЗЯИН — СБОРЩИК. Здесь стоял параметр `uni`,
+    # приходивший из разбора аргументов, тогда как раскрытие доски (`run.expand_board`)
+    # происходит внутри `Collector.start`. Расходились они молча: засев шёл по раскрытой
+    # вселенной, а профиль, источники, расчёт, карточки и леджер — по исходной. Первый
+    # же прогон 2026-08-21 напечатал «засеяно рядов=290, символов=60» и следом «разбор
+    # рядов посчитано=150» — 25 символов на шесть ТФ вместо шестидесяти. Параметр убран
+    # НАСОВСЕМ, а не исправлен: пока их двое, они разойдутся снова.
+    uni = c.uni
     started = clock.monotonic_ns()
     c.report.cycles += 1
     # ⚠ СНИМОК ОБЯЗАН ОСТАТЬСЯ НА ЦИКЛЕ СОБЫТИЙ — это условие его правильности, а не
@@ -266,7 +274,7 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
             # печатается с типом и текстом. Остановка по сигналу (CancelledError)
             # проходит насквозь: это не сбой цикла, а приказ службе.
             try:
-                report, violations = await cycle(c, run_id, uni, horizon_days)
+                report, violations = await cycle(c, run_id, horizon_days)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
