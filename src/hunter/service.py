@@ -41,7 +41,7 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
-from . import clock, log, run
+from . import clock, engine, log, run
 from .config import Universe
 from .models import RunReport, TradeWindows
 from .render import BARS_ON_CHART
@@ -141,8 +141,15 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
     # не снимать рамку и не оставлять её навсегда, а перестать пересчитывать структуры,
     # чей уровень УЖЕ отработан по стр. 25 (`resolve_carried`): тогда докачивать надо
     # только новое, и рамка станет не нужна ни здесь, ни где-либо ещё.
+    # ⚠ ОДИН РАЗБОР НА ЦИКЛ (2026-08-21). Свинги и структуры нужны ОБОИМ шагам —
+    # добору (какие окна качать) и расчёту (`read_series`), — и до этой правки каждый
+    # считал их сам по тем же барам. Замер живой службы: `backfill 673563 мс,
+    # decide 1323297 мс`, из них около 460 с на цикл вселенной уходило ровно на второй
+    # разбор. Переносчик живёт РОВНО этот цикл и умирает вместе с ним.
+    detections = engine.Detections()
     await run.backfill_profile_bars(c.ex, uni, report, horizon_days,
-                                    frame_bars=BARS_ON_CHART)
+                                    frame_bars=BARS_ON_CHART,
+                                    detections=detections)
     # Источники строятся на цикле: им нужен `market_id` инструмента, а рынки живут на
     # объекте биржи, который задача перечитывания меняет именно здесь.
     sources: dict[str, TradeWindows] = {
@@ -176,8 +183,10 @@ async def cycle(c: run.Collector, run_id: str, uni: Universe,
     # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
     t_decide = clock.monotonic_ns()
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
-                                      frame_bars=BARS_ON_CHART)
+                                      BARS_ON_CHART, detections)
     report.stage_ms["decide"] = int((clock.monotonic_ns() - t_decide) / 1e6)
+    log.info("разбор рядов переиспользован", попаданий=detections.hits,
+             посчитано=detections.misses)
     await stage("cards", run.produce_cards, run_id, report, uni, decided)
     await stage("source", run.persist_source, run_id, report, sources)
     await stage("record", run.record, run_id, report, uni, decided)

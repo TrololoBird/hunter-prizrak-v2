@@ -256,13 +256,73 @@ class SymbolDecision(BaseModel):
         return emit.tf_balance(self.emissions)
 
 
+class Detections:
+    """Свинги и структуры, посчитанные ОДИН раз на цикл и отданные обоим потребителям.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-21 ПО ЗАМЕРУ ЖИВОЙ СЛУЖБЫ. Цикл расчёта считал одно и то же
+    ДВАЖДЫ, и это видно по стадиям приёмки: `backfill 673563 мс, decide 1323297 мс`.
+    Внутри добора `profile_windows` вызывает `swings.detect` и `trading_range.detect`
+    по каждому ТФ, чтобы узнать окна структур; следом `decide` → `read_series` считает
+    ТО ЖЕ САМОЕ по тем же барам. Профиль BTC: 8.5 с на символ в доборе плюс ~10 с в
+    расчёте, то есть около 460 с на цикл вселенной — вчетверо больше, чем весь шаг
+    записи в леджер.
+
+    ⚠ ОТПЕЧАТОК РЯДА ПРОВЕРЯЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. Ключ несёт символ, ТФ, длину
+    ряда и его края. Не совпало — считаем заново, а не отдаём чужое. Это то же условие,
+    что у `TradingRange.box`, и оно здесь важнее: между добором и расчётом лежит
+    закачка, и ряд между ними в принципе может измениться. Тогда память промахнётся и
+    пересчитает — то есть худшее, что может случиться, это потерянная экономия, а не
+    подменённый ответ.
+
+    ⚠ ЖИВЁТ ОДИН ЦИКЛ. Объект создаётся в `service.cycle` и умирает вместе с ним;
+    глобального кэша здесь нет сознательно — он копил бы ряды всех прошедших циклов и
+    стал бы утечкой того же класса, из-за которой заведён `keep_bars`.
+    """
+
+    __slots__ = ("_memo", "hits", "misses")
+
+    def __init__(self) -> None:
+        self._memo: dict[
+            tuple[str, str, int, int, int],
+            tuple[SwingSet | NotReady, RangeScan | None],
+        ] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, symbol: str, timeframe: str,
+            bars: list[Bar]) -> tuple[SwingSet | NotReady, RangeScan | None]:
+        """Свинги и структуры ряда. `NotReady` кэшируется наравне с ответом.
+
+        Отказ — такой же результат прохода, как и успех, и пересчитывать его на втором
+        потребителе значит платить за то же самое второй раз. `RangeScan` при отказе
+        свингов равен `None`: структур без свингов не бывает.
+        """
+        key = (symbol, timeframe, len(bars),
+               bars[0].open_ms if bars else 0, bars[-1].open_ms if bars else 0)
+        got = self._memo.get(key)
+        if got is None:
+            self.misses += 1
+            sw = swings.detect(bars)
+            scan = None if isinstance(sw, NotReady) else detect_ranges(bars, sw, timeframe)
+            got = self._memo[key] = (sw, scan)
+        else:
+            self.hits += 1
+        return got
+
+
 def read_series(
-    series: dict[str, list[Bar]], timeframes: tuple[str, ...]
+    series: dict[str, list[Bar]], timeframes: tuple[str, ...],
+    *, symbol: str = "", detections: Detections | None = None,
 ) -> tuple[dict[str, SeriesRead], tuple[Unbuilt, ...]]:
     """Свинги, структуры и тренд по каждому ТФ. Один проход, один результат.
 
     ТФ без кадров и ТФ со слишком коротким рядом возвращаются НАЗВАННЫМИ (§4.3), а не
     молча выпадают: карточка обязана напечатать причину, а не просто не показать строку.
+
+    `detections` — разбор, уже сделанный ДОБОРОМ в этом же цикле (см. `Detections`).
+    Умолчание `None` оставлено намеренно: без него каждый вызов из зондов и старого кода
+    требовал бы сначала собрать переносчик, а поведение при этом ТО ЖЕ — просто разбор
+    считается здесь. Отличается только цена.
     """
     reads: dict[str, SeriesRead] = {}
     bad: list[Unbuilt] = []
@@ -271,11 +331,25 @@ def read_series(
         if not bars:
             bad.append(Unbuilt(timeframe=tf, index=None, reason="кадров нет"))
             continue
-        sw = swings.detect(bars)
-        if isinstance(sw, NotReady):
-            bad.append(Unbuilt(timeframe=tf, index=None, reason=sw.reason))
+        got: SwingSet | NotReady
+        maybe_scan: RangeScan | None
+        if detections is None:
+            got = swings.detect(bars)
+            maybe_scan = None if isinstance(got, NotReady) else detect_ranges(bars, got, tf)
+        else:
+            got, maybe_scan = detections.get(symbol, tf, bars)
+        if isinstance(got, NotReady):
+            bad.append(Unbuilt(timeframe=tf, index=None, reason=got.reason))
             continue
-        scan = detect_ranges(bars, sw, tf)
+        if maybe_scan is None:
+            # Недостижимо по построению `Detections.get`, но проверяется, а не
+            # утверждается: `assert` вырезается ключом `-O`, а отказ обязан быть НАЗВАН
+            # (§4.3), а не превратиться в `AttributeError` этажом ниже.
+            bad.append(Unbuilt(timeframe=tf, index=None,
+                               reason="свинги есть, а разбора структур нет — "
+                                      "переносчик разбора отдал неполную пару"))
+            continue
+        sw, scan = got, maybe_scan
         every = pereprior.detect_all(bars, sw, tf)
         # `detect` — это «последний ПП каждой стороны» из того же прохода; берём его
         # отсюда, чтобы бары не сканировались дважды и чтобы два поля не разошлись.
@@ -363,6 +437,7 @@ def decide(
     trades: TradeWindows | None,
     timeframes: tuple[str, ...],
     frame_bars: int | None = None,
+    detections: Detections | None = None,
 ) -> SymbolDecision:
     """Кадры → решение. Единственная точка, где считается сигнал.
 
@@ -377,7 +452,7 @@ def decide(
     Каждый шаг зовётся РОВНО ОДИН раз. Геометрия — только для эмитируемых.
     """
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
-    reads, unreadable = read_series(series, tfs)
+    reads, unreadable = read_series(series, tfs, symbol=symbol, detections=detections)
     scans = {tf: r.scan for tf, r in reads.items()}
     # `frame_bars` — рамка кадра ответа для сборки по запросу (2026-08-18, п. 3 приказа
     # владельца); боевой прогон передаёт None и строит всё — смысл в `levels.build_all`.

@@ -126,7 +126,7 @@ def _run(args: argparse.Namespace) -> int:
             report.stage_ms[name] = int((time.perf_counter() - t0) * 1000)
 
     t_collect = time.perf_counter()
-    report, sources = asyncio.run(
+    report, sources, detections = asyncio.run(
         collect(uni, args.seconds, args.seed_limit, args.horizon_days)
     )
     report.stage_ms["collect"] = int((time.perf_counter() - t_collect) * 1000)
@@ -134,7 +134,9 @@ def _run(args: argparse.Namespace) -> int:
     # СИГНАЛ СЧИТАЕТСЯ ОДИН РАЗ и отдаётся обоим потребителям — карточке и леджеру.
     # До 2026-08-06 каждый считал его сам, и они расходились: карточка печатала
     # геометрию для 94 уровней, леджер эмитировал 33 (замер на кадрах прогона `a1`).
-    decided = _stage("decide", lambda: decide_once(report, uni, sources))
+    decided = _stage("decide",
+                     lambda: decide_once(report, uni, sources,
+                                         detections=detections))
     _stage("cards", lambda: produce_cards(args.run_id, report, uni, decided))
     # Данные источника профиля кладутся ПОСЛЕ карточек. Без них повтор читает общее
     # хранилище и объявляет «расчёт изменился» на доливке (Н-6, рецидив 2026-08-18).

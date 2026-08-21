@@ -251,7 +251,8 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     # Здесь нужен ТОЛЬКО сбор: `check` отвечает на вопрос «живы ли данные», карточки и
     # леджер к нему отношения не имеют. До разделения конвейера отделить одно от другого
     # было нельзя, и проверка состояния попутно писала в боевую базу.
-    report, _sources = asyncio.run(collect(uni, seconds, seed_limit, horizon_days=0))
+    report, _sources, _det = asyncio.run(
+        collect(uni, seconds, seed_limit, horizon_days=0))
     lines = _report_live(report)
 
     # ⚠ ЗАПАДАНИЕ ПЕЧАТАЕТСЯ ЗДЕСЬ ЖЕ (2026-08-21, задание Т-0). Жалоба владельца — «у

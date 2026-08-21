@@ -808,6 +808,7 @@ def needed_days(
 def profile_windows(
     series: dict[str, list[Bar]], horizon_days: int,
     intrabar_tf: str | None = None, frame_bars: int | None = None,
+    *, symbol: str = "", detections: engine.Detections | None = None,
 ) -> tuple[list[tuple[int, int]], int, int, int, int]:
     """Окна структур, под которые нужен профиль.
     Возвращает (окна, взято, отброшено, окон_старшего_ТФ, окон_вне_кадра).
@@ -846,12 +847,19 @@ def profile_windows(
     for tf, bars in series.items():
         if not bars:
             continue
-        sw = detect_swings(bars)
-        if isinstance(sw, NotReady):
+        # ⚠ РАЗБОР БЕРЁТСЯ ИЗ ПЕРЕНОСЧИКА С 2026-08-21, а не считается здесь заново.
+        # Тот же разбор нужен `engine.read_series` десятью минутами позже в том же
+        # цикле, и до этой правки он считался ДВАЖДЫ — см. докстроку `engine.Detections`.
+        if detections is None:
+            sw = detect_swings(bars)
+            scan = None if isinstance(sw, NotReady) else detect_ranges(bars, sw, tf)
+        else:
+            sw, scan = detections.get(symbol, tf, bars)
+        if isinstance(sw, NotReady) or scan is None:
             continue
         frame_lo = (bars[-1].open_ms - frame_bars * TIMEFRAME_MS[tf]
                     if frame_bars is not None else None)
-        for acc in detect_ranges(bars, sw, tf).closed:
+        for acc in scan.closed:
             lo, hi = levels.structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
             if hi < cut:
                 dropped += 1
@@ -886,7 +894,8 @@ def merge_windows(spans: list[tuple[int, int]], gap_ms: int) -> list[tuple[int, 
 
 async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
                                 horizon_days: int,
-                                frame_bars: int | None = None) -> None:
+                                frame_bars: int | None = None,
+                                detections: engine.Detections | None = None) -> None:
     """Долить СВЕЧИ ПРОФИЛЯ под окна исторических структур.
 
     ⚠ ЗАМЕНА `backfill_trades` С 2026-08-12 (решение владельца: «меняй транспорт на
@@ -929,7 +938,8 @@ async def backfill_profile_bars(ex: Exchange, uni: Universe, report: RunReport,
             continue
         series = bars_of(report, sym)
         wins, used, dropped, _senior, out_of_frame = profile_windows(
-            series, horizon_days, frame_bars=frame_bars)
+            series, horizon_days, frame_bars=frame_bars,
+            symbol=sym, detections=detections)
         report.profile_windows_out_of_frame += out_of_frame
         if not wins:
             # ⚠ ЗДЕСЬ СТОЯЛ МОЛЧАЛИВЫЙ `continue`. Символ без окон профиля не получает
@@ -1465,7 +1475,9 @@ def explained_gaps(st: SeriesState) -> tuple[tuple[int, int], ...]:
 
 def decide_once(report: RunReport, uni: Universe,
                 sources: dict[str, TradeWindows],
-                frame_bars: int | None = None) -> dict[str, engine.SymbolDecision]:
+                frame_bars: int | None = None,
+                detections: engine.Detections | None = None,
+                ) -> dict[str, engine.SymbolDecision]:
     """ШАГ 2 из четырёх: посчитать сигнал. ОДИН раз на символ, для обоих потребителей.
 
     ⚠ Заменил `build_levels_once` 2026-08-06. Тот считал один раз только УРОВНИ (находка
@@ -1486,7 +1498,7 @@ def decide_once(report: RunReport, uni: Universe,
         if not series:
             continue
         out[sym] = engine.decide(sym, series, sources.get(sym), tfs,
-                                 frame_bars=frame_bars)
+                                 frame_bars=frame_bars, detections=detections)
     # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
     # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
     # такой», пока их не сложили). До 2026-08-18 счётчик `windows_refused` у `TVWindows`
@@ -2273,7 +2285,7 @@ class Collector:
 async def collect(uni: Universe, seconds: int, seed_limit: int,
                   horizon_days: int = 90,
                   frame_bars: int | None = None,
-                  ) -> tuple[RunReport, dict[str, TradeWindows]]:
+                  ) -> tuple[RunReport, dict[str, TradeWindows], engine.Detections]:
     """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
 
     Возвращает отчёт и источники профиля. Сеть трогается только здесь — дальше три шага
@@ -2312,8 +2324,9 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
         # исторических структур не покрыты и уровней не бывает вовсе.
         # `frame_bars` — кадр ответа сборки по запросу (2026-08-18): окна структур вне
         # кадра не качаются, их уровни не строятся — фильтр «у структуры» их скрыл бы.
+        detections = engine.Detections()
         await backfill_profile_bars(c.ex, uni, report, horizon_days,
-                                    frame_bars=frame_bars)
+                                    frame_bars=frame_bars, detections=detections)
         # Источники строятся ДО закрытия соединения: им нужен `market_id` инструмента.
         # Сеть после этого не трогается — читается только хранилище баров на диске.
         sources = {sym: src for sym in uni.symbols
@@ -2325,7 +2338,12 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
     report.watch_deaths = c.report.watch_deaths
     report.watch_restarts = c.report.watch_restarts
     report.watch_failures = list(c.report.watch_failures)
-    return report, sources
+    # ⚠ ПЕРЕНОСЧИК РАЗБОРА ОТДАЁТСЯ НАРУЖУ, а не умирает здесь (2026-08-21). Добор уже
+    # разобрал ряды на свинги и структуры; шаг `decide_once` разберёт их ЗАНОВО, если
+    # не получить это. В службе оба шага стоят в одной функции и переносчик виден им
+    # обоим, а в пакетном пути они разнесены по разным вызовам — значит он обязан
+    # пройти через возврат, иначе экономия есть только у одного из двух потребителей.
+    return report, sources, detections
 
 
 OUTCOME_LABEL = {

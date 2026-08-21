@@ -676,15 +676,18 @@ class OnDemand:
             # (основание — комментарий в `live_unique`). Прежний текст (та же
             # рамка 180) всё равно скрыл бы их из ответа. Боевой прогон рамки не передаёт
             # и строит всё: леджер считается по полной карте, а не по кадру ответа.
-            report, sources = await run.collect(one, 0, 0, self.horizon_days,
-                                                frame_bars=BARS_ON_CHART)
+            report, sources, detections = await run.collect(
+                one, 0, 0, self.horizon_days, frame_bars=BARS_ON_CHART)
         except (ccxt.BaseError, CapabilityMissing) as e:
             self.failed += 1
             log.degraded("сборка по запросу не удалась", символ=symbol,
                          причина=f"{type(e).__name__} {e}")
             return NotReady(reason=f"{symbol}: данные не собраны ({type(e).__name__})")
+        # Разбор рядов сделан внутри `collect` — сюда он приходит готовым, а не
+        # считается заново (2026-08-21, `engine.Detections`). Сборка ОДНОГО символа по
+        # запросу занимала до 316 с, и половина её уходила ровно на второй разбор.
         decided = await asyncio.to_thread(run.decide_once, report, one, sources,
-                                          BARS_ON_CHART)
+                                          BARS_ON_CHART, detections)
         got = decided.get(symbol)
         if got is None:
             self.failed += 1
