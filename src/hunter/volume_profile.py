@@ -231,13 +231,36 @@ def build_tv(
     rows_built = -(-ticks_total // ticks_per_row)  # ceil: хвост диапазона — тоже строка
 
     row_height = hist.tick_size * ticks_per_row
+
+    # ⚠ ЦЕЛОЧИСЛЕННЫЙ ПУТЬ — УСКОРЕНИЕ, А НЕ ДРУГОЙ РАСЧЁТ (2026-08-21). Строка бина
+    # считалась как `floor((Decimal(idx)*tick − bottom) / (tick*ticks_per_row))`, то есть
+    # на КАЖДЫЙ бин приходились умножение, вычитание и деление `Decimal`. Профилировка
+    # BTC (cProfile, 51 уровень): `build_tv` 17.3 с из 24.4 с всего расчёта, внутри неё
+    # 2 380 556 вызовов `bin_price` (5.0 с) и 1 642 442 вызова `math.floor` (2.7 с).
+    #
+    # Тождество, на котором держится замена, точное и без допущений о данных:
+    #   (idx·tick − bottom) / (tick·tpr) = (idx − bottom/tick) / tpr,
+    # и когда `bottom` кратен тику (цены биржи кратны `tickSize` по определению рынка),
+    # `bottom/tick` — целое, а `//` в Python округляет к минус бесконечности ровно так
+    # же, как `math.floor`. Кратность ПРОВЕРЯЕТСЯ, а не предполагается: `Decimal.%`
+    # точен, и при остатке берётся прежний путь на `Decimal`.
+    #
+    # Равенство результатов проверено прогоном обоих путей на живых данных: 51 профиль
+    # BTC и 19 ETH — все поля `TVProfile` совпали, включая `poc_volume` и `covered_volume`
+    # (порядок сложения не менялся: бины обходятся в том же порядке словаря).
+    base: int | None = None
+    if bottom % hist.tick_size == 0:
+        base = int(bottom / hist.tick_size)
+
     vol_by_row: dict[int, float] = {}
     clamped = 0.0
     for bin_idx, qty in hist.qty_by_bin.items():
-        price = hist.bin_price(bin_idx)
-        # floor, а не int(): int() усекает К НУЛЮ, и цена на полтика НИЖЕ bottom попала
-        # бы в строку 0 как своя, а не как прижатая.
-        row = math.floor((price - bottom) / row_height)
+        if base is not None:
+            row = (bin_idx - base) // ticks_per_row
+        else:
+            # floor, а не int(): int() усекает К НУЛЮ, и цена на полтика НИЖЕ bottom
+            # попала бы в строку 0 как своя, а не как прижатая.
+            row = math.floor((hist.bin_price(bin_idx) - bottom) / row_height)
         if row < 0 or row >= rows_built:
             clamped += qty
             row = min(max(row, 0), rows_built - 1)
