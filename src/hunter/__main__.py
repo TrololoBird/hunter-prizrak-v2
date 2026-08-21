@@ -90,13 +90,14 @@ HORIZON_DAYS = 180
 def _run(args: argparse.Namespace) -> int:
     uni = load_universe(args.universe)
     if args.symbols:
-        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
-        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
-        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
-        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
-        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
-        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
-        uni = replace(uni, symbols=uni.symbols[: args.symbols])
+        # ⚠ ПОТОЛОК, А НЕ СРЕЗ СПИСКА, и это второе исправление одной и той же ручки.
+        # Первое (2026-08-11): сборка `Universe(uni.symbols[:n], uni.timeframes,
+        # uni.source)` МОЛЧА теряла `venue` и `profile_timeframe` — дефект ждал первой
+        # правки конфигурации, чтобы `--symbols N` начал считать ДРУГОЙ рынок.
+        # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
+        # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
+        # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
+        uni = replace(uni, cap=args.symbols)
     from . import log
     from .run import (
         collect,
@@ -158,13 +159,14 @@ def _serve(args: argparse.Namespace) -> int:
 
     uni = load_universe(args.universe)
     if args.symbols:
-        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
-        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
-        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
-        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
-        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
-        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
-        uni = replace(uni, symbols=uni.symbols[: args.symbols])
+        # ⚠ ПОТОЛОК, А НЕ СРЕЗ СПИСКА, и это второе исправление одной и той же ручки.
+        # Первое (2026-08-11): сборка `Universe(uni.symbols[:n], uni.timeframes,
+        # uni.source)` МОЛЧА теряла `venue` и `profile_timeframe` — дефект ждал первой
+        # правки конфигурации, чтобы `--symbols N` начал считать ДРУГОЙ рынок.
+        # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
+        # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
+        # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
+        uni = replace(uni, cap=args.symbols)
     bad = asyncio.run(serve(uni, args.seed_limit, args.horizon_days, args.run_id,
                             cycle_seconds=args.cycle_seconds, max_cycles=args.cycles))
     return 1 if bad else 0
@@ -176,13 +178,14 @@ def _check(args: argparse.Namespace) -> int:
 
     uni = load_universe(args.universe)
     if args.symbols:
-        # ⚠ `replace`, а не сборка нового `Universe` из трёх полей. Прежняя редакция
-        # писала `Universe(uni.symbols[:n], uni.timeframes, uni.source)` и МОЛЧА теряла
-        # `venue` и `profile_timeframe`: оба брались из умолчаний класса. Пока в
-        # конфигурации стоят ровно умолчания (`binanceusdm`, `1m`), разницы нет — то есть
-        # дефект ждал первой же правки конфигурации, чтобы `--symbols N` начал считать
-        # ДРУГОЙ рынок другим профилем, ничего об этом не сказав.
-        uni = replace(uni, symbols=uni.symbols[: args.symbols])
+        # ⚠ ПОТОЛОК, А НЕ СРЕЗ СПИСКА, и это второе исправление одной и той же ручки.
+        # Первое (2026-08-11): сборка `Universe(uni.symbols[:n], uni.timeframes,
+        # uni.source)` МОЛЧА теряла `venue` и `profile_timeframe` — дефект ждал первой
+        # правки конфигурации, чтобы `--symbols N` начал считать ДРУГОЙ рынок.
+        # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
+        # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
+        # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
+        uni = replace(uni, cap=args.symbols)
     return 1 if run_check(uni, args.seconds, args.seed_limit) else 0
 
 

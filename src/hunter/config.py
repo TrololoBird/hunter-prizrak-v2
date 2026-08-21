@@ -62,6 +62,39 @@ class Universe:
     неверный стоп.
     """
 
+    cap: int = 0
+    """Потолок числа символов — ручка ОПЕРАТОРА (`--symbols N`), ноль = без потолка.
+
+    ⚠ ЗАВЕДЕНО, ПОТОМУ ЧТО ПРЕЖНЯЯ РУЧКА УМЕРЛА БЫ МОЛЧА. `--symbols N` резал
+    `uni.symbols[:N]` в разборе аргументов — то есть ДО того, как `run.expand_board`
+    спросит у биржи всю доску и вернёт 696 обратно. Тормоз остался бы в справке и
+    перестал бы тормозить: ровно тот дефект, из-за которого удалены `bars_per_timeframe`
+    и `admission_required_bars`. Потолок применяется ПОСЛЕ раскрытия, там же, где
+    известен окончательный порядок символов.
+
+    ⚠ Ключом TOML НЕ является (см. `_known_keys`): это ручка запуска, а не свойство
+    вселенной. В файле её место заняло бы решение, которое обязано быть видно в команде.
+    """
+
+    board_contracts: tuple[str, ...] = ()
+    """Какие РОДА КОНТРАКТОВ пускать на доску. Пусто = доска выключена.
+
+    ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-21, дословно: «конечно только крипта! золото и серебро это
+    исключение!». Сказано в ответ на состав доски: из 696 активных бессрочных
+    binanceusdm крипта 525, акции США 137, Гонконг 12, Корея 8, Китай 2, товарные 8,
+    доIPOшные 2 (ANTHROPIC, OPENAI).
+
+    Значение сверяется с полем `contractType` в ответе биржи, а не с видом символа:
+    `PERPETUAL` — крипта (525 монет плюс индексы BTCDOM и ALL), `TRADIFI_PERPETUAL` —
+    всё остальное, от AAPL до нефти.
+
+    ⚠ ИСКЛЮЧЕНИЯ ВЛАДЕЛЬЦА ОТДЕЛЬНОГО КЛЮЧА НЕ ТРЕБУЮТ, и это не экономия, а свойство
+    устройства: ЯДРО (`symbols`) попадает во вселенную ВСЕГДА, мимо фильтра. XAU и XAG
+    в ядре с 2026-08-18, значит золото и серебро остаются просто потому, что владелец
+    их туда и вписал. Второй список исключений был бы второй сущностью под тем же
+    смыслом — и разошёлся бы с первым в первый же день.
+    """
+
     core: frozenset[str] = frozenset()
     """Символы, считаемые ПОЛНОЙ лестницей. Пишет загрузчик и `run.expand_board`.
 
@@ -121,9 +154,9 @@ def _known_keys(cls: type) -> frozenset[str]:
     Выводится из полей, а не переписывается руками: рукописный список разошёлся бы с
     датаклассом молча — тот же дефект, от которого защищает `_reject_unknown`.
 
-    ⚠ `core` исключён по той же причине, что и `source`: оператор его не задаёт — он
-    выводится из `symbols` ДО раскрытия доски (`Universe.core`)."""
-    return frozenset(f.name for f in fields(cls)) - {"source", "core"}
+    ⚠ `core` и `cap` исключены по той же причине, что и `source`: в файле их нет.
+    `core` выводится из `symbols` до раскрытия доски, `cap` приходит из `--symbols`."""
+    return frozenset(f.name for f in fields(cls)) - {"source", "core", "cap"}
 
 
 def _reject_unknown_sections(data: Mapping[str, object], known: str, path: Path) -> None:
@@ -194,6 +227,17 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
         raise ValueError(
             f"{path}: board_timeframes {extra} нет в timeframes {list(timeframes)}; "
             f"лестница доски обязана быть подмножеством лестницы ядра")
+    board_contracts = tuple(section.get("board_contracts", ()))
+    if any(not isinstance(c, str) or not c for c in board_contracts):
+        raise ValueError(f"{path}: board_contracts обязан быть списком непустых строк")
+    if board and not board_contracts:
+        raise ValueError(
+            f"{path}: board=true без board_contracts — на доску пошли бы ВСЕ рынки "
+            f"площадки, включая акции и товарные (167 из 696 на binanceusdm). "
+            f"Владелец 2026-08-21: «конечно только крипта»")
+    if board_contracts and not board:
+        raise ValueError(
+            f"{path}: board_contracts задан, а board=false — ключ не читался бы никем")
     if board and not board_tfs:
         raise ValueError(
             f"{path}: board=true без board_timeframes — доска считалась бы ПОЛНОЙ "
@@ -204,8 +248,14 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
             f"{path}: board_timeframes задан, а board=false — ключ не читался бы никем. "
             f"Это тот же мёртвый ключ, что bars_per_timeframe и admission_required_bars")
 
-    return Universe(tuple(symbols), tuple(timeframes), path, venue, board, board_tfs,
-                    frozenset(symbols), profile_tf)
+    # ⚠ ПО ИМЕНАМ, А НЕ ПО ПОРЯДКУ. Позиционный вызов уже сломался 2026-08-21, когда
+    # между `board_timeframes` и `core` появилось поле `cap`: `frozenset` уехал в
+    # целочисленный потолок. Поймал mypy, а не прогон, — и только потому, что типы
+    # оказались разными; два соседних поля одного типа разъехались бы МОЛЧА.
+    return Universe(symbols=tuple(symbols), timeframes=tuple(timeframes), source=path,
+                    venue=venue, board=board, board_timeframes=board_tfs,
+                    board_contracts=board_contracts,
+                    core=frozenset(symbols), profile_timeframe=profile_tf)
 
 
 @dataclass(frozen=True, slots=True)

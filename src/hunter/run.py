@@ -112,12 +112,12 @@ async def expand_board(ex: Exchange, uni: Universe) -> Universe:
     потеря порядка выглядела бы как «биржа так отдала».
     """
     if not uni.board:
-        return uni
-    everything = ex.board_symbols(uni.symbols)
+        return _capped(uni)
+    everything = ex.board_symbols(uni.symbols, uni.board_contracts)
     if not everything:
         log.degraded("доска пуста — вселенная осталась ядром",
                      площадка=uni.venue, тип=ex.venue.market_type, ядро=len(uni.symbols))
-        return uni
+        return _capped(uni)
 
     turnover: dict[str, float] = {}
     got = await ex.fetch_tickers(None)
@@ -127,25 +127,41 @@ async def expand_board(ex: Exchange, uni: Universe) -> Universe:
     else:
         turnover = {s: t.quote_volume for s, t in got.items()}
 
-    # Ядро сохраняет порядок оператора; хвост доски — по обороту вниз, при равенстве и
-    # при отсутствии тикера — по имени, чтобы порядок был воспроизводим.
-    core = [s for s in uni.symbols if s in everything]
-    lost = [s for s in uni.symbols if s not in everything]
+    # ⚠ ЯДРО ИДЁТ ЦЕЛИКОМ И МИМО ФИЛЬТРА. Именно здесь живут исключения владельца:
+    # XAU и XAG — товарные бессрочные, фильтр «только крипта» их не пропускает, а ядро
+    # пропускает, потому что владелец вписал их в `symbols` 2026-08-18. Отдельного
+    # списка исключений поэтому не существует, и разойтись двум спискам негде.
+    # Символ ядра, которого на площадке нет вовсе, тоже НЕ выбрасывается: его судьбу
+    # решает `check_symbols` сразу после раскрытия, и он обязан дойти туда живым.
+    core = list(uni.symbols)
     rest = sorted(set(everything) - set(core),
                   key=lambda s: (-turnover.get(s, 0.0), s))
     no_turnover = sum(1 for s in rest if s not in turnover)
 
-    if lost:
-        # Символ ядра, которого на доске нет, НЕ выбрасывается: его судьбу решает
-        # `check_symbols`, и он обязан дойти туда, а не исчезнуть здесь молча.
-        log.degraded("символы ядра вне доски площадки — оставлены как есть",
-                     сколько=len(lost), примеры="; ".join(lost[:3]), площадка=uni.venue)
-    log.info("доска раскрыта", всего=len(core) + len(lost) + len(rest),
+    log.info("доска раскрыта", всего=len(core) + len(rest),
              ядро=len(core), добавлено=len(rest), без_оборота=no_turnover,
+             род="/".join(uni.board_contracts) or "любой",
              лестница_ядра="/".join(uni.timeframes),
              лестница_доски="/".join(uni.board_timeframes),
              верх_доски="; ".join(s.split("/")[0] for s in rest[:5]))
-    return replace(uni, symbols=tuple(core) + tuple(lost) + tuple(rest))
+    return _capped(replace(uni, symbols=tuple(core) + tuple(rest)))
+
+
+def _capped(uni: Universe) -> Universe:
+    """Потолок `--symbols N`, применённый ПОСЛЕ раскрытия доски. Ноль — без потолка.
+
+    ⚠ ЯДРО УРЕЗАЕТСЯ ВМЕСТЕ С ВСЕЛЕННОЙ. Оставить `core` прежним значило бы, что
+    `ladder()` обещает полную лестницу символам, которых в `symbols` уже нет: карта
+    ссылалась бы на ряды, которых никто не собирал. Прежняя редакция ручки резала
+    `symbols` и `core` не трогала — сегодня это безвредно только потому, что при
+    выключенной доске `ladder` не смотрит на `core` вовсе.
+    """
+    if uni.cap <= 0 or uni.cap >= len(uni.symbols):
+        return uni
+    kept = uni.symbols[: uni.cap]
+    log.info("потолок символов", взято=len(kept), было=len(uni.symbols),
+             ядра_в_потолке=sum(1 for s in kept if s in uni.core))
+    return replace(uni, symbols=kept, core=uni.core & set(kept))
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,

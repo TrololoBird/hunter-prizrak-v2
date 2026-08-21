@@ -1468,7 +1468,8 @@ class Exchange:
         """ccxt-символ → идентификатор биржи (BTCUSDT). Нужен для архива."""
         return {sym: str(mk.get("id")) for sym, mk in self._ex.markets.items()}
 
-    def board_symbols(self, like: tuple[str, ...]) -> tuple[str, ...]:
+    def board_symbols(self, like: tuple[str, ...],
+                      contracts: tuple[str, ...] = ()) -> tuple[str, ...]:
         """ВСЯ ДОСКА площадки: рынки того же рода, что и образцы `like`.
 
         Приказ владельца 2026-08-21: «всю доску, 696». Отвечает на вопрос «какие вообще
@@ -1490,6 +1491,16 @@ class Exchange:
         `features`). Здесь оно допустимо: это отсев заведомо мёртвых рынков ДО вызовов,
         а не утверждение, что остальные работают. Настоящую проверку делает первый же
         запрос баров, и его отказ называется поимённо.
+
+        ⚠ `contracts` — РОД КОНТРАКТА из `info.contractType`, пустой кортеж значит «любой».
+        Приказ владельца 2026-08-21: «конечно только крипта! золото и серебро это
+        исключение!». Крипта — это `PERPETUAL`; `TRADIFI_PERPETUAL` даёт 169 рынков от
+        AAPL до нефти, и на доску они не идут. Золото с серебром возвращает не этот
+        фильтр, а ЯДРО вселенной, куда владелец их вписал (`config.Universe.board_contracts`).
+
+        ⚠ Род читается из СЫРОГО ответа биржи (`info`), а не из разбора ccxt: поля
+        `contractType` в нормализованном рынке нет вовсе, и вывести его из `type` нельзя —
+        у бессрочной акции и бессрочной монеты `type` одинаков, `swap`.
         """
         quotes = {str((self._ex.markets.get(s) or {}).get("quote", "")) for s in like}
         quotes.discard("")
@@ -1498,6 +1509,8 @@ class Exchange:
             if mk.get("type") == self.venue.market_type
             and mk.get("active")
             and str(mk.get("quote", "")) in quotes
+            and (not contracts
+                 or str((mk.get("info") or {}).get("contractType", "")) in contracts)
         ]
         return tuple(sorted(out))
 
