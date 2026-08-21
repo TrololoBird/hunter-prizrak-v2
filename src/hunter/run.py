@@ -2355,6 +2355,13 @@ class Collector:
                 rep.live_buckets_dropped += acc.drop_before(cutoff)
 
         snap = rep.model_copy()
+        # ⚠ ЗАМИНКА ЦИКЛА СОБЫТИЙ — ПООЦИКЛОВАЯ (2026-08-21). Копия уже снята выше,
+        # значит в снимке лежит величина, накопленная за ПРЕДЫДУЩИЙ цикл; живой счётчик
+        # сбрасывается, чтобы следующий отчёт говорил про следующий цикл, а не про
+        # рекорд за всю жизнь службы. Бегущий максимум не давал отличить заминку засева
+        # от заминки расчёта — а именно это и надо было решить.
+        # Такты не сбрасываются: они знаменатель и должны расти монотонно.
+        rep.loop_stall_max_ms = 0
         snap.series = {k: _copy_series(st) for k, st in rep.series.items()}
         snap.histograms = cycle_hist
         snap.binned = self.binned
@@ -2654,6 +2661,10 @@ def print_report(r: RunReport) -> int:
         for c in lags:
             print(f"   {c.timeframe:6} {c.bars:6} {c.p50_ms:8} мс {c.p95_ms:8} мс "
                   f"{c.max_ms:8} мс {c.p50_ms - floor_ms:8} мс")
+    print(f"   ЗАМИНКА ЦИКЛА СОБЫТИЙ за прошлый цикл: {r.loop_stall_max_ms} мс "
+          f"(тактов {r.heartbeats} по {HEARTBEAT_S} с)")
+    print("     это время, когда задачи опроса баров НЕ РАБОТАЛИ — прямая причина "
+          "хвоста прихода выше; всякий синхронный вызов на цикле держит его 1:1")
     if r.stage_ms:
         total = sum(r.stage_ms.values())
         print("   стадии конвейера: "

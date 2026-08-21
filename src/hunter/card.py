@@ -33,7 +33,7 @@ from . import (
     pereprior,
     swings,
 )
-from .bars import TIMEFRAME_MS, continuous_tail
+from .bars import continuous_tail
 from .models import Bar, NotReady
 from .swings import TrendDirection
 from .trading_range import BorderSource, flat_trades
@@ -818,6 +818,3 @@ def _pennant(pen: figures.Pennant) -> str:
             + ("  структура уже расширялась (стр. 18)" if pen.is_extended else "")
             + f"  вход: {_entries(pen.entries)}")
 
-
-def _tf_ms(tf: str) -> int:
-    return TIMEFRAME_MS[tf]

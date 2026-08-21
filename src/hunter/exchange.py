@@ -256,7 +256,7 @@ Compressed/Aggregate Trades List). ccxt лишь подставляет этот
 
 ⚠ Следствие, из-за которого константа вообще названа: ПУСТОЙ ответ означает «в этот час
 сделок нет», а не «сделок больше нет». Замер 2026-08-11
-(docs/audit/probes/probe_rest_empty_page_2026-08-11.py): у ARPA страница оборвана временем
+(зонд probe_rest_empty_page_2026-08-11 (удалён 19.08)): у ARPA страница оборвана временем
 (792 сделки при limit=1000, размах 3589 с, до отметки since+1ч остаётся 10 с), у BTC —
 лимитом (1000 сделок за 75 с). Прибор различает оба случая, то есть контроль пройден.
 """
@@ -2453,7 +2453,7 @@ class Exchange:
         не дырка в карте, а обычная закачка.
 
         Курсор — ПО ВРЕМЕНИ (`startTime`), а не по `fromId`. Это не вкусовщина, а замер
-        2026-08-11 (docs/audit/probes/probe_rest_trade_depth_2026-08-11.py и
+        2026-08-11 (зонд probe_rest_trade_depth_2026-08-11 (удалён 19.08) и
         probe_backfill_window_2026-08-11.py): у Binance USDⓈ-M `fromId` старше 24 часов
         отклоняется кодом -1000 («Only recent trade history within the past 24 hours is
         supported for aggTrades»), тогда как `startTime` отдаёт сделки минимум 30-суточной

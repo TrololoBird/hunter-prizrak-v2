@@ -510,22 +510,6 @@ RR_EMIT_MIN = 3.0
 эффективности именно РР и именно 1к3. Владелец может сменить порог одной строкой.
 """
 
-
-def risk_reward(setup: Setup) -> float | None:
-    """РР сетапа по ПЕРВОЙ основной цели (стр. 9: профит/риск).
-
-    None — когда РР посчитать нечем: основной цели нет либо риск нулевой. Отказ
-    называется вызывающим, а не подменяется числом (§4.3).
-    """
-    primary = [t for t in setup.targets if t.role is TargetRole.PRIMARY]
-    if not primary:
-        return None
-    risk = abs(setup.entry - setup.stop)
-    if risk == 0:
-        return None
-    return float(abs(primary[0].price - setup.entry) / risk)
-
-
 def build_breakeven_rules(
     *, inside_base: Decimal, level_price: Decimal, first_take: Decimal | None,
 ) -> tuple[BreakevenRule, ...]:

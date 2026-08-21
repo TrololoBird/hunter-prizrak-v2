@@ -357,32 +357,6 @@ def write_binned_trades(run_id: str, t: BarBinnedTrades) -> Path:
     ).write_parquet(path, compression="zstd")
     return path
 
-
-def read_binned_trades(
-    run_id: str, dir_name: str, tick_size: Decimal, bucket_ms: int,
-    symbol: str | None = None,
-) -> BarBinnedTrades | NotReady:
-    """Восстановить раскладку сделок. Отсутствие файла — названная причина, не пустота.
-
-    `dir_name` адресует каталог, `symbol` — НАСТОЯЩЕЕ имя. Их надо различать: имя каталога
-    искажено (`BTC_USDT_USDT`), и попав в текст причины, оно уезжает в карточку владельца.
-    Замер 2026-08-04: именно так и уехало, поймал повтор.
-    """
-    path = _binned_path(run_id, dir_name)
-    name = symbol or dir_name
-    if not path.exists():
-        return NotReady(reason=f"{name}: файла сделок нет — {path}")
-    df = pl.read_parquet(path)
-    t = BarBinnedTrades(symbol=name, tick_size=tick_size, bucket_ms=bucket_ms)
-    for row in df.iter_rows(named=True):
-        b, i = int(row["bucket_ms"]), int(row["bin"])
-        t.qty.setdefault(b, {})[i] = float(row["qty"])
-        t.cnt.setdefault(b, {})[i] = int(row["n"])
-        t.trades_seen += int(row["n"])
-        t.qty_seen += float(row["qty"])
-    return t
-
-
 # --- карточка: единица повтора (§10.3, §10.6 условие 2) -----------------------
 
 def card_path(run_id: str, symbol: str) -> Path:
@@ -1174,7 +1148,8 @@ def sync_levels(
     """Слить свежепосчитанную карту с накопленной.
 
     Зачем накопление, а не пересборка каждый прогон — ЗАМЕР, а не удобство.
-    `scripts/probes.py map-drift`: при сдвиге окна на 200 баров 2% карты BTC и 3% ETH
+    Замер `map-drift` (зонд удалён 19.08): при сдвиге окна на 200 баров 2% карты
+    BTC и 3% ETH
     исчезали не потому, что уровень отработан (стр. 25 — единственная причина, которую
     знает курс), а потому что структура уехала за край окна в 1000 баров. Уровень при
     этом оставался активным. Автор говорит ровно обратное: «зона остаётся актуальна».
@@ -1243,7 +1218,7 @@ def sync_levels(
             # `boundary_hi` у 1374 (76.5%), `volume` у 18 (1.0%). У `side` разошлось 0,
             # и он всё равно внесён: величина выводится из ТОГО ЖЕ окна структуры, а
             # устаревшая сторона в карте есть ровно наслоение встречных зон.
-            # Воспроизведение: docs/audit/evidence/E-stale-ledger-geometry-2026-08-19/
+            # Воспроизведение: свидетельство E-stale-ledger-geometry-2026-08-19 (удалено 19.08)
             #
             # Правило, из которого это следует, — «прибор обязан смотреть на ТУ ЖЕ
             # величину, которую видит владелец»: карточка того же прогона печатала 0
