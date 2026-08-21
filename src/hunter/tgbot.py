@@ -2117,21 +2117,34 @@ class Delivery:
                      сообщений=planned, лимит_в_минуту=Pacer.PER_MINUTE,
                      монет=len(self.cfg.pinned),
                      примерно_минут=round(planned / Pacer.PER_MINUTE, 1))
-        sent = failed = 0
+        sent = 0
+        skipped: list[str] = []
         for raw in self.cfg.pinned:
             symbol = self.index.resolve(raw)
             if symbol is None:
-                failed += 1
+                skipped.append(f"{raw} (не опознана)")
                 log.error("закреплённая монета не опознана", запись=raw,
                           площадка=self.uni.venue)
                 continue
             if await self.answer(bot, self.channel, symbol, None, announce_refusal=False):
                 sent += 1
             else:
-                failed += 1
+                skipped.append(f"{symbol.split('/')[0]} (карты нет)")
+        # ⚠ ЗНАМЕНАТЕЛЬ НАЗЫВАЕТСЯ, И ЭТО НЕ УКРАШЕНИЕ. Здесь стояло «всего=4», и оно
+        # было честным про список публикации — но не про то, о чём думает читатель.
+        # Вселенную владелец расширил до 25 (2026-08-18), список публикации остался на
+        # четырёх, и НИ ОДНО число проекта этого не показывало: в канал шли 3-4 монеты,
+        # а 21 символ не публиковался никогда. Нашёл расхождение владелец глазами
+        # 2026-08-21 («почему приходили скриншоты только по 3-4 символам если вселенная
+        # 25?»), спустя трое суток. Отсюда три величины вместо одной — закреплено,
+        # вселенная, разница, — и пропущенные монеты ПОИМЁННО: молчаливый пропуск
+        # неотличим от «монеты нет в списке», а это разные вещи с разной починкой.
         log.info("публикация закреплённых", канал=self.channel, отправлено=sent,
-                 отказов=failed, всего=len(self.cfg.pinned))
-        return failed
+                 отказов=len(skipped), закреплено=len(self.cfg.pinned),
+                 вселенная=len(self.uni.symbols),
+                 не_публикуются=len(set(self.uni.symbols) - set(self.cfg.pinned)),
+                 пропущены="; ".join(skipped) or "нет")
+        return len(skipped)
 
 
 def seconds_until_publish(timeframe: str, now_ms: int) -> float:
@@ -2246,6 +2259,13 @@ WATCH_EVERY_S = float(TIMEFRAME_MS["5m"]) / 1000 / 5
 Число выведено, а не выбрано: единица наблюдения — самый младший ТФ проекта (5м), и
 пятая часть бара даёт пять замеров на бар. Цена такта — один `fetch_tickers` на все
 рынки, вес 40; при лимите 2400 в минуту это 1.7% бюджета."""
+
+TICKERS_ALL_WEIGHT = 40
+"""Вес запроса ВСЕХ тикеров разом. Он же — точка, где поимённый список дороже общего.
+
+Число не выбрано, а прочитано у биржи: `fetch_tickers` документирован весом 1 за символ
+и 40 за весь рынок (`exchange.Exchange.fetch_tickers`). Значит список длиннее сорока
+символов выгоднее заменить одним общим запросом — это арифметика, а не порог качества."""
 
 SIDE_WORD = {"long": "лонг", "short": "шорт"}
 OUTCOME_WORD = {"stop": "🟥 стоп", "target": "🟩 цель",
@@ -2669,7 +2689,14 @@ class Notifier:
             self.sent_entries += len(entry_lines)
             out.append("\n".join(["✅ Входы состоялись:", *self._cap(entry_lines)]))
 
-        tickers = await ex.fetch_tickers(uni.symbols)
+        # ⚠ ЦЕНА ТАКТА ЗАВИСИТ ОТ РАЗМЕРА ВСЕЛЕННОЙ, И ПЕРЕЛОМ ЛЕЖИТ НА СОРОКА. Вес
+        # `ticker/24hr` — 1 за символ и 40 за ВСЕ рынки сразу (`fetch_tickers(None)`).
+        # На вселенной в 25 поимённый список дешевле (25 против 40); на раскрытой доске
+        # в 696 он стоил бы 696 единиц веса каждые 60 секунд — 39% минутного бюджета в
+        # 1800 против 2.2%. Порога здесь нет: сравниваются две настоящие цены одного и
+        # того же ответа, и берётся меньшая.
+        tickers = await (ex.fetch_tickers(None) if len(uni.symbols) > TICKERS_ALL_WEIGHT
+                         else ex.fetch_tickers(uni.symbols))
         if isinstance(tickers, NotReady):
             log.degraded("наблюдатель: тикеры не получены", причина=tickers.reason)
             self.ticks_failed += 1
@@ -3063,6 +3090,11 @@ async def main(*, horizon_days: int, publish_now: bool = False,
 
     ex = Exchange(uni.venue)
     await ex.open()
+    # ⚠ БОТ РАСКРЫВАЕТ ДОСКУ ТОЙ ЖЕ ФУНКЦИЕЙ, ЧТО И СЛУЖБА. Иначе служба считала бы 696
+    # рынков, а наблюдатель следил за 25 — и уведомление «цена подошла к зоне» не
+    # приходило бы по 96% построенных уровней. Две вселенные под одним именем — тот же
+    # класс дефекта, из-за которого список публикации трое суток отставал от вселенной.
+    uni = await run.expand_board(ex, uni)
     bot = Bot(token=token)
     try:
         index = MarketIndex.build(ex)

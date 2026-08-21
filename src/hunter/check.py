@@ -23,7 +23,13 @@ from .config import Universe
 from .exchange import POLL_OFFSET_S, Exchange
 from .models import NotReady, RunReport
 from .profile_source import PROFILE_LADDER
-from .run import WATCH_TRADES, arrival_lag_survey, collect, explained_gaps
+from .run import (
+    WATCH_TRADES,
+    arrival_lag_survey,
+    collect,
+    expand_board,
+    explained_gaps,
+)
 
 
 def _verdict(lines: list[tuple[str, bool, str]]) -> int:
@@ -53,6 +59,13 @@ async def _admission_survey(
 ) -> dict[str, dict[str, int | NotReady]]:
     ex = Exchange(uni.venue)
     await ex.open()
+    # ⚠ ДОСКА РАСКРЫВАЕТСЯ И ЗДЕСЬ. Иначе вердикт §7.5 описывал бы 25 символов файла,
+    # пока служба считает 696, — то есть владелец читал бы «всё в порядке» про другую
+    # вселенную. Цена названа строкой ниже, а не обнаруживается ожиданием.
+    uni = await expand_board(ex, uni)
+    log.info("обзор допуска: по одному запросу на символ",
+             символов=len(uni.symbols), тф=uni.timeframes[-1],
+             примерно_секунд=round(len(uni.symbols) * 0.35))
     try:
         out: dict[str, dict[str, int | NotReady]] = {}
         for sym in uni.symbols:
@@ -244,7 +257,16 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
     print("=" * 72)
     print("ПРОВЕРКА ЖИВОГО СОСТОЯНИЯ")
     print("=" * 72)
-    print(f"Вселенная: {len(uni.symbols)} символов × {len(uni.timeframes)} таймфреймов")
+    # ⚠ ЯРУСЫ НАЗЫВАЮТСЯ. «N × M таймфреймов» верно только пока лестница одна на всех;
+    # при включённой доске ядро считается шестью ТФ, а остальные рынки — четырьмя, и
+    # одно произведение скрыло бы, что 96% вселенной разбирается КОРОЧЕ (§7.5 требует
+    # вердикт, который читается без кода).
+    if uni.board:
+        print(f"Вселенная: {len(uni.symbols)} символов — ядро {len(uni.core)} по "
+              f"{'/'.join(uni.timeframes)}, доска {len(uni.symbols) - len(uni.core)} по "
+              f"{'/'.join(uni.board_timeframes)}")
+    else:
+        print(f"Вселенная: {len(uni.symbols)} символов × {len(uni.timeframes)} таймфреймов")
     print(f"Наблюдение: {seconds} с. Это займёт примерно {seconds // 60 + 2} минут.")
 
     print("\n1. ЖИВОЙ ПРОГОН")

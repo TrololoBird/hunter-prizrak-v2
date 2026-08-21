@@ -33,6 +33,43 @@ class Universe:
     профиля молча. Умолчание сохраняет прежнее поведение для конфигураций, где ключа нет.
     """
 
+    board: bool = False
+    """Считать ли ВСЮ ДОСКУ площадки, а не только перечисленные символы.
+
+    ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-21, дословно: «всю доску, 696». Задан вопросом — сканер
+    смотрит всю доску или хватит полусотни отобранных монет, — и ответ был «всю».
+
+    ⚠ ЧТО ЭТО МЕНЯЕТ В СМЫСЛЕ `symbols`. Список остаётся ЯДРОМ, а не всей вселенной:
+    ядро считается полной лестницей `timeframes`, остальная доска — укороченной
+    `board_timeframes`. Раскрытие делает `run.expand_board` по живому вызову биржи, и
+    после него `symbols` содержит уже всю доску, а ядро помнит поле `core`. Так все
+    циклы `for sym in uni.symbols` продолжают означать «по всему, что считаем».
+
+    ⚠ ЦЕНА ОДНОЙ ЛЕСТНИЦЫ НА ВСЕХ — арифметика, а не вкус. При горизонте 180 суток
+    5м даёт 51 840 баров на символ, 15м — 17 280; вдвоём это 92.3% всей лестницы.
+    На 696 символах полная лестница весит 52.1 млн баров и 3.89 ГБ ОЗУ при четырёх
+    логических ядрах машины, тогда как 1ч/4ч/1Д/1Н — 4.0 млн и 0.30 ГБ (замер
+    `run.seed_depth` и `sys.getsizeof(Bar)` = 80 байт, 2026-08-21). Засев по весу
+    биржи: 116 минут против 9.
+    """
+
+    board_timeframes: tuple[str, ...] = ()
+    """Лестница для символов ДОСКИ — тех, что не входят в ядро `symbols`.
+
+    Обязана быть ПОДМНОЖЕСТВОМ `timeframes`: доска, считающая таймфрейм, которого нет у
+    ядра, дала бы две несопоставимые карты под одним именем — тот самый класс «две
+    сущности под одним человеческим именем», из-за которого 2026-08-18 полгода жил
+    неверный стоп.
+    """
+
+    core: frozenset[str] = frozenset()
+    """Символы, считаемые ПОЛНОЙ лестницей. Пишет загрузчик и `run.expand_board`.
+
+    ⚠ Ключом TOML НЕ является (см. `_known_keys`): его не задаёт оператор, он выводится
+    из `symbols` до раскрытия доски. Ровно та же причина, по которой не является ключом
+    `source`.
+    """
+
     profile_timeframe: str = "1m"
     """Разрешение свечей, ИЗ КОТОРЫХ строится профиль объёма. Не таймфрейм анализа.
 
@@ -46,6 +83,19 @@ class Universe:
     входит и входить не должен: профиль по дневным свечам размазал бы объём суток по
     всему их диапазону.
     """
+
+
+    def ladder(self, symbol: str) -> tuple[str, ...]:
+        """Лестница ИМЕННО ЭТОГО символа: полная у ядра, укороченная у доски.
+
+        ⚠ Спрашивать `uni.timeframes` внутри цикла по символам с этого дня НЕЛЬЗЯ: при
+        включённой доске это молча вернуло бы полную лестницу для всех 696 монет, то
+        есть 52.1 млн баров вместо 4.0 млн. Прибор, который это ловит, — сама подпись
+        метода: он требует символ, и забыть его нечем.
+        """
+        if not self.board or symbol in self.core:
+            return self.timeframes
+        return self.board_timeframes
 
 
 def _reject_unknown(section: Mapping[str, object], known: frozenset[str], path: Path) -> None:
@@ -69,8 +119,11 @@ def _known_keys(cls: type) -> frozenset[str]:
     """Ключи TOML = поля датакласса минус служебный `source` (его пишет загрузчик).
 
     Выводится из полей, а не переписывается руками: рукописный список разошёлся бы с
-    датаклассом молча — тот же дефект, от которого защищает `_reject_unknown`."""
-    return frozenset(f.name for f in fields(cls)) - {"source"}
+    датаклассом молча — тот же дефект, от которого защищает `_reject_unknown`.
+
+    ⚠ `core` исключён по той же причине, что и `source`: оператор его не задаёт — он
+    выводится из `symbols` ДО раскрытия доски (`Universe.core`)."""
+    return frozenset(f.name for f in fields(cls)) - {"source", "core"}
 
 
 def _reject_unknown_sections(data: Mapping[str, object], known: str, path: Path) -> None:
@@ -120,7 +173,39 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
             f"{path}: profile_timeframe={profile_tf!r} вне {sorted(PROFILE_MS)}; "
             f"профиль строится из МЛАДШИХ свечей, а не из таймфреймов анализа")
 
-    return Universe(tuple(symbols), tuple(timeframes), path, venue, profile_tf)
+    # --- ДОСКА -------------------------------------------------------------------
+    # Приказ владельца 2026-08-21: «всю доску, 696». Ключ выключен по умолчанию, потому
+    # что включённая доска меняет ЦЕНУ прогона на два порядка, и это обязано быть
+    # решением файла, а не умолчанием библиотеки.
+    board = section.get("board", False)
+    if not isinstance(board, bool):
+        raise ValueError(f"{path}: board обязан быть true/false, а не {type(board).__name__}")
+
+    board_tfs = tuple(section.get("board_timeframes", ()))
+    unknown = [t for t in board_tfs if t not in TIMEFRAME_MS]
+    if unknown:
+        raise ValueError(
+            f"{path}: board_timeframes {unknown} вне §2.8 ({sorted(TIMEFRAME_MS)})")
+    # ⚠ ПОДМНОЖЕСТВО, А НЕ ПРОИЗВОЛЬНЫЙ СПИСОК. Таймфрейм, который считает доска и не
+    # считает ядро, дал бы две карты под одним именем «уровень», и одна из них навсегда
+    # осталась бы непроверенной — тот же класс дефекта, что границы уровня 2026-08-18.
+    extra = [t for t in board_tfs if t not in timeframes]
+    if extra:
+        raise ValueError(
+            f"{path}: board_timeframes {extra} нет в timeframes {list(timeframes)}; "
+            f"лестница доски обязана быть подмножеством лестницы ядра")
+    if board and not board_tfs:
+        raise ValueError(
+            f"{path}: board=true без board_timeframes — доска считалась бы ПОЛНОЙ "
+            f"лестницей по всем рынкам площадки (52.1 млн баров, 3.89 ГБ ОЗУ на 696 "
+            f"символах). Укажите лестницу доски явно")
+    if board_tfs and not board:
+        raise ValueError(
+            f"{path}: board_timeframes задан, а board=false — ключ не читался бы никем. "
+            f"Это тот же мёртвый ключ, что bars_per_timeframe и admission_required_bars")
+
+    return Universe(tuple(symbols), tuple(timeframes), path, venue, board, board_tfs,
+                    frozenset(symbols), profile_tf)
 
 
 @dataclass(frozen=True, slots=True)

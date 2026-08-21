@@ -14,6 +14,7 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -88,6 +89,65 @@ def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
     return bars_needed(timeframe, horizon_days, floor)
 
 
+async def expand_board(ex: Exchange, uni: Universe) -> Universe:
+    """Вселенная = ВСЯ ДОСКА площадки, если так велит `universe.board`.
+
+    ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-21, дословно: «всю доску, 696». До него вселенная была
+    рукописным списком из 25 монет — 3.6% активных бессрочных Binance USDⓈ-M.
+
+    ⚠ ЯДРО ОСТАЁТСЯ ЯДРОМ. `symbols` после раскрытия содержит всю доску, но `core`
+    помнит исходный список, и `Universe.ladder` даёт ядру полную лестницу, а доске —
+    укороченную. Без этого доска считалась бы 5-минутками: 52.1 млн баров и 3.89 ГБ ОЗУ
+    против 4.0 млн и 0.30 ГБ (арифметика — в докстроке `Universe.board`).
+
+    ⚠ ПОРЯДОК НЕ АЛФАВИТНЫЙ, И ЭТО НЕ УКРАШЕНИЕ. Сперва ядро в том порядке, в каком его
+    написал оператор, затем остальная доска по СУТОЧНОМУ ОБОРОТУ вниз. Порядок задаёт,
+    что успеет посчитаться раньше, если цикл не доедет до конца, — а значит обрыв цикла
+    съедает самое тонкое, а не случайное. Оборот берётся тем же `quote_volume`, по
+    которому владелец отбирал вселенную руками 2026-08-18.
+
+    ⚠ ЦЕНА ВЫЗОВА — ОДИН ЗАПРОС ВЕСОМ 40 на все рынки сразу (`fetch_tickers(None)`),
+    то есть 2.2% минутного бюджета в 1800. Отказ тикеров НЕ валит раскрытие: доска
+    остаётся, порядок становится алфавитным, и это НАЗЫВАЕТСЯ в логе — иначе молчаливая
+    потеря порядка выглядела бы как «биржа так отдала».
+    """
+    if not uni.board:
+        return uni
+    everything = ex.board_symbols(uni.symbols)
+    if not everything:
+        log.degraded("доска пуста — вселенная осталась ядром",
+                     площадка=uni.venue, тип=ex.venue.market_type, ядро=len(uni.symbols))
+        return uni
+
+    turnover: dict[str, float] = {}
+    got = await ex.fetch_tickers(None)
+    if isinstance(got, NotReady):
+        log.degraded("оборот не получен — доска пойдёт в алфавитном порядке",
+                     причина=got.reason, рынков=len(everything))
+    else:
+        turnover = {s: t.quote_volume for s, t in got.items()}
+
+    # Ядро сохраняет порядок оператора; хвост доски — по обороту вниз, при равенстве и
+    # при отсутствии тикера — по имени, чтобы порядок был воспроизводим.
+    core = [s for s in uni.symbols if s in everything]
+    lost = [s for s in uni.symbols if s not in everything]
+    rest = sorted(set(everything) - set(core),
+                  key=lambda s: (-turnover.get(s, 0.0), s))
+    no_turnover = sum(1 for s in rest if s not in turnover)
+
+    if lost:
+        # Символ ядра, которого на доске нет, НЕ выбрасывается: его судьбу решает
+        # `check_symbols`, и он обязан дойти туда, а не исчезнуть здесь молча.
+        log.degraded("символы ядра вне доски площадки — оставлены как есть",
+                     сколько=len(lost), примеры="; ".join(lost[:3]), площадка=uni.venue)
+    log.info("доска раскрыта", всего=len(core) + len(lost) + len(rest),
+             ядро=len(core), добавлено=len(rest), без_оборота=no_turnover,
+             лестница_ядра="/".join(uni.timeframes),
+             лестница_доски="/".join(uni.board_timeframes),
+             верх_доски="; ".join(s.split("/")[0] for s in rest[:5]))
+    return replace(uni, symbols=tuple(core) + tuple(lost) + tuple(rest))
+
+
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                horizon_days: int = 0) -> None:
     """Засев рядов: хранилище на диске плюс добор хвоста у биржи.
@@ -109,7 +169,10 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
         if isinstance(inst, NotReady):
             log.degraded("инструмент недоступен", причина=inst.reason)
         market_id = None if isinstance(inst, NotReady) else inst.market_id
-        for tf in uni.timeframes:
+        # ⚠ ЛЕСТНИЦА СПРАШИВАЕТСЯ У СИМВОЛА, А НЕ У ВСЕЛЕННОЙ. При включённой доске
+        # `uni.timeframes` вернула бы полную лестницу всем 696 рынкам — 52.1 млн баров
+        # вместо 4.0 млн, то есть засев на 116 минут вместо девяти.
+        for tf in uni.ladder(sym):
             st = SeriesState(symbol=sym, timeframe=tf)
             report.series[(sym, tf)] = st
             report.seed_checked += 1
@@ -1546,13 +1609,16 @@ def decide_once(report: RunReport, uni: Universe,
     Результат — словарь символ → решение. Это НЕ словарь между слоями в смысле §10.1:
     значение типизировано (`engine.SymbolDecision`), а ключ — символ.
     """
-    tfs = tuple(uni.timeframes)
     out: dict[str, engine.SymbolDecision] = {}
     for sym in uni.symbols:
         series = bars_of(report, sym)
         if not series:
             continue
-        out[sym] = engine.decide(sym, series, sources.get(sym), tfs,
+        # ⚠ ЛЕСТНИЦА ПОСИМВОЛЬНАЯ. Здесь стояло `tfs = tuple(uni.timeframes)`, вынесенное
+        # за цикл ради скорости, — и при включённой доске это молча заказало бы разбор
+        # 5м и 15м по всем 696 рынкам, которых для них даже не собрано. Выигрыш от
+        # выноса — один вызов метода на символ; цена ошибки — вся доска.
+        out[sym] = engine.decide(sym, series, sources.get(sym), uni.ladder(sym),
                                  frame_bars=frame_bars, detections=detections)
     # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
     # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
@@ -2165,6 +2231,12 @@ class Collector:
     async def start(self) -> None:
         """Открыть биржу, засеять ряды и поднять задачи наблюдения."""
         sync = await self.ex.open()
+        # ⚠ ДОСКА РАСКРЫВАЕТСЯ ЗДЕСЬ, между открытием биржи и проверкой символов, и
+        # порядок этих трёх шагов не случаен: раскрытие спрашивает у площадки список
+        # рынков (значит, после `open`), а `check_symbols` обязан увидеть уже полную
+        # вселенную (значит, до него). При `board=false` вызов возвращает ту же
+        # вселенную и не делает ни одного запроса.
+        self.uni = await expand_board(self.ex, self.uni)
         # ⚠ Соответствие вселенной площадке проверяется ДО сбора и ОДИН раз. Иначе
         # неверная пара «площадка + список символов» проявлялась бы отдельным отказом на
         # каждый символ в засеве, то есть выглядела бы проблемой данных, а не
@@ -2180,7 +2252,12 @@ class Collector:
                     f"Первый отказ: {bad[0]}")
         self._report = RunReport(sync=sync)
         self._started_ns = clock.monotonic_ns()
-        log.info("засев", символов=len(self.uni.symbols), тф=len(self.uni.timeframes),
+        # ⚠ РЯДОВ, А НЕ «ТФ». При включённой доске лестница у символов РАЗНАЯ, и одно
+        # число таймфреймов стало бы враньём: ядро считается шестью, доска — четырьмя.
+        # Число рядов — это то, что реально пойдёт в засев.
+        series_n = sum(len(self.uni.ladder(s)) for s in self.uni.symbols)
+        log.info("засев", символов=len(self.uni.symbols), рядов=series_n,
+                 ядро=len(self.uni.core) if self.uni.board else len(self.uni.symbols),
                  баров_на_ряд=self.seed_limit)
         await seed(self.ex, self.uni, self.report, self.seed_limit,
                    self.horizon_days)
@@ -2217,9 +2294,12 @@ class Collector:
             inst = self.ex.instrument(sym)
             if isinstance(inst, NotReady):
                 continue
-            # Корзина — самый младший ТФ вселенной: бары старших кратны ему, значит
+            # Корзина — самый младший ТФ ЭТОГО СИМВОЛА: бары старших кратны ему, значит
             # окно любой структуры складывается из целых корзин (см. BarBinnedTrades).
-            bucket = min(TIMEFRAME_MS[tf] for tf in self.uni.timeframes)
+            # ⚠ Лестница посимвольная: у доски младший — 1ч, у ядра — 5м. Общая корзина
+            # в 5 минут дала бы символам доски в двенадцать раз больше пустых корзин,
+            # чем у них есть баров.
+            bucket = min(TIMEFRAME_MS[tf] for tf in self.uni.ladder(sym))
             self.binned[sym] = BarBinnedTrades(
                 symbol=sym, tick_size=inst.tick_size, bucket_ms=bucket)
             h = TradeHistogram(symbol=sym, tick_size=inst.tick_size)

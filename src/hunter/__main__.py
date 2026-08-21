@@ -284,7 +284,9 @@ def _admission(args: argparse.Namespace) -> int:
             for sym in uni.symbols:
                 counts: dict[str, int] = {}
                 unknown: list[str] = []
-                for tf in uni.timeframes:
+                # Лестница посимвольная: у доски она короче, и спрашивать биржу о
+                # 5м-истории рынка, который на 5м не считается, — трата веса впустую.
+                for tf in uni.ladder(sym):
                     got = await ex.count_history(sym, tf, cap=required)
                     if isinstance(got, NotReady):
                         unknown.append(tf)
