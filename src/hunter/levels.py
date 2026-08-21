@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+from bisect import bisect_right
 from decimal import Decimal
 from enum import StrEnum
 
@@ -521,6 +522,11 @@ def build_all(
     # зондов и старых вызовов — тогда третий вид якоря (свинг, стр. 18) просто не ищется,
     # и это ВИДНО по `stop_anchor_source`, а не молчит.
     sw_by_tf: dict[str, SwingSet] = swings or {}
+    # Метки открытия баров каждого ряда — ряд для `bisect`. Считаются ОДИН раз на вызов:
+    # ниже они нужны на каждой структуре, а от структуры не зависят (см. отбор свингов
+    # под якорь стопа). Стоят один проход по ряду, экономят миллион с лишним сравнений.
+    opens_by_tf: dict[str, list[int]] = {
+        stf: [b.open_ms for b in sbars] for stf, sbars in series.items() if sbars}
     del frame_bars  # состав карты рамкой больше не режется — см. докстроку
     for tf in timeframes:
         bars = series.get(tf)
@@ -541,12 +547,17 @@ def build_all(
                                        reason=hist.reason))
                 continue
             # Те же бары, что ушли в гистограмму профиля: иначе сетка натягивается
-            # на диапазон, в котором нет объёма (`structure_bars`).
-            seg = structure_bars(acc, bars)
+            # на диапазон, в котором нет объёма (`structure_bars`). Коробка берётся у
+            # самой структуры (`TradingRange.box`, 2026-08-21) — одна формула на всех
+            # потребителей вместо четырёх копий, см. `_structure_box`.
+            _box = acc.box(bars)
+            if _box is None:
+                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                                       reason="отрезок структуры пуст — коробки нет"))
+                continue
             lvl = build_level(acc, hist, symbol, (lo, hi),
                               created_at_ms(acc, bars, TIMEFRAME_MS[tf]),
-                              (Decimal(str(min(b.low for b in seg))),
-                               Decimal(str(max(b.high for b in seg)))))
+                              (Decimal(str(_box[0])), Decimal(str(_box[1]))))
             if isinstance(lvl, NotReady):
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
                                        reason=lvl.reason))
@@ -597,11 +608,36 @@ def build_all(
                 # Свинг известен не в момент своего экстремума, а когда ПОДТВЕРЖДЁН
                 # (фрактал закрывается двумя барами позже, `confirmed_at_index`).
                 s_step = TIMEFRAME_MS[stf]
-                sw_prices.extend(
-                    s.price for s in sw.swings
-                    if s.kind is kind
-                    and s.confirmed_at_index < len(s_bars)
-                    and s_bars[s.confirmed_at_index].open_ms + s_step <= born_ms)
+                # ⚠ ОТБОР ПРЕФИКСОМ С 2026-08-21 — ТОТ ЖЕ НАБОР, ДРУГАЯ ЦЕНА. Прежде
+                # здесь шёл проход по ВСЕМ экстремумам ряда на КАЖДОЙ структуре:
+                # 1 379 178 вызовов генератора на один символ, 10.3 с — второе место в
+                # расчёте после профиля объёма.
+                #
+                # Почему набор ТОТ ЖЕ. Оба условия монотонны по `confirmed_at_index`:
+                # метки открытия баров не убывают, значит «бар подтверждения закрылся не
+                # позже рождения уровня» верно для префикса и неверно дальше; условие
+                # «индекс внутри ряда» — тоже префикс. Пересечение двух префиксов есть
+                # префикс, и его правый край — последний бар с
+                # `open_ms <= born_ms - s_step`. Порядок `of(kind)` — проверяемое
+                # условие `SwingSet._ordered`, а не совпадение.
+                #
+                # КОНТРОЛЬ, и он потребовал ВТОРОГО ПРИБОРА. Сравнение готовых уровней
+                # (368 штук, побайтово) эту правку НЕ ПРОВЕРЯЕТ: подсаженный сдвиг
+                # порога на 30 баров не изменил в них ни одной строки, на 3000 — 48
+                # строк, обнуление отбора — 104. Якорь-свинг побеждает у 52 уровней из
+                # 368, но побеждает СТАРЫЙ свинг, и мелкая ошибка границы до него не
+                # доходит. «Совпало побайтово» тут означало бы только слепоту прибора.
+                # Поэтому сравнивались САМИ НАБОРЫ цен, старая формула против новой:
+                # 2068 сравнений, разошлось 0; тот же прибор со сдвигом порога на ОДИН
+                # бар — разошлось 105 из 2068. Вот это и есть разрешение в один бар.
+                opens = opens_by_tf.get(stf)
+                if opens is None:
+                    continue
+                last_ok = bisect_right(opens, born_ms - s_step) - 1
+                if last_ok < 0:
+                    continue
+                limit = bisect_right(sw.confirmed_of(kind), last_ok)
+                sw_prices.extend(x.price for x in sw.of(kind)[:limit])
             anchor = stop_anchor(lvl.side, float(lvl.boundary_lo if down else lvl.boundary_hi),
                                  acc.lower if down else acc.upper, svs, tuple(sw_prices),
                                  base_height=float(lvl.boundary_hi - lvl.boundary_lo))

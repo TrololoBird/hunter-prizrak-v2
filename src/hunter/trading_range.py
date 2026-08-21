@@ -451,6 +451,28 @@ class TradingRange(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    _box: dict[tuple[int, int, int], tuple[float, float] | None] = (
+        PrivateAttr(default_factory=dict))
+    """Память `box()`: отпечаток ряда → коробка. НЕ поле модели."""
+
+    def box(self, bars: list[Bar]) -> tuple[float, float] | None:
+        """Коробка ХАЙ…ЛОЙ этой структуры на этом ряду: считается по разу.
+
+        ⚠ ЗАЧЕМ ПАМЯТЬ. Замер BTC на боевых глубинах (`cProfile`): коробка одной и той
+        же структуры пересчитывалась для каждой пары (уровень, структура) и для каждого
+        хозяина стопового объёма — 12 099 220 вызовов генератора `min`/`max` за один
+        символ. Значение тождественно: та же функция, тот же ряд, тот же порядок.
+
+        `_structure_box` и `_series_key` объявлены НИЖЕ по файлу (им нужен
+        `structure_bars`, а тому — этот класс). Имена в теле метода разрешаются в
+        момент ВЫЗОВА, а не определения, поэтому порядок «сначала объект, потом
+        операции над ним» сохраняется без единого трюка.
+        """
+        key = _series_key(bars)
+        if key not in self._box:
+            self._box[key] = _structure_box(self, bars)
+        return self._box[key]
+
     timeframe: str
     first_index: int
     last_index: int
@@ -596,16 +618,41 @@ class RangeScan(BaseModel):
         коробки чужого ряда. Отпечаток (длина, первая и последняя метки) делает такую
         подмену видимой — память просто пересчитается, а не соврёт.
         """
-        key = (len(bars), bars[0].open_ms if bars else 0,
-               bars[-1].open_ms if bars else 0)
+        key = _series_key(bars)
         if (got := self._boxes.get(key)) is None:
-            out: list[tuple[float, float] | None] = []
-            for acc in self.closed:
-                seg = structure_bars(acc, bars)
-                out.append((min(b.low for b in seg), max(b.high for b in seg))
-                           if seg else None)
-            got = self._boxes[key] = tuple(out)
+            got = self._boxes[key] = tuple(acc.box(bars) for acc in self.closed)
         return got
+
+
+def _series_key(bars: list[Bar]) -> tuple[int, int, int]:
+    """Отпечаток ряда для памяти коробок: длина и края.
+
+    Не `id(bars)`: список после сборки мусора отдаёт свой адрес другому списку, и память
+    вернула бы коробки ЧУЖОГО ряда — молча. Тот же довод уже записан в `stop_volume`,
+    где ключ несёт ещё и символ: ряды разных символов выровнены одним окном бэкфилла и
+    по длине с краями совпадают.
+    """
+    return (len(bars), bars[0].open_ms if bars else 0,
+            bars[-1].open_ms if bars else 0)
+
+
+def _structure_box(acc: TradingRange, bars: list[Bar]) -> tuple[float, float] | None:
+    """Коробка ХАЙ…ЛОЙ структуры: `None`, если отрезок пуст.
+
+    ⚠⚠ ЕДИНСТВЕННОЕ МЕСТО, ГДЕ КОРОБКА СЧИТАЕТСЯ. До 2026-08-21 та же пара `min`/`max`
+    по `structure_bars` стояла в ЧЕТЫРЁХ местах: `levels.build_all` (границы уровня),
+    `levels.pressed_structures` (конфигурации стр. 28), `stop_volume.classify`
+    (плотность стопового объёма) и `RangeScan.boxes`. Совпадали они по счастливой
+    случайности — четыре копии одной формулы, и разойтись им ничто не мешало.
+
+    Именно так и родился дефект, который владелец нашёл глазами 2026-08-18: «границы»
+    карточки и коробка профиля оказались разными величинами под одним именем. Здесь
+    копий больше нет — есть одна функция и память при структуре.
+    """
+    seg = structure_bars(acc, bars)
+    if not seg:
+        return None
+    return min(b.low for b in seg), max(b.high for b in seg)
 
 
 def structure_bars(acc: TradingRange, bars: list[Bar]) -> list[Bar]:
