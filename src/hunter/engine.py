@@ -93,6 +93,14 @@ class SeriesRead(BaseModel):
     pennants: tuple[figures.Pennant, ...] = ()
     """Вымпелы/треугольники ЗАКРЫТЫХ структур (стр. 57, 58)."""
 
+    pennants_no_trend: int = 0
+    """Сколько СУЖАЮЩИХСЯ закрытых структур вымпелом не стали: тренда перед ними нет.
+
+    Считается отдельно от «структура не сужается» (это просто не вымпел) и печатается в
+    карточке: отказ по стр. 57 «Торгуем по тренду» задевает ДЕСЯТКИ ПРОЦЕНТОВ сужений
+    (замер 2026-08-22: 602 из 1390 на 10 символах × 5 ТФ), и молча он исчезать не должен.
+    """
+
     open_pennant: figures.Pennant | None = None
     """Вымпел НЕЗАКРЫТОЙ структуры. Отдельным полем, потому что вход по стр. 57 берётся
     на 6 касании ВНУТРИ структуры — то есть до того, как она закроется."""
@@ -356,7 +364,8 @@ def read_series(
         last_side = tuple(seq[-1] for side in (PPSide.SHORT, PPSide.LONG)
                           if (seq := [p for p in every if p.side is side]))
         chans = figures.detect_channels(sw)
-        open_pennant, open_missing = _pennant_of(scan.open_tail)
+        open_pennant, open_missing = _pennant_of(scan.open_tail, sw)
+        closed_pen = [_pennant_of(acc, sw) for acc in scan.closed]
         reads[tf] = SeriesRead(
             timeframe=tf, swings=sw, trend=swings.trend(sw), scan=scan,
             perepriors=last_side,
@@ -364,8 +373,9 @@ def read_series(
             splits=pereprior.split_entries(every),
             channels=chans,
             channel_notes=tuple(_channel_note(c, every) for c in chans),
-            pennants=tuple(pen for acc in scan.closed
-                           if (pen := _pennant_of(acc)[0]) is not None),
+            pennants=tuple(pen for pen, _ in closed_pen if pen is not None),
+            pennants_no_trend=sum(1 for pen, reason in closed_pen
+                                  if pen is None and reason == figures.NO_TREND_REASON),
             open_pennant=open_pennant,
             open_pennant_missing=open_missing,
             multiple_bases=tuple(
@@ -380,15 +390,19 @@ def read_series(
 
 def _pennant_of(
     structure: TradingRange | OpenStructure | None,
+    swings: SwingSet,
 ) -> tuple[figures.Pennant | None, str]:
     """Вымпел структуры (стр. 57, 58) вместе с причиной, если его нет.
 
     Причина возвращается ОТДЕЛЬНОЙ строкой, а не подменяется пустотой: у незакрытой
     структуры «сужения нет» и «структуры нет» — разные ответы (§4.3).
+
+    Свинги нужны для СТОРОНЫ: стр. 57 «Торгуем по тренду», и тренд берётся из них по
+    экстремумам до начала структуры — см. `figures.pennant`.
     """
     if structure is None:
         return None, ""
-    got = figures.pennant(structure)
+    got = figures.pennant(structure, swings)
     if isinstance(got, NotReady):
         return None, got.reason
     return got, ""

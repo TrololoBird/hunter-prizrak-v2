@@ -547,6 +547,9 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         if len(r.pennants) > len(shown_pen):
             out.append(f"  {lab}  ещё {len(r.pennants) - len(shown_pen)} вымпелов раньше "
                        f"по ряду — напечатаны последние {len(shown_pen)}")
+        if r.pennants_no_trend:
+            out.append(f"  {lab}  ещё {r.pennants_no_trend} сужений вымпелом НЕ стали: "
+                       f"тренда перед ними нет, а стр. 57 велит «Торгуем по тренду»")
         if r.open_pennant is not None:
             any_fig = True
             out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: {_pennant(r.open_pennant)}")

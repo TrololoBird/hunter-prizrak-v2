@@ -35,13 +35,23 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .models import NotReady
 from .pereprior import Pereprior, PPKind, PPSide
-from .swings import Swing, SwingKind, SwingSet
+from .swings import Swing, SwingKind, SwingSet, TrendDirection, trend
 from .trading_range import (
     MIN_BOUNDARY_POINTS,
     MIN_BOUNDARY_POINTS_PER_SIDE,
     OpenStructure,
     TradingRange,
 )
+
+NO_TREND_REASON = (
+    "тренда перед сужением нет, а стр. 57 велит «Торгуем по тренду»: "
+    "из тренда берутся и сторона вымпела, и первая точка (стр. 58)"
+)
+"""Отказ вымпела по стр. 57 — КОНСТАНТОЙ, а не строкой на месте.
+
+Считать такие отказы приходится вызывающему (§4.3: молчаливая деградация запрещена), а
+сверка по куску текста разошлась бы с правкой формулировки и молча дала бы ноль.
+"""
 
 TOUCH_FOR_ENTRY = 6
 """Стр. 57: «ждем 6 касание и берем на 6 касании». Стр. 58 повторяет: «берем на 6 касании».
@@ -276,9 +286,17 @@ class Pennant(BaseModel):
     borders: PennantBorders
     side: FigureSide
     first_index: int
+    """Бар ПЕРВОГО касания в нумерации стр. 58 — точки со стороны тренда."""
+
     last_point_index: int
     touches: int
-    """Сквозной счёт касаний обеих границ — `TradingRange.touches` (стр. 57, схема)."""
+    """Сквозной счёт касаний обеих границ (стр. 57, схема).
+
+    ⚠ Это НЕ `TradingRange.touches`, и с 2026-08-22 расходится с ним на единицу там, где
+    структура началась точкой ПРОТИВ тренда: стр. 58 велит начинать счёт со стороны
+    тренда, значит такая точка номера не получает. Иначе карточка печатала бы «касаний
+    N» по одному счёту и «6-е на баре X» по другому — две величины под одним именем.
+    """
 
     touch6_index: int | None
     """Бар ШЕСТОГО касания — ТВХ по стр. 57. `None` — касаний ещё меньше шести."""
@@ -313,16 +331,37 @@ class Pennant(BaseModel):
         return (FigureEntry.NEAREST_LEVEL, FigureEntry.TOUCH_6, FigureEntry.ADD_ON)
 
 
-def pennant(structure: TradingRange | OpenStructure) -> Pennant | NotReady:
+def pennant(
+    structure: TradingRange | OpenStructure, swings: SwingSet
+) -> Pennant | NotReady:
     """Вымпел из готовой структуры накопления (стр. 57, 58).
 
     Сужение читается по счётчикам `BoundaryZone.narrowed`, которые ведёт сама
     `range.detect`: сошлись обе стороны — треугольник «с равными границами»
     (стр. 58), сошлась одна — «с поджатием» (стр. 57).
 
-    Сторона берётся у курса дословно и без замера: стр. 58 «если тренд лонговый, первая
-    точка идет сверху, если тренд шортовый первая точка идет снизу» — значит по тому,
-    какая граница дала ПЕРВУЮ точку, тренд и определяется.
+    ⚠⚠ СТОРОНА С 2026-08-22 БЕРЁТСЯ ИЗ ТРЕНДА, А НЕ ИЗ ПЕРВОЙ ТОЧКИ, И ЭТО ПРАВКА
+    МЕТОДА. Прежняя редакция объявляла себя «у курса дословно и без замера», а делала
+    обратное курсу: выводила ТРЕНД из того, какая граница дала первую точку. Это
+    ОБРАЩЕНИЕ импликации, а не её исполнение. Обе страницы называют тренд ВХОДОМ
+    правила: стр. 57 «Торгуем по тренду. Если тренд Лонговый - ПЕРВАЯ точка берется
+    сверху», стр. 58 «Строим по тренду: если тренд лонговый, первая точка идет сверху».
+
+    Цена прежнего чтения предъявлена, а не оценена: на 777 вымпелах с определённым
+    трендом (10 символов × 5 ТФ) старая сторона расходилась с трендом в 302 случаях —
+    38.9%, и в каждом карточка печатала не ту сторону сделки и прятала стоп за
+    противоположный край структуры. Контроль: доли сторон 48.9% и 48.6% дают при
+    независимости 50.0% совпадений, старый код давал 61.1%. Связь слабая — то есть
+    первая точка тренд НЕ определяет, и обращать импликацию было нельзя.
+
+    Тренд снимается `swings.trend` (стр. 12) по экстремумам, ПОДТВЕРЖДЁННЫМ не позже
+    первой точки структуры: «торгуем по тренду» — про тренд ДО фигуры, который она
+    продолжает, а заглядывать вперёд нельзя.
+
+    Тренда нет — вымпела нет. Стр. 57 начинается словами «Торгуем по тренду», а правила
+    для случая «тренда нет» курс не даёт, и оно не выдумывается: отказ НАЗЫВАЕТСЯ (§4.3).
+    ⚠ Отказ этот НЕ редкий — `trend` возвращает NONE именно на сходящейся цепочке, а
+    вымпел и есть сужение, поэтому доля названа в докладе, а не оставлена молчаливой.
     """
     up, low = structure.upper, structure.lower
     if not up.narrowed and not low.narrowed:
@@ -331,21 +370,31 @@ def pennant(structure: TradingRange | OpenStructure) -> Pennant | NotReady:
         )
     borders = (PennantBorders.EQUAL if up.narrowed and low.narrowed
                else PennantBorders.SQUEEZED)
-    first_up = min(up.point_indices)
-    first_low = min(low.point_indices)
-    if first_up == first_low:
-        return NotReady(
-            reason="первая точка пришла на одном баре и сверху, и снизу — тренд по стр. 58 "
-                   "не определяется, а порядок внутри бара из OHLC не следует"
-        )
-    side = FigureSide.LONG if first_up < first_low else FigureSide.SHORT
+    prior = tuple(s for s in swings.swings
+                  if s.confirmed_at_index <= structure.first_index)
+    direction = trend(SwingSet(
+        swings=prior,
+        bars_scanned=swings.bars_scanned,
+        confirmed_until_index=structure.first_index,
+    )).direction
+    if direction is TrendDirection.NONE:
+        return NotReady(reason=NO_TREND_REASON)
+    side = FigureSide.LONG if direction is TrendDirection.UP else FigureSide.SHORT
+    # Стр. 58: «первая точка идет сверху» у лонга — значит счёт касаний начинается с
+    # точки СТОРОНЫ ТРЕНДА, а пришедшая раньше точка другой стороны номера не получает.
+    # Схема стр. 57 нумерует 1, 3, 5, 7 по одной границе и 2, 4, 6, 8 по другой, то есть
+    # счёт чередуется строго от первой. То же прочтение той же фразы держит и
+    # `_build_channel` для флага с клином — правило одно, и читается одинаково.
+    head = up.point_indices if side is FigureSide.LONG else low.point_indices
     order = sorted(up.point_indices + low.point_indices)
+    if order and order[0] not in head:
+        order = order[1:]
     return Pennant(
         borders=borders,
         side=side,
-        first_index=structure.first_index,
+        first_index=order[0],
         last_point_index=order[-1],
-        touches=structure.touches,
+        touches=len(order),
         touch6_index=order[TOUCH_FOR_ENTRY - 1] if len(order) >= TOUCH_FOR_ENTRY else None,
         stop_anchor=(structure.extended_lo if side is FigureSide.LONG
                      else structure.extended_hi),
