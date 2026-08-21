@@ -445,6 +445,32 @@ class Unbuilt(BaseModel):
     reason: str = Field(min_length=1)
 
 
+LEVELS_PER_SIDE = 5
+"""Сколько уровней СВЕРХУ и СНИЗУ от цены оставлять в карте, по каждому ТФ отдельно.
+
+ПРИКАЗ ВЛАДЕЛЬЦА 2026-08-21, дословно: «очевидно что нам нужны лонг и шорт уровни
+наиближайшие к текущей цене. например по 3-5 уровней сверх и снизу от текущей цены».
+Взята верхняя граница названного им промежутка: отбор — это фильтр, а фильтр прячет
+дефект, по которому его и надо было бы найти, поэтому из двух чисел берётся то, что
+прячет меньше.
+
+⚠ ПО КАЖДОМУ ТФ ОТДЕЛЬНО, А НЕ СКВОЗЬ ВСЕ. Уровни разных ТФ — не сопоставимые между
+собой объекты: стр. 40 говорит «Всегда приоритетный тот ТФ, на котором находится
+текущее накопление», а стр. 24 — что уровни «работают на этом ТФ, а так же на младших
+по отношению к нему». Один список расстояний на все ТФ сравнивал бы несравнимое, и
+пятиминутный шум вытеснил бы недельную базу, которой стр. 48 даёт наивысший винрейт.
+
+⚠ ОТБРОШЕННОЕ СЧИТАЕТСЯ И НАЗЫВАЕТСЯ (`Unbuilt` с причиной «дальше N-го по своей
+стороне»), а не исчезает: правило «порог на выходе не лечит расчёт на входе» запрещает
+молчаливое сокрытие посчитанного. Число отброшенных видно в карточке и в приёмке.
+
+⚠ СИММЕТРИЯ — ЭТО ЗАЩИТА, А НЕ КРАСОТА. Отбор идёт ПО СТОРОНАМ ОТДЕЛЬНО именно потому,
+что предыдущая попытка резать карту (рамка `frame_bars`, снята 2026-08-21) оставила у
+BTC НОЛЬ уровней над ценой — та самая жалоба владельца. Отбор по сторонам обнулить
+сторону не может по построению.
+"""
+
+
 LevelBuild = tuple[tuple["Level", ...], tuple["Unbuilt", ...]]
 """Что отдаёт `build_all`: построенные уровни и НАЗВАННЫЕ причины, где не построен.
 
@@ -461,6 +487,8 @@ def build_all(
     scans: dict[str, RangeScan],
     swings: dict[str, SwingSet] | None = None,
     frame_bars: int | None = None,
+    horizon_days: int = 0,
+    per_side: int = LEVELS_PER_SIDE,
 ) -> LevelBuild:
     """Все уровни по всем ТФ плюс НАЗВАННЫЕ причины, где уровень не построен.
 
@@ -528,6 +556,33 @@ def build_all(
     opens_by_tf: dict[str, list[int]] = {
         stf: [b.open_ms for b in sbars] for stf, sbars in series.items() if sbars}
     del frame_bars  # состав карты рамкой больше не режется — см. докстроку
+
+    # ⚠⚠ ГОРИЗОНТ ДОШЁЛ ДО ПОСТРОЕНИЯ УРОВНЕЙ 2026-08-21. До этого дня он не применялся
+    # здесь ВООБЩЕ: слова «horizon» не было ни в этом модуле, ни в `engine`, ни в
+    # `trading_range` — он жил только в глубине засева (`bars.bars_needed`) и в подборе
+    # окон профиля (`run.profile_windows`). То есть «граница набора» ограничивала часть
+    # набора, а уровни строились из всего, что есть в ряду.
+    #
+    # ЦЕНА ЭТОГО СЧИТАЕТСЯ АРИФМЕТИКОЙ. Пол засева — 200 баров, и он существует ради
+    # `ema200`, то есть ради ИНДИКАТОРА. На 1ч и младше он не действует (горизонт
+    # требует больше), а на старших растягивает ряд далеко за горизонт:
+    #     1Д: нужно 180, берётся 201 — лишних 21 (10.4%)
+    #     1Н: нужно  25, берётся 201 — лишних 176 (87.6%)
+    # Найдено ГЛАЗАМИ по сводке доски: BTC 1Н отдавал уровень 26 804 при живой цене
+    # 77 803, и цена стояла там 23 недельных бара с марта по октябрь 2023 — структура
+    # ТРЁХЛЕТНЕЙ давности в сегодняшней карте. Приказ владельца тем же днём: «исправь
+    # горизонт, чтобы уровни не строились из структур трёхлетней давности».
+    #
+    # ⚠ Отсекается КОНЕЦ окна структуры, а не начало, и это та же мерка, что у
+    # `run.profile_windows` (`if hi < cut`). Иначе получилось бы второе окно под тем же
+    # именем: недельная база, начавшаяся до горизонта и закрывшаяся месяц назад, — живая
+    # структура, а не старьё.
+    #
+    # ⚠ «Сейчас» берётся у САМОГО РЯДА (последний бар), а не у часов: `replay` обязан
+    # давать тот же результат на тех же кадрах, а `clock.now_ms()` сделал бы расчёт
+    # зависящим от момента запуска.
+    now_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
+    cut_ms = now_ms - horizon_days * 86_400_000 if horizon_days > 0 else 0
     for tf in timeframes:
         bars = series.get(tf)
         scan = scans.get(tf)
@@ -541,6 +596,12 @@ def build_all(
                                        reason="сделок не собрано"))
                 continue
             lo, hi = structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
+            if cut_ms and hi < cut_ms:
+                # Не «пропущено», а НАЗВАНО: структура старше горизонта — это ответ,
+                # а не отсутствие ответа (§4.3). Число таких видно в карточке.
+                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                                       reason="структура закрылась раньше горизонта"))
+                continue
             hist = trades.window(lo, hi)
             if isinstance(hist, NotReady):
                 unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
@@ -647,9 +708,54 @@ def build_all(
                 "stop_anchor_narrowed": bool(anchor is not None and anchor.narrowed),
             }))
     built = _one_level_per_range(built, timeframes, unbuilt)
-    last_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
-    built = _with_vrvp(built, trades, last_ms)
+    built = _nearest_by_side(built, series, timeframes, per_side, unbuilt)
+    built = _with_vrvp(built, trades, now_ms)
     return tuple(built), tuple(unbuilt)
+
+
+def _nearest_by_side(built: list[Level], series: dict[str, list[Bar]],
+                     timeframes: tuple[str, ...], per_side: int,
+                     unbuilt: list[Unbuilt]) -> list[Level]:
+    """Оставить `per_side` ближайших к цене уровней СВЕРХУ и СНИЗУ, по каждому ТФ.
+
+    Приказ владельца 2026-08-21: «нам нужны лонг и шорт уровни наиближайшие к текущей
+    цене. например по 3-5 уровней сверх и снизу от текущей цены». Обоснование числа и
+    того, почему отбор идёт по каждому ТФ отдельно, — в докстроке `LEVELS_PER_SIDE`.
+
+    ⚠ СТОРОНА ОПРЕДЕЛЯЕТСЯ ПО ЦЕНЕ УРОВНЯ, А НЕ ПО ЕГО ТИПУ (`side`). Лонг-уровень над
+    ценой и шорт-уровень под ценой существуют оба: стр. 43 переворачивает пробитый
+    уровень, а стр. 44 разбирает случай, когда цена уже внутри зоны. Отбирать по типу
+    значило бы считать «сверху» и «шорт» одним и тем же — две сущности под одним именем.
+
+    ⚠ Цена берётся с МЛАДШЕГО ряда, который есть: он свежее прочих на величину до одного
+    своего бара, тогда как недельный отстаёт на срок до недели.
+    """
+    if per_side <= 0 or not built:
+        return built
+    youngest = min((tf for tf in timeframes if series.get(tf)),
+                   key=lambda tf: TIMEFRAME_MS[tf], default="")
+    if not youngest:
+        return built
+    # ⚠ Decimal, а не float: `Level.price` десятичный, и сравнение с плавающей точкой
+    # дало бы тихую потерю точности на длинных тиках вроде 0.000012345.
+    price = Decimal(str(series[youngest][-1].close))
+    keep: list[Level] = []
+    by_tf: dict[str, list[Level]] = {}
+    for lv in built:
+        by_tf.setdefault(lv.timeframe, []).append(lv)
+    for tf, pool in by_tf.items():
+        above = sorted((lv for lv in pool if lv.price > price),
+                       key=lambda lv: lv.price - price)
+        below = sorted((lv for lv in pool if lv.price <= price),
+                       key=lambda lv: price - lv.price)
+        kept = above[:per_side] + below[:per_side]
+        keep.extend(kept)
+        for lv in above[per_side:] + below[per_side:]:
+            where = "выше" if lv.price > price else "ниже"
+            unbuilt.append(Unbuilt(
+                timeframe=tf, index=0,
+                reason=f"дальше {per_side}-го {where} цены — отбор ближайших"))
+    return keep
 
 
 def _one_level_per_range(

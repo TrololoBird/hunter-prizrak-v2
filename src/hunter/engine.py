@@ -409,6 +409,7 @@ def decide(
     timeframes: tuple[str, ...],
     frame_bars: int | None = None,
     detections: Detections | None = None,
+    horizon_days: int = 0,
 ) -> SymbolDecision:
     """Кадры → решение. Единственная точка, где считается сигнал.
 
@@ -429,7 +430,8 @@ def decide(
     # владельца); боевой прогон передаёт None и строит всё — смысл в `levels.build_all`.
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans,
                                        {tf: r.swings for tf, r in reads.items()},
-                                       frame_bars=frame_bars)
+                                       frame_bars=frame_bars,
+                                       horizon_days=horizon_days)
     # `scans` третьим аргументом — иначе `LevelStatus.playout` знает только картины 1,
     # 3, 4 стр. 28 и закреп без ретеста: картины 2, 5, 6 и 7 требуют разбора структур
     # того же ТФ, и без него страница читалась бы наполовину.

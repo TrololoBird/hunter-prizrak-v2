@@ -224,7 +224,7 @@ async def cycle(c: run.Collector, run_id: str,
     # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
     t_decide = clock.monotonic_ns()
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
-                                      BARS_ON_CHART, detections)
+                                      BARS_ON_CHART, detections, horizon_days)
     report.stage_ms["decide"] = int((clock.monotonic_ns() - t_decide) / 1e6)
     log.info("разбор рядов переиспользован", попаданий=detections.hits,
              посчитано=detections.misses)

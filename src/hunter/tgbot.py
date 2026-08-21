@@ -690,8 +690,12 @@ class OnDemand:
         # Разбор рядов сделан внутри `collect` — сюда он приходит готовым, а не
         # считается заново (2026-08-21, `engine.Detections`). Сборка ОДНОГО символа по
         # запросу занимала до 316 с, и половина её уходила ровно на второй разбор.
+        # ⚠ Горизонт передаётся и здесь: карта по запросу обязана совпадать с картой
+        # службы. Без него бот строил бы уровни из структур за границей набора, а
+        # служба — нет, и владелец видел бы РАЗНЫЕ карты одной монеты.
         decided = await asyncio.to_thread(run.decide_once, report, one, sources,
-                                          BARS_ON_CHART, detections)
+                                          BARS_ON_CHART, detections,
+                                          self.horizon_days)
         got = decided.get(symbol)
         if got is None:
             self.failed += 1

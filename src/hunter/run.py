@@ -1711,6 +1711,7 @@ def decide_once(report: RunReport, uni: Universe,
                 sources: dict[str, TradeWindows],
                 frame_bars: int | None = None,
                 detections: engine.Detections | None = None,
+                horizon_days: int = 0,
                 ) -> dict[str, engine.SymbolDecision]:
     """ШАГ 2 из четырёх: посчитать сигнал. ОДИН раз на символ, для обоих потребителей.
 
@@ -1735,7 +1736,8 @@ def decide_once(report: RunReport, uni: Universe,
         # 5м и 15м по всем 696 рынкам, которых для них даже не собрано. Выигрыш от
         # выноса — один вызов метода на символ; цена ошибки — вся доска.
         out[sym] = engine.decide(sym, series, sources.get(sym), uni.ladder(sym),
-                                 frame_bars=frame_bars, detections=detections)
+                                 frame_bars=frame_bars, detections=detections,
+                                 horizon_days=horizon_days)
     # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
     # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
     # такой», пока их не сложили). До 2026-08-18 счётчик `windows_refused` у `TVWindows`

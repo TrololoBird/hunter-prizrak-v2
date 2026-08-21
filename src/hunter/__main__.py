@@ -137,7 +137,8 @@ def _run(args: argparse.Namespace) -> int:
     # геометрию для 94 уровней, леджер эмитировал 33 (замер на кадрах прогона `a1`).
     decided = _stage("decide",
                      lambda: decide_once(report, uni, sources,
-                                         detections=detections))
+                                         detections=detections,
+                                         horizon_days=args.horizon_days))
     _stage("cards", lambda: produce_cards(args.run_id, report, uni, decided))
     # Данные источника профиля кладутся ПОСЛЕ карточек. Без них повтор читает общее
     # хранилище и объявляет «расчёт изменился» на доливке (Н-6, рецидив 2026-08-18).
