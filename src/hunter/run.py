@@ -2339,8 +2339,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     continue
                 after = [b for b in cbars if b.open_ms > cl.to_ms]
                 verdict = levels.resolve_carried(
-                    cl.side, float(cl.zone_lo), float(cl.zone_hi),
-                    float(cl.boundary_lo), float(cl.boundary_hi), after)
+                    cl.side, float(cl.price), cl.timeframe, after)
                 if verdict is not None:
                     resolved.append((cl.timeframe, cl.from_ms, cl.to_ms, verdict))
             if resolved:
