@@ -292,6 +292,24 @@ def build_tv(
             break
         # Выбор стороны — дословно по справке TV: большая строка; ничья — ближняя к
         # ПОК; при равном расстоянии — верхняя. Расстояния |hi+1−poc| и |poc−(lo−1)|.
+        #
+        # ⚠ ПЕРЕПРОВЕРЕНО У ИСТОЧНИКА 2026-08-22 (страница TV Volume Profile,
+        # tradingview.com/support/solutions/43000502040-volume-profile/). Дословно:
+        # "Take the next row above the POC and the next row below the POC. Compare their
+        # total volumes and choose the larger one", далее — "take the next row on the
+        # side you just added ... and the current row on the opposite side". То есть
+        # сравниваются ОДНА строка сверху и ОДНА снизу, как здесь и сделано.
+        #
+        # ⚠⚠ И ЗДЕСЬ ЖЕ НАЗВАНО, ЧТО НЕ НАДО «ЧИНИТЬ». Классический алгоритм Маркет
+        # Профайл (Steidlmayer / CBOT) расширяет зону ПАРАМИ: сравнивает сумму ДВУХ
+        # строк сверху с суммой ДВУХ снизу. Так делают обе внешние реализации, прочитанные
+        # 2026-08-22 по исходникам: `quantscious/finmlkit` (`comp_poc_hva_lva`,
+        # `up_idx += 2`, порог по умолчанию 68.34%) и `pedrobraiti/volume-profile-trading`
+        # (`_value_area_indices`, докстрока прямо называет это "Steidlmayer's two-line
+        # algorithm"). Расхождение с ними — НЕ дефект: инструмент автора курса —
+        # TradingView, и его правило процитировано выше. Классика тут не применяется по
+        # иерархии §0.1 — она берётся там, где молчат курс и инструмент, а здесь они не
+        # молчат.
         if down_v is None or (up_v is not None and (
                 up_v > down_v
                 or (up_v == down_v and (hi + 1 - poc) <= (poc - (lo - 1))))):

@@ -684,7 +684,11 @@ def build_all(
                 if sw is None or not s_bars:
                     continue
                 # Свинг известен не в момент своего экстремума, а когда ПОДТВЕРЖДЁН
-                # (фрактал закрывается двумя барами позже, `confirmed_at_index`).
+                # (`confirmed_at_index` = index + `swings.ZIGZAG_DEPTH`).
+                # ⚠ Здесь стояло «двумя барами позже» — верно до 2026-08-20, когда
+                # `ZIGZAG_DEPTH` подняли с 2 до 5. Число в комментарии не пересчитали, и
+                # оно пережило правку; сам отбор всегда шёл по полю, а не по константе,
+                # поэтому расчёт не был задет. Исправлено 2026-08-22.
                 s_step = TIMEFRAME_MS[stf]
                 # ⚠ ОТБОР ПРЕФИКСОМ С 2026-08-21 — ТОТ ЖЕ НАБОР, ДРУГАЯ ЦЕНА. Прежде
                 # здесь шёл проход по ВСЕМ экстремумам ряда на КАЖДОЙ структуре:
@@ -1808,7 +1812,8 @@ def playout(
         if any(p.kind is beyond_kind for p in pressed):
             return Playout.BASE_BEYOND
         assert event.resolved_index is not None  # у пробоя бар закрепа есть по построению
-        rt = retest_after(bars, float(level.price), event.resolved_index + 1)
+        rt = retest_after(bars, float(level.price), event.resolved_index + 1,
+                          level.timeframe)
         if rt is None:
             return Playout.BROKEN
         return (Playout.STOP_RUN_FLIP if _stop_taken(level, bars, event, rt)
