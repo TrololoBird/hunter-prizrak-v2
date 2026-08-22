@@ -43,9 +43,18 @@ from .models import (
     Ticker24h,
 )
 
-# Замер 2026-08-03: /fapi/v1/klines принимает limit=1500, на 1501 отвечает
-# HTTP 400 code -1130. ccxt при этом сам режет выдачу до 1000.
-# Протокол: docs/audit/exchange-limits-2026-08-03.md
+# ⚠ ССЫЛКА НА ПРОТОКОЛ БЫЛА ВЫДУМКОЙ, СНЯТА 2026-08-22. Здесь стояло «Протокол:
+# docs/audit/exchange-limits-2026-08-03.md» — файла с таким именем НИКОГДА не было в
+# истории репозитория (`git log --all` по имени: ноль), хотя каталог `docs/audit`
+# отслеживается и насчитывает 210 коммитов. Строка появилась в первом же функциональном
+# коммите (4c86f75) и три недели придавала числам вид проверенных.
+#
+# САМИ ЧИСЛА ВЕРНЫ, и вот их настоящий, проверяемый источник — ИСХОДНИК ccxt:
+#   .venv/Lib/site-packages/ccxt/binance.py, `fetch_ohlcv`:
+#     «# binance docs say that the default limit 500, max 1500 for futures,
+#      max 1000 for spot markets»  и строкой ниже  `maxLimit = 1000`.
+# То есть 1500 — предел биржи для фьючерсов, 1000 — жёсткая отсечка самой библиотеки.
+# Проверить: grep -n "maxLimit = 1000" .venv/Lib/site-packages/ccxt/binance.py
 KLINES_MAX_LIMIT = 1500
 CCXT_EFFECTIVE_LIMIT = 1000
 
