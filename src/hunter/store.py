@@ -1258,13 +1258,18 @@ class CarriedLevel(BaseModel):
     timeframe: str
     side: str
     price: Decimal
-    zone_lo: Decimal
-    zone_hi: Decimal
-    boundary_lo: Decimal
-    boundary_hi: Decimal
-    """Коробка структуры. Нужна, чтобы перенесённый уровень МОЖНО БЫЛО ОЦЕНИТЬ по свежим
-    барам: пробой за коробку — флип (стр. 43), заход в зону с реакцией — отработка
-    (стр. 25). Без неё перенесённый уровень оставался активным вечно."""
+    """Цена уровня — ПОК. Ею и только ею перенесённый уровень оценивается свежими барами:
+    `levels.resolve_carried` спрашивает `breach.first_verdict` НА ЛИНИИ уровня, тот же
+    вердикт, что у обычного уровня в `levels.status`.
+
+    ⚠ ЗДЕСЬ БЫЛИ ЕЩЁ ЧЕТЫРЕ ПОЛЯ — `zone_lo`, `zone_hi`, `boundary_lo`, `boundary_hi`, —
+    и они СНЯТЫ 2026-08-23 вместе с правкой `resolve_carried`. Их обоснование гласило:
+    «коробка нужна, чтобы уровень МОЖНО БЫЛО ОЦЕНИТЬ по свежим барам: пробой за коробку —
+    флип (стр. 43), заход в зону — отработка (стр. 25)». После правки оценка идёт по
+    линии уровня, коробка и зона в ней не участвуют, и потребителей у полей не осталось
+    ни одного (проверено грепом: ни `cl.zone_*`, ни `cl.boundary_*` в `src` больше нет).
+    Оставить их значило бы держать четыре поля с ложным обоснованием — тот же дефект, что
+    удалённый 2026-08-06 `available()` и снятый 2026-08-05 счётчик `ws_unclosed_violations`."""
 
     from_ms: int
     to_ms: int
@@ -1282,18 +1287,14 @@ def carried_levels(
     ПОК у них старый, и выдавать его за свежий нельзя.
     """
     rows = conn.execute(
-        "SELECT timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms, first_seen,"
-        " last_seen, boundary_lo, boundary_hi"
+        "SELECT timeframe, side, price, from_ms, to_ms, first_seen, last_seen"
         " FROM levels WHERE symbol=? AND state='active' AND last_seen < ?"
         " ORDER BY price", (symbol, now_ms),
     ).fetchall()
     return tuple(
         CarriedLevel(
             timeframe=r[0], side=r[1], price=Decimal(str(r[2])),
-            zone_lo=Decimal(str(r[3])), zone_hi=Decimal(str(r[4])),
-            from_ms=r[5], to_ms=r[6], first_seen=r[7], last_seen=r[8],
-            boundary_lo=Decimal(str(r[9] if r[9] is not None else r[3])),
-            boundary_hi=Decimal(str(r[10] if r[10] is not None else r[4])),
+            from_ms=r[3], to_ms=r[4], first_seen=r[5], last_seen=r[6],
         )
         for r in rows
     )
