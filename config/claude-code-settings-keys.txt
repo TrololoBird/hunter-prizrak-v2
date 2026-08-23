@@ -1,8 +1,18 @@
 # Ключи настроек Claude Code, признаваемые приложением. Снято 2026-08-06 из
 # машиночитаемой схемы, а не из страницы документации:
 #
-#   curl -sSL https://json.schemastore.org/claude-code-settings.json \
-#     | python -c "import json,sys; d=json.load(sys.stdin); print('\n'.join(sorted(k for k in d['properties'] if k!='$schema')))"
+#   curl -sSL https://raw.githubusercontent.com/SchemaStore/schemastore/master/src/schemas/json/claude-code-settings.json -o ccs.json
+#   python -c "import json; p=json.load(open('ccs.json',encoding='utf-8'))['properties']; print('\n'.join(sorted(k for k in p if k!='$schema'))); [print('\n['+s+']\n'+'\n'.join(sorted(p[s]['properties']))) for s in ('permissions','hooks')]"
+#
+# ⚠ Адрес сменён 2026-08-23: json.schemastore.org отдаёт этот файл слишком медленно —
+# два обрыва подряд, на 40 и на 180 секундах, получено 4 КБ и 32 КБ из 230 КБ.
+# Первоисточник тот же, репозиторий SchemaStore, но он выкачивается целиком.
+#
+# РАЗДЕЛЫ. Строки до первого [раздела] — ключи ВЕРХНЕГО уровня. Дальше [permissions] и
+# [hooks] — имена ВЛОЖЕННЫХ ключей. Без них гейт сверял только верхний уровень, то есть
+# объявлял охват больше настоящего: опечатка в permissions.denny или hooks.PreToolUsee
+# проходила молча — а именно на этих двух ветках держатся запреты и остановка коммита.
+# Добавлено 2026-08-23.
 #
 # ЗАЧЕМ ЭТОТ ФАЙЛ. Неизвестный ключ в `.claude/settings.json` приложение молча
 # игнорирует: настройка выглядит заданной, а её нет. Это ровно та форма дефекта, из-за
@@ -13,7 +23,9 @@
 # заметен сразу и правится одной командой, а молча проигнорированная настройка — нет.
 #
 # Значения permissions.defaultMode (оттуда же): acceptEdits, bypassPermissions, default, delegate, dontAsk, plan, auto, manual
-# Ключей: 141
+# Ключей: 141 верхних, 7 в permissions, 31 в hooks. Перевыпущено 2026-08-23:
+# расхождений со списком верхнего уровня от 2026-08-06 НЕТ — ни одного ключа не
+# прибавилось и не убыло.
 advisorModel
 agent
 agentPushNotifEnabled
@@ -155,3 +167,45 @@ workflowKeywordTriggerEnabled
 workflowSizeGuideline
 worktree
 wslInheritsWindowsSettings
+
+[permissions]
+additionalDirectories
+allow
+ask
+defaultMode
+deny
+disableAutoMode
+disableBypassPermissionsMode
+
+[hooks]
+ConfigChange
+CwdChanged
+DirectoryAdded
+Elicitation
+ElicitationResult
+FileChanged
+InstructionsLoaded
+MessageDisplay
+Notification
+PermissionDenied
+PermissionRequest
+PostCompact
+PostToolBatch
+PostToolUse
+PostToolUseFailure
+PreCompact
+PreToolUse
+SessionEnd
+SessionStart
+Setup
+Stop
+StopFailure
+SubagentStart
+SubagentStop
+TaskCompleted
+TaskCreated
+TeammateIdle
+UserPromptExpansion
+UserPromptSubmit
+WorktreeCreate
+WorktreeRemove

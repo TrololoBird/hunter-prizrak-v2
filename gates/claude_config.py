@@ -6,7 +6,10 @@ CLAUDE.md, раздел «Проверка»: правило исполняет 
 
   1. опечатка в имени ключа. Приложение игнорирует неизвестный ключ без единого слова:
      настройка выглядит заданной, а её нет. Сверка идёт со списком признаваемых ключей
-     `config/claude-code-settings-keys.txt`, снятым из машиночитаемой схемы;
+     `config/claude-code-settings-keys.txt`, снятым из машиночитаемой схемы — верхний
+     уровень И вложенные ветки `permissions`, `hooks` (последние добавлены 2026-08-23:
+     до того гейт объявлял этот класс, а сверял только верхний уровень, и опечатка в
+     `permissions.denny` снимала все запреты молча);
   2. хук объявлен, а файла нет. `PreToolUse` отменяет вызов ТОЛЬКО кодом 2; запуск
      несуществующего файла даёт код 1, то есть `git commit` при красных гейтах пройдёт.
      Ровно то, против чего хук и написан;
@@ -89,12 +92,35 @@ def load_json(path: Path, bad: list[str]) -> dict[str, Any] | None:
     return data
 
 
-def known_keys(bad: list[str]) -> set[str]:
+SECTION = re.compile(r"^\[([a-zA-Z]+)\]$")
+
+
+def known_keys(bad: list[str]) -> dict[str, set[str]]:
+    """Признаваемые имена ключей по разделам файла.
+
+    Раздел `""` — верхний уровень, `"permissions"` и `"hooks"` — вложенные. До 2026-08-23
+    файл был плоским, и гейт сверял ТОЛЬКО верхний уровень, объявляя при этом охват
+    «опечатка в имени ключа». Опечатка в `permissions.denny` или `hooks.PreToolUsee`
+    проходила молча — то есть отказывали ровно те две ветки, на которых держатся запреты
+    и остановка коммита. Это не «новая проверка», а починка прибора, который смотрел не
+    на ту величину.
+    """
+    out: dict[str, set[str]] = {"": set()}
     if not KNOWN_KEYS.exists():
         bad.append(f"нет списка ключей {KNOWN_KEYS.as_posix()} — сверять не с чем")
-        return set()
-    lines = KNOWN_KEYS.read_text(encoding="utf-8").splitlines()
-    return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+        return out
+    current = ""
+    for raw in KNOWN_KEYS.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        head = SECTION.match(line)
+        if head:
+            current = head.group(1)
+            out.setdefault(current, set())
+            continue
+        out[current].add(line)
+    return out
 
 
 def strings_of(node: Any) -> list[str]:
@@ -124,15 +150,33 @@ def frontmatter(text: str) -> dict[str, str] | None:
 
 
 def check_settings(bad: list[str]) -> tuple[int, int]:
-    """Ключи настроек и ссылки на хуки. Возвращает (ключей, хуков)."""
+    """Ключи настроек и ссылки на хуки. Возвращает (СВЕРЕННЫХ ключей, хуков).
+
+    ⚠ Первое число — сколько ключей сверено, включая вложенные в `permissions` и `hooks`,
+    а не сколько их на верхнем уровне. До 2026-08-23 возвращалось второе, и печать
+    «ключей настроек 8» читалась как охват, которого не было.
+    """
     data = load_json(SETTINGS, bad)
     if data is None:
         return 0, 0
-    allowed = known_keys(bad)
+    sections = known_keys(bad)
+    allowed = sections.get("", set())
+    checked = 0
     for key in sorted(data):
+        checked += 1
         if allowed and key not in allowed:
             bad.append(f"{SETTINGS.as_posix()}: ключ {key!r} не признаётся приложением "
                        f"— оно молча его проигнорирует")
+    for branch in ("permissions", "hooks"):
+        node = data.get(branch)
+        nested = sections.get(branch, set())
+        if not isinstance(node, dict) or not nested:
+            continue
+        for key in sorted(node):
+            checked += 1
+            if key not in nested:
+                bad.append(f"{SETTINGS.as_posix()}: ключ {f'{branch}.{key}'!r} не "
+                           f"признаётся приложением — вся ветка молча не сработает")
     permissions = data.get("permissions")
     if isinstance(permissions, dict):
         mode = permissions.get("defaultMode")
@@ -151,7 +195,7 @@ def check_settings(bad: list[str]) -> tuple[int, int]:
     for name in sorted(on_disk - declared):
         bad.append(f"{HOOKS_DIR.as_posix()}/{name}: файл есть, в настройках не объявлен "
                    f"— значит не запускается никогда")
-    return len(data), len(declared | on_disk)
+    return checked, len(declared | on_disk)
 
 
 def check_mcp(bad: list[str]) -> int:
