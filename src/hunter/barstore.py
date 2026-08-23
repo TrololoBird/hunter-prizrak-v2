@@ -29,11 +29,12 @@ from pathlib import Path
 
 import polars as pl
 
-from . import log
+from . import log, paths
 from .bars import grid_anchor_ms, tf_ms
 from .models import Bar
 
-BARS_DIR = Path("data/bars")
+# Каталог склада — от общего корня данных (`paths.DATA_DIR`, 2026-08-23).
+BARS_DIR = paths.DATA_DIR / "bars"
 
 BARS_LAYOUT = "b1"
 """Метка схемы файла. По той же причине, что `archive.CACHE_LAYOUT`: содержимое зависит
@@ -50,6 +51,43 @@ SCHEMA: dict[str, type[pl.DataType]] = {
     "close": pl.Float64,
     "volume": pl.Float64,
 }
+
+
+def frame_of_bars(bars: list[Bar]) -> pl.DataFrame:
+    """Кадр polars из списка баров. ОДНА сборка на проект.
+
+    ⚠⚠ ЗАВЕДЕНА 2026-08-23: сборка кадра из шести списков была выписана ДВАЖДЫ — здесь
+    (в `append`) и в `store.bars_to_frame`, причём вторая несла СВОЙ литерал схемы
+    вместо общего `SCHEMA`. Две копии определения одного кадра — то же, чем этот проект
+    уже поплатился на границах структуры: совпадали они по счастливой случайности.
+
+    ⚠ Схема задаётся ЯВНО, а не выводится: пустой список без схемы дал бы кадр с
+    колонками типа `Null`, и `write_parquet` записал бы файл, который следующее чтение
+    приняло бы за ряд из нулей.
+    """
+    return pl.DataFrame(
+        {
+            "open_ms": [b.open_ms for b in bars],
+            "open": [b.open for b in bars],
+            "high": [b.high for b in bars],
+            "low": [b.low for b in bars],
+            "close": [b.close for b in bars],
+            "volume": [b.volume for b in bars],
+        },
+        schema=SCHEMA,
+    )
+
+
+def bars_of_frame(frame: pl.DataFrame) -> list[Bar]:
+    """Бары из кадра. Обратная к `frame_of_bars`, и тоже одна на проект.
+
+    Типы приводятся ЯВНО: кадр может прийти из parquet, записанного другой версией
+    polars, и `Bar` — замороженный датакласс без валидации типов на входе."""
+    return [
+        Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
+            low=float(r[3]), close=float(r[4]), volume=float(r[5]))
+        for r in frame.select(COLUMNS).iter_rows()
+    ]
 
 
 def store_path(venue: str, market_id: str, timeframe: str) -> Path:
@@ -208,11 +246,7 @@ def load(
         return []
     if frame.is_empty():
         return []
-    return [
-        Bar(open_ms=int(r[0]), open=float(r[1]), high=float(r[2]),
-            low=float(r[3]), close=float(r[4]), volume=float(r[5]))
-        for r in frame.select(COLUMNS).iter_rows()
-    ]
+    return bars_of_frame(frame)
 
 
 def count(
@@ -276,17 +310,7 @@ def append(
     if not bars:
         return 0, 0
     path = store_path(venue, market_id, timeframe)
-    fresh = pl.DataFrame(
-        {
-            "open_ms": [b.open_ms for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-        },
-        schema=SCHEMA,
-    ).unique(subset=["open_ms"], keep="last")
+    fresh = frame_of_bars(bars).unique(subset=["open_ms"], keep="last")
 
     with _append_lock(path):
         old = _read(path)
@@ -312,7 +336,7 @@ def append(
             )
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_atomic(merged, path)
+        write_atomic(merged, path)
     return added, rewritten
 
 
@@ -403,16 +427,25 @@ def _append_lock(path: Path) -> Iterator[None]:
                      файл=str(lock))
 
 
-def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
-    """Запись через временный файл рядом плюс `os.replace`. Та же причина, что в
-    `archive._write_atomic`: обрыв на записи оставлял бы обрезанный parquet, который
-    читатель принял бы за полный ряд НАВСЕГДА.
+def write_atomic(frame: pl.DataFrame, path: Path) -> None:
+    """Запись через временный файл рядом плюс `os.replace`. ОДНА на проект.
+
+    Обрыв на записи оставил бы обрезанный parquet, который читатель принял бы за полный
+    ряд НАВСЕГДА: он видит `path.exists()` и больше не переспрашивает. `os.replace`
+    атомарна в пределах одной файловой системы — отсюда требование класть временный
+    файл РЯДОМ, а не в системный временный каталог.
 
     ⚠ `os.replace` повторяется при `PermissionError` (2026-08-18): на Windows замена
-    файла, который в этот миг ОТКРЫТ читателем (служба и бот делят `data/bars`),
+    файла, который в этот миг ОТКРЫТ читателем (служба и бот делят склад баров),
     отказывает — пробник barstore-lock-probe поймал это живым прогоном. Чтение
     parquet — доли секунды, поэтому короткие повторы; исчерпание повторов роняет
-    запись ИМЕНОВАННО, а не молча (§4.3)."""
+    запись ИМЕНОВАННО, а не молча (§4.3).
+
+    ⚠⚠ КОПИЙ БЫЛО ДВЕ, И ОНИ УЖЕ РАЗОШЛИСЬ (слито 2026-08-23). В `archive` стояла та же
+    функция БЕЗ повторов на `PermissionError` — при том что суточный кэш сделок читают
+    те же два процесса и на той же Windows, которую владелец называет боевой средой. То
+    есть один и тот же отказ был закрыт в одном хранилище и открыт в другом, и заметить
+    это можно было только сличив два файла глазами."""
     tmp = path.with_suffix(f".part-{os.getpid()}")
     try:
         frame.write_parquet(tmp)

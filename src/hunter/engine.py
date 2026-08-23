@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
-from .bars import TIMEFRAME_MS
+from .bars import TF_RANK, TIMEFRAME_MS
 from .geometry import TF_ORDER, Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
@@ -481,10 +481,10 @@ def _fill_pennants(
     дал, а таких по замеру 2026-08-22 около 43% сужений и порядка процента всех структур.
     """
     for tf, read in list(reads.items()):
-        if tf not in TF_ORDER:
+        if tf not in TF_RANK:
             continue
         bars = series.get(tf) or []
-        higher = [s for s in TF_ORDER[TF_ORDER.index(tf) + 1:]
+        higher = [s for s in TF_ORDER[TF_RANK[tf] + 1:]
                   if s in reads and series.get(s)]
         closed = [
             _pennant_of(acc, read.swings,

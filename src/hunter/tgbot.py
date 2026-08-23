@@ -76,14 +76,28 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import FSInputFile, Message
 
-from . import clock, emit, engine, geometry, levels, log, pereprior, run, service, store, swings
+from . import (
+    clock,
+    emit,
+    engine,
+    geometry,
+    levels,
+    log,
+    paths,
+    pereprior,
+    run,
+    service,
+    store,
+    swings,
+)
 from .bars import (
     BARS_ON_CHART,
+    TF_RANK,
     TIMEFRAME_MS,
     expected_last_closed_open_ms,
     tf_ms,
 )
-from .card import TF_LABEL
+from .card import TF_LABEL, trim_zeros
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
 from .exchange import CapabilityMissing, Exchange, shared
 from .levels import LevelState
@@ -406,6 +420,17 @@ def parse_request(text: str, *, is_private: bool, bot_name: str) -> Request | No
 # `docs/audit/bot-review-2026-08-17.md`.
 
 
+def _spaced(s: str) -> str:
+    """Разряды через УЗКИЙ ПРОБЕЛ вместо запятой — в Telegram он не переносит строку.
+
+    ⚠ Вынесено 2026-08-23: `.replace(",", " ")` стоял ЧЕТЫРЬМЯ копиями внутри одной
+    функции `_fmt_price`. Копии одной строки в одном теле — не стилистика: пробел здесь
+    неразрывный (U+202F выглядит как обычный), и правка одной из четырёх прошла бы
+    незамеченной, а число в сообщении разъехалось бы только у части диапазонов.
+    """
+    return s.replace(",", " ")
+
+
 def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     """Цена так, как её читает человек: 63 460, 3.691, 0.00385.
 
@@ -441,19 +466,22 @@ def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
             q = d.to_integral_value(rounding=ROUND_HALF_UP)
         exact = q * tick
         if exact >= 10_000:
-            return f"{float(exact):,.0f}".replace(",", " ")
+            return _spaced(f"{float(exact):,.0f}")
         # Знаков ровно столько, сколько их у тика: лишние — обещание точности, которой
         # у инструмента нет, недостающие — снова невыставимое число.
         head, _, tail = format(exact, "f").partition(".")
-        head = f"{int(head):,}".replace(",", " ")
+        head = _spaced(f"{int(head):,}")
         return f"{head}.{tail}" if tail else head
     if x >= 10_000:
-        return f"{x:,.0f}".replace(",", " ")
+        return _spaced(f"{x:,.0f}")
     if x >= 1000:
-        return f"{x:,.1f}".replace(",", " ")
+        return _spaced(f"{x:,.1f}")
     if x >= 1:
         return f"{x:.5g}"
-    return f"{x:.8f}".rstrip("0")
+    # ⚠ `card.trim_zeros`, а не `.rstrip("0")` на месте (правка 2026-08-23). Здесь была
+    # ВТОРАЯ копия снятия хвостовых нулей, и она разошлась с первой: без снятия
+    # осиротевшей точки ноль печатался как `0.` — `f"{0.0:.8f}"` это `0.00000000`.
+    return trim_zeros(f"{x:.8f}")
 
 
 RETIRED_WINDOW_MS = BARS_ON_CHART * tf_ms(CHART_TFS[0])
@@ -838,7 +866,7 @@ def zones_for_chart(
     # доставались уровням в пределах полупроцента, а картинка теряла разнос: у автора
     # линии распределены по всему кадру (его BTC 19.08: от 62 024 до 65 203, размах 5%).
     # Сортировка по силе даёт тот же разнос без выдуманного «шага между линиями».
-    order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
+    order = TF_RANK
     cap = near_senior + near_local
 
     def strongest(cands: list[ZoneSpec]) -> list[ZoneSpec]:
@@ -1085,7 +1113,7 @@ def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
     у BTC пробитых у структуры 973, а РАЗНЫХ среди них 259 — читателю называют то, что
     он увидел бы списком, а не длину внутреннего массива.
     """
-    order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
+    order = TF_RANK
     best: dict[tuple[str, str], ZoneSpec] = {}
     # ⚠ СИЛА ПО ОБЪЁМУ РЕШАЕТ ПРИ РАВНОМ ТФ (2026-08-19, приказ владельца: "примени
     # силу по объёму в отборе уровней"). Стр. 22: «Сила уровня определяется ТФ и объемом» —
@@ -1322,7 +1350,7 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                 1 if _waiting_break(z) else 0,
                 _away(z, price))
 
-    order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
+    order = TF_RANK
 
     def spans(rows: list[ZoneSpec]) -> list[list[ZoneSpec]]:
         """Склейка ПЕРЕСЕКАЮЩИХСЯ зон одной стороны в «диапазон интереса».
@@ -1654,7 +1682,7 @@ def _fmt_age(minutes: int) -> str:
 # --- отправка ---------------------------------------------------------------------
 
 
-SENT_DIR = Path("data/sent")
+SENT_DIR = paths.DATA_DIR / "sent"
 """Куда складывается ТЕКСТ каждого отправленного сообщения, по суткам.
 
 ⚠ ЗАВЕДЕНО 2026-08-19 по вопросу владельца: "почему у тебя нигде не сохраняется
@@ -3250,7 +3278,7 @@ def _merge_hits(hits: list[tuple[LevelRow, float, str]],
     все ТФ района: сила решает, а список говорит, что район виден на нескольких
     графиках сразу.
     """
-    order = {tf: i for i, tf in enumerate(TIMEFRAME_MS)}
+    order = TF_RANK
     groups: list[list[tuple[LevelRow, float, str]]] = []
     for hit in sorted(hits, key=lambda h: (h[0].symbol, h[0].side, h[0].zone_lo)):
         lv = hit[0]

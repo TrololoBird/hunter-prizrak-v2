@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import bisect
 from collections.abc import Sequence
 from decimal import Decimal
 from enum import StrEnum
@@ -242,12 +243,24 @@ def first_bar_after(bars: list[Bar], timeframe: str, since_ms: int, not_before: 
 
     `not_before` — нижняя граница поиска (бар появления уровня): раньше неё сделки быть
     не может по стр. 23, даже если момент записи ещё старше.
+
+    ⚠ ДВОИЧНЫЙ ПОИСК, А НЕ ЛИНЕЙНЫЙ (правка 2026-08-23). Здесь стоял проход циклом от
+    `not_before` до конца ряда, при том что `levels`, `figures` и `profile_source` в
+    этом же проекте уже везде на `bisect`. Ряд отсортирован по `open_ms` по построению
+    (`barstore.append` завершается `sort`, кадры пишутся отсортированными), а условие
+    `open_ms + step > since_ms` монотонно по индексу — значит место перехода ищется
+    делением пополам. Зовётся функция на КАЖДЫЙ дорешиваемый сигнал леджера.
+
+    Ответ ТОТ ЖЕ по построению: `bisect_right` по ключу `open_ms` даёт первый бар с
+    `open_ms > since_ms - step`, то есть ровно первый, у которого `open_ms + step >
+    since_ms` (метки целые, строгое неравенство сохраняется).
     """
     step = tf_ms(timeframe)
-    for i in range(max(not_before, 0), len(bars)):
-        if bars[i].open_ms + step > since_ms:
-            return i
-    return len(bars)
+    lo = max(not_before, 0)
+    if lo >= len(bars):
+        return len(bars)
+    return bisect.bisect_right(bars, since_ms - step, lo=lo,
+                               key=lambda b: b.open_ms)
 
 
 def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:

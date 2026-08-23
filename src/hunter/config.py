@@ -13,10 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from . import paths
 from .bars import PROFILE_MS, TIMEFRAME_MS
 
-DEFAULT_PATH = Path("config/universe.toml")
-BOT_PATH = Path("config/bot.toml")
+DEFAULT_PATH = paths.CONFIG_DIR / "universe.toml"
+BOT_PATH = paths.CONFIG_DIR / "bot.toml"
 
 
 @dataclass(frozen=True, slots=True)

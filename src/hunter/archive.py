@@ -37,7 +37,6 @@ REST отдаёт сделки не глубже 24 часов, потом — �
 
 from __future__ import annotations
 
-import os
 import re
 from collections import OrderedDict
 from datetime import UTC, date, datetime, timedelta
@@ -46,7 +45,7 @@ from pathlib import Path
 
 import polars as pl
 
-from . import log
+from . import barstore, log, paths
 from .models import BarBinnedTrades, NotReady, TradeHistogram, tick_scale
 
 
@@ -66,7 +65,8 @@ def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
     return (price * scale + 0.5).floor().cast(pl.Int64) // step
 
 
-CACHE_DIR = Path("data/aggcache")
+# Каталог кэша — от общего корня данных (`paths.DATA_DIR`, 2026-08-23).
+CACHE_DIR = paths.DATA_DIR / "aggcache"
 
 GROUPED_MAX = 1024
 """Ёмкость кэша сгруппированных суток `TradeWindows._grouped`. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО, а
@@ -169,24 +169,14 @@ def cache_path(market_id: str, day: date, tick: Decimal) -> Path:
               f"-{CACHE_LAYOUT}.parquet")
 
 
-def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
-    """Запись через временный файл в ТОМ ЖЕ каталоге плюс `os.replace`.
-
-    ⚠ Прежняя редакция писала прямо по целевому пути. Обрыв процесса (а качается до
-    сотен файлов по ~15 МБ, с таймаутом 900 с и тремя попытками) оставлял обрезанный
-    parquet, и дальше читатель видел `path.exists()` и брал его НАВСЕГДА, не переспрашивая,
-    а `cached_days` считал эти сутки собранными. Причина потом выглядела
-    бы как «битый файл», а не как «недокачано».
-
-    `os.replace` атомарна в пределах одной файловой системы — отсюда требование класть
-    временный файл рядом, а не в системный временный каталог.
-    """
-    tmp = path.with_suffix(f".part-{os.getpid()}")
-    try:
-        frame.write_parquet(tmp)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+# ⚠⚠ СОБСТВЕННЫЙ `_write_atomic` УДАЛЁН 2026-08-23: он был ВТОРОЙ КОПИЕЙ
+# `barstore.write_atomic`, и копии успели разойтись — здесь `os.replace` вызывался ОДИН
+# раз, а там повторяется при `PermissionError`. Windows отказывает в замене файла,
+# открытого читателем, и суточный кэш читают те же два процесса, что и склад баров.
+# Повод правки прежний и в силе: обрыв процесса (сотни файлов по ~15 МБ, таймаут 900 с,
+# три попытки) оставлял обрезанный parquet, который `cached_days` считал собранными
+# сутками НАВСЕГДА — читатель видит `path.exists()` и больше не переспрашивает.
+_write_atomic = barstore.write_atomic
 
 
 def frame_from_pairs(

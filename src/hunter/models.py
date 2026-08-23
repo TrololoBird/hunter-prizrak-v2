@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -117,6 +118,41 @@ class NotReady(BaseModel):
         return f"не готово: {self.reason}"
 
 
+def percentile_rank(values: Sequence[float], x: float) -> float:
+    """Доля значений НЕ ВЫШЕ `x`, в процентах. §4.1: порог — перцентиль своей истории.
+
+    ⚠ Вынесена 2026-08-23 из двух мест, где одна и та же формула была выписана слово в
+    слово: `factors.band_narrowing` (место ширины полос среди прошлых ширин) и
+    `stop_volume.StopVolumeSet.density_percentile` (место плотности среди структур
+    прогона). Обе величины предъявляются, обе меряют одно и то же понятие, и разойтись
+    им ничто не мешало.
+
+    ⚠ Пустая выборка — `ValueError`, а не ноль и не сто: «места среди ничего» не
+    существует, а подставленное число читалось бы как измеренное (§4.3). Вызывающий
+    обязан отсечь пустоту раньше — у обоих потребителей она отсечена по построению.
+    """
+    if not values:
+        raise ValueError("перцентильный ранг по пустой выборке не определён")
+    return sum(1 for v in values if v <= x) / len(values) * 100
+
+
+def all_finite(*values: float) -> bool:
+    """Все значения конечны: ни NaN, ни бесконечности.
+
+    ⚠ Вынесено 2026-08-23 из двух `__post_init__` подряд, где одна и та же цепочка
+    `math.isfinite(...) and ...` была выписана дважды — на пять полей и на восемь.
+
+    ⚠⚠ ЧЕГО ЭТА ФУНКЦИЯ НЕ ЗАМЕНЯЕТ, и это названо, чтобы следующий читатель не свёл
+    сюда лишнего:
+      * `check.py` проверяет бары НЕЗАВИСИМЫМ обходом и с ГЕОМЕТРИЕЙ в том же условии —
+        это ОРАКУЛ, вторая реализация нарочно, и слить её значило бы уничтожить
+        проверку (правило исключения для `gates/`, тот же довод);
+      * `factors._absent` — ДРУГОЙ предикат: `None` или NaN. Он про отсутствие значения
+        индикатора, а не про конечность числа, и совпадает с этим лишь наполовину.
+    """
+    return all(math.isfinite(v) for v in values)
+
+
 @dataclass(slots=True, frozen=True)
 class Bar:
     """Свеча. Не модель pydantic, и это РЕСУРСНОЕ решение с названной ценой.
@@ -157,9 +193,7 @@ class Bar:
         # написаны сравнениями, а сравнение с NaN всегда ложно — NaN-бар проходил их
         # МОЛЧА и дальше отравлял min/max/суммы всего конвейера, где NaN не падает,
         # а тихо съедает результат.
-        if not (math.isfinite(self.open) and math.isfinite(self.high)
-                and math.isfinite(self.low) and math.isfinite(self.close)
-                and math.isfinite(self.volume)):
+        if not all_finite(self.open, self.high, self.low, self.close, self.volume):
             raise ValueError(
                 f"бар {self.open_ms}: неконечное значение "
                 f"(o={self.open} h={self.high} l={self.low} c={self.close} "
@@ -230,11 +264,9 @@ class BarDetail:
     def __post_init__(self) -> None:
         # Та же проверка конечности, что у `Bar`, и по той же причине: остальные
         # проверки — сравнения, а сравнение с NaN всегда ложно.
-        if not (math.isfinite(self.open) and math.isfinite(self.high)
-                and math.isfinite(self.low) and math.isfinite(self.close)
-                and math.isfinite(self.volume) and math.isfinite(self.quote_volume)
-                and math.isfinite(self.taker_buy_base)
-                and math.isfinite(self.taker_buy_quote)):
+        if not all_finite(self.open, self.high, self.low, self.close, self.volume,
+                          self.quote_volume, self.taker_buy_base,
+                          self.taker_buy_quote):
             raise ValueError(f"бар {self.open_ms}: неконечное значение в полях детали")
         if self.close_ms <= self.open_ms:
             raise ValueError(

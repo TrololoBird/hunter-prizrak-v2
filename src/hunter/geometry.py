@@ -34,7 +34,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .bars import BARS_ON_CHART, TIMEFRAME_MS
+from .bars import BARS_ON_CHART, TF_RANK, TIMEFRAME_MS
 from .levels import (
     STOP_ANCHOR_BAND_MAX_PCT,
     Level,
@@ -45,8 +45,13 @@ from .levels import (
 from .models import NotReady
 from .pereprior import Pereprior, PPSide
 
-TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
-"""Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2."""
+TF_ORDER = tuple(TIMEFRAME_MS)
+"""Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2.
+
+⚠ Здесь стоял ЛИТЕРАЛ `("5m", "15m", "1h", "4h", "1d", "1w")` — вторая запись того же
+порядка (правка 2026-08-23). Теперь он выводится из `bars.TIMEFRAME_MS`, который и есть
+список курса; разойтись двум записям больше нечем. Кортеж остаётся кортежем: потребители
+берут из него срезы (`TF_ORDER[rank + 1:]` — «все старше этого»)."""
 
 STOP_MARGIN_MIN_PCT = 1.0
 STOP_MARGIN_MAX_PCT = 3.0
@@ -378,9 +383,9 @@ class Setup(BaseModel):
 
 def _tf_step(a: str, b: str) -> int | None:
     """На сколько ступеней ТФ `b` младше `a`. None — один из ТФ не из основных."""
-    if a not in TF_ORDER or b not in TF_ORDER:
+    if a not in TF_RANK or b not in TF_RANK:
         return None
-    return TF_ORDER.index(a) - TF_ORDER.index(b)
+    return TF_RANK[a] - TF_RANK[b]
 
 
 TARGET_STRUCTURE_FRAME_BARS = BARS_ON_CHART

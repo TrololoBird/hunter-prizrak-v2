@@ -33,7 +33,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .models import Bar
+from .models import Bar, percentile_rank
 from .swings import SwingKind, SwingSet
 
 
@@ -407,7 +407,7 @@ def band_narrowing(upper: list[float | None], lower: list[float | None],
 
     return BandNarrowingFactor(
         width_pct=last,
-        percentile=sum(1 for w in known if w <= last) / len(known) * 100,
+        percentile=percentile_rank(known, last),
         exit_bars_median=statistics.median(waits) if waits else None,
         exit_cases=len(waits),
     )

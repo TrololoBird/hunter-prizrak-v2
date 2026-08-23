@@ -27,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .bars import TIMEFRAME_MS, steps_between, tf_ms
+from .bars import TF_RANK, TIMEFRAME_MS, steps_between, tf_ms
 from .breach import (
     CONFIRM_BODIES,
     RETURN_BARS,
@@ -1242,13 +1242,14 @@ def _younger_tfs(tf: str, available: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _tf_rank(tf: str) -> int:
-    """Старшинство ТФ по порядку `TIMEFRAME_MS` — он и есть список курса со стр. 17.
+    """Старшинство ТФ — из общей таблицы `bars.TF_RANK`.
 
-    Своей копии порядка здесь нет умышленно: вторая копия разошлась бы с первой на первой
-    же правке. Неизвестный ТФ падает через `tf_ms`, а не становится молча самым младшим.
+    ⚠ Здесь стоял `list(TIMEFRAME_MS).index(tf)`: список строился ЗАНОВО на каждый
+    вызов, а вызывают её в отборе младших ТФ на каждый уровень. С 2026-08-23 порядок
+    живёт одной таблицей на проект (разбор — в докстроке `bars.TF_RANK`), а неизвестный
+    ТФ по-прежнему падает, а не становится молча самым младшим.
     """
-    tf_ms(tf)
-    return list(TIMEFRAME_MS).index(tf)
+    return TF_RANK[tf]
 
 
 class TakeDepth(StrEnum):

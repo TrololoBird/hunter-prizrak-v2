@@ -21,12 +21,15 @@ from pathlib import Path
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import log
+from . import barstore, log, paths
 from .bars import tf_ms
 from .levels import EntryRule, Level, LevelState
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
-DATA_DIR = Path("data")
+# Корень данных — из `paths` (2026-08-23): один на проект и настраиваемый
+# переменной окружения. Прежде здесь стоял относительный `Path("data")`, и
+# место склада зависело от текущего каталога процесса.
+DATA_DIR = paths.DATA_DIR
 FRAMES_DIR = DATA_DIR / "frames"
 LEDGER_PATH = DATA_DIR / "ledger.sqlite3"
 
@@ -321,23 +324,12 @@ def frames_path(run_id: str, symbol: str, timeframe: str) -> Path:
     return FRAMES_DIR / run_id / _safe(symbol) / f"{timeframe}.parquet"
 
 
-def bars_to_frame(bars: list[Bar]) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "open_ms": [b.open_ms for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-        },
-        schema={"open_ms": pl.Int64, "open": pl.Float64, "high": pl.Float64,
-                "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64},
-    )
-
-
-def frame_to_bars(df: pl.DataFrame) -> list[Bar]:
-    return [Bar(**row) for row in df.iter_rows(named=True)]
+# ⚠ Сборка и разбор кадра баров живут в `barstore` — ОДНОЙ парой на проект
+# (2026-08-23). Здесь были ВТОРЫЕ копии обеих, причём прямая несла собственный литерал
+# схемы вместо общего `barstore.SCHEMA`. Имена оставлены прежними: их зовут четыре
+# места этого модуля, и переименование не относится к находке.
+bars_to_frame = barstore.frame_of_bars
+frame_to_bars = barstore.bars_of_frame
 
 
 def write_bars(run_id: str, symbol: str, timeframe: str, bars: list[Bar]) -> Path:
@@ -779,7 +771,19 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
     миграций SQLite: DROP старой таблицы при включённых FK отклоняется, хотя новая
     встаёт на её место тем же именем и теми же id).
     """
+    # ⚠ ВОЗВРАТ `foreign_keys = ON` — В `finally` (правка 2026-08-23). Прежде он стоял
+    # СЛЕДУЮЩЕЙ строкой после `executescript`, и всякое исключение внутри перестройки
+    # оставляло соединение БЕЗ внешних ключей. Дальше по этому же соединению работает
+    # весь прогон, а `_tune` объявляет ровно обратное: «§10.2 обещает „записать
+    # бессмысленную строку нельзя“ — обещание держала только схема на бумаге».
     conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        _rebuild_signals_v3(conn)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _rebuild_signals_v3(conn: sqlite3.Connection) -> None:
     conn.executescript(
         "BEGIN;"
         "CREATE TABLE signals_v3 ("
@@ -804,7 +808,6 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
         "ALTER TABLE signals_v3 RENAME TO signals;"
         "COMMIT;"
     )
-    conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
@@ -816,7 +819,15 @@ def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
     `_migrate_2_to_3`: `DROP` таблицы, на которую смотрит `signal_id`, при включённых FK
     отклоняется.
     """
+    # ⚠ Возврат — в `finally`, по той же причине, что в `_migrate_2_to_3`.
     conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        _rebuild_outcomes_v9(conn)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _rebuild_outcomes_v9(conn: sqlite3.Connection) -> None:
     conn.executescript(
         "BEGIN;"
         "CREATE TABLE outcomes_v9 ("
@@ -833,7 +844,82 @@ def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
         "ALTER TABLE outcomes_v9 RENAME TO outcomes;"
         "COMMIT;"
     )
-    conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _check_stamp(conn: sqlite3.Connection, path: Path) -> None:
+    """Сверить ШТАМП базы с версией, ВЫВЕДЕННОЙ ИЗ КОЛОНОК. До миграций, не после.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-23, И ЭТО ДАЁТ `schema_meta` ПОТРЕБИТЕЛЯ. Таблица штамповалась
+    при КАЖДОМ открытии базы и не читалась НИ ОДНОЙ строкой проекта — поле без
+    потребителя, то есть Д-1, и притом ровно там, где сам модуль описывает ловушку:
+    «база помечена мигрированной, не будучи ею».
+
+    ⚠ ПОЧЕМУ ИМЕННО ДО МИГРАЦИЙ, а не после. Первая редакция этой проверки стояла ПОСЛЕ
+    и сравнивала `_schema_version(conn)` с `SCHEMA_VERSION` — и оказалась проверкой,
+    которая НЕ МОЖЕТ СРАБОТАТЬ: последняя строка лестницы возвращает `SCHEMA_VERSION`,
+    поэтому подъём константы без новой ступени двигает ОБЕ величины сразу. Контроль
+    2026-08-23 это и показал: константа поднята до «17», ступени нет, выведено — «17»,
+    расхождения ноль. Проверка, не способная упасть, — тот самый дефект, ради удаления
+    которого весь этот разбор и делается.
+
+    Здесь сравниваются РАЗНЫЕ источники: штамп, ЗАПИСАННЫЙ ПРОШЛЫМ запуском, против
+    состава колонок СЕЙЧАС. Штамп старше состава — след ровно той ловушки: прошлый
+    запуск пометил базу версией, до которой не домигрировал.
+
+    ⚠ Отсутствие штампа — НЕ нарушение: база могла быть создана до появления таблицы
+    либо это первый запуск. Молчим только в этом случае, и он назван.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+    except sqlite3.DatabaseError:
+        return  # таблицы ещё нет — база создаётся сразу свежей
+    if row is None or not str(row[0]).isdigit():
+        return
+    stamped = int(row[0])
+    derived = _schema_version(conn)
+    if derived.isdigit() and stamped > int(derived):
+        log.degraded(
+            "леджер ПОМЕЧЕН версией, до которой не домигрировал — прошлый запуск "
+            "проштамповал базу, не изменив её",
+            штамп=stamped, выведено_из_колонок=derived, файл=str(path))
+
+
+def _backup_before_migration(conn: sqlite3.Connection, path: Path) -> None:
+    """Снимок базы ПЕРЕД миграцией. Ничего не делает, если мигрировать нечего.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-23 ПО РАЗБОРУ АРХИТЕКТУРЫ. Обратных миграций в проекте нет и не
+    предвидится, а ступени 2→3, 8→9, 14→15 и 15→16 ПЕРЕСОЗДАЮТ таблицу: `DROP TABLE`
+    после копирования. Ступень 15→16 вдобавок УДАЛЯЕТ строки, нарушающие новый инвариант
+    зоны. Ошибка в любой из них — и леджер, «единственный будущий источник ответа,
+    работает ли метод» (§8 этап 7), не восстанавливается ничем: он копится только
+    временем.
+
+    Снимок делается штатным `sqlite3.Connection.backup` — он согласован по транзакциям и
+    не требует остановки писателей, в отличие от копирования файла.
+
+    ⚠ Отказ снимка НЕ отменяет миграцию, но и не молчит: диск может быть полон, а
+    прогон обязан состояться. Причина уходит в журнал деградацией (§4.3), и владелец
+    видит, что снимка нет, ДО того, как он понадобится.
+
+    ⚠ Снимок ОДИН на версию: имя несёт версию, с которой уходим. Копить по снимку на
+    каждый запуск нельзя — база растёт только временем, и место кончилось бы быстрее.
+    """
+    was = _schema_version(conn)
+    if was == SCHEMA_VERSION:
+        return
+    dest = path.with_suffix(f".before-v{was}.sqlite3")
+    if dest.exists():
+        return
+    try:
+        with sqlite3.connect(dest) as snap:
+            conn.backup(snap)
+        log.info("снимок леджера перед миграцией сделан", файл=str(dest),
+                 версия_до=was, версия_после=SCHEMA_VERSION)
+    except (sqlite3.Error, OSError) as e:
+        log.degraded("снимок леджера перед миграцией НЕ сделан — миграция всё равно "
+                     "пойдёт, отката не будет", файл=str(dest),
+                     причина=f"{type(e).__name__} {e}")
 
 
 def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
@@ -844,6 +930,8 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     _tune(conn)
+    _check_stamp(conn, path)
+    _backup_before_migration(conn, path)
     if _schema_version(conn) == "1":
         _migrate_1_to_2(conn)
     if _schema_version(conn) == "2":
@@ -1040,6 +1128,12 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (SCHEMA_VERSION,),
     )
+    # `PRAGMA user_version` — штатный механизм версионирования схемы SQLite, и до
+    # 2026-08-23 он не использовался НИ РАЗУ (`grep user_version` → пусто). Ставится
+    # ради внешних инструментов: `sqlite3 ledger.sqlite3 "PRAGMA user_version"` отвечает
+    # без знания устройства нашей таблицы. Авторитетом он не становится — им остаётся
+    # состав колонок; поэтому и пишется он ПОСЛЕ сверки, а не вместо неё.
+    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
     conn.commit()
     return conn
 

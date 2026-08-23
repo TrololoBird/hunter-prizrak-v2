@@ -32,7 +32,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import Bar
+from .models import Bar, percentile_rank
 from .trading_range import TradingRange
 
 
@@ -143,8 +143,9 @@ class StopVolumeSet(BaseModel):
         (новое поле плюс ступень схемы леджера), а цена такой правки выше пользы от
         строки про свойство, которое курс сам называет необязательным.
         """
-        d = sv.density
-        return sum(1 for x in self.densities if x <= d) / len(self.densities) * 100
+        # Формула — общая (`models.percentile_rank`): вторая её копия жила в
+        # `factors.band_narrowing` и мерила то же понятие другими словами.
+        return percentile_rank(self.densities, sv.density)
 
 
 # ⚠⚠ `_VOL_MEMO` УДАЛЁН 2026-08-23. Модульный изменяемый словарь на 100 000 записей жил
