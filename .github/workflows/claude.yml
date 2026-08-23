@@ -85,7 +85,7 @@ jobs:
       - uses: anthropics/claude-code-action@bd4488507006939d8b3b7f098a2231b36e22f8c1  # v1
         if: env.HAS_AUTH == 'true'
         env:
-          # Все 22 гейта печатают по-русски, а раннер отдаёт вывод в cp1252 —
+          # Все гейты печатают по-русски, а раннер отдаёт вывод в cp1252 —
           # без этого первый же гейт падает UnicodeEncodeError (замер 2026-08-06).
           PYTHONIOENCODING: utf-8
         with:
