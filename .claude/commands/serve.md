@@ -1,5 +1,6 @@
 ---
 description: Служба 24/7 — сбор без остановки, расчёт циклами
+disable-model-invocation: true
 argument-hint: "[число символов] [сколько циклов, 0 = бесконечно]"
 ---
 

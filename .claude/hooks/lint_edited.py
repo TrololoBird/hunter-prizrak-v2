@@ -25,6 +25,27 @@ from pathlib import Path
 WATCHED_ROOTS = ("src", "scripts", "gates")
 
 
+def _ruff_cmd(root: Path) -> list[str]:
+    """Чем звать `ruff`, и почему не обёрткой.
+
+    Замер 2026-08-23 на этой машине, по три прогона на вариант:
+    `uv run ruff check <файл>` — 415 мс, `uv run --no-sync` — 284 мс, прямой
+    `.venv/Scripts/ruff.exe` — 164 мс. Хук висит на КАЖДОЙ правке, поэтому разница
+    складывается в минуты за смену. Цена числа названа: одна машина, тёплый кэш,
+    три прогона; направление устойчиво, сама величина — ориентир.
+
+    ⚠ Запасной путь обязателен и он НЕ МОЛЧИТ. Если venv не собран — свежий клон,
+    чужая машина, раннер CI, — берётся `uv run ruff`: медленнее, зато проверка
+    СОСТОИТСЯ. Жёсткий путь без запасного превратил бы отсутствие venv в
+    непроведённую проверку, а §4.3 такую тишину запрещает.
+    """
+    for rel in ("Scripts/ruff.exe", "bin/ruff"):
+        exe = root / ".venv" / rel
+        if exe.is_file():
+            return [str(exe)]
+    return ["uv", "run", "ruff"]
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
@@ -60,7 +81,7 @@ def main() -> int:
 
     # Команда фиксирована, путь получен через `relative_to` от корня проекта.
     done = subprocess.run(
-        ["uv", "run", "ruff", "check", str(rel)], cwd=root,
+        [*_ruff_cmd(root), "check", str(rel)], cwd=root,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if done.returncode == 0:
