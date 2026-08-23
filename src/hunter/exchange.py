@@ -447,6 +447,28 @@ def desync_s(key: str, base_s: float) -> float:
     return base_s * (0.5 + zlib.crc32(key.encode()) % 1000 / 1000)
 
 
+USED_CCXT_METHODS: tuple[str, ...] = (
+    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchCurrencies", "fetchTicker",
+    "fetchTickers", "fetchTrades", "fetchOrderBook", "fetchBidsAsks",
+    "fetchLastPrices", "fetchMarkPrice", "fetchMarkPrices", "fetchFundingRate",
+    "fetchFundingRates", "fetchFundingRateHistory", "fetchFundingIntervals",
+    "fetchOpenInterest", "fetchOpenInterests", "fetchOpenInterestHistory",
+    "fetchLiquidations", "fetchLongShortRatioHistory", "loadMarkets",
+    "watchTrades", "watchOHLCV",
+)
+"""Методы ccxt, которые проект ДЕЙСТВИТЕЛЬНО вызывает. Знаменатель к «спрошено N».
+
+⚠⚠ ЗАВЕДЕНО 2026-08-23. `REQUIRED_CAPABILITIES` ниже покрывает ТРИ метода, и приёмка
+печатала «возможности проверены: 3» — без знаменателя это читается как «проверено всё»,
+хотя не спрошено большинство. Разрыв теперь НАЗЫВАЕТСЯ числом при открытии соединения.
+
+⚠ Список НЕ становится вторым `REQUIRED_CAPABILITIES`, и это не робость: карта `has`
+врёт в обе стороны (разбор двумя абзацами ниже — объявленные `True` методы отвечают
+`-5000 «Method is invalid»`, а существующий метод объявлен `None`). Жёсткая проверка по
+ней остановила бы прогон на работающем методе. Правило проекта — «проверка возможности
+только вызов»; пока вызова нет, честно назвать разрыв, а не закрыть его объявлением.
+"""
+
 REQUIRED_CAPABILITIES: dict[str, str] = {
     "fetchOHLCV": "бары всех ТФ — без них нет ни структур, ни уровней (§2.4, §2.8)",
     "fetchTime": "сведение часов с биржей — §6 запрещает судить о закрытости по локальным",
@@ -1095,6 +1117,21 @@ class Exchange:
         # вывод из рассуждения: рассуждение перестанет быть верным молча.
         self.capabilities_missing = len(missing)
         self.capabilities_emulated = len(emulated)
+        # ⚠⚠ ОХВАТ ПРОВЕРКИ НАЗЫВАЕТСЯ ЧИСЛОМ (2026-08-23). `REQUIRED_CAPABILITIES`
+        # покрывает ТРИ метода из тех, что проект реально вызывает; остальные не
+        # спрашиваются вовсе, и до этой строки об этом не говорилось нигде — а «спрошено
+        # 3» без знаменателя читается как «проверено всё». Расширять список нельзя
+        # бездумно: карта `has` ВРЁТ В ОБЕ СТОРОНЫ (разбор в докстроке
+        # `REQUIRED_CAPABILITIES`), и жёсткая проверка по ней остановила бы прогон на
+        # методе, который работает. Поэтому здесь НАЗЫВАЕТСЯ разрыв, а не вводится
+        # отсечка: правило проекта — «проверка возможности только вызов», и настоящее
+        # закрытие этого разрыва в том, чтобы вызвать, а не спросить.
+        unchecked = sorted(set(USED_CCXT_METHODS) - set(REQUIRED_CAPABILITIES))
+        if unchecked:
+            log.info("возможности, которые проект ВЫЗЫВАЕТ, но у карты не спрашивает",
+                     вызываем=len(USED_CCXT_METHODS),
+                     спрошено=len(REQUIRED_CAPABILITIES),
+                     не_спрошено=len(unchecked), методы=", ".join(unchecked))
         # ⚠ «проверено N» здесь означает «спрошено у карты N раз», а НЕ «работает N».
         # Формулировка правится вместе с находкой о лживости `has`: прежняя читалась как
         # утверждение об исправности.

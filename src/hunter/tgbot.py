@@ -735,8 +735,8 @@ class OnDemand:
         # выдал бы монете вне ядра УКОРОЧЕННУЮ лестницу доски (1ч/4ч/1Д/1Н), и человек,
         # спросивший про монету, получил бы карточку без 5м и 15м. Спросили про неё —
         # значит она и есть ядро этого разбора.
-        one = replace(self.uni, symbols=(symbol,), board=False,
-                      core=frozenset({symbol}))
+        one = self.uni.model_copy(update={
+            "symbols": (symbol,), "board": False, "core": frozenset({symbol})})
         log.info("сборка по запросу начата", символ=symbol, горизонт_суток=self.horizon_days)
         try:
             # ⚠ ОТБОР ОКОН ПРОФИЛЯ — ПО БЛИЗОСТИ К ЦЕНЕ, а не по возрасту (2026-08-21).

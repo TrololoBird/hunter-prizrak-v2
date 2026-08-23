@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -116,6 +117,52 @@ class NotReady(BaseModel):
 
     def __str__(self) -> str:
         return f"не готово: {self.reason}"
+
+
+class LruCache[K, V]:
+    """Память с вытеснением самого давнего. ОДНА реализация на проект.
+
+    ⚠⚠ ЗАВЕДЕНА 2026-08-23: `OrderedDict` + `move_to_end` + `popitem(last=False)` были
+    выписаны ТРИЖДЫ — окна профиля (`profile_source.WindowCache`), суточные кадры и их
+    свёртки (`archive.WindowSource._open`, `._grouped`). Три копии одного механизма
+    расходятся не «если», а «через сколько дней»; здесь их одна.
+
+    ⚠ Ёмкость у каждого потребителя СВОЯ и остаётся его решением: она выведена из
+    размера хранимого, а не из механизма. Сгруппированные сутки в сотни раз меньше
+    сырых, и держать их можно годами окон — это довод про данные, а не про кэш.
+
+    ⚠ Класс держит состояние В ЭКЗЕМПЛЯРЕ, а не в модуле. Разница существенна для §10.3:
+    модульный словарь — глобальное состояние расчёта (запрещено, ловится
+    `gates/purity.py`), а память, принадлежащая объекту, живёт ровно столько, сколько
+    её владелец, и видна в его подписи.
+    """
+
+    __slots__ = ("_items", "_max")
+
+    def __init__(self, max_items: int) -> None:
+        if max_items <= 0:
+            raise ValueError(f"ёмкость памяти обязана быть больше нуля, дано {max_items}")
+        self._items: OrderedDict[K, V] = OrderedDict()
+        self._max = max_items
+
+    def get(self, key: K) -> V | None:
+        """Значение по ключу либо `None`. Попадание освежает запись."""
+        hit = self._items.get(key)
+        if hit is not None:
+            self._items.move_to_end(key)
+        return hit
+
+    def put(self, key: K, value: V) -> None:
+        """Положить значение, вытеснив самое давнее при переполнении."""
+        self._items[key] = value
+        while len(self._items) > self._max:
+            self._items.popitem(last=False)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 def percentile_rank(values: Sequence[float], x: float) -> float:

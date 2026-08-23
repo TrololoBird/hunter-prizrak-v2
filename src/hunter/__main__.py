@@ -8,7 +8,6 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -108,7 +107,7 @@ def _run(args: argparse.Namespace) -> int:
         # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
         # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
         # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
-        uni = replace(uni, cap=args.symbols)
+        uni = uni.model_copy(update={"cap": args.symbols})
     from . import log
     from .run import (
         collect,
@@ -179,7 +178,7 @@ def _serve(args: argparse.Namespace) -> int:
         # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
         # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
         # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
-        uni = replace(uni, cap=args.symbols)
+        uni = uni.model_copy(update={"cap": args.symbols})
     bad = asyncio.run(serve(uni, args.seed_limit, args.horizon_days, args.run_id,
                             cycle_seconds=args.cycle_seconds, max_cycles=args.cycles))
     return 1 if bad else 0
@@ -198,7 +197,7 @@ def _check(args: argparse.Namespace) -> int:
         # Второе (2026-08-21): срез здесь идёт ДО раскрытия доски, а раскрытие вернуло
         # бы все 696 обратно — тормоз остался бы в справке и перестал бы тормозить.
         # Потолок применяет `run._capped` там, где порядок символов уже окончателен.
-        uni = replace(uni, cap=args.symbols)
+        uni = uni.model_copy(update={"cap": args.symbols})
     return 1 if run_check(uni, args.seconds, args.seed_limit) else 0
 
 

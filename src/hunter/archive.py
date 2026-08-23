@@ -38,7 +38,6 @@ REST отдаёт сделки не глубже 24 часов, потом — �
 from __future__ import annotations
 
 import re
-from collections import OrderedDict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -46,7 +45,13 @@ from pathlib import Path
 import polars as pl
 
 from . import barstore, log, paths
-from .models import BarBinnedTrades, NotReady, TradeHistogram, tick_scale
+from .models import (
+    BarBinnedTrades,
+    LruCache,
+    NotReady,
+    TradeHistogram,
+    tick_scale,
+)
 
 
 def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
@@ -404,7 +409,7 @@ class WindowSource:
         ровно тот файл, что читался, иначе пересборка разошлась бы на границе покрытия.
         """
 
-        self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        self._open: LruCache[date, pl.DataFrame] = LruCache(max_open)
         self._open_parts: dict[date, tuple[pl.DataFrame, int] | None] = {}
         self._part_idx: dict[str, tuple[Path, int]] | None = None
         """Индекс частичных суток каталога, построенный ОДНИМ обходом при первом
@@ -413,7 +418,7 @@ class WindowSource:
         (evidence/profile-replay-after-2026-08-17.txt). Экземпляр живёт один цикл, а
         частичные файлы пишет только бэкфилл ДО построения источников — устаревание
         индекса внутри цикла невозможно по порядку шагов `service.cycle`."""
-        self._grouped: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        self._grouped: LruCache[date, pl.DataFrame] = LruCache(GROUPED_MAX)
         """Гистограммы ЦЕЛЫХ суток, сгруппированные один раз. Окна структур перекрываются
         по суткам (профиль повтора 2026-08-17: 329 вызовов `window` на 3 символа), и без
         кэша одни и те же сутки группировались заново под каждым окном — 76% времени
@@ -431,29 +436,29 @@ class WindowSource:
         Ёмкость — своя (`GROUPED_MAX`), не `max_open`: сгруппированные сутки в сотни раз
         меньше сырых (~тысяча бинов против сотен тысяч сделок), держать их можно годами
         окон."""
-        if day in self._grouped:
-            self._grouped.move_to_end(day)
-            return self._grouped[day]
+        # ⚠ Вытеснение — общей памятью `models.LruCache` (2026-08-23): своей копии
+        # `OrderedDict` + `move_to_end` + `popitem` здесь больше нет. Копий этого
+        # механизма в проекте было три; ёмкость остаётся своя — она выведена из
+        # размера хранимого, а не из устройства памяти.
+        hit = self._grouped.get(day)
+        if hit is not None:
+            return hit
         g = frame.group_by("bin", maintain_order=True).agg(pl.col("qty").sum(),
                                                            pl.col("n").sum())
-        self._grouped[day] = g
-        while len(self._grouped) > GROUPED_MAX:
-            self._grouped.popitem(last=False)
+        self._grouped.put(day, g)
         return g
 
     def _day(self, day: date) -> pl.DataFrame | None:
         """Сутки из кэша. Скачивания здесь НЕТ: это работа бэкфилла, а не расчёта."""
-        if day in self._open:
-            self._open.move_to_end(day)
-            return self._open[day]
+        hit = self._open.get(day)
+        if hit is not None:
+            return hit
         path = self.cache_dir / cache_path(self.market_id, day, self.tick).name
         if not path.exists():
             return None
         frame = pl.read_parquet(path)
         self.used_paths.add(path)
-        self._open[day] = frame
-        while len(self._open) > self.max_open:
-            self._open.popitem(last=False)
+        self._open.put(day, frame)
         return frame
 
     def _part(self, day: date) -> tuple[pl.DataFrame, int] | None:

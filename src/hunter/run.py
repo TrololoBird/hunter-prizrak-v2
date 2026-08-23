@@ -14,7 +14,6 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import NamedTuple
@@ -262,7 +261,7 @@ async def expand_board(ex: Exchange, uni: Universe) -> Universe:
              лестница_ядра="/".join(uni.timeframes),
              лестница_доски="/".join(uni.board_timeframes),
              верх_доски="; ".join(s.split("/")[0] for s in rest[:5]))
-    return _capped(replace(uni, symbols=tuple(core) + tuple(rest)))
+    return _capped(uni.model_copy(update={"symbols": tuple(core) + tuple(rest)}))
 
 
 def _capped(uni: Universe) -> Universe:
@@ -279,7 +278,7 @@ def _capped(uni: Universe) -> Universe:
     kept = uni.symbols[: uni.cap]
     log.info("потолок символов", взято=len(kept), было=len(uni.symbols),
              ядра_в_потолке=sum(1 for s in kept if s in uni.core))
-    return replace(uni, symbols=kept, core=uni.core & set(kept))
+    return uni.model_copy(update={"symbols": kept, "core": uni.core & set(kept)})
 
 
 class GapRepair(NamedTuple):
@@ -2961,8 +2960,65 @@ CYCLE_FIELDS = (
 каждую эмиссию каждого цикла — список, растущий без предела, — а «карточек записано»
 означало бы сумму по всем циклам, то есть не отвечало бы ни на один вопрос.
 
-⚠ Список ведётся руками. Новое поле расчёта, забытое здесь, будет накапливаться молча.
+⚠⚠ «ЗАБЫТОЕ ПОЛЕ БУДЕТ НАКАПЛИВАТЬСЯ МОЛЧА» — БОЛЬШЕ НЕТ (2026-08-23). Здесь стояла
+ровно эта строка, и она была признанием, а не защитой: список ведётся руками, а забыть
+в нём поле нечем помешать. Теперь рядом стоит `LIFETIME_FIELDS` — поля, живущие ВСЁ
+время работы, — и `_check_fields_split` требует, чтобы объединение двух списков покрывало
+модель ЦЕЛИКОМ. Новое поле отчёта заставляет сделать выбор ПРИ ИМПОРТЕ модуля, а не
+проявляется через сутки работы службы кривым числом в приёмке.
 """
+
+
+LIFETIME_FIELDS = (
+    # Часы и биржа: состояние процесса, а не цикла.
+    "clock_age_ms", "clock_drift_max_ms", "clock_drift_ms", "clock_recheck_after_s",
+    "clock_resync_failures", "clock_resyncs", "clock_stale", "sync", "taken_at_ms",
+    "capabilities_checked", "capabilities_emulated", "capabilities_missing",
+    "markets_checked", "markets_reload_failures", "markets_reloads",
+    "delisted_mid_run", "tick_changes", "weight_limit", "weight_peak", "weight_reads",
+    "rest_errors", "rest_gate_held", "rest_rate_limited",
+    # Сбор: копится с запуска службы, обнуление сделало бы его бессмысленным.
+    "bars_from_store", "bars_rewritten", "bars_stored", "bars_trimmed",
+    "seed_already_current", "seed_checked", "seed_gap_bars", "seed_gaps_filled",
+    "seed_gaps_found", "seed_gaps_left", "seed_gaps_rebuilt", "seed_tail_failed",
+    "seeded_bars", "poll_revived", "heartbeats", "uptime_s", "cycles", "cycle_seconds",
+    "watch_deaths", "watch_failures", "watch_restarts", "ws_reconnects",
+    "ws_stream_errors", "trade_gap_events", "trade_gaps", "trade_gaps_recovered",
+    "trade_gaps_unrecovered", "trade_ids_checked", "trades_total",
+    "live_buckets_dropped", "live_days_flushed", "cache_orphaned",
+    # Контейнеры, которые снимок ЗАМЕЩАЕТ целиком, а не обнуляет.
+    "series", "histograms", "binned", "stage_ms", "stage_windows_ns",
+    "loop_late_events", "loop_late_total_ms", "loop_stall_max_ms",
+    "profile_spans_by_tf", "profile_symbols_no_windows",
+)
+"""Поля, живущие ВСЁ время работы процесса, а не один расчёт.
+
+Список нужен не сам по себе, а как ВТОРАЯ ПОЛОВИНА разбиения: вместе с `CYCLE_FIELDS`
+он обязан покрывать модель отчёта целиком, и это проверяется ниже. Без него «поле не
+обнуляется» и «поле забыли» выглядят одинаково.
+"""
+
+
+def _check_fields_split() -> None:
+    """Каждое поле отчёта отнесено ЛИБО к циклу, ЛИБО ко времени жизни процесса.
+
+    ⚠ Падает ПРИ ИМПОРТЕ, и это выбор: поле, не отнесённое никуда, — молчаливая
+    деградация того самого вида, ради которого заведён `CYCLE_FIELDS`, и обнаружиться
+    она может только по кривому числу в приёмке через сутки работы. Импорт же ломается
+    сразу и ловится гейтом `smoke_import` на каждом коммите.
+    """
+    known = set(CYCLE_FIELDS) | set(LIFETIME_FIELDS)
+    fields = set(RunReport.model_fields)
+    lost = sorted(fields - known)
+    extra = sorted(known - fields)
+    if lost or extra:
+        raise RuntimeError(
+            f"разбиение полей отчёта неполно: не отнесены ни к циклу, ни ко времени "
+            f"жизни {lost}; названы, но в модели отсутствуют {extra}. "
+            f"Новое поле обязано попасть либо в CYCLE_FIELDS, либо в LIFETIME_FIELDS")
+
+
+_check_fields_split()
 
 
 def _copy_series(st: SeriesState) -> SeriesState:

@@ -49,13 +49,12 @@
 from __future__ import annotations
 
 import bisect
-from collections import OrderedDict
 from decimal import Decimal
 
 import numpy as np
 
 from .bars import tf_ms
-from .models import Bar, NotReady, TradeHistogram, tick_scale
+from .models import Bar, LruCache, NotReady, TradeHistogram, tick_scale
 
 PROFILE_LADDER = ("1m", "5m", "15m", "1h", "4h", "1d")
 TV_INTRABAR_MAX_BARS = 5000
@@ -96,7 +95,7 @@ WINDOW_CACHE_MAX = 40
 CACHE_MIN_BARS = 43_200
 
 
-class WindowCache:
+class WindowCache(LruCache[_WindowKey, TradeHistogram]):
     """Память ДОРОГИХ окон профиля, переживающая циклы службы (2026-08-17).
 
     ⚠⚠ БЫЛА МОДУЛЬНЫМ СЛОВАРЁМ `_WINDOW_CACHE` — вынесена в объект 2026-08-23. Модуль
@@ -120,27 +119,14 @@ class WindowCache:
     ⚠ Возвращается ОБЩИЙ объект: контракт потребителей — ТОЛЬКО ЧТЕНИЕ (`build_level` и
     `_with_vrvp` гистограмму не мутируют). Значения при попадании БАЙТ-В-БАЙТ те же, что
     при пересчёте, — это тот же объект, порядок сложений не менялся вовсе.
+
+    ⚠ Механизм вытеснения — общий (`models.LruCache`): своей копии `OrderedDict` +
+    `move_to_end` + `popitem` здесь больше нет, таких копий в проекте было три.
+    Собственным остаётся только ЁМКОСТЬ — она выведена из размера хранимого.
     """
 
-    __slots__ = ("_items", "_max")
-
     def __init__(self, max_items: int = WINDOW_CACHE_MAX) -> None:
-        self._items: OrderedDict[_WindowKey, TradeHistogram] = OrderedDict()
-        self._max = max_items
-
-    def get(self, key: _WindowKey) -> TradeHistogram | None:
-        hit = self._items.get(key)
-        if hit is not None:
-            self._items.move_to_end(key)
-        return hit
-
-    def put(self, key: _WindowKey, value: TradeHistogram) -> None:
-        self._items[key] = value
-        while len(self._items) > self._max:
-            self._items.popitem(last=False)
-
-    def __len__(self) -> int:
-        return len(self._items)
+        super().__init__(max_items)
 
 
 def intrabar_timeframe(duration_ms: int) -> str:

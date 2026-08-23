@@ -10,20 +10,48 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import paths
 from .bars import PROFILE_MS, TIMEFRAME_MS
+
+PositiveInt = Annotated[int, Field(gt=0, strict=True)]
+"""Целое СТРОГО больше нуля, без приведения типов.
+
+⚠ Заменяет рукописную `_positive_int` (2026-08-23). `strict=True` здесь не украшение:
+без него pydantic принял бы `true` за единицу, `"7"` за семь и `1.0` за единицу, а в
+TOML `answer_cooldown_s = true` — это опечатка, а не выключатель. Прежняя проверка
+отдельно отбивала `bool` (`isinstance(raw, bool)`), и это свойство обязано было
+сохраниться при переезде, иначе правка молча ослабила бы контракт.
+
+Ноль здесь всегда означал бы выключение через опечатку — отсюда `gt=0`, а не `ge=0`."""
 
 DEFAULT_PATH = paths.CONFIG_DIR / "universe.toml"
 BOT_PATH = paths.CONFIG_DIR / "bot.toml"
 
 
-@dataclass(frozen=True, slots=True)
-class Universe:
-    symbols: tuple[str, ...]
-    timeframes: tuple[str, ...]
+class Universe(BaseModel):
+    """Закреплённая вселенная §5.
+
+    ⚠⚠ ПЕРЕВЕДЕНА С `@dataclass` НА PYDANTIC 2026-08-23. Причина не в моде: §10.1
+    требует ОДНОЙ системы контрактов между слоями, а конфигурация была единственным
+    местом на весь проект, где стоял датакласс с рукописным валидатором — 21 `raise
+    ValueError` и 7 `isinstance` при том, что pydantic уже в боевых зависимостях.
+    Одиннадцать из этих отказов были чистой ФОРМОЙ (лишний ключ, тип поля, пустой
+    список, «больше нуля») — то есть объявлением, а не кодом.
+
+    Перекрёстные правила (доска против её лестницы, подмножество ТФ, повторы символов)
+    остались правилами и переехали в `model_validator` НИЖЕ — со своими русскими
+    текстами и со ссылкой на файл: сообщение оператору здесь важнее краткости.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbols: tuple[str, ...] = Field(min_length=1)
+    timeframes: tuple[str, ...] = Field(min_length=1)
     source: Path
     venue: str = "binanceusdm"
     """Площадка Binance: `binanceusdm` (бессрочные на USDT), `binancecoinm` (монетное
@@ -124,6 +152,76 @@ class Universe:
     всему их диапазону.
     """
 
+    @model_validator(mode="after")
+    def _rules(self) -> Universe:
+        """Перекрёстные правила вселенной. ФОРМУ полей держат сами поля.
+
+        ⚠ Здесь ровно то, чего объявлением не выразить: согласие двух полей между собой.
+        Сообщения остались русскими и с именем файла — оператор читает их вместо
+        трассировки, и это часть контракта, а не украшение.
+
+        ⚠ Правила зовутся при ПОСТРОЕНИИ модели, а не при `model_copy`. Так и надо:
+        `run.expand_board` и сборка по запросу в боте строят СУЖЕННУЮ копию вселенной
+        (`board=False` при непустой `board_timeframes`), и она законна — это уже не файл
+        оператора, а рабочее подмножество. Прежний датакласс вёл себя так же: проверки
+        жили в загрузчике, а `dataclasses.replace` их не звал.
+        """
+        where = self.source
+        bad = [t for t in self.timeframes if t not in TIMEFRAME_MS]
+        if bad:
+            raise ValueError(
+                f"{where}: таймфреймы {bad} вне §2.8 ({sorted(TIMEFRAME_MS)})")
+        dupes = {s for s in self.symbols if self.symbols.count(s) > 1}
+        if dupes:
+            raise ValueError(f"{where}: символы повторяются: {sorted(dupes)}")
+        # ⚠ Разрешение профиля проверяется по СВОЕЙ таблице, а не по §2.8: значение вроде
+        # `1d` здесь синтаксически верно и содержательно разрушительно — объём суток лёг
+        # бы ровным слоем по всему суточному диапазону.
+        if self.profile_timeframe not in PROFILE_MS:
+            raise ValueError(
+                f"{where}: profile_timeframe={self.profile_timeframe!r} вне "
+                f"{sorted(PROFILE_MS)}; профиль строится из МЛАДШИХ свечей, а не из "
+                f"таймфреймов анализа")
+        bad = [t for t in self.board_timeframes if t not in TIMEFRAME_MS]
+        if bad:
+            raise ValueError(
+                f"{where}: board_timeframes {bad} вне §2.8 ({sorted(TIMEFRAME_MS)})")
+        # ⚠ ПОДМНОЖЕСТВО, А НЕ ПРОИЗВОЛЬНЫЙ СПИСОК. Таймфрейм, который считает доска и не
+        # считает ядро, дал бы две карты под одним именем «уровень», и одна из них
+        # навсегда осталась бы непроверенной — тот же класс дефекта, что границы уровня
+        # 2026-08-18.
+        extra = [t for t in self.board_timeframes if t not in self.timeframes]
+        if extra:
+            raise ValueError(
+                f"{where}: board_timeframes {extra} нет в timeframes "
+                f"{list(self.timeframes)}; лестница доски обязана быть подмножеством "
+                f"лестницы ядра")
+        if any(not c for c in self.board_contracts):
+            raise ValueError(f"{where}: board_contracts обязан быть списком НЕПУСТЫХ строк")
+        if self.board and not self.board_contracts:
+            raise ValueError(
+                f"{where}: board=true без board_contracts — на доску пошли бы ВСЕ рынки "
+                f"площадки, включая акции и товарные (167 из 696 на binanceusdm). "
+                f"Владелец 2026-08-21: «конечно только крипта»")
+        if self.board and not self.board_timeframes:
+            raise ValueError(
+                f"{where}: board=true без board_timeframes — доска считалась бы ПОЛНОЙ "
+                f"лестницей по всем рынкам площадки (39.6 млн баров, 9.01 ГБ ОЗУ на 529 "
+                f"крипто-бессрочных). Укажите лестницу доски явно")
+        # ⚠ ОБРАТНАЯ ПОЛОВИНА ОБОИХ ПРАВИЛ — ЭТО ЛОВЛЯ МЁРТВОГО КЛЮЧА, и она обязана
+        # оставаться: ключ, который никто не читает, — тот же дефект, что
+        # `bars_per_timeframe` и `admission_required_bars`. Срабатывает только при
+        # ЧТЕНИИ ФАЙЛА: рабочие копии вселенной строятся `model_copy` и валидацию не
+        # зовут (см. оговорку в начале правил).
+        if self.board_contracts and not self.board:
+            raise ValueError(
+                f"{where}: board_contracts задан, а board=false — ключ не читался бы никем")
+        if self.board_timeframes and not self.board:
+            raise ValueError(
+                f"{where}: board_timeframes задан, а board=false — ключ не читался бы "
+                f"никем. Это тот же мёртвый ключ, что bars_per_timeframe и "
+                f"admission_required_bars")
+        return self
 
     def ladder(self, symbol: str) -> tuple[str, ...]:
         """Лестница ИМЕННО ЭТОГО символа: полная у ядра, укороченная у доски.
@@ -155,15 +253,21 @@ def _reject_unknown(section: Mapping[str, object], known: frozenset[str], path: 
             f"Мёртвый или опечатанный ключ не читается никем — это молчаливая деградация")
 
 
-def _known_keys(cls: type) -> frozenset[str]:
-    """Ключи TOML = поля датакласса минус служебный `source` (его пишет загрузчик).
+def _known_keys(cls: type[BaseModel]) -> frozenset[str]:
+    """Ключи TOML = поля модели минус служебные (`source`, `core`, `cap`).
 
     Выводится из полей, а не переписывается руками: рукописный список разошёлся бы с
-    датаклассом молча — тот же дефект, от которого защищает `_reject_unknown`.
+    моделью молча — тот же дефект, от которого защищает `_reject_unknown`.
+    (Источник полей сменился с `dataclasses.fields` на `model_fields` 2026-08-23 вместе
+    с переездом на pydantic; смысл прежний.)
 
-    ⚠ `core` и `cap` исключены по той же причине, что и `source`: в файле их нет.
-    `core` выводится из `symbols` до раскрытия доски, `cap` приходит из `--symbols`."""
-    return frozenset(f.name for f in fields(cls)) - {"source", "core", "cap"}
+    ⚠ ЭТА ПРОВЕРКА НЕ ЗАМЕНЯЕТСЯ `extra="forbid"` У МОДЕЛИ, и это не дублирование.
+    Набор ключей ФАЙЛА У́ЖЕ набора полей модели ровно на три служебных: `source` пишет
+    загрузчик, `core` выводится из `symbols` до раскрытия доски, `cap` приходит из
+    `--symbols`. Полагаться на `extra="forbid"` значило бы ПРИНЯТЬ `cap = 50` из TOML
+    как свойство вселенной — то есть завести ручку, которая обязана быть видна в
+    команде запуска."""
+    return frozenset(cls.model_fields) - {"source", "core", "cap"}
 
 
 def _reject_unknown_sections(data: Mapping[str, object], known: str, path: Path) -> None:
@@ -173,6 +277,56 @@ def _reject_unknown_sections(data: Mapping[str, object], known: str, path: Path)
     if unknown:
         raise ValueError(
             f"{path}: неизвестные секции {unknown}; здесь живёт только [{known}]")
+
+
+_RU = {
+    "string_type": "нужна строка",
+    "int_type": "нужно ЦЕЛОЕ (не строка, не дробь и не true/false)",
+    "bool_type": "нужно true или false",
+    "bool_parsing": "нужно true или false",
+    "greater_than": "нужно число больше нуля",
+    "too_short": "список пуст, а нужен хотя бы один элемент",
+    "list_type": "нужен список",
+    "tuple_type": "нужен список",
+    "missing": "ключ обязателен, а его нет",
+    "path_type": "нужен путь",
+}
+"""Отказы ФОРМЫ по-русски. Ключ — код ошибки pydantic, а не её английский текст.
+
+⚠ ЗАЧЕМ ПЕРЕВОД. Владелец проекта — не программист (CLAUDE.md, раздел «ГЛАВНОЕ»), и до
+переезда на pydantic (2026-08-23) все отказы конфигурации были русскими. Оставить
+английские значило бы ухудшить предъявляемое ради краткости кода — то есть заплатить
+тем самым, что этот проект бережёт.
+
+⚠ Неизвестный код НЕ маскируется: тогда печатается родной текст pydantic. Пустая
+строка вместо него была бы отказом без причины (§4.3)."""
+
+
+def _built[M: BaseModel](model: type[M], path: Path,
+                         values: Mapping[str, object]) -> M:
+    """Построить модель, переведя отказ pydantic на русский и назвав ФАЙЛ.
+
+    ⚠ ЗАЧЕМ ПЕРЕВОД, А НЕ ГОЛЫЙ `ValidationError`. Оператор проекта — не программист
+    (CLAUDE.md, раздел «ГЛАВНОЕ»), и всё предъявляемое обязано быть проверяемо без
+    чтения кода. Английская трассировка pydantic этому не отвечает, а имя файла в ней
+    не появляется вовсе — а именно оно первое, что нужно правящему конфигурацию.
+
+    ⚠ Правила самой модели (`model_validator`) поднимают ГОТОВОЕ русское сообщение;
+    оно проходит насквозь, а не заворачивается второй раз. Различаются они по типу
+    ошибки внутри `ValidationError`: `value_error` — наше, остальное — форма поля.
+    """
+    try:
+        return model(**values)
+    except ValidationError as e:
+        parts: list[str] = []
+        for err in e.errors():
+            if err["type"] == "value_error":
+                # Наше правило: текст уже русский и уже с именем файла.
+                parts.append(str(err.get("ctx", {}).get("error", err["msg"])))
+                continue
+            where = ".".join(str(x) for x in err["loc"]) or "<корень>"
+            parts.append(f"{path}: ключ {where} — {_RU.get(err['type'], err['msg'])}")
+        raise ValueError("; ".join(parts) or f"{path}: {e}") from e
 
 
 def load_universe(path: Path = DEFAULT_PATH) -> Universe:
@@ -185,88 +339,21 @@ def load_universe(path: Path = DEFAULT_PATH) -> Universe:
         raise ValueError(f"{path}: нет секции [universe]")
     _reject_unknown(section, _known_keys(Universe), path)
 
-    symbols = section.get("symbols")
-    if not symbols:
-        raise ValueError(f"{path}: пустой список symbols")
-    timeframes = section.get("timeframes")
-    if not timeframes:
-        raise ValueError(f"{path}: пустой список timeframes")
-
-    unknown = [t for t in timeframes if t not in TIMEFRAME_MS]
-    if unknown:
-        raise ValueError(f"{path}: таймфреймы {unknown} вне §2.8 ({sorted(TIMEFRAME_MS)})")
-
-    dupes = {s for s in symbols if symbols.count(s) > 1}
-    if dupes:
-        raise ValueError(f"{path}: символы повторяются: {sorted(dupes)}")
-
-    venue = section.get("venue", "binanceusdm")
-    if not isinstance(venue, str):
-        raise ValueError(f"{path}: venue обязан быть строкой, а не {type(venue).__name__}")
-
-    # ⚠ Разрешение профиля проверяется по СВОЕЙ таблице, а не по §2.8: значение вроде
-    # `1d` здесь синтаксически верно и содержательно разрушительно — объём суток лёг бы
-    # ровным слоем по всему суточному диапазону.
-    profile_tf = section.get("profile_timeframe", "1m")
-    if profile_tf not in PROFILE_MS:
-        raise ValueError(
-            f"{path}: profile_timeframe={profile_tf!r} вне {sorted(PROFILE_MS)}; "
-            f"профиль строится из МЛАДШИХ свечей, а не из таймфреймов анализа")
-
-    # --- ДОСКА -------------------------------------------------------------------
-    # Приказ владельца 2026-08-21: «всю доску, 696». Ключ выключен по умолчанию, потому
-    # что включённая доска меняет ЦЕНУ прогона на два порядка, и это обязано быть
-    # решением файла, а не умолчанием библиотеки.
-    board = section.get("board", False)
-    if not isinstance(board, bool):
-        raise ValueError(f"{path}: board обязан быть true/false, а не {type(board).__name__}")
-
-    board_tfs = tuple(section.get("board_timeframes", ()))
-    unknown = [t for t in board_tfs if t not in TIMEFRAME_MS]
-    if unknown:
-        raise ValueError(
-            f"{path}: board_timeframes {unknown} вне §2.8 ({sorted(TIMEFRAME_MS)})")
-    # ⚠ ПОДМНОЖЕСТВО, А НЕ ПРОИЗВОЛЬНЫЙ СПИСОК. Таймфрейм, который считает доска и не
-    # считает ядро, дал бы две карты под одним именем «уровень», и одна из них навсегда
-    # осталась бы непроверенной — тот же класс дефекта, что границы уровня 2026-08-18.
-    extra = [t for t in board_tfs if t not in timeframes]
-    if extra:
-        raise ValueError(
-            f"{path}: board_timeframes {extra} нет в timeframes {list(timeframes)}; "
-            f"лестница доски обязана быть подмножеством лестницы ядра")
-    board_contracts = tuple(section.get("board_contracts", ()))
-    if any(not isinstance(c, str) or not c for c in board_contracts):
-        raise ValueError(f"{path}: board_contracts обязан быть списком непустых строк")
-    if board and not board_contracts:
-        raise ValueError(
-            f"{path}: board=true без board_contracts — на доску пошли бы ВСЕ рынки "
-            f"площадки, включая акции и товарные (167 из 696 на binanceusdm). "
-            f"Владелец 2026-08-21: «конечно только крипта»")
-    if board_contracts and not board:
-        raise ValueError(
-            f"{path}: board_contracts задан, а board=false — ключ не читался бы никем")
-    if board and not board_tfs:
-        raise ValueError(
-            f"{path}: board=true без board_timeframes — доска считалась бы ПОЛНОЙ "
-            f"лестницей по всем рынкам площадки (39.6 млн баров, 9.01 ГБ ОЗУ на 529 "
-            f"крипто-бессрочных). Укажите лестницу доски явно")
-    if board_tfs and not board:
-        raise ValueError(
-            f"{path}: board_timeframes задан, а board=false — ключ не читался бы никем. "
-            f"Это тот же мёртвый ключ, что bars_per_timeframe и admission_required_bars")
-
+    # ⚠⚠ ФОРМА ПОЛЕЙ ЗДЕСЬ БОЛЬШЕ НЕ ПРОВЕРЯЕТСЯ (2026-08-23). Пустой список, не тот
+    # тип, не то значение — всё это ОБЪЯВЛЕНО у самой модели (`Field(min_length=1)`,
+    # типы полей, `PositiveInt`), а перекрёстные правила живут в `Universe._rules`.
+    # Здесь остался разбор файла и перевод отказа на русский с именем файла.
+    #
     # ⚠ ПО ИМЕНАМ, А НЕ ПО ПОРЯДКУ. Позиционный вызов уже сломался 2026-08-21, когда
     # между `board_timeframes` и `core` появилось поле `cap`: `frozenset` уехал в
     # целочисленный потолок. Поймал mypy, а не прогон, — и только потому, что типы
     # оказались разными; два соседних поля одного типа разъехались бы МОЛЧА.
-    return Universe(symbols=tuple(symbols), timeframes=tuple(timeframes), source=path,
-                    venue=venue, board=board, board_timeframes=board_tfs,
-                    board_contracts=board_contracts,
-                    core=frozenset(symbols), profile_timeframe=profile_tf)
+    symbols = tuple(section.get("symbols", ()))
+    return _built(Universe, path, dict(section) | {
+        "symbols": symbols, "source": path, "core": frozenset(symbols)})
 
 
-@dataclass(frozen=True, slots=True)
-class BotConfig:
+class BotConfig(BaseModel):
     """Настройки ДОСТАВКИ. Ни одно из этих чисел не участвует в расчёте.
 
     ⚠ Отделено от вселенной осознанно: universe.toml — файл, по которому воспроизводится
@@ -274,7 +361,12 @@ class BotConfig:
 
     ⚠ Отсутствие файла — НЕ ошибка, а состояние «публиковать нечего», и оно НАЗЫВАЕТСЯ
     вызывающим в логе (§4.3): пустой `pinned` и «файла нет» различаются полем `source`.
+
+    ⚠ Переведена с `@dataclass` на pydantic 2026-08-23 вместе с `Universe` — разбор в её
+    докстроке.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     pinned: tuple[str, ...] = ()
     """Закреплённые монеты: их карта уходит в канал по расписанию, без запроса.
@@ -292,7 +384,7 @@ class BotConfig:
     в канал тем же составом. Реже — значит показывать карту, устаревшую на бар.
     """
 
-    answer_cooldown_s: int = 60
+    answer_cooldown_s: PositiveInt = 60
     """Пауза между запросами ОДНОГО пользователя. Выведена из лимита Telegram, не из вкуса.
 
     Telegram документирует (core.telegram.org/bots/faq): «In a group, bots are not be able
@@ -304,7 +396,7 @@ class BotConfig:
     Замер, который его уточнит, — доля отказов по перегреву в логе (`log.degraded`).
     """
 
-    build_queue_max: int = 8
+    build_queue_max: PositiveInt = 8
     """Сколько монет вне вселенной может ждать сборки одновременно.
 
     Сборка идёт ПО ОДНОЙ (общий лимит веса биржи на весь IP), и её цена ЗАМЕРЕНА:
@@ -315,7 +407,7 @@ class BotConfig:
     выбрасывание запроса. Протокол: `docs/audit/tgbot-channel-2026-08-17.md`.
     """
 
-    map_ttl_minutes: int = 30
+    map_ttl_minutes: PositiveInt = 30
     """Сколько построенная по запросу карта считается свежей. ⚠ ЧИСЛО — РАЗМЕН, НЕ ЗАМЕР.
 
     Строго по §2.8 карта стареет с закрытием бара младшего ТФ, то есть за 5 минут. Так и
@@ -328,13 +420,18 @@ class BotConfig:
     source: Path | None = None
     """Откуда прочитано. `None` — файла нет, и это отличается от «файл есть, список пуст»."""
 
+    @model_validator(mode="after")
+    def _rules(self) -> BotConfig:
+        """Единственное перекрёстное правило доставки: ТФ публикации из §2.8."""
+        if self.publish_timeframe not in TIMEFRAME_MS:
+            raise ValueError(
+                f"{self.source or BOT_PATH}: publish_timeframe="
+                f"{self.publish_timeframe!r} вне §2.8 ({sorted(TIMEFRAME_MS)})")
+        return self
 
-def _positive_int(section: Mapping[str, object], key: str, default: int, path: Path) -> int:
-    """Целое строго больше нуля. Ноль здесь всегда означал бы выключение через опечатку."""
-    raw = section.get(key, default)
-    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
-        raise ValueError(f"{path}: {key}={raw!r} — нужно целое больше нуля")
-    return raw
+
+# ⚠ `_positive_int` УДАЛЕНА 2026-08-23: три ручки бота объявлены типом `PositiveInt`
+# (см. его докстроку), включая отказ от приведения `bool`/`str`/`float` к целому.
 
 
 def load_bot_config(path: Path = BOT_PATH) -> BotConfig:
@@ -353,19 +450,5 @@ def load_bot_config(path: Path = BOT_PATH) -> BotConfig:
         raise ValueError(f"{path}: нет секции [bot]")
     _reject_unknown(section, _known_keys(BotConfig), path)
 
-    pinned = section.get("pinned", [])
-    if not isinstance(pinned, list) or any(not isinstance(s, str) for s in pinned):
-        raise ValueError(f"{path}: pinned обязан быть списком строк")
-
-    tf = section.get("publish_timeframe", "4h")
-    if tf not in TIMEFRAME_MS:
-        raise ValueError(f"{path}: publish_timeframe={tf!r} вне §2.8 ({sorted(TIMEFRAME_MS)})")
-
-    return BotConfig(
-        pinned=tuple(pinned),
-        publish_timeframe=tf,
-        answer_cooldown_s=_positive_int(section, "answer_cooldown_s", 60, path),
-        build_queue_max=_positive_int(section, "build_queue_max", 8, path),
-        map_ttl_minutes=_positive_int(section, "map_ttl_minutes", 30, path),
-        source=path,
-    )
+    # Форма полей — у самой модели; здесь остаётся разбор файла (см. `load_universe`).
+    return _built(BotConfig, path, dict(section) | {"source": path})
