@@ -175,6 +175,18 @@ ADD_ON_LABEL = {
     "new_level_after_take": "новый уровень, сформированный после взятия цели (стр. 24)",
 }
 
+TARGET_LABEL = {
+    "primary": "цель",
+    "intermediate": "промежуточная",
+    "boundary": "граница базы",
+}
+"""Как цель НАЗЫВАЕТСЯ в карточке. Ключи — значения `geometry.TargetRole`.
+
+⚠ Заведено 2026-08-24. До этого дня ролей печаталось ДВЕ («цель» и всё остальное —
+«промежуточная»), а их три, и третья с этого дня приходит в обычную сделку. Владелец
+проверяет расчёт по карточке: слово «промежуточная» у границы базы отсылало бы его к
+правилу стр. 24 про небольшие тейки вместо стр. 19 про тейк 50% по верхней границе."""
+
 FIGURE_KIND_LABEL = {"flag": "флаг (стр. 56)", "wedge": "клин (стр. 60)"}
 FIGURE_SIDE_LABEL = {"long": "в ЛОНГ", "short": "в ШОРТ"}
 PENNANT_LABEL = {
@@ -488,7 +500,13 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"        ⚠ {dec.tf_trap}")
         if s.targets:
             for t in s.targets:
-                role = "цель" if t.role is geometry.TargetRole.PRIMARY else "промежуточная"
+                # ⚠ ТРИ РОЛИ, А НЕ ДВЕ (правка 2026-08-24). Здесь стояло
+                # `"цель" if PRIMARY else "промежуточная"`, и появившаяся у обычной
+                # сделки граница базы печаталась словом «промежуточная» — то есть
+                # ссылалась на правило стр. 24 («небольшие тейки») там, где работает
+                # стр. 19 («по верхней границе делаете тейк 50%»). Владелец читает
+                # карточку, а не код: имя роли и есть то, чем он проверяет расчёт.
+                role = TARGET_LABEL[t.role.value]
                 out.append(f"        {role} {_num(t.price)} "
                            f"({TF_LABEL.get(t.timeframe, t.timeframe)}, "
                            f"{t.distance_pct:.2f}%) — {_take_share(t.take)}")
@@ -814,8 +832,11 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # это НАЗЫВАЕТСЯ, а не подменяется текущей ценой.
         ref = next((x.setup for x in d.decisions
                     if x.setup is not None and x.level.timeframe == tf), None)
-        goal = None if ref is None else next(
-            (t.price for t in ref.targets if t.role is geometry.TargetRole.PRIMARY), None)
+        # ⚠ ЧЕТВЁРТАЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24: здесь стоял свой
+        # `role is TargetRole.PRIMARY`, такие же — в `Setup.rr`, `emit.outcome_of` и
+        # `run.py`. Правило одно: `geometry.first_major`.
+        major = None if ref is None else geometry.first_major(ref.targets)
+        goal = None if major is None else major.price
         for name, expr200 in (("EMA200", indicators.ema(200)),
                               ("MA200", indicators.sma(200))):
             # Тот же явный допуск: ewm отдаёт числа с первого бара, но каноничны они

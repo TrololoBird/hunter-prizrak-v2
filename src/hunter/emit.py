@@ -33,7 +33,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .bars import TIMEFRAME_MS, tf_ms
-from .geometry import Setup, TargetRole
+from .geometry import Setup, breakeven_watch, first_major
 from .levels import Level, LevelSide, LevelState, LevelStatus
 from .models import Bar
 from .outcome import Outcome, resolve
@@ -281,13 +281,25 @@ def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
     # и `card.render` сравнивают члены enum). Переименование значения `TargetRole.PRIMARY`
     # молча обнулило бы ВСЕ исходы «по цели», и не поймал бы этого ни mypy, ни гейт:
     # сравнение строки со строкой законно всегда.
-    primary = [t for t in em.setup.targets if t.role is TargetRole.PRIMARY]
+    #
+    # ⚠⚠ СОБСТВЕННЫЙ ФИЛЬТР СНЯТ 2026-08-24: правило «какая цель считается первой» жило
+    # ЗДЕСЬ, в `Setup.rr` и в `run.py` тремя копиями. Теперь оно одно —
+    # `geometry.first_major`.
+    first = first_major(em.setup.targets)
     return resolve(
         side=em.level.side,
         entry=em.setup.entry,
         stop=em.ledger_stop,
-        target=primary[0].price if primary else None,
+        target=first.price if first is not None else None,
         bars=bars,
         from_index=first_bar_after(bars, em.level.timeframe, since_ms,
                                   em.level.created_at_index + 1),
+        # ⚠⚠ БЕЗУБЫТОК ЗДЕСЬ НЕ ПЕРЕДАВАЛСЯ ВОВСЕ (правка 2026-08-24), и это давало ДВА
+        # разных правила под одним именем «исход». Тот же сигнал, дорешанный позже из
+        # леджера (`run._resolve_pending`), считался С безубытком — `breakeven_at`
+        # хранится в таблице с v9, — а посчитанный здесь, в момент записи, БЕЗ него.
+        # Что попадёт в колонку `outcome`, зависело от того, успел ли сигнал разрешиться
+        # в том же прогоне; ни один инвариант этого не ловил, потому что обе ветки
+        # возвращают законный `Outcome`.
+        breakeven_at=breakeven_watch(em.setup.breakeven_rules),
     )

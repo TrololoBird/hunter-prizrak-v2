@@ -2562,9 +2562,16 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
             side = (levels.LevelSide.LONG if p.direction == "long"
                     else levels.LevelSide.SHORT)
             # Безубыток (стр. 19: «Цена показала реакцию и ушла внутрь базы – ставите
-            # стоп в б/у»). Порог взведения — ПЕРВАЯ цель: именно на ней курс велит
-            # крыть часть и двигать стоп (стр. 15). Цели нет — безубытка тоже нет, и
-            # это отказ с причиной, а не подставленный вход.
+            # стоп в б/у»). Порог взведения лежит в леджере с v9 и считается
+            # `geometry.breakeven_watch` в момент записи сигнала.
+            #
+            # ⚠ ЗДЕСЬ СТОЯЛО ЛОЖНОЕ ОПИСАНИЕ, СНЯТО 2026-08-24. Дословно было: «Порог
+            # взведения — ПЕРВАЯ цель: именно на ней курс велит крыть часть и двигать
+            # стоп (стр. 15). Цели нет — безубытка тоже нет». Ни одно из трёх
+            # утверждений не описывало код: в `p.breakeven_at` пишется правило стр. 19
+            # (край зоны, а с 2026-08-24 — не ближе 1R), к цели оно не привязано, и у
+            # сделки без цели безубыток есть. Комментарий описывал ПЕРВУЮ редакцию
+            # 2026-08-19, отменённую в тот же день соседней правкой, — и пережил её.
             res = outcome_resolve(
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
@@ -2802,23 +2809,23 @@ def record(run_id: str, report: RunReport, uni: Universe,
             for em in d.emissions:
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
-                targets = [t for t in em.setup.targets
-                           if t.role is geometry.TargetRole.PRIMARY]
+                # ⚠ ТРЕТЬЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24. Здесь стоял свой
+                # `role is geometry.TargetRole.PRIMARY`, такой же — в `Setup.rr` и в
+                # `emit.outcome_of`. Правило теперь одно: `geometry.first_major`.
+                first = geometry.first_major(em.setup.targets)
                 sig = store.record_signal(
                     conn, sym, em.level.timeframe, em.direction, opened_at,
                     em.setup.entry, em.ledger_stop, run_id, stamp_ms,
-                    # Цель — та же ПЕРВАЯ основная, по которой считается РР (стр. 9).
+                    # Цель — та же ПЕРВАЯ КРУПНАЯ, по которой считается РР (стр. 9).
                     # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
                     # ни в одном прогоне, кроме выдавшего сигнал.
-                    target=targets[0].price if targets else None,
-                    # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Берётся ПЕРВОЕ по ходу
-                    # сделки правило стр. 19 («цена показала реакцию и ушла внутрь
-                    # базы»): оно наступает раньше цели и потому вообще способно
-                    # сработать. Подача сюда `target` (первая редакция 2026-08-19)
-                    # делала исход «в безубытке» недостижимым: взведение и закрытие
-                    # по цели приходятся на один бар, а цель проверяется первой.
-                    breakeven_at=(em.setup.breakeven_rules[0].watch_price
-                                  if em.setup.breakeven_rules else None),
+                    target=first.price if first is not None else None,
+                    # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Правило выбирается ПО
+                    # ТРИГГЕРУ (`geometry.breakeven_watch`), а не по номеру в списке:
+                    # здесь стояло `breakeven_rules[0]`, и смысл величины держался на
+                    # порядке `append` в `build_breakeven_rules`. Разбор — в докстроке
+                    # `breakeven_watch`.
+                    breakeven_at=geometry.breakeven_watch(em.setup.breakeven_rules),
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)
