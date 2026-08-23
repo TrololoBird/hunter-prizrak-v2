@@ -77,13 +77,18 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import FSInputFile, Message
 
 from . import clock, emit, engine, geometry, levels, log, pereprior, run, service, store, swings
-from .bars import TIMEFRAME_MS, expected_last_closed_open_ms, tf_ms
+from .bars import (
+    BARS_ON_CHART,
+    TIMEFRAME_MS,
+    expected_last_closed_open_ms,
+    tf_ms,
+)
 from .card import TF_LABEL
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
 from .exchange import CapabilityMissing, Exchange, shared
 from .levels import LevelState
 from .models import Bar, NotReady
-from .render import BARS_ON_CHART, ZoneSpec, chart_png
+from .render import ZoneSpec, chart_png
 
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 CHANNEL_ENV = "TELEGRAM_CHANNEL_ID"

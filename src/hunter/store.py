@@ -178,11 +178,37 @@ CREATE TABLE IF NOT EXISTS levels (
     priority_depth INTEGER,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
+    -- ⚠⚠ ЗОНА ВНУТРИ СТРУКТУРЫ. Ограничение добавлено 2026-08-23 (схема 16), и оно
+    -- ровно то, что владелец зафиксировал капслоком 2026-08-18: «ЕСЛИ зона выходит за
+    -- структуру то СТРУКТУРА ОПРЕДЛЕННА НЕ ВЕРНО». До этого дня инвариант сторожил
+    -- ТОЛЬКО `gates/geometry_invariants.check_level` — то есть гейт на объектах в
+    -- памяти, а карта, которая живёт МЕЖДУ прогонами и питает бота, пропускала
+    -- нарушение молча. Проверка в схеме сильнее любого гейта: её исполняет SQLite на
+    -- КАЖДОЙ настоящей записи, а не наш код на подобранных примерах.
+    CHECK (boundary_lo <= zone_lo AND zone_hi <= boundary_hi),
     CHECK (to_ms > from_ms),
     CHECK (last_seen >= first_seen),
     CHECK ((retired_at IS NULL) = (state = 'active')),
     PRIMARY KEY (symbol, timeframe, from_ms, to_ms)
 );
+
+-- ⚠⚠ ИНДЕКСЫ ЗАВЕДЕНЫ 2026-08-23. До этого дня в проекте не было НИ ОДНОГО
+-- (`grep "CREATE INDEX" src/hunter/store.py` → пусто), при том что бот на каждый ответ
+-- ходит `WHERE symbol=? AND state='active' … ORDER BY price` по таблице, чей первичный
+-- ключ — `(symbol, timeframe, from_ms, to_ms)`: по нему отбор по состоянию и сортировка
+-- по цене не поддерживаются, и SQLite читает все строки символа. Сводки по времени
+-- (`signals.recorded_at`, `outcomes.closed_at`) сканировали таблицу целиком.
+--
+-- `IF NOT EXISTS` и место в общем тексте схемы — не украшение: `executescript(SCHEMA)`
+-- выполняется при КАЖДОМ открытии базы, поэтому индексы появляются и у свежей базы, и
+-- у выросшей миграциями, без отдельной ступени и без риска разойтись с текстом схемы
+-- (тот дефект здесь уже случался — см. комментарий у `stop_price`).
+CREATE INDEX IF NOT EXISTS levels_symbol_state ON levels (symbol, state, price);
+CREATE INDEX IF NOT EXISTS levels_last_seen ON levels (symbol, last_seen);
+CREATE INDEX IF NOT EXISTS levels_retired ON levels (retired_at);
+CREATE INDEX IF NOT EXISTS signals_recorded ON signals (recorded_at);
+CREATE INDEX IF NOT EXISTS signals_lookup ON signals (kind, symbol, timeframe);
+CREATE INDEX IF NOT EXISTS outcomes_closed ON outcomes (closed_at);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
@@ -218,8 +244,16 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
+(`boundary_lo <= zone_lo AND zone_hi <= boundary_hi`) — то самое, что владелец
+зафиксировал капслоком 2026-08-18. До него инвариант сторожил только гейт, то есть
+объекты в памяти, а карта между прогонами пропускала нарушение молча. Прежние строки,
+нарушающие его, УДАЛЯЮТСЯ миграцией и их число НАЗЫВАЕТСЯ в журнале: они построены
+расчётом, про который сам владелец сказал, что он неверен, и оставить их значило бы
+показывать их боту дальше. Той же ступенью заводятся первые в проекте индексы.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
 знала три исхода, и `CHECK (kind IN …)` отклонил бы четвёртый — то есть сделка, вышедшая
@@ -680,8 +714,15 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     lvl_sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='levels'"
     ).fetchone()
-    if lvl_sql is not None and "stale_calc" not in (lvl_sql[0] or ""):
+    lvl_text = (lvl_sql[0] or "") if lvl_sql is not None else ""
+    if lvl_sql is not None and "stale_calc" not in lvl_text:
         return "14"
+    # 15 → 16 тоже не видно по колонкам: добавляется `CHECK` «зона внутри структуры».
+    # Тот же приём, что у ступеней 8 → 9 и 14 → 15, и та же причина держать ступень
+    # здесь: без неё база версии 15 назвала бы себя шестнадцатой, ограничение не
+    # появилось бы НИ РАЗУ, а `schema_meta` всё равно проштамповалась бы новым числом.
+    if lvl_sql is not None and "zone_hi <= boundary_hi" not in lvl_text:
+        return "15"
     return SCHEMA_VERSION
 
 
@@ -939,6 +980,61 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
             conn.execute("ROLLBACK")
             raise
         conn.commit()
+    if _schema_version(conn) == "15":
+        # 15 → 16: ЗОНА ВНУТРИ СТРУКТУРЫ — ограничение схемы, а не только гейта.
+        #
+        # ⚠ Как и 14→15, `ALTER TABLE` здесь бессилен: меняется `CHECK`, а SQLite их на
+        # месте не правит. Определение новой таблицы берётся ИЗ `SCHEMA` по той же
+        # причине, что и там: вторая копия определения — тот самый дефект, из-за
+        # которого текст схемы уже разъезжался с лестницей миграций.
+        #
+        # ⚠⚠ СТРОКИ, НАРУШАЮЩИЕ ИНВАРИАНТ, УДАЛЯЮТСЯ, И ИХ ЧИСЛО НАЗЫВАЕТСЯ. Молча
+        # перелить их нельзя — новая таблица их не примет; молча упасть тоже нельзя —
+        # база осталась бы немигрированной без объяснения. Довод за удаление принадлежит
+        # владельцу дословно (2026-08-18): «ЕСЛИ зона выходит за структуру то СТРУКТУРА
+        # ОПРЕДЛЕННА НЕ ВЕРНО». Такой уровень построен расчётом, признанным неверным, и
+        # держать его в карте значит и дальше показывать его боту. До слияния границ
+        # (2026-08-18) таких уровней было 51.7% — на базе тех времён удаление будет
+        # массовым, и потому оно ГРОМКОЕ, а не тихое.
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM levels"
+            " WHERE NOT (boundary_lo <= zone_lo AND zone_hi <= boundary_hi)"
+        ).fetchone()[0]
+        head = "CREATE TABLE IF NOT EXISTS levels ("
+        start = SCHEMA.index(head)
+        tail = chr(10) + ");"
+        end = SCHEMA.index(tail, start) + len(tail)
+        create_v16 = SCHEMA[start:end].replace(head, "CREATE TABLE levels_v16 (", 1)
+        live = [r[1] for r in conn.execute("PRAGMA table_info(levels)")]
+        names = ", ".join(live)
+        conn.execute("BEGIN")
+        try:
+            conn.execute(create_v16)
+            conn.execute(
+                f"INSERT INTO levels_v16 ({names}) SELECT {names} FROM levels"
+                f" WHERE boundary_lo <= zone_lo AND zone_hi <= boundary_hi")
+            moved = conn.execute("SELECT COUNT(*) FROM levels_v16").fetchone()[0]
+            had = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+            if moved != had - bad:
+                raise RuntimeError(
+                    f"миграция 15→16: перелито {moved} строк из {had} при {bad} "
+                    f"нарушающих — таблица НЕ заменена, база осталась прежней")
+            conn.execute("DROP TABLE levels")
+            conn.execute("ALTER TABLE levels_v16 RENAME TO levels")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.commit()
+        if bad:
+            log.degraded(
+                "миграция 15→16: из карты УДАЛЕНЫ уровни, чья зона выходит за структуру",
+                удалено=bad, осталось=moved,
+                причина="владелец 2026-08-18: зона вне структуры = структура определена "
+                        "неверно")
+        else:
+            log.info("миграция 15→16: ограничение «зона внутри структуры» добавлено",
+                     нарушающих_строк=0, строк=moved)
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",

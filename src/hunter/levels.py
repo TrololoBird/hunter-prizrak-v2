@@ -722,7 +722,7 @@ def build_all(
                     if first_ms <= y_bars[a.exit.confirmed_at_index].open_ms
                     and y_bars[a.exit.confirmed_at_index].open_ms + y_step <= born_ms)
                 collected.extend(classify_stop_volume(
-                    known, y_bars, acc, bars, tf, symbol=symbol).items)
+                    known, y_bars, acc, bars, tf).items)
             svs: tuple[StopVolume, ...] = tuple(collected)
             down = lvl.side is LevelSide.LONG
             # Лои своего ТФ и ТФ−1 для лонга, хаи для шорта — вторая половина фразы

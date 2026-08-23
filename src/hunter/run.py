@@ -62,7 +62,12 @@ from .models import (
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
-from .profile_source import PROFILE_LADDER, TVWindows, intrabar_timeframe
+from .profile_source import (
+    PROFILE_LADDER,
+    TVWindows,
+    WindowCache,
+    intrabar_timeframe,
+)
 from .swings import detect as detect_swings
 from .trading_range import detect as detect_ranges
 
@@ -1211,18 +1216,26 @@ class TradeSequence:
         self.checked = 0
         self.unnumbered = 0
 
-    def note(self, raw: object) -> None:
+    def note(self, raw: object) -> int | None:
+        """Учесть номер сделки. Возвращает разобранный номер, `None` — ненумерованная.
+
+        ⚠ ВОЗВРАТ ЗАВЕДЁН 2026-08-23: вызывающий (`_watch_trades_impl`) разбирал тот же
+        номер ВТОРОЙ РАЗ своим `int(str(...))`, и его копия при отказе разбора молча
+        писала `None`, не оставляя следа. Одна формула — одно место; счётчик
+        `unnumbered` теперь один на обоих потребителей.
+        """
         try:
             tid = int(str(raw))
         except (TypeError, ValueError):
             self.unnumbered += 1
-            return
+            return None
         self.checked += 1
         if self.last is not None and tid > self.last + 1:
             self.gaps += tid - self.last - 1
             self.gap_events += 1
         if self.last is None or tid > self.last:
             self.last = tid
+        return tid
 
 
 async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
@@ -1237,17 +1250,21 @@ async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
             gaps: list[tuple[int, int]] = []
             prev = seq.last
             for t in batch:
-                try:
-                    tid: int | None = int(str(t.id))
-                except (TypeError, ValueError):
-                    tid = None
+                # ⚠⚠ НОМЕР РАЗБИРАЕТСЯ В ОДНОМ МЕСТЕ (правка 2026-08-23). Здесь стоял
+                # СВОЙ `int(str(t.id))` в `try`, а строкой ниже `seq.note(t.id)`
+                # разбирал тот же номер ВТОРОЙ РАЗ — две копии одной формулы. Хуже:
+                # локальная копия при неразбираемом номере писала `tid = None` и
+                # молча выбывала из поиска разрывов, не оставив следа вовсе (счётчик
+                # `unnumbered` рос только внутри `note`). Теперь `note` возвращает
+                # разобранный номер, и обе задачи стоят на одном разборе и одном
+                # счётчике.
+                # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
+                # здесь больше не нужно и нельзя — их нет.
+                tid = seq.note(t.id)
                 if tid is not None:
                     if prev is not None and tid > prev + 1:
                         gaps.append((prev + 1, tid))
                     prev = tid if prev is None else max(prev, tid)
-                # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
-                # здесь больше не нужно и нельзя — их нет.
-                seq.note(t.id)
                 hist.add(t.price, t.amount, t.timestamp)
                 binned.add(t.price, t.amount, t.timestamp)
             for lo, hi in gaps:
@@ -2258,7 +2275,8 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
 
 
 def build_sources(insts: dict[str, Instrument], report: RunReport,
-                  uni: Universe) -> dict[str, TradeWindows]:
+                  uni: Universe,
+                  cache: WindowCache | None = None) -> dict[str, TradeWindows]:
     """Источники профиля для всех символов сразу — ЧИСТАЯ функция для рабочего потока.
 
     ⚠ ЗАВЕДЕНА 2026-08-21, чтобы снять эту работу с цикла событий. Прежде служба
@@ -2271,6 +2289,12 @@ def build_sources(insts: dict[str, Instrument], report: RunReport,
     перечитывания состава, которая живёт на цикле событий, а функция работает в потоке.
     Инструменты добываются ВЫЗЫВАЮЩИМ на цикле и приходят готовыми — читать из потока
     словарь, который в это же время меняют, значит однажды получить полуобновлённый.
+
+    ⚠ `cache` — память дорогих окон профиля, ПЕРЕЖИВАЮЩАЯ циклы. Владелец её —
+    служба; здесь она только передаётся дальше. До 2026-08-23 она жила модульным
+    словарём внутри `profile_source`, объявленного ЧИСТЫМ, — то есть чистый модуль
+    держал глобальное состояние, а гейт чистоты этого не видел. `None` — памяти нет:
+    так работают разовый прогон и повтор, и им это НУЖНО, а не безразлично.
     """
     out: dict[str, TradeWindows] = {}
     for sym, inst in insts.items():
@@ -2282,7 +2306,7 @@ def build_sources(insts: dict[str, Instrument], report: RunReport,
             have = series.get(tf)
             series[tf] = _merge_bars(stored, have) if have else stored
         if series:
-            out[sym] = TVWindows(sym, inst.tick_size, series)
+            out[sym] = TVWindows(sym, inst.tick_size, series, cache)
     return out
 
 
@@ -3191,8 +3215,12 @@ class Collector:
         rep.trades_total = (self._absorbed_trades
                             + sum(h.trades_seen for h in self.live_hist.values()))
         # Прогон досюда доходит только при пройденной проверке: `open()` иначе бросает
-        # `CapabilityMissing`. Число нужно, чтобы «отсутствует 0» имело знаменатель.
+        # `CapabilityMissing`. Числа берутся у самой проверки, а не выводятся из того,
+        # что прогон дошёл сюда: безусловно напечатанное утверждение в этом проекте уже
+        # соврало однажды (2026-08-03).
         rep.capabilities_checked = len(REQUIRED_CAPABILITIES)
+        rep.capabilities_missing = self.ex.capabilities_missing
+        rep.capabilities_emulated = self.ex.capabilities_emulated
 
     def snapshot(self) -> RunReport:
         """Согласованный срез собранного. Участок БЕЗ ОЖИДАНИЯ — это условие правильности.
@@ -3407,6 +3435,13 @@ def print_report(r: RunReport) -> int:
     В пакетном прогоне разница была секундами и терялась в допуске; у службы между ними
     лежит весь расчёт — замер 2026-08-06: 25 секунд, — и если за это время пересекалась
     граница 5м, отчёт печатал отставание, которого не было. Разбор — в `taken_at_ms`.
+
+    ⚠⚠ НУМЕРАЦИЯ РАЗДЕЛОВ ВЫПРАВЛЕНА 2026-08-23. Была сломана трижды сразу: ДВА разных
+    раздела носили номер «4б» («ЗАПАДАНИЕ» и «ЗАДАЧИ СБОРА»), раздела «2» не было
+    вовсе, а порядок печати шёл 4 → 4б → 4а → 4в → 5 → 6 → 5б → 5в → 7. Отчёт — тот
+    самый артефакт, который §7.5 и §7.6 требуют делать проверяемым БЕЗ ЧТЕНИЯ КОДА, а
+    ориентироваться в нём по номерам было нельзя: владелец не может сослаться на раздел,
+    которых два. Теперь номера идут подряд, 0..15, в порядке печати.
     """
     now_ms = r.taken_at_ms
     print()
@@ -3524,7 +3559,7 @@ def print_report(r: RunReport) -> int:
         print(f"   ОТСТАЁТ: {s}")
     print(f"   баров вне сетки в засеве: {len(offgrid_seed)}")
 
-    print("\n3. ПРОПУСКИ — молчание запрещено (§4.3)")
+    print("\n2. ПРОПУСКИ — молчание запрещено (§4.3)")
     print(f"   рядов без данных: {len(missing)} из {len(r.series)}")
     for st in missing:
         assert st.not_ready is not None
@@ -3550,7 +3585,7 @@ def print_report(r: RunReport) -> int:
     late = sum(s.poll_late for s in r.series.values())
     not_ready = sum(s.poll_not_ready for s in r.series.values())
     catchups = sum(s.poll_catchups for s in r.series.values())
-    print("\n4. ЗАКРЫТАЯ СВЕЧА: ОПРОС ПРОТИВ ЧАСОВ (§6)")
+    print("\n3. ЗАКРЫТАЯ СВЕЧА: ОПРОС ПРОТИВ ЧАСОВ (§6)")
     print(f"   опросов сделано: {requests}, баров добрано: {polled}")
     print(f"   из них ДОГОНЯЮЩИХ (ряд отставал на момент запроса): {catchups}")
     print(f"   биржа опоздала с ожидаемой свечой: {late} из {requests}"
@@ -3559,7 +3594,7 @@ def print_report(r: RunReport) -> int:
     print(f"   отступ опроса POLL_OFFSET_S = {POLL_OFFSET_S} с — НЕ ЗАМЕРЕН, "
           f"верхняя оценка; строка «биржа опоздала» и есть его замер (Ж-1)")
 
-    print("\n4б. ЗАПАДАНИЕ: СКОЛЬКО БАР ИДЁТ ДО РАСЧЁТА (Т-0)")
+    print("\n4. ЗАПАДАНИЕ: СКОЛЬКО БАР ИДЁТ ДО РАСЧЁТА (Т-0)")
     lags = arrival_lag_survey(r)
     if not lags:
         print("   баров опросом не добрано — задержку мерить не на чем "
@@ -3594,10 +3629,13 @@ def print_report(r: RunReport) -> int:
     # Ж-11: после перехода на REST лимит биржи — главный отказ системы. Превышение даёт
     # HTTP 429, продолжение после него — бан по IP на срок до трёх суток. Лимит СПРОШЕН
     # у биржи, а не зашит: 2400/мин во всех прежних расчётах бюджета были «общеизвестным».
-    print(f"   возможности ccxt проверены до прогона: {r.capabilities_checked}, "
-          f"отсутствует 0 — иначе прогона бы не было")
+    print(f"   возможности ccxt СПРОШЕНЫ У КАРТЫ has до прогона: "
+          f"{r.capabilities_checked}, отсутствует {r.capabilities_missing}, "
+          f"эмулируется {r.capabilities_emulated}")
+    if r.capabilities_checked == 0:
+        print("   ⚠ карта возможностей НЕ СПРАШИВАЛАСЬ — строка выше ничего не значит")
 
-    print("\n4а. ЛИМИТ БИРЖИ (Ж-11)")
+    print("\n5. ЛИМИТ БИРЖИ (Ж-11)")
     if r.weight_reads == 0:
         print("   ⚠ заголовок X-MBX-USED-WEIGHT-1M не пришёл НИ РАЗУ — "
               "потребление не измерено, ноль ниже ничего не значит")
@@ -3616,7 +3654,7 @@ def print_report(r: RunReport) -> int:
               f"{', '.join(f'{k} {v}' for k, v in r.rest_errors.items())}")
     else:
         print("   отказов REST по классам: ни одного")
-    print("\n4в. СОСТАВ БИРЖИ ПОСРЕДИ ПРОГОНА (§5, Б-4)")
+    print("\n6. СОСТАВ БИРЖИ ПОСРЕДИ ПРОГОНА (§5, Б-4)")
     print(f"   рынки перечитаны: {r.markets_reloads} раз (каждые {MARKETS_RELOAD_S:.0f} с), "
           f"отказов {r.markets_reload_failures}")
     if not r.markets_reloads:
@@ -3631,7 +3669,7 @@ def print_report(r: RunReport) -> int:
     for s in r.delisted_mid_run:
         print(f"     {s}")
 
-    print("\n5. СДЕЛКИ И ПРОФИЛЬ (§5)")
+    print("\n7. СДЕЛКИ И ПРОФИЛЬ (§5)")
     if not WATCH_TRADES:
         print("   ПОТОК СДЕЛОК ВЫКЛЮЧЕН (Т-1, 2026-08-21): расчёт его не читает — "
               "профиль объёма и уторговка идут по СВЕЧАМ с 2026-08-12. Нули ниже — "
@@ -3659,11 +3697,11 @@ def print_report(r: RunReport) -> int:
         print(f"   из них добрано REST-догоном fromId: {r.trade_gaps_recovered}, "
               f"осталось потерянными: {r.trade_gaps_unrecovered}")
 
-    print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
+    print("\n8. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
     print(f"   файлов parquet записано: {r.frames_written}")
     print(f"   карточек сохранено: {r.cards_written}")
 
-    print("\n5б. СВЕЧИ ПРОФИЛЯ ПОД ОКНА СТРУКТУР")
+    print("\n9. СВЕЧИ ПРОФИЛЯ ПОД ОКНА СТРУКТУР")
     print(f"   окон структур: {r.profile_windows}, "
           f"старше горизонта отброшено: {r.profile_windows_dropped}, "
           f"символов пропущено: {r.profile_symbols_skipped}")
@@ -3681,7 +3719,7 @@ def print_report(r: RunReport) -> int:
     if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
         print("   ⚠ окна есть, а участков профиля НЕТ — уровней не будет ни одного")
 
-    print("\n5в. АРХИВ СДЕЛОК (источником профиля НЕ является с 2026-08-12)")
+    print("\n10. АРХИВ СДЕЛОК (источником профиля НЕ является с 2026-08-12)")
     print(f"   структур в горизонте: {r.backfill_structures}, "
           f"старше горизонта отброшено: {r.backfill_structures_old}")
     print(f"   суток загружено: {r.backfill_days_loaded}, не получено: "
@@ -3695,7 +3733,7 @@ def print_report(r: RunReport) -> int:
               + ", ".join(f"{s} {n}" for s, n in by_sym))
     print(f"   сделок влито: {r.backfill_trades}")
 
-    print("\n7. ЛЕДЖЕР (§8 этап 7)")
+    print("\n11. ЛЕДЖЕР (§8 этап 7)")
     print(f"   сигналов записано ВПЕРВЫЕ: {r.signals_recorded}, "
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
@@ -3726,7 +3764,7 @@ def print_report(r: RunReport) -> int:
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())
-    print("\n7а. ЧТО СТОИТ ЗА СУММОЙ R — знаменатель (§4.3, стр. 9)")
+    print("\n12. ЧТО СТОИТ ЗА СУММОЙ R — знаменатель (§4.3, стр. 9)")
     print(f"   эмиссий всего: {emitted}")
     for kind in OutcomeKind:
         n = r.emitted_outcomes.get(kind.value, 0)
@@ -3744,7 +3782,7 @@ def print_report(r: RunReport) -> int:
               f"{med:.3f}% — это около {0.1 / med * 100:.0f}% риска на сделку")
 
     carried = sum(len(v) for v in r.map_carried.values())
-    print("\n7б. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
+    print("\n13. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
     print(f"   новых уровней: {r.map_added}, подтверждено прежних: {r.map_updated}")
     print(f"   снято по курсу (отработан/пробит): "
           f"{r.map_retired - r.map_stale_calc}")
@@ -3762,7 +3800,7 @@ def print_report(r: RunReport) -> int:
             print(f"     {sym:16} {c.timeframe:>3} {c.side:5} ПОК {c.price} "
                   f"(окно {c.from_ms}…{c.to_ms})")
 
-    print("\n4б. ЗАДАЧИ СБОРА — живы ли (§4.3)")
+    print("\n14. ЗАДАЧИ СБОРА — живы ли (§4.3)")
     print(f"   задач наблюдения умерло: {r.watch_deaths}, из них поднято заново: "
           f"{r.watch_restarts}")
     if r.watch_deaths > len(r.watch_failures):
@@ -3801,8 +3839,11 @@ def print_report(r: RunReport) -> int:
     violations = (r.watch_deaths
                   + len(stale) + len(missing) + unexplained + not_ready
                   + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale))
-    print("\n8. ИТОГ")
-    print(f"   деградаций отмечено: {log.degraded_count()}")
+    print("\n15. ИТОГ")
+    # ⚠ ЗА ЦИКЛ и ВСЕГО — два разных вопроса, и раздел «ИТОГ» задаёт первый. Здесь
+    # стоял только процессный счётчик, монотонно растущий у службы за сутки.
+    print(f"   деградаций отмечено ЗА ЭТОТ ЦИКЛ: {log.degraded_since_mark()} "
+          f"(всего с запуска процесса: {log.degraded_count()})")
     print(f"   нарушений приёмки: {violations}")
     print("=" * 78)
     return violations

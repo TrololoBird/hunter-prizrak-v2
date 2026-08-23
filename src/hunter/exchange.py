@@ -1066,6 +1066,12 @@ class Exchange:
         а без счётчика переподключение неотличимо от бесперебойной работы.
         """
 
+        self.capabilities_missing = 0
+        self.capabilities_emulated = 0
+        """Итог `check_capabilities`: сколько возможностей карта `has` НЕ объявила и
+        сколько объявила эмулируемыми. Заведены 2026-08-23, чтобы приёмка печатала
+        ЗАМЕР, а не литерал «отсутствует 0» в тексте строки."""
+
     def check_capabilities(self) -> tuple[str, ...]:
         """Что из необходимого биржа не умеет. Пустой кортеж — умеет всё.
 
@@ -1080,6 +1086,15 @@ class Exchange:
                 emulated.append(name)
             elif not value:
                 missing.append(f"{name} ({why})")
+        # ⚠ ЧИСЛА ЗАПОМИНАЮТСЯ НА ОБЪЕКТЕ (2026-08-23). Приёмка печатала строку
+        # «возможности ccxt проверены до прогона: N, отсутствует 0 — иначе прогона бы не
+        # было»: число проверенных бралось из отчёта, а число ОТСУТСТВУЮЩИХ было
+        # ЛИТЕРАЛОМ в тексте. Это буквальное повторение дефекта, записанного в
+        # CLAUDE.md: «Строка „гейты зелёные“, напечатанная безусловно, уже один раз
+        # соврала». Довод «иначе прогона бы не было» верен, но печатать надо ЗАМЕР, а не
+        # вывод из рассуждения: рассуждение перестанет быть верным молча.
+        self.capabilities_missing = len(missing)
+        self.capabilities_emulated = len(emulated)
         # ⚠ «проверено N» здесь означает «спрошено у карты N раз», а НЕ «работает N».
         # Формулировка правится вместе с находкой о лживости `has`: прежняя читалась как
         # утверждение об исправности.
@@ -2157,7 +2172,32 @@ class Exchange:
             async with sem:
                 return await self._fetch_ohlcv_guarded(symbol, timeframe, s, OHLCV_PAGE)
 
-        results = await asyncio.gather(*(one(s) for s in starts))
+        # ⚠⚠ `return_exceptions=True` ОБЯЗАТЕЛЕН (правка 2026-08-23). Без него ЛЮБОЕ
+        # исключение, которого не ждёт `_fetch_ohlcv_guarded` (разбор ответа, `TypeError`
+        # на неожиданной форме, отмена вне дерева ccxt), поднималось из `gather` и
+        # обрушивало ВЕСЬ добор ряда — а остальные страницы оставались неожидаемыми
+        # задачами. Это ровно то, ради отмены чего пагинация и переписывалась 2026-08-17:
+        # «раньше ОДИН таймаут обрывал весь остаток пагинации… теперь падает страница,
+        # она повторяется, а невосполненная — считается и называется». Известные классы
+        # ccxt `_fetch_ohlcv_guarded` превращает в `NotReady` сам; здесь закрывается
+        # ОСТАЛЬНОЕ, и закрывается тем же способом — отказом с НАЗВАННОЙ причиной, а не
+        # молчанием: неизвестное исключение становится `NotReady`, страница уходит в
+        # повтор, и если не восполнится — весь ряд станет несобранным ниже.
+        # ⚠ `CancelledError` пропускается наверх: это приказ остановиться, а не сбой
+        # страницы. Он наследует `BaseException`, поэтому `gather` его и так не
+        # заворачивает в результат, но условие названо, чтобы читатель не гадал.
+        raw = await asyncio.gather(*(one(s) for s in starts), return_exceptions=True)
+        results: list[list[list[Any]] | NotReady] = []
+        for s, item in zip(starts, raw, strict=True):
+            if isinstance(item, BaseException):
+                log.degraded("страница ряда упала НЕОЖИДАННЫМ исключением",
+                             символ=symbol, тф=timeframe, since=s,
+                             причина=f"{type(item).__name__}: {item}")
+                results.append(NotReady(
+                    reason=f"{symbol} {timeframe}: страница since={s} — "
+                           f"{type(item).__name__}: {item}"))
+            else:
+                results.append(item)
         retry = [s for s, r in zip(starts, results, strict=True) if isinstance(r, NotReady)]
         by_open: dict[int, list[Any]] = {}
         for r in results:

@@ -44,6 +44,7 @@ from typing import Any
 from . import clock, engine, levels, log, run
 from .config import Universe
 from .models import NotReady, RunReport, TradeWindows
+from .profile_source import WindowCache
 
 # ⚠ ИМПОРТ `render` УБРАН 2026-08-23. Служба брала оттуда `BARS_ON_CHART` — ширину
 # КАРТИНКИ бота — и передавала её расчёту рамкой `frame_bars`; рамка не резала состав
@@ -104,8 +105,8 @@ def _install_stop_handlers(stop: asyncio.Event) -> tuple[str, ...]:
     return tuple(installed)
 
 
-async def cycle(c: run.Collector, run_id: str,
-                horizon_days: int) -> tuple[RunReport, int]:
+async def cycle(c: run.Collector, run_id: str, horizon_days: int,
+                windows: WindowCache | None = None) -> tuple[RunReport, int]:
     """Один цикл расчёта на снимке. Возвращает отчёт цикла и число нарушений.
 
     Порядок шагов тот же, что у `hunter run`, и это не совпадение: расходиться им нельзя,
@@ -224,7 +225,7 @@ async def cycle(c: run.Collector, run_id: str,
     insts = {sym: inst for sym in uni.symbols
              if not isinstance(inst := c.ex.instrument(sym), NotReady)}
     sources: dict[str, TradeWindows] = await asyncio.to_thread(
-        run.build_sources, insts, report, uni)
+        run.build_sources, insts, report, uni, windows)
     report.stage_ms["sources"] = int((clock.monotonic_ns() - src_t0) / 1e6)
     _window("sources", src_t0)
 
@@ -293,6 +294,13 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
     # это предел памяти службы, а не глубина истории. Глубину с 2026-08-11 задаёт горизонт
     # отдельно по каждому ТФ (`run.seed_depth`), и она живёт на диске, а не в кольце.
     c = run.Collector(uni, seed_limit, keep_bars=seed_limit, horizon_days=horizon_days)
+    # ⚠ ВЛАДЕЛЕЦ ПАМЯТИ ДОРОГИХ ОКОН — СЛУЖБА (2026-08-23). Раньше эта память жила
+    # модульным словарём в `profile_source`, объявленном ЧИСТЫМ модулем: состояние
+    # переживало циклы, но принадлежало никому и в подписях не значилось. Теперь оно
+    # рождается здесь — ровно там, где живёт дольше одного цикла, — и передаётся вниз.
+    # Разовый прогон (`hunter run`) и повтор кэша не получают, и это их правильность:
+    # у них один цикл, а переживший расчёт объект был бы состоянием между прогонами.
+    windows = WindowCache()
     stop_signals = _install_stop_handlers(c.stop)
     log.info("служба запускается", такт_с=cycle_seconds, циклов=max_cycles or "без предела",
              сигналы_остановки=",".join(stop_signals) or "НИ ОДНОГО")
@@ -309,7 +317,7 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
             # печатается с типом и текстом. Остановка по сигналу (CancelledError)
             # проходит насквозь: это не сбой цикла, а приказ службе.
             try:
-                report, violations = await cycle(c, run_id, horizon_days)
+                report, violations = await cycle(c, run_id, horizon_days, windows)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

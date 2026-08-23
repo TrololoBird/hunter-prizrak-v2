@@ -92,25 +92,55 @@ MAX_BINS_PER_BAR = 200_000
 
 
 _WindowKey = tuple[str, str, str, int, int, int, int]
-_WINDOW_CACHE: OrderedDict[_WindowKey, TradeHistogram] = OrderedDict()
-_WINDOW_CACHE_MAX = 40
-_CACHE_MIN_BARS = 43_200
-"""Кэш ДОРОГИХ окон профиля, переживающий циклы службы (2026-08-17).
+WINDOW_CACHE_MAX = 40
+CACHE_MIN_BARS = 43_200
 
-Диагноз замером (evidence/profile-live-pipeline и зонд одного вызова): окно во весь
-минутный ряд BTC стоит 9.2 с, 30-суточное — 0.9 с, и КАЖДЫЙ цикл службы строил их
-заново — экземпляр `CandleWindows` живёт один цикл, а окна закрытых структур между
-циклами НЕ МЕНЯЮТСЯ. Отсюда расчётная фаза в часы на 27 символах.
 
-Устройство честности: ключ несёт ОТПЕЧАТОК ДАННЫХ (длина ряда и метка последнего бара
-в окне) — дорос ряд, изменилось окно → ключ другой, пересчёт; никакой инвалидации по
-времени. Кэшируются только окна от `_CACHE_MIN_BARS` минуток (30 суток): дешёвые
-(63 мс на двух сутках) выгоднее пересчитать, чем держать. Ёмкость 40 — это композиты
-VRVP всех символов вселенной плюс годовые окна старших ТФ.
+class WindowCache:
+    """Память ДОРОГИХ окон профиля, переживающая циклы службы (2026-08-17).
 
-⚠ Возвращается ОБЩИЙ объект: контракт потребителей — только чтение (build_level и
-_with_vrvp гистограмму не мутируют). Значения при попадании в кэш БАЙТ-В-БАЙТ те же,
-что при пересчёте, — это тот же объект, порядок сложений не менялся вовсе."""
+    ⚠⚠ БЫЛА МОДУЛЬНЫМ СЛОВАРЁМ `_WINDOW_CACHE` — вынесена в объект 2026-08-23. Модуль
+    объявлен ЧИСТЫМ (§10.3: «никакого обращения к часам, сети или ГЛОБАЛЬНОМУ
+    СОСТОЯНИЮ»), а `gates/purity.py` до того же дня разбирал только импорты и модульного
+    состояния не видел вовсе — то есть половина процитированного им требования не
+    проверялась ничем. Теперь владелец памяти НАЗВАН: её создаёт служба и передаёт в
+    источники; без переданного кэша расчёт состояния между вызовами не имеет.
+
+    Диагноз замером (зонд одного вызова, 2026-08-17): окно во весь минутный ряд BTC
+    стоит 9.2 с, 30-суточное — 0.9 с, и КАЖДЫЙ цикл службы строил их заново — экземпляр
+    `CandleWindows` живёт один цикл, а окна ЗАКРЫТЫХ структур между циклами НЕ МЕНЯЮТСЯ.
+    Отсюда расчётная фаза в часы на 27 символах.
+
+    Устройство честности: ключ несёт ОТПЕЧАТОК ДАННЫХ (длина ряда и метка последнего
+    бара в окне) — дорос ряд, изменилось окно → ключ другой, пересчёт; никакой
+    инвалидации по времени. Кэшируются только окна от `CACHE_MIN_BARS` минуток (30
+    суток): дешёвые (63 мс на двух сутках) выгоднее пересчитать, чем держать. Ёмкость
+    40 — это композиты VRVP всех символов вселенной плюс годовые окна старших ТФ.
+
+    ⚠ Возвращается ОБЩИЙ объект: контракт потребителей — ТОЛЬКО ЧТЕНИЕ (`build_level` и
+    `_with_vrvp` гистограмму не мутируют). Значения при попадании БАЙТ-В-БАЙТ те же, что
+    при пересчёте, — это тот же объект, порядок сложений не менялся вовсе.
+    """
+
+    __slots__ = ("_items", "_max")
+
+    def __init__(self, max_items: int = WINDOW_CACHE_MAX) -> None:
+        self._items: OrderedDict[_WindowKey, TradeHistogram] = OrderedDict()
+        self._max = max_items
+
+    def get(self, key: _WindowKey) -> TradeHistogram | None:
+        hit = self._items.get(key)
+        if hit is not None:
+            self._items.move_to_end(key)
+        return hit
+
+    def put(self, key: _WindowKey, value: TradeHistogram) -> None:
+        self._items[key] = value
+        while len(self._items) > self._max:
+            self._items.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 def intrabar_timeframe(duration_ms: int) -> str:
@@ -139,9 +169,14 @@ class TVWindows:
     """
 
     def __init__(self, symbol: str, tick: Decimal,
-                 series: dict[str, list[Bar]]) -> None:
+                 series: dict[str, list[Bar]],
+                 cache: WindowCache | None = None) -> None:
+        # ⚠ `cache` ПЕРЕДАЁТСЯ, а не берётся из модуля (2026-08-23): память дорогих окон
+        # принадлежит СЛУЖБЕ, живущей циклами, и её владение теперь видно в подписи.
+        # `None` — памяти нет вовсе: так работают повтор и разовые сборки, и это условие
+        # их правильности, а не экономия.
         self.symbol = symbol
-        self._sources = {tf: CandleWindows(symbol, tick, bars, tf)
+        self._sources = {tf: CandleWindows(symbol, tick, bars, tf, cache)
                          for tf, bars in series.items() if bars}
         self.windows_refused = 0
         self.refused_by_tf: dict[str, int] = {}
@@ -176,9 +211,15 @@ class CandleWindows:
     """
 
     def __init__(self, symbol: str, tick: Decimal, bars: list[Bar],
-                 timeframe: str = "1m") -> None:
+                 timeframe: str = "1m", cache: WindowCache | None = None) -> None:
         self.symbol = symbol
         self.tick = tick
+        self._cache = cache
+        """Память дорогих окон, ПЕРЕДАННАЯ владельцем. `None` — памяти нет.
+
+        ⚠ Здесь был модульный `_WINDOW_CACHE` (вынесен 2026-08-23). Модуль объявлен
+        чистым, а модульный словарь — ровно то глобальное состояние, которое §10.3
+        запрещает; `gates/purity.py` его не видел, потому что разбирал одни импорты."""
         self.timeframe = timeframe
         self.step = tf_ms(timeframe)
         self.bars = sorted(bars, key=lambda b: b.open_ms)
@@ -195,12 +236,11 @@ class CandleWindows:
         i = bisect.bisect_left(self._keys, from_ms)
         j = bisect.bisect_left(self._keys, to_ms)
         cache_key = None
-        if j - i >= _CACHE_MIN_BARS:
+        if self._cache is not None and j - i >= CACHE_MIN_BARS:
             cache_key = (self.symbol, self.timeframe, str(self.tick), from_ms, to_ms,
                          j - i, self._keys[j - 1] if j > i else 0)
-            hit = _WINDOW_CACHE.get(cache_key)
+            hit = self._cache.get(cache_key)
             if hit is not None:
-                _WINDOW_CACHE.move_to_end(cache_key)
                 self.windows_built += 1
                 return hit
         chunk = self.bars[i:j]
@@ -343,8 +383,6 @@ class CandleWindows:
             self.windows_refused += 1
             return NotReady(reason=f"{self.symbol}: в окне {from_ms}..{to_ms} нет объёма")
         self.windows_built += 1
-        if cache_key is not None:
-            _WINDOW_CACHE[cache_key] = h
-            while len(_WINDOW_CACHE) > _WINDOW_CACHE_MAX:
-                _WINDOW_CACHE.popitem(last=False)
+        if cache_key is not None and self._cache is not None:
+            self._cache.put(cache_key, h)
         return h

@@ -34,7 +34,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .bars import TIMEFRAME_MS
+from .bars import BARS_ON_CHART, TIMEFRAME_MS
 from .levels import (
     STOP_ANCHOR_BAND_MAX_PCT,
     Level,
@@ -44,7 +44,6 @@ from .levels import (
 )
 from .models import NotReady
 from .pereprior import Pereprior, PPSide
-from .render import BARS_ON_CHART
 
 TF_ORDER = ("5m", "15m", "1h", "4h", "1d", "1w")
 """Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2."""

@@ -146,7 +146,6 @@ Williams & Gregory-Williams, "Trading Chaos" 2-е изд., Wiley 2004, page 137:
 from __future__ import annotations
 
 import bisect
-from collections import OrderedDict
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
@@ -265,6 +264,14 @@ class SwingSet(BaseModel):
 
     _confirmed_of: dict[SwingKind, tuple[int, ...]] = PrivateAttr(default_factory=dict)
     """Память `confirmed_of()` — та же причина."""
+
+    _prefixes: ZigzagPrefixes | None = PrivateAttr(default=None)
+    """Память `prefixes_of()` — индекс зигзага со всеми префиксами этого набора.
+
+    ⚠ Перенесена сюда 2026-08-23 из МОДУЛЬНОГО словаря `_PREFIX_CACHE`: чистый модуль
+    не имеет права держать глобальное состояние (§10.3), а память чистой функции,
+    привязанная к своему объекту, состоянием модуля не является. Разбор — в докстроке
+    `prefixes_of`."""
 
     @model_validator(mode="after")
     def _ordered(self) -> SwingSet:
@@ -602,34 +609,28 @@ class ZigzagPrefixes:
         return self._total
 
 
-_PREFIX_CACHE: OrderedDict[int, tuple[tuple[Swing, ...], ZigzagPrefixes]] = OrderedDict()
-_PREFIX_CACHE_MAX = 16
-"""Ровно один индекс на ряд, и рядов у символа шесть — шестнадцать с запасом на два.
-
-⚠ Ключ — `id` кортежа, и это безопасно ТОЛЬКО вместе с проверкой `is` при попадании:
-`id` переиспользуется после сборки мусора, поэтому одного числа мало. Сам кортеж лежит
-в значении, то есть удерживается ссылкой, пока запись жива, — за это время `id` занят
-и переиспользован быть не может.
-"""
-
-
 def prefixes_of(swings: SwingSet) -> ZigzagPrefixes:
     """Индекс префиксов набора — считается один раз на набор.
 
     ⚠ Это ЗАПОМИНАНИЕ ЧИСТОЙ ФУНКЦИИ, а не состояние расчёта: тот же кортеж свингов
-    всегда даёт тот же индекс, и попадание подтверждается сравнением `is`, а не
-    только числом-ключом. Промах стоит одного лишнего прохода, а не неверного ответа.
+    всегда даёт тот же индекс. Промах стоит одного лишнего прохода, а не неверного
+    ответа.
+
+    ⚠⚠ ПАМЯТЬ ЖИВЁТ НА САМОМ НАБОРЕ (правка 2026-08-23). Здесь стоял МОДУЛЬНЫЙ
+    `_PREFIX_CACHE` — `OrderedDict` на 16 записей с ключом `id(кортежа)` и проверкой
+    `is` при попадании. Модуль объявлен ЧИСТЫМ (§10.3 запрещает глобальное состояние
+    внутри расчёта), а `gates/purity.py` разбирал одни импорты и модульного состояния
+    не видел — та же дыра, что у `_VOL_MEMO` и `_WINDOW_CACHE`.
+
+    Теперь индекс лежит в `SwingSet._prefixes` — рядом с двумя такими же памятками
+    (`_by_kind`, `_confirmed_of`), которые в этом классе живут с самого начала. Ключ по
+    `id` при этом исчез как понятие: владелец кортежа и есть его набор, вытеснять
+    нечего, а вопрос «не переиспользован ли `id` после сборки мусора» не возникает.
     """
-    key = id(swings.swings)
-    hit = _PREFIX_CACHE.get(key)
-    if hit is not None and hit[0] is swings.swings:
-        _PREFIX_CACHE.move_to_end(key)
-        return hit[1]
-    made = ZigzagPrefixes(list(swings.swings))
-    _PREFIX_CACHE[key] = (swings.swings, made)
-    _PREFIX_CACHE.move_to_end(key)
-    while len(_PREFIX_CACHE) > _PREFIX_CACHE_MAX:
-        _PREFIX_CACHE.popitem(last=False)
+    made = swings._prefixes
+    if made is None:
+        made = ZigzagPrefixes(list(swings.swings))
+        swings._prefixes = made
     return made
 
 
