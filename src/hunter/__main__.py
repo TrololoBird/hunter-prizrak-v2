@@ -211,7 +211,7 @@ def _profile(args: argparse.Namespace) -> int:
     """
     import datetime as dt
 
-    from .exchange import Exchange
+    from .exchange import shared
     from .models import NotReady, RawTrade, TradeHistogram, bin_index
     from .volume_profile import Expansion, build
 
@@ -220,7 +220,7 @@ def _profile(args: argparse.Namespace) -> int:
     end = start + 86_400_000
 
     async def day_histogram() -> tuple[Decimal, TradeHistogram] | NotReady:
-        ex = Exchange(load_universe(args.universe).venue)
+        ex = shared(load_universe(args.universe).venue)
         await ex.open()
         try:
             symbol = next((s for s, mk in ex.markets_by_id().items()
@@ -277,7 +277,7 @@ def _profile(args: argparse.Namespace) -> int:
 def _admission(args: argparse.Namespace) -> int:
     """Хватает ли истории, чтобы величины §2.9 вообще существовали."""
     from .admission import REQUIRED_BARS, admits, seed_floor, unavailable_quantities
-    from .exchange import Exchange
+    from .exchange import shared
 
     uni = load_universe(args.universe)
     # ⚠ До 2026-08-17 умолчанием стоял max(REQUIRED_BARS.values()) = 304 — порог от
@@ -292,7 +292,7 @@ def _admission(args: argparse.Namespace) -> int:
         как «у символа нет истории» (§4.3)."""
         from .models import NotReady
 
-        ex = Exchange(uni.venue)
+        ex = shared(uni.venue)
         await ex.open()
         try:
             out: list[tuple[str, dict[str, int], tuple[str, ...]]] = []

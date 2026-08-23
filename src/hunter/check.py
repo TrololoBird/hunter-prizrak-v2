@@ -20,7 +20,7 @@ from . import log, store
 from .admission import REQUIRED_BARS, USED_BY_2_9, strictest_requirement
 from .bars import expected_last_closed_open_ms, tf_ms
 from .config import Universe
-from .exchange import POLL_OFFSET_S, Exchange
+from .exchange import POLL_OFFSET_S, shared
 from .models import NotReady, RunReport
 from .profile_source import PROFILE_LADDER
 from .run import (
@@ -57,7 +57,7 @@ def _verdict(lines: list[tuple[str, bool, str]]) -> int:
 async def _admission_survey(
     uni: Universe, required: int
 ) -> dict[str, dict[str, int | NotReady]]:
-    ex = Exchange(uni.venue)
+    ex = shared(uni.venue)
     await ex.open()
     # ⚠ ДОСКА РАСКРЫВАЕТСЯ И ЗДЕСЬ. Иначе вердикт §7.5 описывал бы 25 символов файла,
     # пока служба считает 696, — то есть владелец читал бы «всё в порядке» про другую

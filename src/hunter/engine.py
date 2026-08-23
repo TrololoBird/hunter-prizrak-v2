@@ -80,7 +80,13 @@ class SeriesRead(BaseModel):
     """
 
     splits: tuple[pereprior.SplitEntry, ...] = ()
-    """Пары "истинный + ранний ПП" рядом — стр. 51: «закуп лучше делить на 2 части»."""
+    """Пары "истинный + ранний ПП" рядом — стр. 51: «закуп лучше делить на 2 части».
+
+    ⚠ СМЫСЛ СУЖЕН 2026-08-23: здесь ДЕЙСТВУЮЩИЕ пары (`pereprior.current_splits`), не
+    больше одной на сторону, а не все пары за историю ряда. Разбор и цена — в докстроке
+    `current_splits`; коротко: карточка печатала это поле целиком и выдавала 394 строки
+    на один символ, меряя «текущее» иначе, чем соседнее поле `perepriors`.
+    """
 
     channels: tuple[figures.Channel, ...] = ()
     """Флаги (стр. 56) и клинья (стр. 60) этого ряда."""
@@ -370,7 +376,7 @@ def read_series(
             timeframe=tf, swings=sw, trend=swings.trend(sw), scan=scan,
             perepriors=last_side,
             all_perepriors=every,
-            splits=pereprior.split_entries(every),
+            splits=pereprior.current_splits(every),
             channels=chans,
             channel_notes=tuple(_channel_note(c, every) for c in chans),
             multiple_bases=tuple(

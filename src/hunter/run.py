@@ -42,6 +42,7 @@ from .exchange import (
     REQUIRED_CAPABILITIES,
     CapabilityMissing,
     Exchange,
+    shared,
 )
 from .models import (
     Bar,
@@ -2661,7 +2662,19 @@ class Collector:
         `seed_limit`», то есть прежнее поведение."""
         self.keep_bars = keep_bars
         self.keep_trade_days = keep_trade_days
-        self.ex = Exchange(uni.venue)
+        self.ex = shared(uni.venue)
+        """⚠ ОБЩИЙ НА ПРОЦЕСС, А НЕ СВОЙ. До 2026-08-23 здесь стоял `Exchange(...)`, и
+        при сборке по запросу в процессе телеграм-бота жили ДВА объекта площадки: свой
+        у бота и свой у сборщика. Каждый назначал себе 75% лимита веса по IP, а биржа
+        считает вес по IP — вместе они целились в 150%, что даёт `HTTP 429` и бан по IP
+        до 3 суток. Подробности механизма — в докстроке `exchange._LIVE`.
+
+        Отпускается зовом `self.ex.close()` в `stop()`; соединение закроется, только
+        когда отпустит последний держатель."""
+        self._subs_at_start = self.ex.watching()
+        """Подписки, которые были на общем объекте площадки ДО нас. Их снимать нельзя:
+        они чужие. Разность со снимком на выходе — ровно наши (`watching_since`)."""
+
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self.seq: dict[str, TradeSequence] = {}
@@ -2919,6 +2932,12 @@ class Collector:
         self.stop.set()
         for t in self.tasks:
             t.cancel()
+        # ⚠ СВОИ ПОДПИСКИ СНИМАЮТСЯ ЗДЕСЬ, А НЕ В `close()`. Объект площадки общий на
+        # процесс (`exchange.shared`), и при сборке по запросу он переживает сборщика:
+        # `close()` увидит второго держателя (бота) и соединение не тронет. Значит
+        # подписки сборщика остались бы жить на чужом соединении, и биржа продолжала бы
+        # слать в них данные. Снимается ровно то, что появилось за нашу жизнь.
+        await self.ex.unwatch_all(self.ex.watching_since(self._subs_at_start))
         if self._report is None:
             await self.ex.close()
             return
