@@ -427,16 +427,16 @@ def _trend_as_of(read: SeriesRead, bars: list[Bar], upto_ms: int) -> Trend:
     бара позже своей вершины, и берётся именно момент ИЗВЕСТНОСТИ.
     """
     sw = read.swings
-    cut = tuple(s for s in sw.swings
-                if s.confirmed_at_index < len(bars)
-                and bars[s.confirmed_at_index].open_ms <= upto_ms)
-    if len(cut) < 2:
+    # ⚠ СЧИТАЕТСЯ ДЛИНА, А НЕ СТРОИТСЯ НАБОР — та же правка, что в `figures.pennant`.
+    # Условие есть `confirmed_at_index <= C` при постоянном C: бары упорядочены по
+    # `open_ms`, поэтому «подтверждён не позже `upto_ms`» — это порог по индексу, а
+    # не произвольная выборка. Значит отбор — префикс, и от него нужна длина.
+    cut_len = sum(1 for s in sw.swings
+                  if s.confirmed_at_index < len(bars)
+                  and bars[s.confirmed_at_index].open_ms <= upto_ms)
+    if cut_len < 2:
         return Trend(direction=TrendDirection.NONE, holds_for=0)
-    return swings.trend(SwingSet(
-        swings=cut,
-        bars_scanned=sw.bars_scanned,
-        confirmed_until_index=cut[-1].confirmed_at_index,
-    ))
+    return swings.trend_upto(sw, cut_len)
 
 
 def _senior_priority(

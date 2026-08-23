@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import NotReady
 from .pereprior import Pereprior, PPKind, PPSide
 from .priority import Agreement, Priority, agreement_of
-from .swings import Swing, SwingKind, SwingSet, TrendDirection, trend
+from .swings import Swing, SwingKind, SwingSet, TrendDirection, trend_upto
 from .trading_range import (
     MIN_BOUNDARY_POINTS,
     MIN_BOUNDARY_POINTS_PER_SIDE,
@@ -414,13 +414,14 @@ def pennant(
         )
     borders = (PennantBorders.EQUAL if up.narrowed and low.narrowed
                else PennantBorders.SQUEEZED)
-    prior = tuple(s for s in swings.swings
-                  if s.confirmed_at_index <= structure.first_index)
-    direction = trend(SwingSet(
-        swings=prior,
-        bars_scanned=swings.bars_scanned,
-        confirmed_until_index=structure.first_index,
-    )).direction
+    # ⚠ СЧИТАЕТСЯ ДЛИНА, А НЕ СТРОИТСЯ НАБОР — правка скорости 2026-08-23, ответ ТОТ ЖЕ.
+    # Здесь строился кортеж `prior` и по нему заново гонялся зигзаг, для КАЖДОЙ
+    # структуры. Профиль: 576 таких вызовов на 2 символах стоили 80.5 с из 287 с.
+    # Набор «свинги с `confirmed_at_index <= K`» есть ПРЕФИКС сортированного порядка
+    # зигзага, поэтому от него нужна только длина — разбор в `swings.ZigzagPrefixes`.
+    prior_len = sum(1 for s in swings.swings
+                    if s.confirmed_at_index <= structure.first_index)
+    direction = trend_upto(swings, prior_len).direction
     source = OWN_TF_SOURCE
     if direction is TrendDirection.NONE and senior is not None:
         direction = senior.direction
