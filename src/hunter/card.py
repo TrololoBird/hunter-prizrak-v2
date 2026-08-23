@@ -370,7 +370,12 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
     for dec in d.decisions:
         lvl, st, pr, ag = dec.level, dec.status, dec.priority, dec.agreement
         out.append(
-            f"  {SIDE_LABEL[lvl.side.value]} {TF_LABEL.get(lvl.timeframe, lvl.timeframe):>3}  "
+            # ⚠ СТОРОНА СЕЙЧАС (правка 2026-08-24): у пробитого уровня она
+            # противоположна (стр. 43), а карточка печатала сторону рождения —
+            # и тут же ниже писала «вход по ретесту в ДРУГУЮ сторону», то есть
+            # противоречила себе. Разбор — `levels.level_now`.
+            f"  {SIDE_LABEL[dec.current.side.value]} "
+            f"{TF_LABEL.get(lvl.timeframe, lvl.timeframe):>3}  "
             f"ПОК {_num(lvl.price)}  зона {_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}  "
             f"объём {_num(lvl.structure_volume, 2)}  {STATE_LABEL[st.state.value]}"
             # Цена по ту сторону всей структуры — печатается РЯДОМ СО СТАТУСОМ, потому

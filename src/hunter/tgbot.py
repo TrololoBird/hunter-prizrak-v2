@@ -594,7 +594,10 @@ def zones_of(decision: engine.SymbolDecision,
         if not active and now_ms and resolved < now_ms - RETIRED_WINDOW_MS:
             continue
         out.append(ZoneSpec(
-            side=m.level.side.value, timeframe=m.level.timeframe,
+            # ⚠ СТОРОНА СЕЙЧАС, а не при рождении (правка 2026-08-24): пробитый уровень
+            # по стр. 43 «менятся для нас на противоположный», и карта показывала его
+            # старой стороной — 42% уровней на замере того дня. Разбор — `MappedLevel.current`.
+            side=m.current.side.value, timeframe=m.level.timeframe,
             price=float(m.level.price), zone_lo=float(m.level.zone_lo),
             zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
             state=m.status.state.value,
@@ -1209,7 +1212,8 @@ def trade_notes(decision: engine.SymbolDecision) -> tuple[TradeNote, ...]:
             text += (f" · ⚠ ловушка ТФ: встречный уровень "
                      f"{TF_LABEL.get(near.timeframe, near.timeframe)} "
                      f"{_fmt_price(float(near.price))}, {near.distance_pct:.1f}% от ПОК")
-        out.append(TradeNote(side=dec.level.side.value, timeframe=dec.level.timeframe,
+        # ⚠ Сторона СЕЙЧАС, а не при рождении (стр. 43) — см. `levels.level_now`.
+        out.append(TradeNote(side=dec.current.side.value, timeframe=dec.level.timeframe,
                              price=float(dec.level.price), text=text))
     return tuple(out)
 

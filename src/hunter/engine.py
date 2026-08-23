@@ -188,6 +188,15 @@ class Decision(BaseModel):
     def emitted(self) -> bool:
         return self.setup is not None
 
+    @property
+    def current(self) -> Level:
+        """Уровень, каким он стоит СЕЙЧАС: у пробитого сторона другая (стр. 43).
+
+        Та же величина, что `MappedLevel.current`, и та же единственная формула
+        `levels.level_now`. `self.level` остаётся стороной РОЖДЕНИЯ — по ней считается
+        всё «на момент», и подменять её нельзя."""
+        return levels.level_now(self.level, self.status)
+
 
 class PPSignal(BaseModel):
     """Сделка от переприора — второй тип сигнала (стр. 50; реестр долга, строка 3).

@@ -145,6 +145,33 @@ def c_breakout_is_flipped() -> tuple[object, object]:
     return status(level(98.0), b).state, LevelState.FLIPPED
 
 
+def c_flipped_level_changes_side() -> tuple[object, object]:
+    """Стр. 43 дословно: «Уровень лонг/шорт менятся для нас на противоположный».
+
+    ⚠ Случай добавлен 2026-08-24, потому что правило было НАПИСАНО и НЕ ИСПОЛНЯЛОСЬ.
+    `Level.flipped()` существовал с давних пор и не вызывался НИ ОТКУДА: единственное
+    упоминание стояло в докстроке `EntryRule.RETEST_FLIPPED`, которая УТВЕРЖДАЛА, что
+    уровень «уже другой стороны». На свежих данных 2026-08-24 в этом состоянии было
+    56 уровней из 132 (42%), и каждый предъявлялся владельцу СТАРОЙ стороной, тогда
+    как соседняя строка той же карточки писала «вход по ретесту в ДРУГУЮ сторону».
+
+    Три плеча, и все нужны:
+      * пробитый — сторона перевёрнута;
+      * активный — сторона НЕ трогается (иначе прибор переворачивает всё подряд);
+      * сторона РОЖДЕНИЯ (`level.side`) остаётся прежней и у пробитого: по ней
+        считается всё «на момент», и подмена задним числом сменила бы историю.
+    """
+    b = bars((100, 101, 99, 100), (97, 97.5, 96, 96.5), (96, 96.5, 95, 95.5))
+    lvl = level(98.0, LevelSide.LONG)
+    broken = MappedLevel(level=lvl, status=status(lvl, b))
+    calm = mapped(level(98.0, LevelSide.LONG))
+    return (
+        (broken.status.state.value, broken.current.side.value, broken.level.side.value,
+         calm.current.side.value),
+        ("flipped", "short", "long", "long"),
+    )
+
+
 def c_late_return_no_bodies_is_puncture() -> tuple[object, object]:
     """Поздний возврат БЕЗ единого тела за уровнем — прокол.
 
@@ -571,6 +598,7 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("цена за уровень не заходила — уровень жив (стр. 23)", c_no_event),
     ("прокол → уровень отработан (стр. 25)", c_puncture_is_worked_off),
     ("пробой → уровень флипнут (стр. 43)", c_breakout_is_flipped),
+    ("флипнутый уровень СМЕНИЛ сторону (стр. 43)", c_flipped_level_changes_side),
     ("поздний возврат без тел — прокол по классике (стр. 6 + §0.1)",
      c_late_return_no_bodies_is_puncture),
     ("поздний возврат С телом — вердикта нет (стр. 55)",
