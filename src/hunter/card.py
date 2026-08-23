@@ -243,7 +243,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         ladder = sum(1 for a in sc.closed if BorderSource.LADDER
                      in (a.upper.source, a.lower.source))
         out.append(f"  {TF_LABEL.get(tf, tf):>3}  баров {sc.bars_scanned}  "
-                   f"структур {len(sc.closed)}  распадов {sc.resets}  "
+                   f"структур {len(sc.closed)}  отвергнуто начал {sc.rejected}  "
                    f"в сужении {narrowing}  лесенка {ladder}  "
                    f"тренд {TREND_LABEL[tr.direction.value]} (держится на {tr.holds_for})  "
                    f"незакрытая структура: {tail}")

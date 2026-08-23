@@ -69,7 +69,7 @@ def seed_warmup() -> int:
     Складывается из двух требований, и каждое приходит из своего места, а не из вкуса:
 
       * величины §2.9 (`admission.seed_floor()`, строжайшее — ema200 с 200 барами);
-      * длина структуры (`trading_range.STRUCTURE_WARMUP_BARS` = 700, замер в докстроке
+      * длина структуры (`trading_range.MAX_STRUCTURE_BARS` = 700, замер в докстроке
         константы), иначе структура на левом краю горизонта окажется усечённой началом
         загрузки.
 
@@ -79,9 +79,9 @@ def seed_warmup() -> int:
     180 суток) — перекос вдоль ТФ, найден rules-auditor 2026-08-17.
     """
     from .admission import seed_floor
-    from .trading_range import STRUCTURE_WARMUP_BARS
+    from .trading_range import MAX_STRUCTURE_BARS
 
-    return max(seed_floor() + 1, STRUCTURE_WARMUP_BARS)
+    return max(seed_floor() + 1, MAX_STRUCTURE_BARS)
 
 
 def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
