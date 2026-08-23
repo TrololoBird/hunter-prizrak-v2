@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, "src")
 
-from hunter.bars import grid_anchor_ms, resample_from_1m, tf_ms
+from hunter.bars import grid_anchor_ms, resample, tf_ms
 from hunter.models import Bar
 
 DAY = 86_400_000
@@ -54,7 +54,7 @@ def main() -> int:
     bad: list[str] = []
 
     for tf in ("5m", "1h", "1d", "1w"):
-        res = resample_from_1m(m1, tf)
+        res = resample(m1, "1m", tf)
         anchor = grid_anchor_ms(tf)
         step = tf_ms(tf)
         off_grid = [b for b in res if (b.open_ms - anchor) % step]
@@ -64,7 +64,7 @@ def main() -> int:
         if phantom_leak:
             bad.append(f"{tf}: фантомная цена просочилась в {len(phantom_leak)} корзин")
 
-    d = resample_from_1m(m1, "1d")
+    d = resample(m1, "1m", "1d")
     empty_day = T0 + 15 * DAY
     if any(b.open_ms == empty_day for b in d):
         bad.append("1d: пустая корзина ВЫДУМАНА вместо пропуска")
@@ -78,7 +78,7 @@ def main() -> int:
     # k=6, то есть ВТОРАЯ корзина 5м (k=5..9); первая корзина фантома не содержит.
     b5 = T0 + tf_ms("5m")
     naive_high = max(b.high for b in m1 if b5 <= b.open_ms < b5 + tf_ms("5m"))
-    right = next(b for b in resample_from_1m(m1, "5m") if b.open_ms == b5)
+    right = next(b for b in resample(m1, "1m", "5m") if b.open_ms == b5)
     if not (naive_high >= 999.0 > right.high):
         print("ПРОВАЛ: подсаженный фантом не различим — синтетика ослепла")
         return 1
@@ -87,7 +87,7 @@ def main() -> int:
     if abs(right.volume - 4.0) > 1e-12:  # 5 минут корзины, одна — фантом
         bad.append(f"5m: объём корзины с фантомом {right.volume}, ожидалось 4.0")
 
-    n = sum(len(resample_from_1m(m1, tf)) for tf in ("5m", "1h", "1d", "1w"))
+    n = sum(len(resample(m1, "1m", tf)) for tf in ("5m", "1h", "1d", "1w"))
     print(f"синтетика: минуток {len(m1)}, корзин собрано {n}, нарушений {len(bad)}; "
           f"подсаженный фантом пойман")
     for b in bad:

@@ -655,6 +655,58 @@ FETCH_HISTORY_CACHE = 64
 """
 
 
+_HOOKED: dict[type, type] = {}
+"""Подклассы ccxt с крюком на ответ, по одному на класс площадки. Кэш, а не реестр."""
+
+
+def _with_response_hook(base: type) -> type:
+    """Подкласс ccxt, отдающий нам заголовки КАЖДОГО ответа вместе с его кодом.
+
+    ⚠ ЗАЧЕМ, ЕСЛИ ЕСТЬ `last_response_headers`. Затем, что это ОБЩЕЕ поле: оно
+    показывает последний ответ, дошедший до библиотеки, а не тот, ради которого его
+    читают. Отсюда два следствия, и они разного веса:
+
+    * СЧЁТ. Читать общее поле можно только там, где после вызова стоит наша строка, —
+      то есть в четырёх обёртках REST. Ответы, приходящие мимо них, в пик не попадали
+      вовсе, а пик от этого может ошибиться ТОЛЬКО В МЕНЬШУЮ сторону: прибор
+      безопасности врёт в опасную сторону.
+      ⚠ ВЕЛИЧИНА РАЗРЫВА ЗАМЕРЕНА, А НЕ ОЦЕНЕНА, и она ОКАЗАЛАСЬ МАЛОЙ. Первая
+      редакция этой строки называла «29 замеров при ~36 ответах»; число ~36 было
+      выведено арифметикой из счётчиков запросов и ОТОЗВАНО. Прямой замер (крюк
+      считает все ответы, прибор — свои; открытие площадки плюс 4 ряда по 1500 баров,
+      4 счёта истории, 4 тикера): было 31 из 32 (97%), стало 32 из 32. Непосчитанным
+      был `ping` из `read_status`. Пик в этой нагрузке сошёлся у обоих — то есть
+      правка закрывает возможность занижения, а не наблюдённое занижение;
+    * ГОНКА. Теоретически между записью поля в ccxt и нашим чтением может вклиниться
+      другой ответ. ⚠ ВОСПРОИЗВЕСТИ ЕЁ НЕ УДАЛОСЬ: 160 ответов, пущенных с
+      перекрытием (40 запросов по 1500 баров, то есть по 4 страницы каждый), дали
+      полное совпадение прочитанного с истинным, и пик сошёлся. Причина в том, что на
+      пути от записи заголовка до нашего чтения цикл событий управление не отдаёт.
+      Значит гонка ЗДЕСЬ — опасность конструкции, а не наблюдённый дефект, и
+      предъявляется она именно так.
+
+    `on_rest_response` — штатная точка расширения ccxt: библиотека зовёт её с
+    заголовками ИМЕННО ЭТОГО ответа и его кодом, до всякой записи в общее поле.
+    Умолчание возвращает тело со снятыми пробелами, и оно вызывается дальше как есть.
+    """
+    if base in _HOOKED:
+        return _HOOKED[base]
+
+    def on_rest_response(self: Any, code: int, reason: str, url: str, method: str,
+                         response_headers: Any, response_body: str,
+                         request_headers: Any, request_body: Any) -> Any:
+        sink = getattr(self, "hunter_sink", None)
+        if sink is not None:
+            sink(code, response_headers)
+        return base.on_rest_response(  # type: ignore[attr-defined]
+            self, code, reason, url, method, response_headers, response_body,
+            request_headers, request_body)
+
+    klass = type(f"Hunter{base.__name__}", (base,), {"on_rest_response": on_rest_response})
+    _HOOKED[base] = klass
+    return klass
+
+
 _LIVE: dict[str, Exchange] = {}
 """Живые объекты площадки В ЭТОМ ПРОЦЕССЕ, по одному на класс ccxt.
 
@@ -845,7 +897,7 @@ class Exchange:
         """Раньше этого мгновения (`clock.monotonic_ns`) долю НЕ УВЕЛИЧИВАТЬ, даже если
         сосед ушёл: его вес выходит из скользящего окна биржи целую минуту."""
 
-        self._ex = getattr(ccxtpro, self.venue.ccxt_class)({
+        self._ex = _with_response_hook(getattr(ccxtpro, self.venue.ccxt_class))({
             "enableRateLimit": True,
             # ⚠ ЗАДАНО ЯВНО 2026-08-11. Умолчание ccxt — 10 000 мс
             # (ccxt/base/exchange.py, `timeout = 10000`), и оно НАС УЖЕ ЛОВИЛО: за двое
@@ -904,6 +956,13 @@ class Exchange:
                    if self.venue.default_sub_type else {}),
             },
         })
+        self._ex.hunter_sink = self._note_response
+        """Крюк на КАЖДЫЙ ответ REST — см. `_with_response_hook`. Ставится сразу после
+        постройки: до первого запроса, то есть ни один ответ мимо не пройдёт."""
+
+        self._retry_after_s: float | None = None
+        """`Retry-After` С ОТВЕТА 429, а не из общего поля. `None` — не приходил."""
+
         self._instruments: dict[str, Instrument] = {}
         self.weight_limit: int | None = None
         """Лимит веса за минуту, ПРОЧИТАННЫЙ У БИРЖИ, а не зашитый. `None` — не прочитан.
@@ -1172,7 +1231,6 @@ class Exchange:
             log.degraded("лимит веса у биржи не прочитан",
                          причина=f"{type(e).__name__} {e}")
             return
-        self._note_weight()
         for row in info.get("rateLimits", []):
             if (row.get("rateLimitType") == "REQUEST_WEIGHT"
                     and row.get("interval") == "MINUTE"
@@ -1445,18 +1503,19 @@ class Exchange:
         заголовок — получить 429, то есть намеренно нарушить лимит публичного бота.
 
         Минута снизу — из окна веса: лимит считается за одну минуту
-        (`REQUEST_WEIGHT/MINUTE/1` в `exchangeInfo`, читается при открытии). Регистр
-        ключа ищется явно — та же ловушка асинхронного клиента, что у `_note_weight`.
+        (`REQUEST_WEIGHT/MINUTE/1` в `exchangeInfo`, читается при открытии).
+
+        ⚠ ЗНАЧЕНИЕ БЕРЁТСЯ С ОТВЕТА 429, А НЕ ИЗ ОБЩЕГО ПОЛЯ — правка 2026-08-23.
+        Здесь читался `last_response_headers`, то есть заголовки ПОСЛЕДНЕГО дошедшего
+        до библиотеки ответа, кем бы он ни был: пауза после лимита назначалась бы по
+        заголовкам чужого удачного запроса. Теперь `Retry-After` снимается крюком
+        `_note_response` там, где код ответа РАВЕН 429, и разбор регистра и числа
+        сделан там же.
         """
-        headers = self._ex.last_response_headers or {}
-        raw = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        raw = self._retry_after_s
         if raw is None:
             return RATE_LIMIT_BACKOFF_S
-        try:
-            return max(RATE_LIMIT_BACKOFF_S, float(raw))
-        except ValueError:
-            log.degraded("Retry-After нечитаем — пауза по умолчанию", значение=str(raw))
-            return RATE_LIMIT_BACKOFF_S
+        return max(RATE_LIMIT_BACKOFF_S, raw)
 
     def _declare_quiet(self, pause_s: float) -> None:
         """Объявить глобальную тишину REST на `pause_s` от СЕЙЧАС. Только удлиняет:
@@ -1479,11 +1538,15 @@ class Exchange:
         log.degraded("REST придержан глобальной паузой лимита", секунд=round(wait_s, 1))
         await asyncio.sleep(wait_s)
 
-    def _note_weight(self) -> None:
-        """Запомнить потребление веса из заголовка последнего ответа.
+    def _note_response(self, code: int, headers: Any) -> None:
+        """Разобрать заголовки ОДНОГО ответа: потребление веса и паузу после 429.
 
-        Зовётся после КАЖДОГО REST-вызова этого класса. Заголовок приходит не всегда
-        (например, у ответов из кэша ccxt), поэтому число прочтений считается отдельно.
+        ⚠ ЗОВЁТСЯ ИЗ ccxt НА КАЖДЫЙ ОТВЕТ (`_with_response_hook`), а не из наших
+        обёрток. До 2026-08-23 вес читался из общего поля `last_response_headers` в
+        четырёх местах, и ответы мимо этих четырёх мест в пик не попадали вовсе.
+        Ошибка односторонняя: пик мог быть только ЗАНИЖЕН. Замер разрыва и его цена —
+        в докстроке `_with_response_hook`; он оказался малым (31 из 32 против 32 из 32),
+        и правка закрывает ВОЗМОЖНОСТЬ занижения, а не наблюдённое занижение.
 
         ⚠ Регистр ключа ищется ЯВНО. У синхронного клиента ccxt заголовки приходят в
         `CaseInsensitiveDict`, и `get("X-MBX-USED-WEIGHT-1M")` работает; у асинхронного —
@@ -1491,14 +1554,34 @@ class Exchange:
         был проверен на синхронном клиенте, а применён к асинхронному: прогон напечатал
         «пик 0 — 0.0% лимита» при живом заголовке `x-mbx-used-weight-1m = 2`.
         Поймал это `weight_reads`: ноль замеров отличим от нуля потребления.
+
+        Заголовок приходит не всегда (ответ из кэша ccxt, ответ не от Binance), поэтому
+        число прочтений считается отдельно и остаётся знаменателем к пику.
         """
-        headers = self._ex.last_response_headers or {}
         raw = next((v for k, v in headers.items()
                     if k.lower() == "x-mbx-used-weight-1m"), None)
-        if raw is None:
+        if raw is not None:
+            try:
+                weight = int(raw)
+            except (TypeError, ValueError):
+                # Не число там, где обещано число. Молчать нельзя: пик остался бы
+                # прежним, и это выглядело бы как «потребление не выросло».
+                log.degraded("заголовок веса нечитаем — ответ в пик не вошёл",
+                             значение=str(raw))
+            else:
+                self.weight_reads += 1
+                self.weight_peak = max(self.weight_peak, weight)
+        if code != 429:
             return
-        self.weight_reads += 1
-        self.weight_peak = max(self.weight_peak, int(raw))
+        ra = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        if ra is None:
+            self._retry_after_s = None
+            return
+        try:
+            self._retry_after_s = float(ra)
+        except (TypeError, ValueError):
+            self._retry_after_s = None
+            log.degraded("Retry-After нечитаем — пауза по умолчанию", значение=str(ra))
 
     def check_unwatch_table(self) -> tuple[str, ...]:
         """Сверить таблицу `UNWATCH` с НАСТОЯЩИМИ сигнатурами ccxt. Пусто — всё сходится.
@@ -1782,7 +1865,6 @@ class Exchange:
             log.error(f"{what}: прочий отказ ccxt (третья ветвь дерева исключений)",
                       ключ=key, причина=f"{type(e).__name__} {e}")
             return NotReady(reason=f"{key}: {what} — отказ ({type(e).__name__})")
-        self._note_weight()
         return got
 
     async def fetch_server_ms(self) -> int:
@@ -1804,7 +1886,6 @@ class Exchange:
             self.rest_rate_limited += 1
             self._declare_quiet(self._rate_limit_pause_s())
             raise
-        self._note_weight()
         return got
 
     # --- инструменты -------------------------------------------------------
@@ -1877,7 +1958,6 @@ class Exchange:
         except ccxt.BaseError as e:
             self.rest_errors[type(e).__name__] += 1
             return NotReady(reason=f"перечитать рынки: {type(e).__name__} {e}")
-        self._note_weight()
         self._instruments.clear()
 
         ticks: list[TickChange] = []

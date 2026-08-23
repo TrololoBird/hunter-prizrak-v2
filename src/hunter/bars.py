@@ -332,8 +332,25 @@ def find_gaps(bars: list[Bar], timeframe: str) -> list[tuple[int, int]]:
     return out
 
 
-def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
-    """Собрать бары ТФ из минуток — jesse-модель, принятая владельцем 2026-08-17.
+LOWER_TF: dict[str, str] = {
+    "1w": "1d", "1d": "4h", "4h": "1h", "1h": "15m", "15m": "5m", "5m": "1m",
+}
+"""Следующий младший ТФ боевой лестницы. Нужен пересборке битого старшего бара."""
+
+
+def resample(src: list[Bar], source: str, timeframe: str) -> list[Bar]:
+    """Собрать бары ТФ из младших — jesse-модель, принятая владельцем 2026-08-17.
+
+    ⚠ БЫЛА `resample_from_1m` С ЖЁСТКОЙ МИНУТОЙ; источник стал параметром 2026-08-23,
+    когда у функции появился ПЕРВЫЙ боевой потребитель — пересборка битого старшего бара
+    (`run._rebuild_from_lower`). Прежняя докстрока называла отсутствие такого потребителя
+    прямо: «символ, чей ряд старшего ТФ биржа не отдала, сейчас теряется целиком, хотя
+    минутки для него есть». Случай нашёлся не гипотетический: BCH/USDT:USDT, неделя
+    2020-01-13 — биржа отдаёт агрегат с максимумом НИЖЕ открытия (o=339.65 h=215.69
+    l=182.65 c=339.62) и объёмом, заниженным впятеро против суммы суток.
+    ⚠ Сверка на 2 127 895 корзинах делалась ИМЕННО ДЛЯ МИНУТ; для источника крупнее
+    она не повторялась, и это названо, а не замолчано. Правило же («корзина с недобором
+    источника пропускается») от гранулярности не зависит: оно про полноту, а не про минуту.
 
     ⚠⚠ БОЕВЫМ КОДОМ НЕ ВЫЗЫВАЕТСЯ, и это сказано здесь, чтобы читатель не принял её за
     работающую часть конвейера (проверено грепом 2026-08-21: единственный вызывающий —
@@ -391,20 +408,23 @@ def resample_from_1m(m1: list[Bar], timeframe: str) -> list[Bar]:
     библиотеку напрямую, минуя обёртку, то есть проверяли библиотеку, а не проект»).
     Место, где она нужна, названо: символ, чей ряд старшего ТФ биржа не отдала (за цикл
     2026-08-20 таких рядов 57), сейчас теряется целиком, хотя минутки для него есть."""
-    if not m1:
+    if not src:
         return []
     step = tf_ms(timeframe)
+    src_step = tf_ms(source)
+    if src_step >= step:
+        raise ValueError(f"источник {source} не мельче цели {timeframe}")
     anchor = grid_anchor_ms(timeframe)
     out: list[Bar] = []
     cur_bucket: int | None = None
     traded = False
     o = h = lo_ = c = 0.0
     vol = 0.0
-    need = step // 60_000
+    need = step // src_step
     minutes = 0
-    first_bucket = (m1[0].open_ms - anchor) // step * step + anchor
-    last_bucket = (max(b.open_ms for b in m1) - anchor) // step * step + anchor
-    for b in sorted(m1, key=lambda x: x.open_ms):
+    first_bucket = (src[0].open_ms - anchor) // step * step + anchor
+    last_bucket = (max(b.open_ms for b in src) - anchor) // step * step + anchor
+    for b in sorted(src, key=lambda x: x.open_ms):
         bucket = (b.open_ms - anchor) // step * step + anchor
         if bucket != cur_bucket:
             edge = cur_bucket in (first_bucket, last_bucket)

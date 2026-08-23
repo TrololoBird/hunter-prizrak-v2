@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import NamedTuple
 
 import ccxt
 import polars as pl
@@ -24,12 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import archive, barstore, card, clock, emit, engine, geometry, levels, log, store
 from .bars import (
+    LOWER_TF,
     TIMEFRAME_MS,
     bars_needed,
     expected_last_closed_open_ms,
     find_gaps,
     grid_floor_ms,
     on_grid,
+    resample,
     tf_ms,
 )
 from .config import Universe
@@ -274,11 +277,89 @@ def _capped(uni: Universe) -> Universe:
     return replace(uni, symbols=kept, core=uni.core & set(kept))
 
 
+class GapRepair(NamedTuple):
+    """Итог добора дыр: сколько баров легло и что биржа прислала БИТЫМ.
+
+    ⚠ ОТКЛОНЁННЫЕ БАРЫ ЗДЕСЬ ПОЯВИЛИСЬ 2026-08-23, И ЭТО ПОЧИНКА СЛЕПОЙ ПРИЁМКИ.
+    `_fill_seed_gaps` звал `fetch_closed_ohlcv` отдельно от общего пути засева и список
+    `OhlcvFetch.rejected` ВЫБРАСЫВАЛ. Итог: битый бар писался в журнал строкой `error` и
+    исчезал из отчёта — приёмка печатала «баров ОТКЛОНЕНО как битые: 0», а дыру на том же
+    месте объявляла «необъяснённой». Два прибора одного прогона противоречили друг другу,
+    и слеп был тот, который читает владелец.
+
+    Замер (прогон `gapfix-2026-08-23`, 4 символа): журнал — 1 строка «бар отклонён как
+    битый», приёмка — «отклонено 0, необъяснённых 1».
+    """
+
+    added: int
+    rejected: list[str]
+    rejected_at_ms: list[int]
+
+
+async def _rebuild_from_lower(
+    ex: Exchange, uni: Universe, symbol: str, timeframe: str, market_id: str,
+    lo: int, hi: int,
+) -> int:
+    """Пересобрать участок старшего ТФ из МЛАДШЕГО. Вернуть число записанных баров.
+
+    ⚠ ЗАЧЕМ. Дыра старшего ряда бывает не только от молчания биржи: биржа умеет отдать
+    бар, который НЕ ЯВЛЯЕТСЯ свечой. Найдено 2026-08-23 на BCH/USDT:USDT 1w, неделя
+    2020-01-13 — и это не гипотеза, а два независимых эндпоинта той же биржи:
+
+        fapiPublicGetKlines           o=339.65 h=215.69 l=182.65 c=339.62 v=975831
+        fapiPublicGetContinuousKlines o=339.65 h=215.69 l=182.65 c=339.62 v=975831
+        СЕМЬ СУТОЧНЫХ БАРОВ той же недели: o=270.83 h=408.37 l=260.76 c=339.62 v=4923413
+
+    То есть у недельного агрегата неверны открытие, максимум, минимум И объём (занижен
+    в 5.05 раза), а верно только закрытие. Соседние недели целы, маркировочная цена за ту
+    же неделю разумна. Наша проверка определения свечи отклоняет такой бар (максимум ниже
+    открытия) — и до этой правки ряд оставался с дырой НАВСЕГДА: повтор запроса приносил
+    бы тот же битый бар вечно.
+
+    ⚠ Это НЕ выдумывание данных. Собирается тот же рынок той же биржи, только мельче:
+    формула сверена с нативными барами на 2 127 895 полных корзинах (докстрока
+    `bars.resample`). Сочинения здесь нет — есть отказ от неверного агрегата в пользу
+    верных слагаемых.
+
+    ⚠ ОГРАНИЧЕНИЯ, И ОНИ НАЗВАНЫ. Спуск ровно НА ОДНУ ступень: если и младший ряд битый,
+    участок остаётся дырой и о ней докладывают. Корзина принимается только ПОЛНОЙ (все
+    `need` баров источника на месте) — неполная дала бы бар, неотличимый от настоящего,
+    то есть ровно ту молчаливую деградацию, против которой всё это и написано.
+    """
+    src_tf = LOWER_TF.get(timeframe)
+    if src_tf is None:
+        return 0
+    need = tf_ms(timeframe) // tf_ms(src_tf)
+    want = max(1, (hi - lo) // tf_ms(timeframe))
+    got = await ex.fetch_closed_ohlcv(
+        symbol, src_tf, limit=int(need * want) + 2, since_ms=lo)
+    if isinstance(got, NotReady):
+        log.degraded("пересборка из младшего ТФ не вышла — биржа не ответила",
+                     символ=symbol, тф=timeframe, источник=src_tf, причина=got.reason)
+        return 0
+    src = [b for b in got.bars if lo <= b.open_ms < hi]
+    made = [b for b in resample(src, src_tf, timeframe)
+            if lo <= b.open_ms < hi
+            and sum(1 for x in src if b.open_ms <= x.open_ms
+                    < b.open_ms + tf_ms(timeframe)) == need]
+    if not made:
+        log.degraded("пересборка из младшего ТФ не вышла — источник неполон",
+                     символ=symbol, тф=timeframe, источник=src_tf,
+                     баров_источника=len(src), нужно_на_бар=need)
+        return 0
+    added, _ = barstore.append(uni.venue, market_id, timeframe, made)
+    log.info("битый бар биржи ПЕРЕСОБРАН из младшего ТФ", символ=symbol, тф=timeframe,
+             источник=src_tf, баров=added,
+             первый=made[0].open_ms, o=made[0].open, h=made[0].high,
+             l=made[0].low, c=made[0].close, v=made[0].volume)
+    return added
+
+
 async def _fill_seed_gaps(
     ex: Exchange, uni: Universe, report: RunReport, symbol: str, timeframe: str,
     market_id: str, want_from_ms: int, depth: int,
-) -> int:
-    """Добрать у биржи участки окна засева, которых нет в хранилище. Вернуть число баров.
+) -> GapRepair:
+    """Добрать у биржи участки окна засева, которых нет в хранилище.
 
     ⚠ ЗАЧЕМ ЭТО ЗАВЕДЕНО (2026-08-21, разбор досье `Documents/Prizzrak`). Засев спрашивал
     только хвост — `missing_tail_since` отвечает «после последнего сохранённого бара», —
@@ -308,9 +389,11 @@ async def _fill_seed_gaps(
     # Хвостовой участок добирается общим путём засева ниже — здесь только ВНУТРЕННИЕ.
     inner = [(lo, hi) for lo, hi in spans if hi <= upto]
     if not inner:
-        return 0
+        return GapRepair(0, [], [])
     report.seed_gaps_found += len(inner)
     added_total = 0
+    rejected: list[str] = []
+    rejected_at: list[int] = []
     for lo, hi in inner:
         want = max(1, (hi - lo) // step)
         got = await ex.fetch_closed_ohlcv(
@@ -322,6 +405,11 @@ async def _fill_seed_gaps(
                          причина=got.reason)
             continue
         inside = [b for b in got.bars if lo <= b.open_ms < hi]
+        # Отклонённые бары этого участка идут ДАЛЬШЕ, а не остаются в журнале.
+        spoiled = [(w, at) for w, at in zip(got.rejected, got.rejected_at_ms, strict=True)
+                   if lo <= at < hi]
+        rejected += [w for w, _ in spoiled]
+        rejected_at += [at for _, at in spoiled]
         added, rewritten = barstore.append(uni.venue, market_id, timeframe, inside)
         added_total += added
         report.seed_gap_bars += added
@@ -330,10 +418,39 @@ async def _fill_seed_gaps(
             report.seed_gaps_filled += 1
         else:
             report.seed_gaps_left += 1
-            log.degraded("дыра ряда закрыта НЕ ЦЕЛИКОМ — у биржи столько баров нет",
-                         символ=symbol, тф=timeframe, от=lo, до=hi,
-                         баров_в_дыре=want, добрано=added)
-    return added_total
+            # ⚠ ДИАГНОЗ РАЗДЕЛЁН 2026-08-23. Здесь стояла ОДНА строка «у биржи столько
+            # баров нет», и на BCH/USDT:USDT 1w она была ЛОЖЬЮ: биржа бар прислала, его
+            # отклонила наша же проверка определения свечи. Живой запрос к
+            # `fapiPublicGetKlines` (и к `fapiPublicGetContinuousKlines`, второй эндпоинт
+            # тех же данных) вернул за неделю 2020-01-13: o=339.65 h=215.69 l=182.65
+            # c=339.62 — максимум НИЖЕ открытия. Соседние недели целы, суточные бары той
+            # же недели целы (o=270.83 h=408.37 l=260.76 c=339.62), маркировочная цена
+            # разумна: битый агрегат самой биржи, а не наша потеря и не её молчание.
+            #
+            # Различать причины обязательно, потому что лечение у них РАЗНОЕ: молчание
+            # биржи лечится повтором, битый агрегат — пересборкой из младшего ТФ.
+            if spoiled:
+                # Повтор запроса принесёт тот же битый агрегат: чиним ПЕРЕСБОРКОЙ.
+                rebuilt = await _rebuild_from_lower(
+                    ex, uni, symbol, timeframe, market_id, lo, hi)
+                added_total += rebuilt
+                report.seed_gap_bars += rebuilt
+                if rebuilt >= want:
+                    report.seed_gaps_filled += 1
+                    report.seed_gaps_left -= 1
+                    report.seed_gaps_rebuilt += rebuilt
+                    continue
+                report.seed_gaps_rebuilt += rebuilt
+                log.degraded(
+                    "дыра ряда НЕ закрыта — биржа прислала БИТЫЙ бар, он отклонён",
+                    символ=symbol, тф=timeframe, от=lo, до=hi, баров_в_дыре=want,
+                    добрано=added, пересобрано=rebuilt,
+                    отклонено=len(spoiled), причина=spoiled[0][0])
+            else:
+                log.degraded("дыра ряда закрыта НЕ ЦЕЛИКОМ — у биржи столько баров нет",
+                             символ=symbol, тф=timeframe, от=lo, до=hi,
+                             баров_в_дыре=want, добрано=added)
+    return GapRepair(added_total, rejected, rejected_at)
 
 
 async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
@@ -359,12 +476,12 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
     streak = cascades = retried = recovered = skipped = 0
     # ⚠ ИНСТРУМЕНТЫ БЕРУТСЯ ОДИН РАЗ, ДО ПРОХОДОВ: проходов два, и второй не обязан
     # заново спрашивать площадку про те же рынки.
-    insts: dict[str, str | None] = {}
+    insts: dict[str, Instrument | None] = {}
     for sym in uni.symbols:
         inst = ex.instrument(sym)
         if isinstance(inst, NotReady):
             log.degraded("инструмент недоступен", причина=inst.reason)
-        insts[sym] = None if isinstance(inst, NotReady) else inst.market_id
+        insts[sym] = None if isinstance(inst, NotReady) else inst
 
     # ⚠ ЛЕСТНИЦА СПРАШИВАЕТСЯ У СИМВОЛА, А НЕ У ВСЕЛЕННОЙ. При включённой доске
     # `uni.timeframes` вернула бы полную лестницу всем 529 рынкам — 39.6 млн баров
@@ -386,7 +503,8 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             log.warn("ВТОРОЙ ПРОХОД ЗАСЕВА — голова каскада", рядов=len(todo),
                      каскадов=cascades)
         for sym, tf in todo:
-            market_id = insts[sym]
+            inst_i = insts[sym]
+            market_id = None if inst_i is None else inst_i.market_id
             st = SeriesState(symbol=sym, timeframe=tf)
             report.series[(sym, tf)] = st
             if seed_pass == 1:
@@ -396,6 +514,17 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             # делала карту несопоставимой самой с собой (см. `seed_depth`).
             depth = seed_depth(tf, horizon_days, limit)
             want_from = seed_start_ms(tf, depth, clock.now_ms())
+            # ⚠ ЛЕВЫЙ КРАЙ ОБРЕЗАЕТСЯ ДАТОЙ СОЗДАНИЯ КОНТРАКТА — правка 2026-08-23,
+            # парная к снятию условия у поиска дыр ниже. Без неё пролёт «от начала
+            # окна до листинга» стал бы дырой, которую биржа закрыть НЕ МОЖЕТ ни
+            # сейчас, ни когда-либо: у неё там ничего не было. Просился бы он каждый
+            # прогон, и каждый прогон честно печатал бы «дыра не закрыта».
+            #
+            # Замер, на котором это стоит (склад 2026-08-23, 2165 рядов боевой
+            # лестницы): окно 1н уходит на 1400 недель назад, то есть в 1999 год, —
+            # раньше не только контракта, но и самой биржи.
+            if inst_i is not None and inst_i.created_ms:
+                want_from = max(want_from, inst_i.created_ms)
             # ⚠ Потолок запросов считается по ОКНУ, а не по `depth`. С закреплением
             # левого края окно длиннее заказанной глубины (до недели в барах), и
             # прежний потолок `depth` обрезал бы добор ровно на этой добавке — то есть
@@ -410,15 +539,37 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                     uni.venue, market_id, tf, want_from)
                 report.bars_from_store += len(stored)
                 # ⚠ ДЫРА ВНУТРИ ОКНА ДОБИРАЕТСЯ ОТДЕЛЬНО, потому что хвостовой курсор к
-                # ней слеп по построению (`barstore.missing_spans`). Только когда курсор
-                # НЕ `None`: при `None` окно и так просится целиком, и повторный запрос
-                # тех же баров был бы платой ни за что.
-                if since_ms is not None:
-                    repaired = await _fill_seed_gaps(
-                        ex, uni, report, sym, tf, market_id, want_from, window_bars)
-                    if repaired:
-                        stored = barstore.load(
-                            uni.venue, market_id, tf, since_ms=want_from)
+                # ней слеп по построению (`barstore.missing_spans`).
+                #
+                # ⚠⚠ УСЛОВИЕ `if since_ms is not None` СНЯТО 2026-08-23, И ЭТО ПОЧИНКА
+                # ПОТЕРЯННЫХ СВЕЧЕЙ. Стоял довод: «при `None` окно и так просится
+                # целиком, и повторный запрос тех же баров был бы платой ни за что».
+                # Довод был бы верен, если бы окно действительно просилось, — но у
+                # ряда с ЗДОРОВЫМ хвостом оно не просится вовсе: строкой ниже такой
+                # ряд отсекает `seed_already_current` («последний закрытый бар на
+                # месте — запрос не делается», правка 2026-08-22). Два условия вместе
+                # означали: у здорового ряда дыра в середине НЕ ИЩЕТСЯ НИКОГДА.
+                #
+                # Найдено разбором собственной приёмки: она печатала «разрывов сетки
+                # внутри рядов: 1, необъяснённых 1 — BCH/USDT:USDT 1w между 2020-01-06
+                # и 2020-01-20», а засев в том же прогоне печатал «дыр найдено 0».
+                # Два прибора противоречили друг другу, и слеп был засев. Живой запрос
+                # к бирже подтвердил: свеча 2020-01-13 у неё ЕСТЬ (открытие 339.65,
+                # объём 975831.371) — потеряли её мы.
+                #
+                # Цена снятия условия названа: поиск дыры читает СКЛАД, а не сеть
+                # (`barstore.missing_spans`), и запрос уходит только если дыра есть.
+                # То есть добавляется один проход по столбцу меток на ряд.
+                fix = await _fill_seed_gaps(
+                    ex, uni, report, sym, tf, market_id, want_from, window_bars)
+                repaired = fix.added
+                st.rejected_bars = list(fix.rejected)
+                st.rejected_at_ms = list(fix.rejected_at_ms)
+                if repaired:
+                    stored = barstore.load(
+                        uni.venue, market_id, tf, since_ms=want_from)
+                    since_ms = barstore.missing_tail_since(
+                        uni.venue, market_id, tf, want_from)
 
             # Размер хвоста считается ПО РАЗРЫВУ, а не берётся константой.
             #
@@ -541,8 +692,9 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                 fresh: list[Bar] = []
             else:
                 fresh = got.bars
-                st.rejected_bars = got.rejected
-                st.rejected_at_ms = got.rejected_at_ms
+                # СЛОЖЕНИЕ, а не присваивание: отклонённые при доборе дыр уже лежат.
+                st.rejected_bars = [*st.rejected_bars, *got.rejected]
+                st.rejected_at_ms = [*st.rejected_at_ms, *got.rejected_at_ms]
 
             # ⚠ `repaired` в условии — не украшение: добор дыр уже ЗАПИСАЛ бары в
             # хранилище, а `stored` мог быть прочитан до него. Без этой ветви ряд с
@@ -603,7 +755,9 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
     # из-за которой хвостовой курсор и прожил слепым до 2026-08-21.
     log.info("засев: дыры внутри окна", найдено=report.seed_gaps_found,
              закрыто=report.seed_gaps_filled, осталось=report.seed_gaps_left,
-             баров_добрано=report.seed_gap_bars, из_рядов=report.seed_checked)
+             баров_добрано=report.seed_gap_bars,
+             пересобрано_из_младшего_ТФ=report.seed_gaps_rebuilt,
+             из_рядов=report.seed_checked)
 
 
 def _merge_bars(stored: list[Bar], fresh: list[Bar]) -> list[Bar]:
