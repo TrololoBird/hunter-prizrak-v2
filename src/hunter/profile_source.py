@@ -262,7 +262,13 @@ class CandleWindows:
             return NotReady(
                 reason=f"{self.symbol}: окно {from_ms}..{to_ms} — все {len(chunk)} свечей "
                        f"отвергнуты как неправдоподобно широкие")
-        h.trades_seen = int(k0s.size)
+        # ⚠⚠ ЧИСЛО СВЕЧЕЙ ИДЁТ В `bars_seen`, А НЕ В `trades_seen` (правка 2026-08-23).
+        # Здесь стояло `h.trades_seen = int(k0s.size)` — количество принятых СВЕЧЕЙ в
+        # поле с человеческим именем «сделок», при том что `count_by_bin` свечной
+        # источник не заполняет вовсе. `absorption.AbsorptionRead.qty_window` прямо
+        # утверждала обратное: «свечной источник профиля счётчики сделок не заполняет —
+        # поле печаталось бы ложным нулём». Оно заполнялось, и не нулём.
+        h.bars_seen = int(k0s.size)
         qty_seen = 0.0
         for v in vols_kept.tolist():
             qty_seen += v

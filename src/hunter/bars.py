@@ -422,7 +422,12 @@ def resample(src: list[Bar], source: str, timeframe: str) -> list[Bar]:
     vol = 0.0
     need = step // src_step
     minutes = 0
-    first_bucket = (src[0].open_ms - anchor) // step * step + anchor
+    # ⚠ Края берутся МИНИМУМОМ и МАКСИМУМОМ, а не `src[0]`. Цикл ниже сортирует вход —
+    # то есть функция прямо допускает неотсортированный `src`, — а край читался нулевым
+    # элементом как есть. При обратном или перемешанном порядке `first_bucket` указывал
+    # на чужую корзину: настоящая первая теряла поблажку `edge` и отбрасывалась недобором
+    # минут, а та, на которую он указал, получала её посреди ряда.
+    first_bucket = (min(b.open_ms for b in src) - anchor) // step * step + anchor
     last_bucket = (max(b.open_ms for b in src) - anchor) // step * step + anchor
     for b in sorted(src, key=lambda x: x.open_ms):
         bucket = (b.open_ms - anchor) // step * step + anchor

@@ -2344,7 +2344,6 @@ def explained_gaps(st: SeriesState) -> tuple[tuple[int, int], ...]:
 
 def decide_once(report: RunReport, uni: Universe,
                 sources: dict[str, TradeWindows],
-                frame_bars: int | None = None,
                 detections: engine.Detections | None = None,
                 horizon_days: int = 0,
                 ) -> dict[str, engine.SymbolDecision]:
@@ -2371,7 +2370,7 @@ def decide_once(report: RunReport, uni: Universe,
         # 5м и 15м по всем 696 рынкам, которых для них даже не собрано. Выигрыш от
         # выноса — один вызов метода на символ; цена ошибки — вся доска.
         out[sym] = engine.decide(sym, series, sources.get(sym), uni.ladder(sym),
-                                 frame_bars=frame_bars, detections=detections,
+                                 detections=detections,
                                  horizon_days=horizon_days)
     # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
     # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
@@ -2497,7 +2496,7 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
     Отказы называются числами, а не молчанием: сигнал без цели (записан до v5), символ
     без рядов в этом прогоне и ТФ без баров считаются раздельно.
     """
-    no_target = no_bars = 0
+    no_target = no_bars = degenerate = 0
     for sym in uni.symbols:
         series = bars_of(report, sym)
         if not series:
@@ -2534,6 +2533,13 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
                 breakeven_at=p.breakeven_at,
             )
+            if res.kind is OutcomeKind.UNMEASURABLE:
+                # Вырожденный риск (стоп совпал со входом): единицы R не существует, и
+                # в леджер такая сделка не идёт НИКАК — ни исходом, ни состоянием.
+                # Прежде `resolve` отвечал на неё `not_filled`, и она молча попадала в
+                # долю «мимо входа», то есть в число, которое читает владелец.
+                degenerate += 1
+                continue
             if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
@@ -2553,8 +2559,15 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                     report.states_recorded += 1
     report.pending_no_target = no_target
     report.pending_no_bars = no_bars
+    report.pending_degenerate_risk = degenerate
     if no_bars:
         log.degraded("часть сигналов дорешать нельзя", без_баров=no_bars)
+    if degenerate:
+        # Деградация, а не примечание: стоп, совпавший со входом, — дефект РАСЧЁТА
+        # геометрии, а не законное состояние рынка. Молчать о нём значило бы прятать
+        # его ровно так, как прежде прятал `not_filled`.
+        log.degraded("у сигнала вырожден риск: стоп совпал со входом",
+                     сигналов=degenerate)
     if no_target:
         # НЕ деградация: такие сигналы дорешиваются, просто исход `цель` у них
         # невозможен по построению. Знать их число всё равно нужно — оно знаменатель
@@ -2890,7 +2903,8 @@ CYCLE_FIELDS = (
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
     "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
-    "pending_no_target", "pending_no_bars", "emitted_outcomes",
+    "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
+    "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "map_stale_calc",
@@ -3706,6 +3720,9 @@ def print_report(r: RunReport) -> int:
               f"цели» у них невозможен по построению; это знаменатель к «по цели 0%»")
     if r.pending_no_bars:
         print(f"   дорешать НЕЛЬЗЯ: без ряда ТФ в этом прогоне {r.pending_no_bars}")
+    if r.pending_degenerate_risk:
+        print(f"   ⚠ ВЫРОЖДЕН РИСК (стоп совпал со входом): "
+              f"{r.pending_degenerate_risk} — в R не измеряются, в леджер не пишутся")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())

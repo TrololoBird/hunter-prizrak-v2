@@ -32,7 +32,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .bars import TIMEFRAME_MS, tf_ms
-from .geometry import Setup
+from .geometry import Setup, TargetRole
 from .levels import Level, LevelSide, LevelState, LevelStatus
 from .models import Bar
 from .outcome import Outcome, resolve
@@ -263,7 +263,12 @@ def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
     Следствие честное и неприятное: у только что записанного сигнала исхода нет и быть
     не может. Он дописывается позже, по мере поступления новых баров.
     """
-    primary = [t for t in em.setup.targets if t.role.value == "primary"]
+    # ⚠ Роль сравнивается ПЕРЕЧИСЛЕНИЕМ, а не строкой (правка 2026-08-23). Здесь стояло
+    # `t.role.value == "primary"` — единственное такое место в проекте (`geometry.Setup.rr`
+    # и `card.render` сравнивают члены enum). Переименование значения `TargetRole.PRIMARY`
+    # молча обнулило бы ВСЕ исходы «по цели», и не поймал бы этого ни mypy, ни гейт:
+    # сравнение строки со строкой законно всегда.
+    primary = [t for t in em.setup.targets if t.role is TargetRole.PRIMARY]
     return resolve(
         side=em.level.side,
         entry=em.setup.entry,

@@ -27,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .bars import TIMEFRAME_MS, tf_ms
+from .bars import TIMEFRAME_MS, steps_between, tf_ms
 from .breach import (
     CONFIRM_BODIES,
     RETURN_BARS,
@@ -503,7 +503,6 @@ def build_all(
     timeframes: tuple[str, ...],
     scans: dict[str, RangeScan],
     swings: dict[str, SwingSet] | None = None,
-    frame_bars: int | None = None,
     horizon_days: int = 0,
     per_side: int = LEVELS_PER_SIDE,
 ) -> LevelBuild:
@@ -516,7 +515,16 @@ def build_all(
     подпись ТФ — дело печати, и склеивать её здесь значит навязывать формат всем
     вызывающим.
 
-    ⚠⚠ `frame_bars` БОЛЬШЕ НЕ ОТБРАСЫВАЕТ СТРУКТУРУ (2026-08-21). Прежняя редакция
+    ⚠⚠ ПАРАМЕТР `frame_bars` УДАЛЁН ИЗ ПОДПИСИ 2026-08-23. Он перестал что-либо делать
+    2026-08-21 (разбор ниже), но остался ручкой: принимался здесь, передавался из
+    `engine.decide` и `run.decide_once`, а первой же строкой тела шёл `del frame_bars`.
+    Ручка, не соединённая ни с чем, — тот самый класс, ради которого удалены
+    `bars_per_timeframe` и `admission_required_bars` и заведён гейт
+    `config_forbids_unknown`; там он ловится в TOML, здесь его не ловил никто. Вместе с
+    параметром из `service.py` ушёл импорт `render` — служба брала оттуда `BARS_ON_CHART`
+    ровно ради этого аргумента, то есть ширина картинки числилась входом расчёта.
+
+    ⚠⚠ РАМКА БОЛЬШЕ НЕ ОТБРАСЫВАЕТ СТРУКТУРУ (2026-08-21). Прежняя редакция
     пропускала структуру, чей конец старше `frame_bars` баров своего ТФ, доводом «уровень
     всё равно скрыл бы фильтр „у структуры“ (`tgbot.near_structure`, снят 2026-08-21),
     значит строить его — платить профилем за невидимое». Довод был верен ровно до тех
@@ -572,7 +580,6 @@ def build_all(
     # под якорь стопа). Стоят один проход по ряду, экономят миллион с лишним сравнений.
     opens_by_tf: dict[str, list[int]] = {
         stf: [b.open_ms for b in sbars] for stf, sbars in series.items() if sbars}
-    del frame_bars  # состав карты рамкой больше не режется — см. докстроку
 
     # ⚠⚠ ГОРИЗОНТ ДОШЁЛ ДО ПОСТРОЕНИЯ УРОВНЕЙ 2026-08-21. До этого дня он не применялся
     # здесь ВООБЩЕ: слова «horizon» не было ни в этом модуле, ни в `engine`, ни в
@@ -1328,6 +1335,15 @@ def take_depth(
     run = 0
     for i in range(level.created_at_index + 1, len(bars)):
         bar = bars[i]
+        # ⚠ Дыра в ряду РВЁТ серию. Курс на стр. 55 говорит о полных телах свечей
+        # ЭТОГО ТФ подряд, то есть о ВРЕМЕНИ, а счётчик считал соседей ПО СПИСКУ:
+        # при пропуске в ряду два бара, отстоящих на часы, засчитывались как подряд
+        # идущие и объявляли `BEYOND` — то есть снимали лимитки с уровня. Это Р-2, под
+        # который заведена `bars.steps_between`; `breach.first_breach` и
+        # `trading_range.detect` её соблюдают, а этот счётчик — нет.
+        if i > level.created_at_index + 1 and steps_between(
+                bars[i - 1], bar, level.timeframe) != 1:
+            run = 0
         run = run + 1 if closed_beyond(bar, poc, direction) else 0
         if run >= confirm_bodies:
             return ZoneTake(depth=TakeDepth.BEYOND, first_index=first, deepest_index=i)

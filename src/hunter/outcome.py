@@ -59,6 +59,21 @@ class OutcomeKind(StrEnum):
     NOT_FILLED = "not_filled"
     """Цена так и не дошла до входа: сделки не было вовсе."""
 
+    UNMEASURABLE = "unmeasurable"
+    """Риск вырожден: стоп совпал со входом, единицы R не существует.
+
+    ⚠⚠ ЗАВЕДЁН 2026-08-23. До этого дня такой случай возвращал `NOT_FILLED`, чьё
+    определение — «цена так и не дошла до входа: сделки не было вовсе». Это отказ
+    ПРИБОРА, выданный за вердикт о РЫНКЕ: цена могла прийти на вход и уйти куда угодно,
+    но измерить это в R нечем — знаменатель ноль. Исход при этом попадал в знаменатель
+    `emitted_outcomes` и в долю «мимо входа», то есть портил обе величины, которые
+    предъявляются владельцу.
+
+    Наружу (в леджер) он НЕ ПИШЕТСЯ: таблица состояний знает только `not_filled` и
+    `open`, и добавлять туда третье значение значило бы записывать в журнал сделок то,
+    что сделкой не является. Он НАЗЫВАЕТСЯ числом в приёмке — как всякий отказ (§4.3).
+    """
+
 
 class Outcome(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -118,7 +133,9 @@ def resolve(
     """
     risk = abs(entry - stop)
     if risk == 0:
-        return Outcome(kind=OutcomeKind.NOT_FILLED, filled_at_index=None,
+        # ⚠ НЕ `NOT_FILLED` (правка 2026-08-23): вырожденный стоп — это «мерить
+        # нечем», а не «цена не пришла». Разбор — в докстроке `OutcomeKind.UNMEASURABLE`.
+        return Outcome(kind=OutcomeKind.UNMEASURABLE, filled_at_index=None,
                        closed_at_index=None, exit_price=None, r=None)
 
     long = side is LevelSide.LONG

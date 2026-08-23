@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -337,24 +338,69 @@ def _append_lock(path: Path) -> Iterator[None]:
     """
     lock = path.with_suffix(path.suffix + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
+    # ⚠ МЕТКА ВЛАДЕЛЬЦА. Без неё снятие замка в `finally` было безусловным
+    # `unlink(missing_ok=True)` — то есть процесс снимал ТОТ ЗАМОК, ЧТО ЛЕЖИТ, а не
+    # свой. Метка пишется в сам файл при взятии и сверяется при снятии.
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
     deadline = time.monotonic() + _LOCK_WAIT_S
     while True:
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
+            try:
+                os.write(fd, token.encode())
+            finally:
+                os.close(fd)
             break
         except FileExistsError:
             if time.monotonic() > deadline:
+                # ⚠⚠ ОТБОР АТОМАРЕН (правка 2026-08-23). Здесь стояло
+                # `lock.unlink(missing_ok=True)` и `continue`, и это давало ДВА отказа
+                # сразу — ровно тот сценарий потери баров, ради которого замок и
+                # написан:
+                #   * два ждущих процесса снимали ОДИН И ТОТ ЖЕ замок и входили ОБА
+                #     (`unlink` + `O_EXCL` — не одна операция);
+                #   * исходный владелец, у которого замок отобрали, в своём `finally`
+                #     удалял замок ПЕРЕХВАТИВШЕГО, и дальше внутрь входил третий.
+                # Теперь брошенный замок УВОДИТСЯ переименованием: `os.rename` на
+                # несуществующий путь атомарен, и из двух отбирающих успевает ровно
+                # один — второй получает `FileNotFoundError` и просто идёт на новый
+                # круг `O_EXCL`.
+                stale = lock.with_suffix(lock.suffix + f".stale-{token}")
+                try:
+                    os.rename(lock, stale)
+                except (FileNotFoundError, PermissionError):
+                    # Владелец успел снять замок сам (или Windows держит файл
+                    # открытым) — это не отказ, а гонка, которую решает новый круг.
+                    time.sleep(0.05)
+                    deadline = time.monotonic() + _LOCK_WAIT_S
+                    continue
                 log.warn("замок ряда отобран после ожидания", файл=str(lock),
-                            ожидание_с=_LOCK_WAIT_S)
-                lock.unlink(missing_ok=True)
+                         ожидание_с=_LOCK_WAIT_S)
+                stale.unlink(missing_ok=True)
                 deadline = time.monotonic() + _LOCK_WAIT_S
                 continue
             time.sleep(0.05)
     try:
         yield
     finally:
-        lock.unlink(missing_ok=True)
+        # Снимается ТОЛЬКО СВОЙ замок. Чужая метка означает, что замок у нас уже
+        # отобрали: трогать его нельзя — он принадлежит другому писателю.
+        mine = False
+        try:
+            mine = lock.read_bytes().decode() == token
+        except FileNotFoundError:
+            # Замок исчез, пока мы работали, — значит его отобрали и уже сняли. Молчать
+            # об этом нельзя (§4.3): это то же событие «наша запись шла без замка», что
+            # и отбор, только с другой стороны.
+            log.warn("замок ряда исчез до снятия — его отобрали", файл=str(lock))
+        except OSError as e:
+            log.error("замок ряда не прочитан при снятии", файл=str(lock),
+                      причина=f"{type(e).__name__} {e}")
+        if mine:
+            lock.unlink(missing_ok=True)
+        elif lock.exists():
+            log.warn("замок ряда принадлежит уже не нам — чужой не трогаем",
+                     файл=str(lock))
 
 
 def _write_atomic(frame: pl.DataFrame, path: Path) -> None:

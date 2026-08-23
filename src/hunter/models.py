@@ -175,8 +175,12 @@ class Bar:
                 f"бар {self.open_ms}: high/low не накрывают open/close "
                 f"(o={self.open} h={self.high} l={self.low} c={self.close})"
             )
-        if self.high < self.low:
-            raise ValueError(f"бар {self.open_ms}: high < low")
+        # ⚠ ЗДЕСЬ СТОЯЛА ПРОВЕРКА `high < low` — НЕДОСТИЖИМАЯ, снята 2026-08-23.
+        # Условие выше её поглощает: после него `high >= max(open, close)` и
+        # `low <= min(open, close)`, а `max(o, c) >= min(o, c)` тождественно, значит
+        # `high >= low` уже доказано. Проверка выглядела защитой, ею не являясь, — и
+        # именно её сообщение («high < low») читатель ждал бы на битом баре, тогда как
+        # он всегда получает сообщение предыдущей.
 
 
 @dataclass(slots=True, frozen=True)
@@ -540,6 +544,22 @@ class TradeHistogram(BaseModel):
     qty_by_bin: dict[int, float] = Field(default_factory=dict)
     count_by_bin: dict[int, int] = Field(default_factory=dict)
     trades_seen: int = 0
+    """Сколько СДЕЛОК легло в гистограмму. Ноль у свечного источника — и это правда.
+
+    ⚠⚠ СЮДА КЛАЛИ ЧИСЛО БАРОВ (исправлено 2026-08-23). `profile_source.CandleWindows`
+    писал `h.trades_seen = int(k0s.size)` — количество принятых СВЕЧЕЙ, — а
+    `count_by_bin` при этом не заполнял вовсе. То есть поле с человеческим именем
+    «сделок» несло другую величину, а инвариант «сумма `count_by_bin` равна
+    `trades_seen`» держался только у потокового источника. Число свечей теперь живёт в
+    `bars_seen`, и оба поля отвечают за то, как называются."""
+
+    bars_seen: int = 0
+    """Сколько СВЕЧЕЙ разложено в гистограмму свечным источником профиля.
+
+    Ненулевое ровно там, где `trades_seen` нулевое, и наоборот: источник у окна один.
+    Заведено 2026-08-23 вместе с разделением величин — до него обе жили под именем
+    «сделок»."""
+
     qty_seen: float = 0.0
     """Контроль: сумма по сырью до агрегации. Сверяется с суммой по бинам."""
 
@@ -601,6 +621,7 @@ class TradeHistogram(BaseModel):
         for idx, n in other.count_by_bin.items():
             self.count_by_bin[idx] = self.count_by_bin.get(idx, 0) + n
         self.trades_seen += other.trades_seen
+        self.bars_seen += other.bars_seen
         self.qty_seen += other.qty_seen
         if other.first_ms is not None:
             self.first_ms = (other.first_ms if self.first_ms is None
@@ -614,6 +635,7 @@ class TradeHistogram(BaseModel):
         self.qty_by_bin.clear()
         self.count_by_bin.clear()
         self.trades_seen = 0
+        self.bars_seen = 0
         self.qty_seen = 0.0
         self.first_ms = None
         self.last_ms = None
@@ -670,11 +692,15 @@ class BarBinnedTrades(BaseModel):
                     f"{self.symbol}: корзина архива {bucket} не ложится на сетку "
                     f"{self.bucket_ms} — окно структуры пришлось бы округлять"
                 )
-            own = bucket - bucket % self.bucket_ms
-            self.qty.setdefault(own, {})
-            self.cnt.setdefault(own, {})
-            self.qty[own][idx] = self.qty[own].get(idx, 0.0) + qty
-            self.cnt[own][idx] = self.cnt[own].get(idx, 0) + cnt
+            # ⚠ ЗДЕСЬ СТОЯЛО `own = bucket - bucket % self.bucket_ms` — вычисление-
+            # пустышка, снято 2026-08-23: строкой выше ненулевой остаток уже поднял
+            # исключение, значит `bucket % self.bucket_ms` здесь тождественно ноль и
+            # `own` всегда равно `bucket`. Имя `own` при этом намекало на приведение к
+            # своей сетке, которого не происходило.
+            self.qty.setdefault(bucket, {})
+            self.cnt.setdefault(bucket, {})
+            self.qty[bucket][idx] = self.qty[bucket].get(idx, 0.0) + qty
+            self.cnt[bucket][idx] = self.cnt[bucket].get(idx, 0) + cnt
             self.trades_seen += cnt
             self.qty_seen += qty
 
@@ -1152,6 +1178,14 @@ class RunReport(BaseModel):
 
     pending_no_bars: int = 0
     """Сигналов, которые дорешать нельзя: ряда их ТФ в этом прогоне нет."""
+
+    pending_degenerate_risk: int = 0
+    """Сигналов с ВЫРОЖДЕННЫМ риском: стоп совпал со входом, единицы R не существует.
+
+    ⚠ Заведено 2026-08-23 вместе с `OutcomeKind.UNMEASURABLE`. До того такой сигнал
+    получал исход `not_filled` («цена так и не дошла до входа»), то есть отказ прибора
+    выдавался за вердикт о рынке и портил долю «мимо входа». Ноль здесь — законное
+    состояние; ненулевое значение означает дефект геометрии, а не рынка."""
 
     states_recorded: int = 0
     """Состояний незакрытых сделок записано в леджер (`not_filled`/`open`, схема v4,

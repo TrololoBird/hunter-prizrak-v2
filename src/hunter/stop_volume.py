@@ -151,14 +151,28 @@ _VOL_MEMO: dict[tuple[str, int, int, int, int, int], float] = {}
 """Суммы объёма спанов младших накоплений: см. комментарий при использовании."""
 
 
-def _placement(small: TradingRange, host: TradingRange,
-               small_bars: list[Bar], host_bars: list[Bar]) -> Placement:
-    if small_bars[small.last_index].open_ms < host_bars[host.first_index].open_ms:
+def _placement(small_box: tuple[float, float], host_box: tuple[float, float],
+               small_last_ms: int, host_first_ms: int) -> Placement:
+    """Где стоповый стоит относительно хозяина. Обе геометрии — КОРОБКИ ПО СВЕЧАМ.
+
+    ⚠⚠ ЗДЕСЬ ЖИЛА ТРЕТЬЯ ГЕОМЕТРИЯ ТОЙ ЖЕ СТРУКТУРЫ (исправлено 2026-08-23). Функция
+    брала ЛИНИИ детектора — `small.upper.edge`, `small.lower.edge`, `host.upper.edge`,
+    `host.lower.edge`, — тогда как `price_range`, `box_lo`, `box_hi` и `bar_volume` в
+    том же `classify` с 2026-08-20 считаются по КОРОБКЕ свечей, и сам модуль объявил
+    этот класс закрытым («ОДИН ОТРЕЗОК И ОДНА ГЕОМЕТРИЯ НА СТРУКТУРУ»).
+
+    Расхождение не косметическое: замер 2026-08-20, записанный в поле `box_lo/box_hi`,
+    даёт «свечи выходят за линии детектора у 85.4%, медиана превышения 0.703%, максимум
+    22.42%». `placement` — это то, чем стоповый объём относится к базе (стр. 34/36/37/39),
+    то есть ИМЕННО РАЗЛИЧЕНИЕ "внутри структуры" и "за её границей"; на разнице в 0.7%
+    у границы вердикт переворачивается.
+    """
+    if small_last_ms < host_first_ms:
         return Placement.BEFORE
-    mid = (small.upper.edge + small.lower.edge) / 2
-    if mid > host.upper.edge:
+    mid = (small_box[0] + small_box[1]) / 2
+    if mid > host_box[1]:
         return Placement.ABOVE
-    if mid < host.lower.edge:
+    if mid < host_box[0]:
         return Placement.BELOW
     return Placement.INSIDE
 
@@ -179,6 +193,16 @@ def classify(
     «магическим числом», от которого правило §0 и защищает.
     """
     items: list[StopVolume] = []
+    # Коробка ХОЗЯИНА считается по разу на вызов, а не на каждое младшее накопление:
+    # `TradingRange.box` держит собственную память, но обращение к ней стоит ключа ряда.
+    host_box = host.box(host_bars)
+    if host_box is None:
+        # Отрезок структуры-хозяина пуст — относить к ней нечего. То же решение, что
+        # строкой ниже для младшего накопления: `None` от `box` означает «отрезка нет»,
+        # а не «коробка нулевой высоты», и подставлять вместо него линии детектора
+        # значило бы вернуть ту самую вторую геометрию.
+        return StopVolumeSet(items=(), densities=())
+    host_first_ms = host_bars[host.first_index].open_ms
     for a in small:
         # ⚠ МЕМО ПО СПАНУ — правка 2026-08-17 по живому стеку (py-spy): одни и те же
         # накопления младшего ТФ пересуммировались для КАЖДОЙ структуры-хозяина заново —
@@ -236,7 +260,9 @@ def classify(
             StopVolume(
                 trading_range=a,
                 host_timeframe=host_timeframe,
-                placement=_placement(a, host, small_bars, host_bars),
+                placement=_placement(
+                    (box_lo, box_hi), host_box,
+                    small_bars[a.last_index].open_ms, host_first_ms),
                 price_range=rng,
                 bar_volume=vol,
                 box_lo=box_lo,

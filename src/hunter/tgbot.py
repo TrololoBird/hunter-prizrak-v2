@@ -496,8 +496,12 @@ def read_map(symbol: str) -> MapRead | NotReady:
     # Колонка плотности объёма появилась в схеме 8, а мигрирует базу ПИСАТЕЛЬ: до
     # первого боевого прогона бот видит прежнюю схему, и запрос с `vrvp_density` вернул
     # бы «леджер не прочитан», то есть пустую карту. Спрашиваем схему, а не предполагаем.
-    dens_col = ("COALESCE(vrvp_density, 0)"
-                if "vrvp_density" in store.level_columns(conn) else "0")
+    # ⚠ БЕЗ `COALESCE(…, 0)` (2026-08-23): NULL в этой колонке означает «композит не
+    # построен», и схема леджера оговаривает это отдельной строкой. Превращая его в
+    # ноль здесь, показ приравнивал непосчитанное к посчитанному нулю и отбирал по
+    # нему (§4.3). Отсутствие колонки целиком — тоже NULL, а не ноль.
+    dens_col = ("vrvp_density"
+                if "vrvp_density" in store.level_columns(conn) else "NULL")
     try:
         rows = conn.execute(
             # ⚠ Берутся НЕ ТОЛЬКО активные. Снятые уровни нужны разметке: отработанный
@@ -528,7 +532,7 @@ def read_map(symbol: str) -> MapRead | NotReady:
                            boundary_lo=float(r[7]), boundary_hi=float(r[8]),
                            from_ms=int(r[9]), to_ms=int(r[10]),
                            state=r[11], retired_at_ms=int(r[12]),
-                           vrvp_density=float(r[13]))
+                           vrvp_density=None if r[13] is None else float(r[13]))
                   for r in rows)
     return MapRead(zones=zones, last_seen_ms=max((int(r[6]) for r in rows), default=0))
 
@@ -565,7 +569,7 @@ def zones_of(decision: engine.SymbolDecision,
             boundary_lo=float(m.level.boundary_lo),
             boundary_hi=float(m.level.boundary_hi),
             from_ms=m.level.structure_from_ms, to_ms=m.level.structure_to_ms,
-            vrvp_density=m.level.vrvp_density or 0.0))
+            vrvp_density=m.level.vrvp_density))
     return tuple(sorted(out, key=lambda z: z.price))
 
 
@@ -722,8 +726,7 @@ class OnDemand:
         # службы. Без него бот строил бы уровни из структур за границей набора, а
         # служба — нет, и владелец видел бы РАЗНЫЕ карты одной монеты.
         decided = await asyncio.to_thread(run.decide_once, report, one, sources,
-                                          BARS_ON_CHART, detections,
-                                          self.horizon_days)
+                                          detections, self.horizon_days)
         got = decided.get(symbol)
         if got is None:
             self.failed += 1
@@ -913,8 +916,17 @@ def _away(z: ZoneSpec, price: float) -> float:
 
 
 def _passed(z: ZoneSpec, price: float) -> bool:
-    """Цена уже прошла уровень: лонг над ценой / шорт под ней (стр. 30: вход ОТ уровня)."""
-    return (z.side == "long" and z.price >= price) or (
+    """Цена уже прошла уровень: лонг над ценой / шорт под ней (стр. 30: вход ОТ уровня).
+
+    ⚠ ГРАНИЦА СИММЕТРИЧНА (правка 2026-08-23). Здесь стояло `z.price >= price` для лонга
+    и `z.price < price` для шорта: на ТОЧНОМ равенстве цены и уровня лонг объявлялся
+    пройденным, а шорт — нет. Одна и та же конфигурация читалась по-разному в
+    зависимости от стороны, и это уходило и в текст сводки, и в подпись графика
+    (`tradable_counts`). Теперь «прошла» означает СТРОГО за уровнем на обеих сторонах:
+    цена, стоящая РОВНО на уровне, к нему ещё не приходила и не уходила — лимитка на нём
+    исполнима, а «вход ОТ уровня» стр. 30 говорит именно о входе на самой цене уровня.
+    """
+    return (z.side == "long" and z.price > price) or (
         z.side == "short" and z.price < price)
 
 
@@ -942,13 +954,13 @@ def tradable_counts(
     одном ответе. `now_ms` обязателен по той же причине: забытый фильтр в одном из двух
     путей вернул бы это расхождение.
     """
-    _, unique, _, _ = live_unique(zones, price, now_ms)
+    _, unique, _ = live_unique(zones, price, now_ms)
     t = [z for z in unique if not _passed(z, price)]
     return (len([z for z in t if z.side == "long"]),
             len([z for z in t if z.side == "short"]))
 
 
-def _strength(z: ZoneSpec, order: dict[str, int]) -> tuple[int, float]:
+def _strength(z: ZoneSpec, order: dict[str, int]) -> tuple[int, int, float]:
     """Сила уровня по стр. 22: «Сила уровня определяется ТФ и объемом».
 
     Кортеж, а НЕ одно число: курс называет два признака и шкалы между ними не даёт.
@@ -959,13 +971,21 @@ def _strength(z: ZoneSpec, order: dict[str, int]) -> tuple[int, float]:
     ⚠ Плотность, а НЕ доля объёма. Доля («сколько композита лежит в зоне») растёт вместе
     с шириной зоны — ранговая корреляция +0.716 на 9715 уровнях, — и отбор по ней
     означал бы «показываем самую широкую полосу». Разбор: `levels.Level.vrvp_zone_bins`.
+
+    ⚠⚠ ТРЕТЬЕ ЧИСЛО В КЛЮЧЕ — «ИЗМЕРЕНО ЛИ» (2026-08-23). До этой правки поле было
+    `float = 0.0`, и уровень, у которого композит НЕ ПОСТРОЕН, шёл в отбор с нулевой
+    плотностью — наравне с уровнем, у которого она измерена и равна нулю. Это §4.3
+    («ноль вместо отказа») прямо в отборе того, что владелец увидит. Теперь при равном
+    ТФ измеренная плотность сильнее неизмеренной, а неизмеренные между собой ничьей
+    уходят на следующий критерий — ширину зоны, как было до введения объёма в отбор.
     """
-    return order.get(z.timeframe, 0), z.vrvp_density
+    d = z.vrvp_density
+    return order.get(z.timeframe, 0), 0 if d is None else 1, d or 0.0
 
 
 def live_unique(
     zones: tuple[ZoneSpec, ...], price: float, now_ms: int,
-) -> tuple[list[ZoneSpec], list[ZoneSpec], list[ZoneSpec], list[ZoneSpec]]:
+) -> tuple[list[ZoneSpec], list[ZoneSpec], list[ZoneSpec]]:
     """ЖИВЫЕ уровни и их дедубликация по цене — ОДНА на текст и подпись графика.
 
     С 2026-08-17 `read_map` отдаёт и снятые уровни (графику нужны значки судьбы), и
@@ -975,11 +995,15 @@ def live_unique(
     (курс, стр. 48: старший сильнее). Пока подпись и текст считали по-разному, читатель
     видел два несовместимых числа в одном ответе.
 
-    ⚠ ФИЛЬТР ВОЗРАСТА СНЯТ 2026-08-21; третий список пуст по построению.
-    Прежняя редакция: скрытые фильтром уровни
-    возвращаются ТРЕТЬИМ списком — сводка обязана назвать их числом, а не растворить.
+    ⚠⚠ ТРЕТИЙ СПИСОК (`off_struct`) УДАЛЁН 2026-08-23. Фильтр возраста сняли
+    2026-08-21, и с того дня список был ПУСТ ПО ПОСТРОЕНИЮ — а его длина продолжала
+    печататься в сводке строкой «N скрыто — структура старше кадра графика», и среди
+    его элементов искался сильнейший по объёму. Счётчик, который не может вырасти, —
+    это Д-1, форма, из-за которой в проекте уже удалялся
+    `SeriesState.ws_unclosed_violations`. Оставлять его «ради формы ответа» значило
+    держать в контракте величину, про которую заранее известно, что она ноль.
 
-    ⚠ ЧЕТВЁРТЫЙ СПИСОК — ФЛИПНУТЫЕ, и заведён он 2026-08-19 потому, что до этого дня
+    ⚠ ТРЕТИЙ СПИСОК — ФЛИПНУТЫЕ, и заведён он 2026-08-19 потому, что до этого дня
     целый торгуемый класс исчезал из сообщения МОЛЧА. Отбор `state == "active"`
     выбрасывает `flipped`, а курс на стр. 43 говорит о них прямо: «Уровень лонг/шорт
     менятся для нас на противоположный. По возврату цены на ретест уровня -
@@ -1017,10 +1041,6 @@ def live_unique(
     # Поэтому здесь не осталось условия: условие, которое не может стать ложным, — тот
     # самый дефект Д-1, из-за которого в этом проекте уже удалялся счётчик.
     alive = [z for z in zones if z.state == "active"]
-    off_struct: list[ZoneSpec] = []
-    """Пуст ПО ПОСТРОЕНИЮ с 2026-08-21: скрывать по возрасту больше нечем. Список
-    оставлен в контракте, потому что его число печатает сводка, и убрать его значило бы
-    молча сменить форму ответа для всех вызывающих."""
     # ⚠⚠ ПРОБИТЫЕ ВПУЩЕНЫ В СПИСКИ СО СМЕНОЙ СТОРОНЫ 2026-08-23, и это ПРАВИЛО
     # КУРСА, а не послабление. Стр. 43 дословно: «Уровень лонг/шорт менятся для нас на
     # противоположный. По возврату цены на ретест уровня -  открываем позицию и ставим
@@ -1049,7 +1069,7 @@ def live_unique(
     flipped = [replace(z, side=("short" if z.side == "long" else "long"))
                for z in zones if z.state == "flipped"]
     pool = alive + flipped
-    return pool, _dedupe(pool, price), off_struct, _dedupe(flipped, price)
+    return pool, _dedupe(pool, price), _dedupe(flipped, price)
 
 
 def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
@@ -1263,7 +1283,7 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
     не выдаётся за их отсутствие у самих уровней (§4.3).
     """
     base = symbol.split("/")[0]
-    live, unique, off_struct, flipped = live_unique(zones, price, now_ms)
+    live, unique, flipped = live_unique(zones, price, now_ms)
     hidden_dupes = len(live) - len(unique)
 
     # Шапка — как в посте автора 17.08.2026: «🪙#BTC …», цена рядом.
@@ -1425,13 +1445,15 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         # ⚠ Сила по объёму ПЕЧАТАЕТСЯ (2026-08-19). С этой правки плотность объёма
         # решает, какой из двух уровней одного ТФ читатель увидит, — а всё, на чём стоит
         # решение, обязано быть предъявлено.
-        vol = max(z.vrvp_density for z in g)
         # «×N к среднему», а не проценты: печатается ПЛОТНОСТЬ — во сколько раз объём
         # на ценовую строку в зоне выше среднего по композиту. Единица означает «зона
-        # ничем не выделяется», поэтому называется только сгущение. Ноль — «не
-        # считалось» (карта до схемы 8), и тогда строки нет: печатать «×0» значило бы
-        # назвать пустым непосчитанное.
-        strength = f" · объём ×{vol:.1f} к среднему" if vol >= 1.2 else ""
+        # ничем не выделяется», поэтому называется только сгущение. `None` — «не
+        # считалось» (композит не построен), и тогда строки нет: печатать «×0» значило
+        # бы назвать пустым непосчитанное (§4.3).
+        vol = max((z.vrvp_density for z in g if z.vrvp_density is not None),
+                  default=None)
+        strength = (f" · объём ×{vol:.1f} к среднему"
+                    if vol is not None and vol >= 1.2 else "")
         return f"{core} · {role(g, g_lo <= price <= g_hi)}{strength}{far}{marks}"
 
     def block(side: str, title: str) -> list[str]:
@@ -1450,14 +1472,13 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                          if z.side == side and z.state == "worked_off")
             flipped = sum(1 for z in zones
                           if z.side == side and z.state == "flipped")
-            hidden = sum(1 for z in off_struct if z.side == side)
             why = []
             if worked:
                 why.append(f"{worked} отработано ценой")
             if flipped:
                 why.append(f"{flipped} перевёрнуто пробоем")
-            if hidden:
-                why.append(f"{hidden} скрыто — структура старше кадра графика")
+            # ⚠ Строки «N скрыто — структура старше кадра» здесь больше нет: считалась
+            # она по `off_struct`, пустому по построению с 2026-08-21 (см. `live_unique`).
             if why:
                 return [f"{title} свежих нет ({', '.join(why)})", ""]
             return [f"{title} пока нет — структур этой стороны карта не нашла", ""]
@@ -1497,12 +1518,20 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
             # тем же способом, каким скрывались все четыре дефекта смены, — молчаливым
             # сокращением. Порог не выдумывается: называется тогда и только тогда, когда
             # хвост сильнее ЛЮБОГО показанного.
-            best_rest = max(rest, key=lambda g: max(z.vrvp_density for z in g))
-            rest_vol = max(z.vrvp_density for z in best_rest)
-            shown_vol = max((z.vrvp_density for g in shown for z in g), default=0.0)
-            if rest_vol > shown_vol and rest_vol >= 1.2:
-                out.append(f"   ⚠ сильнейший по объёму — не выше: "
-                           f"{span_line(best_rest)[2:]}")
+            # ⚠ Неизмеренная плотность (`None`) в сравнение не входит вовсе: сравнивать
+            # «не считалось» с числом нечем, а подстановка нуля была бы ложным ответом
+            # (§4.3). Группа без единой измеренной плотности в сравнении не участвует.
+            measured = [(d, g) for g in rest
+                        if (d := max((z.vrvp_density for z in g
+                                      if z.vrvp_density is not None),
+                                     default=None)) is not None]
+            shown_vol = max((z.vrvp_density for g in shown for z in g
+                             if z.vrvp_density is not None), default=0.0)
+            if measured:
+                rest_vol, best_rest = max(measured, key=lambda p: p[0])
+                if rest_vol > shown_vol and rest_vol >= 1.2:
+                    out.append(f"   ⚠ сильнейший по объёму — не выше: "
+                               f"{span_line(best_rest)[2:]}")
         if passed:
             # Пройденные НАЗЫВАЮТСЯ, но не подаются как торгуемые: по карте цена их
             # уже прошла, а карта может быть старой — читатель вправе знать оба факта.
@@ -1569,29 +1598,13 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                              "пересборке по запросу; эта карта взята из леджера")
     if hidden_dupes:
         service_notes.append(f"{hidden_dupes} слились с соседями по зоне")
-    if off_struct:
-        note = f"{len(off_struct)} скрыто — структура старше кадра графика"
-        # ⚠ СИЛЬНЕЙШИЙ ПО ОБЪЁМУ СРЕДИ СКРЫТЫХ — НАЗЫВАЕТСЯ (2026-08-19). Возрастной
-        # фильтр снимает основную массу карты: замер на кадрах прогона `last` — 340
-        # активных уровней из 376 у пяти символов. В четырёх символах он согласен с
-        # силой (сильнейший актив показан), в пятом — нет: у POL сильнейший актив
-        # (шорт 4ч, 18.32% композита) скрыт возрастом, а лучший показанный несёт 7.29%.
-        # Владелец видел «43 скрыто» и не мог узнать, что среди них сильнейший.
-        #
-        # Фильтр НЕ отменяется: он взят у автора (видео-обзор 17.08.2026 — «мне нужна
-        # структурка, без неё шорты не рассматриваю»), и заменять правило источника
-        # собственным замером запрещено. Скрытое именно НАЗЫВАЕТСЯ — как свёрнутый
-        # хвост строкой выше.
-        shown_max = max((z.vrvp_density for z in unique), default=0.0)
-        top_hidden = max(off_struct, key=lambda z: z.vrvp_density, default=None)
-        if top_hidden is not None and top_hidden.vrvp_density > max(shown_max, 1.2):
-            note += (f"; сильнейший из них по объёму — "
-                     f"{'лонг' if top_hidden.side == 'long' else 'шорт'} "
-                     f"{_fmt_price(top_hidden.price)} "
-                     f"({TF_LABEL.get(top_hidden.timeframe, top_hidden.timeframe)}, "
-                     f"объём ×{top_hidden.vrvp_density:.1f} к среднему против "
-                     f"×{shown_max:.1f} у показанных)")
-        service_notes.append(note)
+    # ⚠⚠ СТРОКА «N СКРЫТО — СТРУКТУРА СТАРШЕ КАДРА» УДАЛЕНА 2026-08-23 ВМЕСТЕ СО СПИСКОМ.
+    # Список `off_struct` был ПУСТ ПО ПОСТРОЕНИЮ с 2026-08-21 (фильтр `near_structure`
+    # удалён тем днём), а его число всё это время печаталось в сводке и его сильнейший
+    # элемент искался `max`-ом. Это ровно Д-1 — счётчик, который не может вырасти, — та
+    # самая форма, из-за которой в проекте уже удалялся `SeriesState.ws_unclosed_violations`.
+    # Пустой список в контракте четырёх возвращаемых значений держал ещё и вызывающих:
+    # `tradable_counts` распаковывал его прочерком.
     if flipped:
         # ⚠⚠ СТРОКА ПЕРЕПИСАНА 2026-08-23. Здесь было «N пробитых НЕ В СПИСКЕ» —
         # теперь они В СПИСКЕ, и прежняя формулировка стала бы прямой ложью в тексте,
@@ -2042,7 +2055,7 @@ class Delivery:
             # цены. Растяжение ограничено размахом самих свечей — то есть кадр не более чем
             # удваивается, и свечи остаются читаемыми. Числа «5% от цены» здесь нет: обе
             # величины взяты у самого графика.
-            _, uniq_all, _, _ = live_unique(got.zones, price, now_ms)
+            _, uniq_all, _ = live_unique(got.zones, price, now_ms)
             tradable = [z for z in uniq_all if not _passed(z, price)]
             span = c_hi - c_lo
             for z in tradable:

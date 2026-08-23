@@ -1092,8 +1092,15 @@ def _attempt(
     Здесь, а не в `repeats`, потому что предикат зовётся на каждой точке.
     """
 
-    def repeats(price: float, first: float, first_index: int) -> bool:
-        del first_index  # подпись сохранена: см. MAX_PAIR_PCT
+    def repeats(price: float, first: float) -> bool:
+        """Повторяется ли цена на границе (стр. 13). Мерка — ПРОЦЕНТ цены первой точки.
+
+        ⚠ ТРЕТИЙ АРГУМЕНТ `first_index` УДАЛЁН 2026-08-23. Он принимался и выбрасывался
+        первой же строкой тела (`del first_index`), а вызывающие его считали и
+        передавали. Осталось от мерки ПО ATR своего ТФ на баре первой точки — та мерка
+        (`MAX_PAIR_ATR = 50.0`) отозвана 2026-08-21 вместе со своим замером, и с тех пор
+        индекс бара здесь не нужен ничему.
+        """
         return abs(price - first) / first * 100.0 <= pair_pct
 
     def upper_zone() -> tuple[float, float]:
@@ -1174,7 +1181,7 @@ def _attempt(
                 continue
             if kind is SwingKind.HIGH:
                 if len(hi_px) < 2:
-                    if hi_px and not repeats(price, hi_px[0], hi_idx[0]):
+                    if hi_px and not repeats(price, hi_px[0]):
                         # Стр. 13: границей называется цена, на которой хаи ПОВТОРЯЮТСЯ.
                         # Пара, разнесённая на десятки ATR, повтором не является —
                         # первая точка принадлежала другой формации и забывается, а
@@ -1259,7 +1266,7 @@ def _attempt(
                     hi_punct = price if hi_punct is None else max(hi_punct, price)
             else:
                 if len(lo_px) < 2:
-                    if lo_px and not repeats(price, lo_px[0], lo_idx[0]):
+                    if lo_px and not repeats(price, lo_px[0]):
                         # Зеркально верхней стороне: см. пояснение выше и `MAX_PAIR_PCT`.
                         lo_px[0], lo_idx[0] = price, index
                         lo_ord0 = ordinal + 1
