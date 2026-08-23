@@ -153,7 +153,8 @@ def _run(args: argparse.Namespace) -> int:
     _stage("cards", lambda: produce_cards(args.run_id, report, uni, decided))
     # Данные источника профиля кладутся ПОСЛЕ карточек. Без них повтор читает общее
     # хранилище и объявляет «расчёт изменился» на доливке (Н-6, рецидив 2026-08-18).
-    _stage("source", lambda: persist_source(args.run_id, report, sources))
+    _stage("source", lambda: persist_source(args.run_id, report, sources,
+                                            horizon_days=args.horizon_days))
     _stage("record", lambda: record(args.run_id, report, uni, decided, detections))
     log.info("кадры сохранены", файлов=report.frames_written,
              карточек=report.cards_written,

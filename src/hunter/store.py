@@ -420,7 +420,8 @@ def write_profile_bars(run_id: str, symbol: str, timeframe: str,
 
 
 def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str],
-                      analysis_tfs: list[str] | None = None) -> Path:
+                      analysis_tfs: list[str] | None = None,
+                      horizon_days: int | None = None) -> Path:
     """Манифест источника профиля: КАКИЕ профильные ряды прогон положил в кадры.
 
     Пустой список — честное «минуток в хранилище не было»: повтор тогда строит
@@ -436,13 +437,28 @@ def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str],
     `analysis_tfs` (добавлено 2026-08-18) — состав АНАЛИТИЧЕСКИХ рядов, записанных
     в кадры. Без него повтор выводил набор ТФ из наличия файлов на диске: пропавший
     после прогона parquet менял состав молча, и дифф читался как «расчёт изменился».
-    None — манифест старой формы, сверка состава тогда не проводится (названно)."""
+    None — манифест старой формы, сверка состава тогда не проводится (названно).
+
+    ⚠⚠ `horizon_days` (добавлено 2026-08-23) — ГОРИЗОНТ, С КОТОРЫМ СЧИТАЛ ПРОГОН, и без
+    него повтор §10.6 не мог совпасть НИ С ОДНИМ боевым прогоном. `replay` звал
+    `engine.decide` без этого аргумента, то есть пересчитывал с `horizon_days=0` —
+    отсечки старых структур не было вовсе. Замер на кадрах `rebuild-2026-08-23`:
+    строка «структура закрылась раньше горизонта» стоит в сохранённой карточке 367 раз
+    и в пересчитанной НОЛЬ раз; вслед за ней уезжает состав ближайших уровней и окно
+    композита (433 против 213 суток). Повтор печатал «ИЗМЕНИЛОСЬ 4 из 4» при
+    неизменённом коде — тот же класс отказа, что и потеря профильного ряда выше, и
+    лечится так же: величина, от которой зависит ответ, кладётся В КАДРЫ.
+
+    None — манифест старой формы (до 2026-08-23). Повтор таких кадров ОТКАЗЫВАЕТСЯ:
+    подставить 0 значило бы молча посчитать другое и выдать это за сравнение."""
     path = FRAMES_DIR / run_id / _safe(symbol) / "source.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     d: dict[str, object] = {"transport": "tv_candles",
                             "profile_tfs": sorted(profile_tfs)}
     if analysis_tfs is not None:
         d["analysis_tfs"] = sorted(analysis_tfs)
+    if horizon_days is not None:
+        d["horizon_days"] = int(horizon_days)
     path.write_text(json.dumps(d, ensure_ascii=False),
                     encoding="utf-8", newline="\n")
     return path
@@ -450,11 +466,13 @@ def write_source_meta(run_id: str, symbol: str, profile_tfs: list[str],
 
 def read_source_meta(
     run_id: str, dir_name: str,
-) -> tuple[list[str], list[str] | None] | NotReady:
-    """Манифест источника: (профильные ТФ, аналитические ТФ). `NotReady` — манифеста нет.
+) -> tuple[list[str], list[str] | None, int | None] | NotReady:
+    """Манифест: (профильные ТФ, аналитические ТФ, горизонт). `NotReady` — манифеста нет.
 
     Второй элемент `None` — манифест старой формы (до 2026-08-18), состав
-    аналитических рядов тогда не записывался и сверить его повтору не с чем."""
+    аналитических рядов тогда не записывался и сверить его повтору не с чем.
+    Третий `None` — форма до 2026-08-23, горизонт не записывался; что из этого следует
+    для повтора, разобрано в `write_source_meta`."""
     path = FRAMES_DIR / run_id / _safe(dir_name) / "source.json"
     if not path.exists():
         return NotReady(
@@ -463,8 +481,10 @@ def read_source_meta(
                    f"профиля из таких кадров не строится")
     d = json.loads(path.read_text(encoding="utf-8"))
     analysis = d.get("analysis_tfs")
+    horizon = d.get("horizon_days")
     return ([str(tf) for tf in d.get("profile_tfs", [])],
-            None if analysis is None else [str(tf) for tf in analysis])
+            None if analysis is None else [str(tf) for tf in analysis],
+            None if horizon is None else int(horizon))
 
 
 def read_profile_bars(run_id: str, dir_name: str) -> dict[str, list[Bar]]:

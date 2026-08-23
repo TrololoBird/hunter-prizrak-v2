@@ -394,6 +394,12 @@ async def _fill_seed_gaps(
     added_total = 0
     rejected: list[str] = []
     rejected_at: list[int] = []
+    # ⚠ САМЫЙ ЛЕВЫЙ участок и то, с чего начинается СОХРАНЁННОЕ, — нужны, чтобы отличить
+    # «биржа моложе окна» от дыры в середине её собственной истории. Читается ОДИН раз:
+    # внутри цикла хранилище меняется, а вопрос задаётся про состояние до добора.
+    leftmost = inner[0][0]
+    cov = barstore.coverage(uni.venue, market_id, timeframe)
+    first_stored = None if cov is None else cov[0]
     for lo, hi in inner:
         want = max(1, (hi - lo) // step)
         got = await ex.fetch_closed_ohlcv(
@@ -414,8 +420,37 @@ async def _fill_seed_gaps(
         added_total += added
         report.seed_gap_bars += added
         report.bars_rewritten += rewritten
+        # ⚠⚠ «У БИРЖИ ЭТОГО НЕТ» И «БИРЖА МОЛОЖЕ ОКНА» — РАЗНЫЕ СОСТОЯНИЯ, И ДО
+        # 2026-08-23 ОНИ БЫЛИ ОДНОЙ СТРОКОЙ. Второе не дефект вовсе: контракт просто
+        # начал торговаться позже, чем начинается заказанное окно. Отличить их можно
+        # БЕЗ единого лишнего запроса — ответ уже пришёл: если биржа на запрос от
+        # самого левого края вернула бары, начинающиеся ПОЗЖЕ него, и ни один бар
+        # участка не был отклонён нашей же проверкой, значит раньше первого
+        # присланного у неё нет ничего. Это утверждение биржи, а не наша догадка.
+        #
+        # Условий три, и каждое закрывает свой способ ошибиться:
+        #   * участок САМЫЙ ЛЕВЫЙ, и левее него в хранилище пусто — иначе это дыра в
+        #     середине истории, и «началом» её объявлять нельзя;
+        #   * отклонённых баров в участке НЕТ — иначе пропуск сделан НАМИ (ровно
+        #     случай BCH 1w), и биржа тут ни при чём;
+        #   * ответ НЕПУСТОЙ — молчание означает сбой связи и лечится повтором.
+        edge_ms: int | None = None
+        if (lo == leftmost and not spoiled and got.bars
+                and (first_stored is None or first_stored >= lo)):
+            b0 = min(b.open_ms for b in got.bars)
+            if b0 > lo:
+                edge_ms = b0
         if added >= want:
             report.seed_gaps_filled += 1
+        elif edge_ms is not None:
+            # Участок закрыт НАСТОЛЬКО, насколько рынок вообще существует. Остаток —
+            # не потеря данных, и деградацией он не называется; чтобы он не просился
+            # снова каждый прогон, начало истории запоминается.
+            barstore.set_history_floor(uni.venue, market_id, timeframe, edge_ms)
+            report.seed_gaps_filled += 1
+            log.info("участок закрыт ДО НАЧАЛА ИСТОРИИ БИРЖИ — раньше баров нет",
+                     символ=symbol, тф=timeframe, от=lo, до=hi, баров_в_дыре=want,
+                     добрано=added, раньше_баров_нет=edge_ms)
         else:
             report.seed_gaps_left += 1
             # ⚠ ДИАГНОЗ РАЗДЕЛЁН 2026-08-23. Здесь стояла ОДНА строка «у биржи столько
@@ -525,6 +560,20 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             # раньше не только контракта, но и самой биржи.
             if inst_i is not None and inst_i.created_ms:
                 want_from = max(want_from, inst_i.created_ms)
+            # ⚠⚠ ДАТЫ ЛИСТИНГА НЕДОСТАТОЧНО — ЗАМЕР 2026-08-23. Биржа отдаёт свечи
+            # ПОЗЖЕ листинга, и задержка не выводится из даты никаким округлением:
+            # у 11 проверенных символов первый бар 1д отстоит от `onboardDate` на
+            # 1-4 суток, и ни округление вниз, ни вверх не совпало ни разу (таблица —
+            # в докстроке `barstore.history_floor`). Пока этой обрезки не было, 9 из
+            # 15 незакрытых дыр доски не добирали РОВНО ОДИН бар — тот, которого у
+            # биржи нет и не будет, — и каждый прогон печатал об этом деградацию.
+            #
+            # Величина не вычисляется, а УЗНАЁТСЯ: её ставит `_fill_seed_gaps`, когда
+            # биржа на запрос от левого края ответила барами, начинающимися позже.
+            if market_id is not None:
+                floor_ms = barstore.history_floor(uni.venue, market_id, tf)
+                if floor_ms is not None:
+                    want_from = max(want_from, floor_ms)
             # ⚠ Потолок запросов считается по ОКНУ, а не по `depth`. С закреплением
             # левого края окно длиннее заказанной глубины (до недели в барах), и
             # прежний потолок `depth` обрезал бы добор ровно на этой добавке — то есть
@@ -533,6 +582,9 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             stored: list[Bar] = []
             since_ms: int | None = None
             repaired = 0
+            # Отклонённые ГЛАВНЫМ забором — отдельно от отклонённых при доборе дыр:
+            # первые оставляют дыру, которую в этом же прогоне ещё никто не искал.
+            fetch_rejected_at: list[int] = []
             if market_id is not None:
                 stored = barstore.load(uni.venue, market_id, tf, since_ms=want_from)
                 since_ms = barstore.missing_tail_since(
@@ -695,6 +747,7 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                 # СЛОЖЕНИЕ, а не присваивание: отклонённые при доборе дыр уже лежат.
                 st.rejected_bars = [*st.rejected_bars, *got.rejected]
                 st.rejected_at_ms = [*st.rejected_at_ms, *got.rejected_at_ms]
+                fetch_rejected_at = list(got.rejected_at_ms)
 
             # ⚠ `repaired` в условии — не украшение: добор дыр уже ЗАПИСАЛ бары в
             # хранилище, а `stored` мог быть прочитан до него. Без этой ветви ряд с
@@ -707,6 +760,36 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
                 if rewritten:
                     log.warn("биржа отдала ИНЫЕ числа по уже сохранённым барам",
                              символ=sym, тф=tf, переписано=rewritten)
+                # ⚠⚠ ДЫРА, ОСТАВЛЕННАЯ ЭТИМ ЖЕ ЗАБОРОМ, ЧИНИТСЯ ЗДЕСЬ ЖЕ. ПРАВКА
+                # 2026-08-23, найдена ПРОВЕРКОЙ ХОЛОДНОГО ЗАСЕВА, а не рассуждением.
+                #
+                # Порядок был такой: поиск дыр (`_fill_seed_gaps`) идёт ДО главного
+                # забора, а битый бар биржи отклоняется ВО ВРЕМЯ него. На пустом
+                # хранилище искать было нечего — дыры ещё не существовало, — а после
+                # забора её уже никто не искал. Прогон печатал «дыр найдено 0», и в
+                # ТОМ ЖЕ прогоне приёмка печатала «разрывов сетки внутри рядов: 1».
+                # Два прибора под одним человеческим именем — ровно тот дефект, ради
+                # которого весь этот путь и переписывался; чинилось только вторым
+                # запуском, то есть ряд жил с дырой до следующего прогона.
+                #
+                # Повторно спрашивать тот же ТФ незачем: биржа принесёт тот же битый
+                # агрегат (разбор — в `_rebuild_from_lower`). Спускаемся сразу.
+                for at in sorted({t for t in fetch_rejected_at if want_from <= t < upto}):
+                    if barstore.load(uni.venue, market_id, tf, since_ms=at, upto_ms=at):
+                        continue  # бар всё-таки на месте: отклонён был повтор метки
+                    report.seed_gaps_found += 1
+                    made = await _rebuild_from_lower(
+                        ex, uni, sym, tf, market_id, at, at + tf_ms(tf))
+                    report.seed_gap_bars += made
+                    if made:
+                        report.seed_gaps_filled += 1
+                        report.seed_gaps_rebuilt += made
+                        repaired += made
+                    else:
+                        report.seed_gaps_left += 1
+                        log.degraded(
+                            "БИТЫЙ бар биржи отклонён, пересобрать не вышло — дыра",
+                            символ=sym, тф=tf, метка=at)
                 merged = barstore.load(uni.venue, market_id, tf, since_ms=want_from)
             else:
                 merged = _merge_bars(stored, fresh)
@@ -2323,7 +2406,8 @@ def produce_cards(run_id: str, report: RunReport, uni: Universe,
 
 
 def persist_source(run_id: str, report: RunReport,
-                   sources: dict[str, TradeWindows]) -> None:
+                   sources: dict[str, TradeWindows],
+                   horizon_days: int = 0) -> None:
     """ШАГ 3б: положить в кадры ТО, из чего строился профиль карточки.
 
     До перевода профиля на свечи (решение владельца 2026-08-12, код — 2026-08-17;
@@ -2351,9 +2435,27 @@ def persist_source(run_id: str, report: RunReport,
     """
     for sym, src in sources.items():
         if isinstance(src, TVWindows):
-            saved = set(bars_of(report, sym))
-            extra = {tf: bars for tf, bars in src.series_by_tf().items()
-                     if tf not in saved and bars}
+            # ⚠⚠ КРИТЕРИЙ БЫЛ «ТФ НЕТ СРЕДИ КАДРОВ» И ЭТОГО МАЛО. ПРАВКА 2026-08-23.
+            # Источник профиля читает хранилище СВОИМ окном, и для ТФ, который среди
+            # аналитических кадров ЕСТЬ, его ряд бывает ДЛИННЕЕ: аналитический режется
+            # по `want_from` засева, а окно структуры уходит левее. Кадр тогда несёт
+            # меньше свечей, чем читал прогон, и повтор честно отказывает по покрытию —
+            # то есть печатает «расчёт изменился» при неизменном коде.
+            #
+            # Найдено проверкой /verify 2026-08-23 на BCH: у повтора пропал недельный
+            # уровень (ПОК 594.63, активен), и карточка сама назвала причину — «окно
+            # 1750032000000..1779062400000 покрыто свечами 4h не полностью — 1932 из
+            # 2016». Вслед за ним уехало окно композита (433 против 213 суток) и с ним
+            # 123 строки. Это третий случай одного класса в этой функции: величина, от
+            # которой зависит ответ, обязана лежать В КАДРАХ целиком.
+            saved = bars_of(report, sym)
+            extra = {}
+            for tf, bars in src.series_by_tf().items():
+                if not bars:
+                    continue
+                have = saved.get(tf)
+                if have is None or not have or bars[0].open_ms < have[0].open_ms:
+                    extra[tf] = bars
             for tf, bars in extra.items():
                 store.write_profile_bars(run_id, sym, tf, bars)
                 report.profile_series_written += 1
@@ -2361,7 +2463,8 @@ def persist_source(run_id: str, report: RunReport,
             # файлами на диске, иначе пропавший parquet менял бы набор ТФ молча и
             # дифф читался бы как «расчёт изменился» (2026-08-18).
             store.write_source_meta(run_id, sym, list(extra),
-                                    analysis_tfs=sorted(saved))
+                                    analysis_tfs=sorted(saved),
+                                    horizon_days=horizon_days)
             if not extra:
                 log.degraded("профильный ряд в кадры не положен — минуток в "
                              "хранилище нет, повтор воспроизведёт те же отказы",
