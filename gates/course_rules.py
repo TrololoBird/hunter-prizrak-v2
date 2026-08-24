@@ -398,6 +398,61 @@ def c_outcome_not_filled() -> tuple[object, object]:
     return (res.kind, res.r), (OutcomeKind.NOT_FILLED, None)
 
 
+def c_flipped_level_is_target_of_new_side() -> tuple[object, object]:
+    """Стр. 43 + стр. 24: пробитый уровень — уровень НОВОЙ стороны, и как встречный он ЦЕЛЬ.
+
+    ⚠ Добавлен 2026-08-24 вместе с `levels.level_as_of` (разбор критической ошибки целей
+    по требованию владельца). До этого дня пул целей выбрасывал пробитые уровни целиком,
+    как отработанные, — читал стр. 43 («Уровень лонг/шорт менятся для нас на
+    противоположный») как стр. 25 («мы этот уровень удаляем»). Пробитый вниз лонг-уровень
+    — это сопротивление НАД ценой, то есть ровно «шорт уровень», который стр. 24 называет
+    целью лонга.
+
+    Три плеча:
+      * ЛОНГ-уровень на 118, пробитый к as_of (стал шортом), — цель лонга от 100;
+      * тот же уровень, но АКТИВНЫЙ (сторона всё ещё лонг), — НЕ цель: сторона своя;
+      * тот же уровень, но ОТРАБОТАННЫЙ к as_of, — НЕ цель: стр. 25 удаляет, а не
+        переворачивает.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    as_of = src.created_at_ms
+    born = level(118.0, LevelSide.LONG, created=1, born_ms=T0)
+    flipped = mapped(born, LevelState.FLIPPED, resolved_at_ms=as_of - STEP)
+    active = mapped(born)
+    worked = mapped(born, LevelState.WORKED_OFF, resolved_at_ms=as_of - STEP)
+    return (
+        (tuple(float(t.price) for t in build_targets(src, (flipped,))),
+         tuple(float(t.price) for t in build_targets(src, (active,))),
+         tuple(float(t.price) for t in build_targets(src, (worked,)))),
+        ((118.0,), (), ()),
+    )
+
+
+def c_targets_as_of_decision() -> tuple[object, object]:
+    """Дата отбора целей = МОМЕНТ РЕШЕНИЯ, а не рождение уровня (правка 2026-08-24).
+
+    Сигнал уходит в леджер с датой записи; цели, отобранные по миру на момент рождения
+    уровня (на живых данных — медиана 101 бар в прошлом), были бы второй сущностью под
+    именем «момент сигнала». Два плеча:
+      * цель, родившаяся ПОСЛЕ рождения уровня, но ДО решения, — законна (стр. 24
+        живёт в мире, где уровни продолжают рождаться: «ближайшего нового
+        сформированного уровня»);
+      * цель, родившаяся ПОСЛЕ решения, — не существует и целью не является.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    later = level(118.0, LevelSide.SHORT, created=40,
+                  born_ms=src.created_at_ms + 10 * STEP)
+    as_of_yes = src.created_at_ms + 20 * STEP
+    as_of_no = src.created_at_ms + 5 * STEP
+    return (
+        (tuple(float(t.price) for t in
+               build_targets(src, (mapped(later),), as_of_ms=as_of_yes)),
+         tuple(float(t.price) for t in
+               build_targets(src, (mapped(later),), as_of_ms=as_of_no))),
+        ((118.0,), ()),
+    )
+
+
 def c_target_not_from_future() -> tuple[object, object]:
     """Стр. 23: уровня не существует, пока цена не вышла из структуры.
 
@@ -621,6 +676,9 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
      c_target_outside_own_structure),
     ("тейк по границе — это флэт стр. 19, а не сделка от уровня",
      c_no_boundary_target_for_level_trade),
+    ("пробитый уровень — цель НОВОЙ стороной (стр. 43, 24)",
+     c_flipped_level_is_target_of_new_side),
+    ("цели отбираются на момент РЕШЕНИЯ", c_targets_as_of_decision),
     ("цель не может появиться позже сигнала (стр. 23)", c_target_not_from_future),
     ("снятый уровень целью не является (стр. 25, 43)", c_target_not_retired),
     ("снятый ПОЗЖЕ сигнала — целью являлся (стр. 25)", c_target_retired_later_still_counts),

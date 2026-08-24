@@ -555,6 +555,10 @@ def decide(
     # того же ТФ, и без него страница читалась бы наполовину.
     mapped = levels.map_levels(frozen, series, scans)
     trends = {tf: r.trend for tf, r in reads.items()}
+    # «Сейчас» берётся у САМОГО РЯДА, не у часов — тот же приём и тот же довод, что у
+    # горизонта в `levels.build_all`: повтор обязан давать тот же результат на тех же
+    # кадрах. Правый край закрытых баров и есть момент решения.
+    now_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
 
     decisions: list[Decision] = []
     for m in mapped:
@@ -571,7 +575,12 @@ def decide(
             status=m.status,
             priority=pr,
             agreement=priority.agreement(m.level.side, pr),
-            setup=None if hold else geometry.build_setup(m.level, mapped),
+            # ⚠ Цели отбираются НА МОМЕНТ РЕШЕНИЯ — правый край закрытых баров, тот
+            # же `now_ms`, каким `build_all` резал горизонт (правка 2026-08-24, разбор
+            # в докстроке `geometry.build_targets`). До неё цели брались на момент
+            # РОЖДЕНИЯ уровня — на медиану 101 бар в прошлом от записи сигнала.
+            setup=None if hold else geometry.build_setup(
+                m.level, mapped, as_of_ms=now_ms),
             hold=hold,
             mtf_break=_mtf_break(m, series, reads, tfs),
             pressed=_pressed_note(m, reads, series),

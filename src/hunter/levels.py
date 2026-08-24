@@ -1569,14 +1569,40 @@ class LevelStatus(BaseModel):
         return self.state
 
 
-def level_now(lvl: Level, st: LevelStatus) -> Level:
-    """Уровень, каким он стоит СЕЙЧАС: у пробитого сторона противоположна (стр. 43).
+def flipped_if(lvl: Level, state: LevelState) -> Level:
+    """Уровень в ДАННОМ состоянии: у пробитого сторона противоположна (стр. 43).
 
-    ОДНО место, где живёт это правило. Читают его `MappedLevel.current` и
-    `engine.Decision.current` — две точки доступа, одна формула: вторая копия разошлась
-    бы с первой молча, потому что обе вернули бы законный `Level`, просто разной стороны.
+    ЕДИНСТВЕННОЕ место формулы переворота. `level_now` и `level_as_of` — две точки
+    доступа к ней с разными датами; вторая копия формулы разошлась бы молча, потому что
+    обе вернули бы законный `Level`, просто разной стороны."""
+    return lvl.flipped() if state is LevelState.FLIPPED else lvl
+
+
+def level_now(lvl: Level, st: LevelStatus) -> Level:
+    """Уровень, каким он стоит СЕЙЧАС. Читают `MappedLevel.current` и
+    `engine.Decision.current`."""
+    return flipped_if(lvl, st.state)
+
+
+def level_as_of(m: MappedLevel, as_of_ms: int) -> Level | None:
+    """Уровень, каким он СТОЯЛ на момент `as_of_ms`. None — его тогда НЕ БЫЛО.
+
+    ⚠ Заведено 2026-08-24 для отбора целей (разбор — `geometry.build_targets`).
+    Три исхода, каждый из курса:
+      * уровень ещё не родился (стр. 23: уровня нет до подтверждения выхода) — None;
+      * уровень отработан к этому моменту (стр. 25: «мы этот уровень удаляем») — None;
+      * уровень пробит к этому моменту (стр. 43: «Уровень лонг/шорт менятся для нас
+        на противоположный») — уровень ПРОТИВОПОЛОЖНОЙ стороны, а не ничто. До этой
+        функции пул целей выбрасывал пробитые уровни целиком, как отработанные, — то
+        есть читал стр. 43 как стр. 25, хотя стр. 43 не удаляет уровень, а меняет
+        его сторону.
     """
-    return lvl.flipped() if st.state is LevelState.FLIPPED else lvl
+    if m.level.created_at_ms > as_of_ms:
+        return None
+    st = m.status.state_at(as_of_ms)
+    if st is LevelState.WORKED_OFF:
+        return None
+    return flipped_if(m.level, st)
 
 
 class MappedLevel(BaseModel):
