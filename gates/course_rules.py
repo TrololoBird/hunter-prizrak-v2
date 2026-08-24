@@ -32,6 +32,7 @@ from decimal import Decimal
 from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
+from hunter.figures import pennant
 from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_setup, build_targets
 from hunter.levels import (
     Level,
@@ -43,9 +44,10 @@ from hunter.levels import (
     status,
     stop_anchor,
 )
-from hunter.models import Bar
+from hunter.models import Bar, NotReady
 from hunter.outcome import OutcomeKind, resolve
-from hunter.swings import ZIGZAG_DEPTH
+from hunter.priority import Priority
+from hunter.swings import ZIGZAG_DEPTH, TrendDirection
 from hunter.swings import detect as detect_swings
 from hunter.trading_range import MIN_BOUNDARY_POINTS, BoundaryZone
 from hunter.trading_range import detect as detect_ranges
@@ -652,6 +654,42 @@ def c_two_candles_are_time_not_index() -> tuple[object, object]:
     return (ev.kind if ev else None), BreachKind.UNRESOLVED
 
 
+def c_pennant_stop_has_margin() -> tuple[object, object]:
+    """Стр. 58: «Стоп всегда прячем за всю структуру с запасом 1-3%».
+
+    что из чего следует: край структуры и сторона фигуры → цена стопа. Слово «всегда»
+    безусловно, и стр. 58 — это страница самого треугольника, а не соседняя тема.
+
+    ⚠ Случай ЗАВЕДЁН 2026-08-24 по дефекту, а не для полноты. `figures.pennant` отдавал
+    наружу только `stop_anchor` — край структуры, — и запаса к нему не прибавлял НИКТО:
+    докстрока модуля поручала это `geometry`, где слова «вымпел» нет ни разу. Карточка
+    печатала край структуры под словом «стоп»: на живом прогоне 2026-08-24 так стояли
+    все 48 вымпелов. Это третий случай одного класса — тот же дефект чинился у уровня
+    2026-08-18 и у ПП 2026-08-19.
+
+    Два плеча, чтобы прибор не был заперт в одном ответе, и они же ловят обращение
+    правила: у ЛОНГА стоп ниже нижнего края (92 − 2.76 = 89.24), у ШОРТА выше верхнего
+    (108 + 3.24 = 111.24). Пропажа запаса даёт 92 и 108, обмен сторон — 89.24 и 111.24
+    местами; ни то, ни другое не совпадает с ожиданием.
+
+    Тренд подаётся `senior`-приоритетом: своего у короткого ряда нет (стр. 47 разрешает
+    брать его со старшего ТФ), а без тренда стр. 57 вымпела не даёт вовсе.
+    """
+    b = _pair_structure(112.0, 110.0, 88.0, 90.0, 108.0, 92.0)
+    sw = detect_swings(b)
+    st = detect_ranges(b, sw, TF).closed[0]  # type: ignore[arg-type]
+    long_pen = pennant(st, sw,  # type: ignore[arg-type]
+                       Priority(timeframe="1d", direction=TrendDirection.UP, holds_for=3))
+    short_pen = pennant(st, sw,  # type: ignore[arg-type]
+                        Priority(timeframe="1d", direction=TrendDirection.DOWN, holds_for=3))
+    assert not isinstance(long_pen, NotReady) and not isinstance(short_pen, NotReady)
+    return (
+        (long_pen.stop_anchor, round(long_pen.stop_price, 6),
+         short_pen.stop_anchor, round(short_pen.stop_price, 6)),
+        (92.0, 89.24, 108.0, 111.24),
+    )
+
+
 CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("прокол идёт в стоп с 3-й СКВОЗНОЙ точки (стр. 18)", c_puncture_needs_third_point),
     ("прокол — отработка уровня (стр. 6, 55)", c_puncture),
@@ -690,6 +728,8 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("стоп прячется ЗА якорь с запасом, а не на его цене (стр. 18 + 33/58)",
      c_stop_hidden_beyond_anchor),
     ("«следующая свеча» — это время, а не индекс (стр. 55)", c_two_candles_are_time_not_index),
+    ("стоп вымпела — за структуру С ЗАПАСОМ, а не на её краю (стр. 58)",
+     c_pennant_stop_has_margin),
 ]
 
 

@@ -3438,8 +3438,12 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         # строк карты старее схемы 13. Своя формула знает лишь курсовой пол (стр. 58) и
         # не знает ЯКОРЯ (стр. 18) — а якорь решает в половине сделок и уводит стоп
         # дальше. Пояснение и числа — в докстроке `LevelRow.stop_price`.
-        margin = edge * geometry.DEFAULT_MARGIN_PCT / 100
-        stop = lv.stop_price if lv.stop_price else (edge - margin if buy else edge + margin)
+        # ⚠ Формула запаса здесь БОЛЬШЕ НЕ ПИШЕТСЯ (2026-08-24): стояло
+        # `edge * DEFAULT_MARGIN_PCT / 100` — вторая запись той же величины. Теперь
+        # зовётся `geometry.stop_beyond_edge`, одна на проект.
+        fallback = geometry.stop_beyond_edge(
+            Decimal(str(edge)), geometry.DEFAULT_MARGIN_PCT, up=buy)
+        stop = lv.stop_price if lv.stop_price else float(fallback)
         # РИСК В ПРОЦЕНТАХ — не новая величина, а то же расстояние вход↔стоп, названное
         # так, как его использует читатель. Стр. 9 определяет Р как «один Риск» и
         # единицу измерения сделки; проценты дают посчитать объём позиции, не зная
