@@ -398,17 +398,6 @@ def c_outcome_not_filled() -> tuple[object, object]:
     return (res.kind, res.r), (OutcomeKind.NOT_FILLED, None)
 
 
-# ⚠⚠ ЧЕТЫРЕ ОЖИДАНИЯ НИЖЕ ПОПОЛНЕНЫ ЦЕНОЙ 110.0 — 2026-08-24. Причина, по которой
-# старое ожидание было неверным, а не «мешало»: у `level()` граница базы `hi=110.0`, и
-# с этого дня встречная граница СВОЕЙ базы — законная цель (стр. 19: «По верхней границе
-# – делаете тейк 50%», разбор в `geometry.build_targets`). Каждый из четырёх случаев
-# проверяет правило отбора ЦЕЛЕЙ ИЗ ПУЛА, а 110.0 берётся не из пула вовсе; прежние
-# кортежи перечисляли весь ответ функции и потому пиняли заодно то, о чём случай не
-# спрашивает. Проверяемое правило НЕ ослаблено: пуловая часть ответа сверяется ровно
-# как раньше, и подмешавшийся уровень по-прежнему провалил бы случай.
-# Ниже добавлен отдельный случай `c_target_boundary_of_own_base` — оба его плеча.
-
-
 def c_target_not_from_future() -> tuple[object, object]:
     """Стр. 23: уровня не существует, пока цена не вышла из структуры.
 
@@ -419,7 +408,7 @@ def c_target_not_from_future() -> tuple[object, object]:
     future = level(120.0, LevelSide.SHORT, created=50, born_ms=src.created_at_ms + STEP)
     past = level(118.0, LevelSide.SHORT, created=1, born_ms=src.created_at_ms - STEP)
     got = build_targets(src, (mapped(future), mapped(past)))
-    return tuple(float(t.price) for t in got), (110.0, 118.0)
+    return tuple(float(t.price) for t in got), (118.0,)
 
 
 def c_target_not_retired() -> tuple[object, object]:
@@ -432,7 +421,7 @@ def c_target_not_retired() -> tuple[object, object]:
                   LevelState.WORKED_OFF, resolved_at_ms=T0 + STEP)
     alive = mapped(level(118.0, LevelSide.SHORT, created=1, born_ms=T0))
     got = build_targets(src, (dead, alive))
-    return tuple(float(t.price) for t in got), (110.0, 118.0)
+    return tuple(float(t.price) for t in got), (118.0,)
 
 
 def c_target_retired_later_still_counts() -> tuple[object, object]:
@@ -445,32 +434,49 @@ def c_target_retired_later_still_counts() -> tuple[object, object]:
     later = mapped(level(118.0, LevelSide.SHORT, created=1, born_ms=T0),
                    LevelState.WORKED_OFF, resolved_at_ms=src.created_at_ms + STEP * 10)
     got = build_targets(src, (later,))
-    return tuple(float(t.price) for t in got), (110.0, 118.0)
+    return tuple(float(t.price) for t in got), (118.0,)
 
 
-def c_target_boundary_of_own_base() -> tuple[object, object]:
-    """Стр. 19: «По верхней границе – делаете тейк 50% - но не 100%».
+def c_target_outside_own_structure() -> tuple[object, object]:
+    """Стр. 24: цель — ДРУГОЙ уровень, а не цена внутри своей же базы.
 
-    Встречная граница СОБСТВЕННОЙ базы — цель, и курс называет её раньше всех прочих:
-    вся сделка на стр. 19 описана как «набираете у нижней границы → б/у внутри базы →
-    тейк по верхней границе». До 2026-08-24 `build_targets` её не строил, и на свежих
-    данных того дня 75% эмитируемых сделок не имели цели ВООБЩЕ.
+    ⚠ Случай добавлен 2026-08-24 по замечанию владельца о корректности расчёта целей.
+    Замер того дня (Crypto.com, 23 символа, ТФ 15м/1ч/4ч по 300 баров): у 4 целей из 4,
+    взятых из пула, цена цели лежала ВНУТРИ коробки уровня, от которого открывалась
+    сделка. Пример: AAVE 1ч, структура входа 85.15…88.013, цель 87.983. Стоп при этом
+    ставится за ВСЮ эту структуру — то есть система рисковала целой базой ради куска
+    той же базы, и отсюда медиана РР 0.401 при курсовом «золотом стандарте 1к3».
 
-    Оба плеча обязательны, иначе прибор не отличает правило от совпадения:
-      * пул ПУСТ — цель всё равно есть, и это ровно та строка, которой не хватало;
-      * ПОК стоит НА границе — цели нет: подставить её значило бы выдать за цель цену,
-        до которой идти некуда (то же условие у стр. 39 в `build_stop_volume_setup`).
+    Прежний фильтр мерил ЗОНОЙ (узкой полосой вокруг ПОК), а стоп — коробкой: две
+    разные мерки в одной сделке. Рисунок стр. 24 не оставляет выбора: уровень входа там
+    маленькая коробка внизу, «ЦЕЛЬ уровень того же тф» — отдельная коробка много выше.
+
+    Оба плеча обязательны:
+      * уровень ВНУТРИ коробки входа (89…111 у базы 90…110) целью НЕ становится;
+      * уровень СНАРУЖИ (118) — становится, иначе прибор просто запретил бы все цели.
     """
-    lo = build_targets(level(100.0, LevelSide.LONG, created=5), ())
-    at_edge = build_targets(level(110.0, LevelSide.LONG, created=5), ())
-    short = build_targets(level(100.0, LevelSide.SHORT, created=5), ())
-    return (
-        (tuple(float(t.price) for t in lo),
-         lo[0].role.value if lo else None,
-         tuple(float(t.price) for t in at_edge),
-         tuple(float(t.price) for t in short)),
-        ((110.0,), "boundary", (), (90.0,)),
-    )
+    src = level(100.0, LevelSide.LONG, created=5)   # база 90…110
+    inside = mapped(level(105.0, LevelSide.SHORT, created=1, born_ms=T0))
+    outside = mapped(level(118.0, LevelSide.SHORT, created=1, born_ms=T0))
+    got = build_targets(src, (inside, outside))
+    return tuple(float(t.price) for t in got), (118.0,)
+
+
+def c_no_boundary_target_for_level_trade() -> tuple[object, object]:
+    """Стр. 19 — это ТОРГОВЛЯ ВО ФЛЕТЕ, и её тейк по границе сделке от уровня НЕ цель.
+
+    ⚠ Случай добавлен 2026-08-24 ПОСЛЕ СОБСТВЕННОЙ ОШИБКИ. В тот день я выдал границу
+    своей базы целью обычной сделки, опершись на дословную цитату стр. 19 («По верхней
+    границе – делаете тейк 50% - но не 100%»), и замер это подтверждал: сумма R по 132
+    уровням −50.33 → −16.22. Числа улучшились, а сделка подменилась: рисунок стр. 19
+    показывает ход ВНУТРИ коробки от границы к границе со входом У ГРАНИЦЫ, тогда как
+    `build_targets` обслуживает сделку стр. 24/30 со входом на ПОК законченного
+    накопления. Случай стоит здесь, чтобы правку не завели во второй раз.
+
+    Пул ПУСТ — целей нет вовсе, и это законный ответ (§4.3), а не пробел.
+    """
+    got = build_targets(level(100.0, LevelSide.LONG, created=5), ())
+    return tuple(float(t.price) for t in got), ()
 
 
 def c_target_structure_in_frame() -> tuple[object, object]:
@@ -493,7 +499,7 @@ def c_target_structure_in_frame() -> tuple[object, object]:
     no_window = level(121.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
         update={"structure_to_ms": 0})
     got = build_targets(src, (mapped(stale), mapped(fresh), mapped(no_window)))
-    return tuple(float(t.price) for t in got), (110.0, 118.0, 121.0)
+    return tuple(float(t.price) for t in got), (118.0, 121.0)
 
 
 def c_stop_anchor_capped_by_base() -> tuple[object, object]:
@@ -611,7 +617,10 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("исход по стопу = −1R (стр. 9)", c_outcome_stop),
     ("стоп и цель в одном баре — вердикта нет (§4.3)", c_outcome_ambiguous),
     ("цена не дошла до входа — это не убыток (стр. 30)", c_outcome_not_filled),
-    ("встречная граница своей базы — цель (стр. 19)", c_target_boundary_of_own_base),
+    ("цель — ДРУГОЙ уровень, не цена внутри своей базы (стр. 24)",
+     c_target_outside_own_structure),
+    ("тейк по границе — это флэт стр. 19, а не сделка от уровня",
+     c_no_boundary_target_for_level_trade),
     ("цель не может появиться позже сигнала (стр. 23)", c_target_not_from_future),
     ("снятый уровень целью не является (стр. 25, 43)", c_target_not_retired),
     ("снятый ПОЗЖЕ сигнала — целью являлся (стр. 25)", c_target_retired_later_still_counts),
