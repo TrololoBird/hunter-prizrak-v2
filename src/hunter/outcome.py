@@ -75,6 +75,20 @@ class OutcomeKind(StrEnum):
     """
 
 
+CLOSED_KINDS = frozenset(
+    {OutcomeKind.STOP, OutcomeKind.TARGET, OutcomeKind.AMBIGUOUS, OutcomeKind.BREAKEVEN}
+)
+"""Исходы, ЗАКРЫВАЮЩИЕ сделку, — против незакрытых состояний (`open`, `not_filled`).
+
+⚠ ОДИН предикат на проект (ревизия 2026-08-24). Прежде набор жил СТРОКАМИ в трёх местах
+`run` — `("stop", "target", "ambiguous", "breakeven")` — и когда 2026-08-23 появился
+`UNMEASURABLE`, его перехватили только у одного из трёх: у двух других он падал в ветку
+«записать состояние», а схема леджера состояний (`CHECK state IN ('not_filled','open')`)
+отбивала запись — покруговая деградация с чужой подписью, при том что докстрока выше
+прямо говорит «наружу он НЕ ПИШЕТСЯ». Новый член перечисления обязан ЛОМАТЬ ровно одно
+место, а не молча уезжать в else трёх копий."""
+
+
 class Outcome(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

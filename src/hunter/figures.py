@@ -184,9 +184,9 @@ def _alternating(swings: SwingSet) -> list[Swing]:
     out: list[Swing] = []
     for s in sorted(swings.swings, key=lambda x: x.index):
         if out and out[-1].kind is s.kind:
-            outer = (s.price > out[-1].price if s.kind is SwingKind.HIGH
-                     else s.price < out[-1].price)
-            if outer:
+            # Правило «экстремальнее — победил» зовётся у `Swing.outer_than` — той же
+            # записью, что у зигзага, а не второй копией рядом с ссылкой на неё.
+            if s.outer_than(out[-1]):
                 out[-1] = s
             continue
         out.append(s)
@@ -346,8 +346,9 @@ class Pennant(BaseModel):
     Цена — в `stop_price`.
     """
 
-    stop_price: float
-    """КУДА ставим. Край структуры плюс курсовой запас — `geometry.stop_beyond_edge`.
+    @property
+    def stop_price(self) -> float:
+        """КУДА ставим. Край структуры плюс курсовой запас — `geometry.stop_beyond_edge`.
 
     Стр. 58 — страница треугольника с равными границами, то есть про эту самую фигуру:
     «Стоп всегда прячем за всю структуру с запасом 1-3%». Слово «всегда» безусловно, и
@@ -363,9 +364,18 @@ class Pennant(BaseModel):
 
     ⚠ Взят ДАЛЬНИЙ край диапазона (`DEFAULT_MARGIN_PCT` = 3%) — то же число и то же
     основание, что у сделки от уровня: там оно разобрано в докстроке
-    `geometry.DEFAULT_MARGIN_PCT` вместе с ценой выбора. Разные числа у двух сделок
-    одного метода были бы второй записью одной величины.
-    """
+        `geometry.DEFAULT_MARGIN_PCT` вместе с ценой выбора. Разные числа у двух сделок
+        одного метода были бы второй записью одной величины.
+
+        ⚠ СВОЙСТВО, А НЕ ПОЛЕ (ревизия 2026-08-24): величина ЦЕЛИКОМ выводится из
+        `stop_anchor` и `side`, и хранить её значило бы допускать рассогласованную
+        сборку. Тот же приём, что у `MappedLevel.current` и `Setup.breakeven_price`.
+        """
+        long_side = self.side is FigureSide.LONG
+        # Decimal только здесь: одна формула проекта живёт на десятичной арифметике,
+        # наружу уходит float — как все цены модуля.
+        return float(stop_beyond_edge(
+            Decimal(str(self.stop_anchor)), DEFAULT_MARGIN_PCT, up=long_side))
 
     upper_edge: float
     lower_edge: float
@@ -488,12 +498,6 @@ def pennant(
     order = sorted(up.point_indices + low.point_indices)
     if order and order[0] not in head:
         order = order[1:]
-    long_side = side is FigureSide.LONG
-    anchor = structure.extended_lo if long_side else structure.extended_hi
-    # Decimal только на этой строке: запас считается ОДНОЙ формулой проекта, а она
-    # живёт на десятичной арифметике `Level` (`geometry.margin_of`). Обратно наружу
-    # уходит float — как и все прочие цены этого модуля.
-    stop = float(stop_beyond_edge(Decimal(str(anchor)), DEFAULT_MARGIN_PCT, up=long_side))
     return Pennant(
         borders=borders,
         side=side,
@@ -501,8 +505,8 @@ def pennant(
         last_point_index=order[-1],
         touches=len(order),
         touch6_index=order[TOUCH_FOR_ENTRY - 1] if len(order) >= TOUCH_FOR_ENTRY else None,
-        stop_anchor=anchor,
-        stop_price=stop,
+        stop_anchor=(structure.extended_lo if side is FigureSide.LONG
+                     else structure.extended_hi),
         upper_edge=up.edge,
         lower_edge=low.edge,
         is_extended=structure.is_extended,
