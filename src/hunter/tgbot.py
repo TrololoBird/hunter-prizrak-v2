@@ -1586,7 +1586,11 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         # 0.96%; ПЕРЕВЁРНУТЫХ (lo > hi) — НОЛЬ, то есть арифметика верна и чинить в
         # расчёте нечего. Чинится только печать: «0.1849–0.1849» читается как ошибка.
         def pp_zone(p: ZoneSpec) -> str:
-            if p.zone_lo == p.zone_hi:
+            # ⚠ Предикат ОДИН и живёт в `pereprior.Pereprior.zone_degenerate`
+            # (правка 2026-08-24). Здесь стояла его вторая запись `zone_lo == zone_hi`;
+            # ZoneSpec — плоская строка карты и самого ПП не несёт, поэтому сравнение
+            # остаётся здесь, но названо тем же именем, чтобы копия была ВИДНА.
+            if pereprior.zone_is_degenerate(p.zone_lo, p.zone_hi):
                 return f"{_fmt_price(p.zone_lo)} (свеча без тени — зона в одну цену)"
             return f"{_fmt_price(p.zone_lo)}–{_fmt_price(p.zone_hi)}"
 

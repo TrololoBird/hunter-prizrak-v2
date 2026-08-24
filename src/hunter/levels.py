@@ -1840,15 +1840,30 @@ def status(
                            entry_rule=EntryRule.LIMIT, resolved_at_ms=None)
     assert ev.resolved_index is not None  # у разрешившегося события бар есть по построению
     at = bars[ev.resolved_index].open_ms + tf_ms(level.timeframe)
+    # ⚠ ОБЕ ВЕТКИ ЯВНЫЕ, ВЕТКИ «ИНАЧЕ» НЕТ (правка 2026-08-24). Здесь стояло
+    # `if ev.kind is BreachKind.BREAKOUT: … return WORKED_OFF` — то есть ВТОРАЯ копия
+    # правила стр. 6 (прокол — отработка, пробой — нет), записанная отрицанием.
+    # Первая живёт в `Breach.worked_off` и до этого дня не вызывалась НИОТКУДА.
+    #
+    # Сегодня копии согласны: `OPEN` и `UNRESOLVED` отсечены ветками выше, так что сюда
+    # доходят только `PUNCTURE` и `BREAKOUT`. Но согласны они по счастливой случайности —
+    # пятый член `BreachKind` провалился бы в `WORKED_OFF` молча, потому что это была
+    # ветка «иначе». Теперь спрашивается само правило, вторая ветка названа по имени, а
+    # невозможный случай ПАДАЕТ: молчаливое зачисление нового вида события в отработку
+    # ровно та деградация, которую проект запрещает (§4.3).
+    if ev.worked_off:
+        return LevelStatus(state=LevelState.WORKED_OFF, event=ev,
+                           limit_orders_allowed=False, price_in_zone=in_zone,
+                           price_beyond=beyond, take=take, playout=play,
+                           entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
     if ev.kind is BreachKind.BREAKOUT:
         return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False,
                            price_in_zone=in_zone, price_beyond=beyond, take=take,
                            playout=play,
                            entry_rule=EntryRule.RETEST_FLIPPED, resolved_at_ms=at)
-    return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
-                       price_in_zone=in_zone, price_beyond=beyond, take=take,
-                       playout=play,
-                       entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
+    raise AssertionError(
+        f"разрешившееся событие вида {ev.kind.value} курс не классифицирует: стр. 6 "
+        "знает прокол и пробой, а этот вид не отнесён ни к тому, ни к другому")
 
 
 class PressedKind(StrEnum):
