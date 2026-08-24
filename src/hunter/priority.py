@@ -25,6 +25,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
+from .bars import TF_RANK
 from .geometry import TF_ORDER
 from .levels import Level, LevelSide, LevelState, MappedLevel
 from .swings import Trend, TrendDirection
@@ -65,9 +66,9 @@ def resolve(trends: dict[str, Trend], above: str) -> Priority:
     Идём сверху вниз и берём первый определившийся: «приоритет старший таймфрейм»
     означает именно старшинство, а не голосование нескольких ТФ (§4.2 — весовых сумм нет).
     """
-    if above not in TF_ORDER:
+    if above not in TF_RANK:
         return Priority(timeframe=None, direction=TrendDirection.NONE, holds_for=0)
-    higher = TF_ORDER[TF_ORDER.index(above) + 1:]
+    higher = TF_ORDER[TF_RANK[above] + 1:]
     for tf in reversed(higher):
         t = trends.get(tf)
         if t is not None and t.direction is not TrendDirection.NONE:
@@ -164,16 +165,16 @@ def counter_levels(level: Level, pool: tuple[MappedLevel, ...]) -> tuple[Counter
     тот момент отдаётся полем `state`. Сторона берётся ИСХОДНАЯ: стр. 46 зовёт его
     «шорт уровень ТФ 1д» и после пробоя.
     """
-    if level.timeframe not in TF_ORDER or level.price <= 0:
+    if level.timeframe not in TF_RANK or level.price <= 0:
         return ()
-    rank = TF_ORDER.index(level.timeframe)
+    rank = TF_RANK[level.timeframe]
     want = LevelSide.SHORT if level.side is LevelSide.LONG else LevelSide.LONG
     out: list[CounterLevel] = []
     for mapped in pool:
         other = mapped.level
         if other.symbol != level.symbol or other.side is not want:
             continue
-        if other.timeframe not in TF_ORDER or TF_ORDER.index(other.timeframe) <= rank:
+        if other.timeframe not in TF_RANK or TF_RANK[other.timeframe] <= rank:
             continue
         if other.created_at_ms > level.created_at_ms:
             continue

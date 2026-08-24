@@ -146,7 +146,6 @@ Williams & Gregory-Williams, "Trading Chaos" 2-е изд., Wiley 2004, page 137:
 from __future__ import annotations
 
 import bisect
-from collections import OrderedDict
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
@@ -217,7 +216,16 @@ class Swing(BaseModel):
     open_ms: int
     price: float
     confirmed_at_index: int
-    """Индекс бара, после закрытия которого фрактал стал известен: index + 2."""
+    """Индекс бара, после закрытия которого фрактал стал известен: `index + depth`.
+
+    ⚠ ЗДЕСЬ СТОЯЛО «index + 2» (исправлено 2026-08-23) — число от ПЯТИБАРНОГО фрактала
+    Вильямса, у которого крыло равно двум. `ZIGZAG_DEPTH` равен 5 с 2026-08-20, то есть
+    подтверждение отстоит на ПЯТЬ баров, а не на два. Поле — то самое, по которому
+    потребитель решает, что свинг можно брать БЕЗ ЗАГЛЯДЫВАНИЯ ВПЕРЁД (I-5): докстрока,
+    занижающая задержку подтверждения втрое, разрешала бы читать будущее.
+
+    ⚠ Здесь именно `depth`, а не литерал: значение приходит из `local_extremes`, и
+    зависимость проверяется отдельно (`SwingSet._ordered`), а не выводится из `index`."""
 
 
 class SwingSet(BaseModel):
@@ -256,6 +264,14 @@ class SwingSet(BaseModel):
 
     _confirmed_of: dict[SwingKind, tuple[int, ...]] = PrivateAttr(default_factory=dict)
     """Память `confirmed_of()` — та же причина."""
+
+    _prefixes: ZigzagPrefixes | None = PrivateAttr(default=None)
+    """Память `prefixes_of()` — индекс зигзага со всеми префиксами этого набора.
+
+    ⚠ Перенесена сюда 2026-08-23 из МОДУЛЬНОГО словаря `_PREFIX_CACHE`: чистый модуль
+    не имеет права держать глобальное состояние (§10.3), а память чистой функции,
+    привязанная к своему объекту, состоянием модуля не является. Разбор — в докстроке
+    `prefixes_of`."""
 
     @model_validator(mode="after")
     def _ordered(self) -> SwingSet:
@@ -482,28 +498,15 @@ def zigzag(raw: list[Swing]) -> list[Swing]:
     ⚠ `confirmed_at_index` у звена ПЕРЕПИСЫВАЕТСЯ на момент, когда оно стало
     окончательным. Это не косметика: потребитель проигрывает свинги по этому индексу, и
     отдать звено раньше значило бы отдать предварительное — см. докстроку модуля.
+
+    ⚠⚠ ТЕЛО ЦИКЛА ЗДЕСЬ БОЛЬШЕ НЕ ЖИВЁТ. Оно было ВТОРОЙ КОПИЕЙ свёртки из
+    `ZigzagPrefixes.__init__`, и копии успели разойтись по существу: правило внешнего
+    бара, объявленное абзацем выше, не исполнялось НИ ОДНОЙ из них — оба экстремума
+    одного бара проходили как разные звенья и давали колено НУЛЕВОЙ длины, по которому
+    `trend()` читает «каждый следующий лой выше предыдущего» (стр. 12). Правило заведено
+    в свёртке, свёртка осталась одна, а `zigzag` — её полный префикс.
     """
-    chain: list[Swing] = []
-    # ⚠ `x.kind`, А НЕ `x.kind.value` — правка скорости 2026-08-23, порядок ТОТ ЖЕ.
-    # `SwingKind` это `StrEnum`, то есть член сам является строкой и сравнивается с
-    # такой же строкой как она; `.value` же идёт через дескриптор `DynamicClassAttribute`
-    # и стоит вызова на КАЖДОЕ сравнение внутри сортировки. Цена была замерена профилем
-    # прогона 2 символов: `enum.__get__` 1 970 076 вызовов, 4.6 с.
-    for s in sorted(raw, key=lambda x: (x.confirmed_at_index, x.index, x.kind)):
-        if not chain:
-            chain.append(s)
-            continue
-        if chain[-1].kind is s.kind:
-            outer = (s.price > chain[-1].price if s.kind is SwingKind.HIGH
-                     else s.price < chain[-1].price)
-            if outer:
-                chain[-1] = s
-            continue
-        chain[-1] = chain[-1].model_copy(update={"confirmed_at_index": s.confirmed_at_index})
-        chain.append(s)
-    # Последнее звено осталось ПРЕДВАРИТЕЛЬНЫМ: противоположного экстремума за ним ещё не
-    # было, значит оно может быть замещено следующим баром. Наружу оно не идёт (I-5).
-    return chain[:-1]
+    return ZigzagPrefixes(raw).upto(len(raw))
 
 
 class ZigzagPrefixes:
@@ -536,8 +539,18 @@ class ZigzagPrefixes:
     стало окончательным. Ответ на префикс длины m — звенья с шагом не больше m, то есть
     двоичный поиск по неубывающему списку шагов.
 
-    Проверка не аналитическая, а исчерпывающая: `gates/zigzag_prefixes.py` сверяет
-    `upto(m)` с `zigzag(префикс)` для ВСЕХ m на настоящих рядах склада.
+    ⚠ ССЫЛКА НА `gates/zigzag_prefixes.py` УБРАНА 2026-08-23: такого файла в `gates/`
+    НЕТ и не было (`ls gates/` → 23 файла, этого имени среди них нет). Строка обещала
+    исчерпывающую сверку `upto(m)` с `zigzag(префикс)` — сверки не существует. Свойство
+    держится теперь ПО ПОСТРОЕНИЮ, а не сверкой: `zigzag` есть `upto(len(raw))` того же
+    объекта, то есть второй реализации, с которой можно разойтись, больше нет.
+
+    ⚠⚠ ЗДЕСЬ ЖЕ ЖИВЁТ ПРАВИЛО ВНЕШНЕГО БАРА. Бар, чей хай выше предыдущего, а лой ниже,
+    даёт ОБА экстремума на одном индексе. Оба звена в цепочку не идут: колено между ними
+    имеет нулевую длину по времени, а `trend` читает такое колено как настоящее.
+    Берётся тот, что ЧЕРЕДУЕТСЯ с предыдущим звеном; при пустой цепочке — первый по
+    порядку сортировки. Правило было записано в докстроке `zigzag` с 2026-08-17 и до
+    2026-08-23 не исполнялось ни одной строкой кода.
     """
 
     __slots__ = ("_finals", "_steps", "_total")
@@ -546,8 +559,27 @@ class ZigzagPrefixes:
         finals: list[Swing] = []
         steps: list[int] = []
         chain: list[Swing] = []
+        # ⚠ `x.kind`, А НЕ `x.kind.value` — правка скорости 2026-08-23, порядок ТОТ ЖЕ.
+        # `SwingKind` это `StrEnum`, то есть член сам является строкой и сравнивается с
+        # такой же строкой как она; `.value` же идёт через дескриптор
+        # `DynamicClassAttribute` и стоит вызова на КАЖДОЕ сравнение внутри сортировки.
+        # Цена замерена профилем прогона 2 символов: `enum.__get__` 1 970 076 вызовов, 4.6 с.
         order = sorted(raw, key=lambda x: (x.confirmed_at_index, x.index, x.kind))
-        for m, s in enumerate(order, start=1):
+        n = len(order)
+        i = 0
+        while i < n:
+            s = order[i]
+            # ⚠ ШАГ — ПОЗИЦИЯ ВЗЯТОГО свинга, а не конца пары. От этого зависит
+            # свойство префикса: `upto(m)` обязан совпадать с `zigzag(order[:m])` при
+            # ЛЮБОМ m, а не только на границах пар.
+            m = i + 1
+            i += 1
+            if i < n and order[i].index == s.index and order[i].kind is not s.kind:
+                # внешний бар: два экстремума на одном индексе — берём чередующийся
+                other, other_m = order[i], i + 1
+                i += 1
+                if chain and s.kind is chain[-1].kind:
+                    s, m = other, other_m
             if not chain:
                 chain.append(s)
                 continue
@@ -565,7 +597,7 @@ class ZigzagPrefixes:
             chain.append(s)
         self._finals: tuple[Swing, ...] = tuple(finals)
         self._steps: tuple[int, ...] = tuple(steps)
-        self._total = len(order)
+        self._total = n
 
     def upto(self, m: int) -> list[Swing]:
         """Цепочка для префикса длины `m` — то же, что `zigzag(префикс)`."""
@@ -577,34 +609,28 @@ class ZigzagPrefixes:
         return self._total
 
 
-_PREFIX_CACHE: OrderedDict[int, tuple[tuple[Swing, ...], ZigzagPrefixes]] = OrderedDict()
-_PREFIX_CACHE_MAX = 16
-"""Ровно один индекс на ряд, и рядов у символа шесть — шестнадцать с запасом на два.
-
-⚠ Ключ — `id` кортежа, и это безопасно ТОЛЬКО вместе с проверкой `is` при попадании:
-`id` переиспользуется после сборки мусора, поэтому одного числа мало. Сам кортеж лежит
-в значении, то есть удерживается ссылкой, пока запись жива, — за это время `id` занят
-и переиспользован быть не может.
-"""
-
-
 def prefixes_of(swings: SwingSet) -> ZigzagPrefixes:
     """Индекс префиксов набора — считается один раз на набор.
 
     ⚠ Это ЗАПОМИНАНИЕ ЧИСТОЙ ФУНКЦИИ, а не состояние расчёта: тот же кортеж свингов
-    всегда даёт тот же индекс, и попадание подтверждается сравнением `is`, а не
-    только числом-ключом. Промах стоит одного лишнего прохода, а не неверного ответа.
+    всегда даёт тот же индекс. Промах стоит одного лишнего прохода, а не неверного
+    ответа.
+
+    ⚠⚠ ПАМЯТЬ ЖИВЁТ НА САМОМ НАБОРЕ (правка 2026-08-23). Здесь стоял МОДУЛЬНЫЙ
+    `_PREFIX_CACHE` — `OrderedDict` на 16 записей с ключом `id(кортежа)` и проверкой
+    `is` при попадании. Модуль объявлен ЧИСТЫМ (§10.3 запрещает глобальное состояние
+    внутри расчёта), а `gates/purity.py` разбирал одни импорты и модульного состояния
+    не видел — та же дыра, что у `_VOL_MEMO` и `_WINDOW_CACHE`.
+
+    Теперь индекс лежит в `SwingSet._prefixes` — рядом с двумя такими же памятками
+    (`_by_kind`, `_confirmed_of`), которые в этом классе живут с самого начала. Ключ по
+    `id` при этом исчез как понятие: владелец кортежа и есть его набор, вытеснять
+    нечего, а вопрос «не переиспользован ли `id` после сборки мусора» не возникает.
     """
-    key = id(swings.swings)
-    hit = _PREFIX_CACHE.get(key)
-    if hit is not None and hit[0] is swings.swings:
-        _PREFIX_CACHE.move_to_end(key)
-        return hit[1]
-    made = ZigzagPrefixes(list(swings.swings))
-    _PREFIX_CACHE[key] = (swings.swings, made)
-    _PREFIX_CACHE.move_to_end(key)
-    while len(_PREFIX_CACHE) > _PREFIX_CACHE_MAX:
-        _PREFIX_CACHE.popitem(last=False)
+    made = swings._prefixes
+    if made is None:
+        made = ZigzagPrefixes(list(swings.swings))
+        swings._prefixes = made
     return made
 
 

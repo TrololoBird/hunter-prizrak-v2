@@ -14,7 +14,6 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import NamedTuple
@@ -62,7 +61,12 @@ from .models import (
 )
 from .outcome import OutcomeKind
 from .outcome import resolve as outcome_resolve
-from .profile_source import PROFILE_LADDER, TVWindows, intrabar_timeframe
+from .profile_source import (
+    PROFILE_LADDER,
+    TVWindows,
+    WindowCache,
+    intrabar_timeframe,
+)
 from .swings import detect as detect_swings
 from .trading_range import detect as detect_ranges
 
@@ -257,7 +261,7 @@ async def expand_board(ex: Exchange, uni: Universe) -> Universe:
              лестница_ядра="/".join(uni.timeframes),
              лестница_доски="/".join(uni.board_timeframes),
              верх_доски="; ".join(s.split("/")[0] for s in rest[:5]))
-    return _capped(replace(uni, symbols=tuple(core) + tuple(rest)))
+    return _capped(uni.model_copy(update={"symbols": tuple(core) + tuple(rest)}))
 
 
 def _capped(uni: Universe) -> Universe:
@@ -274,7 +278,7 @@ def _capped(uni: Universe) -> Universe:
     kept = uni.symbols[: uni.cap]
     log.info("потолок символов", взято=len(kept), было=len(uni.symbols),
              ядра_в_потолке=sum(1 for s in kept if s in uni.core))
-    return replace(uni, symbols=kept, core=uni.core & set(kept))
+    return uni.model_copy(update={"symbols": kept, "core": uni.core & set(kept)})
 
 
 class GapRepair(NamedTuple):
@@ -1011,6 +1015,20 @@ def percentile(values: list[int], q: float) -> int:
     Своя реализация, а не `statistics.quantiles`, по одной причине: та интерполирует
     между соседями и на выборке из двух-трёх значений выдаёт число, которого в замере
     не было. Здесь всякое напечатанное число — настоящая наблюдённая задержка.
+
+    ⚠ ДОВОД ВЫШЕ ВЕРЕН ПРОТИВ `statistics` И НЕВЕРЕН ПРОТИВ NUMPY — оговорено 2026-08-23.
+    У `numpy.percentile` есть `method="inverted_cdf"`, который тоже возвращает
+    НАБЛЮДЁННОЕ значение (проверено чтением установленного исходника,
+    `numpy/lib/_function_base_impl.py`, numpy 2.2.6). То есть библиотека, уже стоящая в
+    боевых зависимостях, умеет ровно это, и «своё, потому что библиотеки нет» здесь
+    сказать нельзя.
+
+    Функция всё же оставлена своей, и вот чем это отличается от упрямства: разница
+    между `inverted_cdf` (ранг `ceil(q·n)`, счёт с единицы) и этой формулой в третьем
+    знаке определения, а величина уходит В ПРИЁМКУ — то есть в число, которое читает
+    владелец. Менять определение предъявляемой величины ради снятия десяти строк —
+    правка расчёта, и она требует двух карточек, а не рассуждения. Замена законна, но
+    отдельной правкой и с замером расхождения на живых задержках.
     """
     if not values:
         raise ValueError("перцентиль пустой выборки не определён")
@@ -1211,18 +1229,26 @@ class TradeSequence:
         self.checked = 0
         self.unnumbered = 0
 
-    def note(self, raw: object) -> None:
+    def note(self, raw: object) -> int | None:
+        """Учесть номер сделки. Возвращает разобранный номер, `None` — ненумерованная.
+
+        ⚠ ВОЗВРАТ ЗАВЕДЁН 2026-08-23: вызывающий (`_watch_trades_impl`) разбирал тот же
+        номер ВТОРОЙ РАЗ своим `int(str(...))`, и его копия при отказе разбора молча
+        писала `None`, не оставляя следа. Одна формула — одно место; счётчик
+        `unnumbered` теперь один на обоих потребителей.
+        """
         try:
             tid = int(str(raw))
         except (TypeError, ValueError):
             self.unnumbered += 1
-            return
+            return None
         self.checked += 1
         if self.last is not None and tid > self.last + 1:
             self.gaps += tid - self.last - 1
             self.gap_events += 1
         if self.last is None or tid > self.last:
             self.last = tid
+        return tid
 
 
 async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
@@ -1237,17 +1263,21 @@ async def _watch_trades_impl(ex: Exchange, sym: str, hist: TradeHistogram,
             gaps: list[tuple[int, int]] = []
             prev = seq.last
             for t in batch:
-                try:
-                    tid: int | None = int(str(t.id))
-                except (TypeError, ValueError):
-                    tid = None
+                # ⚠⚠ НОМЕР РАЗБИРАЕТСЯ В ОДНОМ МЕСТЕ (правка 2026-08-23). Здесь стоял
+                # СВОЙ `int(str(t.id))` в `try`, а строкой ниже `seq.note(t.id)`
+                # разбирал тот же номер ВТОРОЙ РАЗ — две копии одной формулы. Хуже:
+                # локальная копия при неразбираемом номере писала `tid = None` и
+                # молча выбывала из поиска разрывов, не оставив следа вовсе (счётчик
+                # `unnumbered` рос только внутри `note`). Теперь `note` возвращает
+                # разобранный номер, и обе задачи стоят на одном разборе и одном
+                # счётчике.
+                # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
+                # здесь больше не нужно и нельзя — их нет.
+                tid = seq.note(t.id)
                 if tid is not None:
                     if prev is not None and tid > prev + 1:
                         gaps.append((prev + 1, tid))
                     prev = tid if prev is None else max(prev, tid)
-                # Сделка уже разобрана в тип на границе с ccxt (А-5): проверять ключи
-                # здесь больше не нужно и нельзя — их нет.
-                seq.note(t.id)
                 hist.add(t.price, t.amount, t.timestamp)
                 binned.add(t.price, t.amount, t.timestamp)
             for lo, hi in gaps:
@@ -2258,7 +2288,8 @@ def trade_source(ex: Exchange, sym: str, report: RunReport,
 
 
 def build_sources(insts: dict[str, Instrument], report: RunReport,
-                  uni: Universe) -> dict[str, TradeWindows]:
+                  uni: Universe,
+                  cache: WindowCache | None = None) -> dict[str, TradeWindows]:
     """Источники профиля для всех символов сразу — ЧИСТАЯ функция для рабочего потока.
 
     ⚠ ЗАВЕДЕНА 2026-08-21, чтобы снять эту работу с цикла событий. Прежде служба
@@ -2271,6 +2302,12 @@ def build_sources(insts: dict[str, Instrument], report: RunReport,
     перечитывания состава, которая живёт на цикле событий, а функция работает в потоке.
     Инструменты добываются ВЫЗЫВАЮЩИМ на цикле и приходят готовыми — читать из потока
     словарь, который в это же время меняют, значит однажды получить полуобновлённый.
+
+    ⚠ `cache` — память дорогих окон профиля, ПЕРЕЖИВАЮЩАЯ циклы. Владелец её —
+    служба; здесь она только передаётся дальше. До 2026-08-23 она жила модульным
+    словарём внутри `profile_source`, объявленного ЧИСТЫМ, — то есть чистый модуль
+    держал глобальное состояние, а гейт чистоты этого не видел. `None` — памяти нет:
+    так работают разовый прогон и повтор, и им это НУЖНО, а не безразлично.
     """
     out: dict[str, TradeWindows] = {}
     for sym, inst in insts.items():
@@ -2282,7 +2319,7 @@ def build_sources(insts: dict[str, Instrument], report: RunReport,
             have = series.get(tf)
             series[tf] = _merge_bars(stored, have) if have else stored
         if series:
-            out[sym] = TVWindows(sym, inst.tick_size, series)
+            out[sym] = TVWindows(sym, inst.tick_size, series, cache)
     return out
 
 
@@ -2344,7 +2381,6 @@ def explained_gaps(st: SeriesState) -> tuple[tuple[int, int], ...]:
 
 def decide_once(report: RunReport, uni: Universe,
                 sources: dict[str, TradeWindows],
-                frame_bars: int | None = None,
                 detections: engine.Detections | None = None,
                 horizon_days: int = 0,
                 ) -> dict[str, engine.SymbolDecision]:
@@ -2371,7 +2407,7 @@ def decide_once(report: RunReport, uni: Universe,
         # 5м и 15м по всем 696 рынкам, которых для них даже не собрано. Выигрыш от
         # выноса — один вызов метода на символ; цена ошибки — вся доска.
         out[sym] = engine.decide(sym, series, sources.get(sym), uni.ladder(sym),
-                                 frame_bars=frame_bars, detections=detections,
+                                 detections=detections,
                                  horizon_days=horizon_days)
     # СВОДКА отказов «нет ряда нужного ТФ» по измерению возможного перекоса (правило
     # backfill-window-2026-08-04: сто честных отказов на одном ТФ читаются как «рынок
@@ -2497,7 +2533,7 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
     Отказы называются числами, а не молчанием: сигнал без цели (записан до v5), символ
     без рядов в этом прогоне и ТФ без баров считаются раздельно.
     """
-    no_target = no_bars = 0
+    no_target = no_bars = degenerate = 0
     for sym in uni.symbols:
         series = bars_of(report, sym)
         if not series:
@@ -2526,14 +2562,28 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
             side = (levels.LevelSide.LONG if p.direction == "long"
                     else levels.LevelSide.SHORT)
             # Безубыток (стр. 19: «Цена показала реакцию и ушла внутрь базы – ставите
-            # стоп в б/у»). Порог взведения — ПЕРВАЯ цель: именно на ней курс велит
-            # крыть часть и двигать стоп (стр. 15). Цели нет — безубытка тоже нет, и
-            # это отказ с причиной, а не подставленный вход.
+            # стоп в б/у»). Порог взведения лежит в леджере с v9 и считается
+            # `geometry.breakeven_watch` в момент записи сигнала.
+            #
+            # ⚠ ЗДЕСЬ СТОЯЛО ЛОЖНОЕ ОПИСАНИЕ, СНЯТО 2026-08-24. Дословно было: «Порог
+            # взведения — ПЕРВАЯ цель: именно на ней курс велит крыть часть и двигать
+            # стоп (стр. 15). Цели нет — безубытка тоже нет». Ни одно из трёх
+            # утверждений не описывало код: в `p.breakeven_at` пишется правило стр. 19
+            # (край зоны, а с 2026-08-24 — не ближе 1R), к цели оно не привязано, и у
+            # сделки без цели безубыток есть. Комментарий описывал ПЕРВУЮ редакцию
+            # 2026-08-19, отменённую в тот же день соседней правкой, — и пережил её.
             res = outcome_resolve(
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
                 breakeven_at=p.breakeven_at,
             )
+            if res.kind is OutcomeKind.UNMEASURABLE:
+                # Вырожденный риск (стоп совпал со входом): единицы R не существует, и
+                # в леджер такая сделка не идёт НИКАК — ни исходом, ни состоянием.
+                # Прежде `resolve` отвечал на неё `not_filled`, и она молча попадала в
+                # долю «мимо входа», то есть в число, которое читает владелец.
+                degenerate += 1
+                continue
             if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
@@ -2553,8 +2603,15 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                     report.states_recorded += 1
     report.pending_no_target = no_target
     report.pending_no_bars = no_bars
+    report.pending_degenerate_risk = degenerate
     if no_bars:
         log.degraded("часть сигналов дорешать нельзя", без_баров=no_bars)
+    if degenerate:
+        # Деградация, а не примечание: стоп, совпавший со входом, — дефект РАСЧЁТА
+        # геометрии, а не законное состояние рынка. Молчать о нём значило бы прятать
+        # его ровно так, как прежде прятал `not_filled`.
+        log.degraded("у сигнала вырожден риск: стоп совпал со входом",
+                     сигналов=degenerate)
     if no_target:
         # НЕ деградация: такие сигналы дорешиваются, просто исход `цель` у них
         # невозможен по построению. Знать их число всё равно нужно — оно знаменатель
@@ -2752,23 +2809,23 @@ def record(run_id: str, report: RunReport, uni: Universe,
             for em in d.emissions:
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
-                targets = [t for t in em.setup.targets
-                           if t.role is geometry.TargetRole.PRIMARY]
+                # ⚠ ТРЕТЬЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24. Здесь стоял свой
+                # `role is geometry.TargetRole.PRIMARY`, такой же — в `Setup.rr` и в
+                # `emit.outcome_of`. Правило теперь одно: `geometry.first_major`.
+                first = geometry.first_major(em.setup.targets)
                 sig = store.record_signal(
                     conn, sym, em.level.timeframe, em.direction, opened_at,
                     em.setup.entry, em.ledger_stop, run_id, stamp_ms,
-                    # Цель — та же ПЕРВАЯ основная, по которой считается РР (стр. 9).
+                    # Цель — та же ПЕРВАЯ КРУПНАЯ, по которой считается РР (стр. 9).
                     # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
                     # ни в одном прогоне, кроме выдавшего сигнал.
-                    target=targets[0].price if targets else None,
-                    # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Берётся ПЕРВОЕ по ходу
-                    # сделки правило стр. 19 («цена показала реакцию и ушла внутрь
-                    # базы»): оно наступает раньше цели и потому вообще способно
-                    # сработать. Подача сюда `target` (первая редакция 2026-08-19)
-                    # делала исход «в безубытке» недостижимым: взведение и закрытие
-                    # по цели приходятся на один бар, а цель проверяется первой.
-                    breakeven_at=(em.setup.breakeven_rules[0].watch_price
-                                  if em.setup.breakeven_rules else None),
+                    target=first.price if first is not None else None,
+                    # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Правило выбирается ПО
+                    # ТРИГГЕРУ (`geometry.breakeven_watch`), а не по номеру в списке:
+                    # здесь стояло `breakeven_rules[0]`, и смысл величины держался на
+                    # порядке `append` в `build_breakeven_rules`. Разбор — в докстроке
+                    # `breakeven_watch`.
+                    breakeven_at=geometry.breakeven_watch(em.setup.breakeven_rules),
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)
@@ -2890,7 +2947,8 @@ CYCLE_FIELDS = (
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
     "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
-    "pending_no_target", "pending_no_bars", "emitted_outcomes",
+    "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
+    "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "map_stale_calc",
@@ -2909,8 +2967,65 @@ CYCLE_FIELDS = (
 каждую эмиссию каждого цикла — список, растущий без предела, — а «карточек записано»
 означало бы сумму по всем циклам, то есть не отвечало бы ни на один вопрос.
 
-⚠ Список ведётся руками. Новое поле расчёта, забытое здесь, будет накапливаться молча.
+⚠⚠ «ЗАБЫТОЕ ПОЛЕ БУДЕТ НАКАПЛИВАТЬСЯ МОЛЧА» — БОЛЬШЕ НЕТ (2026-08-23). Здесь стояла
+ровно эта строка, и она была признанием, а не защитой: список ведётся руками, а забыть
+в нём поле нечем помешать. Теперь рядом стоит `LIFETIME_FIELDS` — поля, живущие ВСЁ
+время работы, — и `_check_fields_split` требует, чтобы объединение двух списков покрывало
+модель ЦЕЛИКОМ. Новое поле отчёта заставляет сделать выбор ПРИ ИМПОРТЕ модуля, а не
+проявляется через сутки работы службы кривым числом в приёмке.
 """
+
+
+LIFETIME_FIELDS = (
+    # Часы и биржа: состояние процесса, а не цикла.
+    "clock_age_ms", "clock_drift_max_ms", "clock_drift_ms", "clock_recheck_after_s",
+    "clock_resync_failures", "clock_resyncs", "clock_stale", "sync", "taken_at_ms",
+    "capabilities_checked", "capabilities_emulated", "capabilities_missing",
+    "markets_checked", "markets_reload_failures", "markets_reloads",
+    "delisted_mid_run", "tick_changes", "weight_limit", "weight_peak", "weight_reads",
+    "rest_errors", "rest_gate_held", "rest_rate_limited",
+    # Сбор: копится с запуска службы, обнуление сделало бы его бессмысленным.
+    "bars_from_store", "bars_rewritten", "bars_stored", "bars_trimmed",
+    "seed_already_current", "seed_checked", "seed_gap_bars", "seed_gaps_filled",
+    "seed_gaps_found", "seed_gaps_left", "seed_gaps_rebuilt", "seed_tail_failed",
+    "seeded_bars", "poll_revived", "heartbeats", "uptime_s", "cycles", "cycle_seconds",
+    "watch_deaths", "watch_failures", "watch_restarts", "ws_reconnects",
+    "ws_stream_errors", "trade_gap_events", "trade_gaps", "trade_gaps_recovered",
+    "trade_gaps_unrecovered", "trade_ids_checked", "trades_total",
+    "live_buckets_dropped", "live_days_flushed", "cache_orphaned",
+    # Контейнеры, которые снимок ЗАМЕЩАЕТ целиком, а не обнуляет.
+    "series", "histograms", "binned", "stage_ms", "stage_windows_ns",
+    "loop_late_events", "loop_late_total_ms", "loop_stall_max_ms",
+    "profile_spans_by_tf", "profile_symbols_no_windows",
+)
+"""Поля, живущие ВСЁ время работы процесса, а не один расчёт.
+
+Список нужен не сам по себе, а как ВТОРАЯ ПОЛОВИНА разбиения: вместе с `CYCLE_FIELDS`
+он обязан покрывать модель отчёта целиком, и это проверяется ниже. Без него «поле не
+обнуляется» и «поле забыли» выглядят одинаково.
+"""
+
+
+def _check_fields_split() -> None:
+    """Каждое поле отчёта отнесено ЛИБО к циклу, ЛИБО ко времени жизни процесса.
+
+    ⚠ Падает ПРИ ИМПОРТЕ, и это выбор: поле, не отнесённое никуда, — молчаливая
+    деградация того самого вида, ради которого заведён `CYCLE_FIELDS`, и обнаружиться
+    она может только по кривому числу в приёмке через сутки работы. Импорт же ломается
+    сразу и ловится гейтом `smoke_import` на каждом коммите.
+    """
+    known = set(CYCLE_FIELDS) | set(LIFETIME_FIELDS)
+    fields = set(RunReport.model_fields)
+    lost = sorted(fields - known)
+    extra = sorted(known - fields)
+    if lost or extra:
+        raise RuntimeError(
+            f"разбиение полей отчёта неполно: не отнесены ни к циклу, ни ко времени "
+            f"жизни {lost}; названы, но в модели отсутствуют {extra}. "
+            f"Новое поле обязано попасть либо в CYCLE_FIELDS, либо в LIFETIME_FIELDS")
+
+
+_check_fields_split()
 
 
 def _copy_series(st: SeriesState) -> SeriesState:
@@ -3177,8 +3292,12 @@ class Collector:
         rep.trades_total = (self._absorbed_trades
                             + sum(h.trades_seen for h in self.live_hist.values()))
         # Прогон досюда доходит только при пройденной проверке: `open()` иначе бросает
-        # `CapabilityMissing`. Число нужно, чтобы «отсутствует 0» имело знаменатель.
+        # `CapabilityMissing`. Числа берутся у самой проверки, а не выводятся из того,
+        # что прогон дошёл сюда: безусловно напечатанное утверждение в этом проекте уже
+        # соврало однажды (2026-08-03).
         rep.capabilities_checked = len(REQUIRED_CAPABILITIES)
+        rep.capabilities_missing = self.ex.capabilities_missing
+        rep.capabilities_emulated = self.ex.capabilities_emulated
 
     def snapshot(self) -> RunReport:
         """Согласованный срез собранного. Участок БЕЗ ОЖИДАНИЯ — это условие правильности.
@@ -3393,6 +3512,13 @@ def print_report(r: RunReport) -> int:
     В пакетном прогоне разница была секундами и терялась в допуске; у службы между ними
     лежит весь расчёт — замер 2026-08-06: 25 секунд, — и если за это время пересекалась
     граница 5м, отчёт печатал отставание, которого не было. Разбор — в `taken_at_ms`.
+
+    ⚠⚠ НУМЕРАЦИЯ РАЗДЕЛОВ ВЫПРАВЛЕНА 2026-08-23. Была сломана трижды сразу: ДВА разных
+    раздела носили номер «4б» («ЗАПАДАНИЕ» и «ЗАДАЧИ СБОРА»), раздела «2» не было
+    вовсе, а порядок печати шёл 4 → 4б → 4а → 4в → 5 → 6 → 5б → 5в → 7. Отчёт — тот
+    самый артефакт, который §7.5 и §7.6 требуют делать проверяемым БЕЗ ЧТЕНИЯ КОДА, а
+    ориентироваться в нём по номерам было нельзя: владелец не может сослаться на раздел,
+    которых два. Теперь номера идут подряд, 0..15, в порядке печати.
     """
     now_ms = r.taken_at_ms
     print()
@@ -3510,7 +3636,7 @@ def print_report(r: RunReport) -> int:
         print(f"   ОТСТАЁТ: {s}")
     print(f"   баров вне сетки в засеве: {len(offgrid_seed)}")
 
-    print("\n3. ПРОПУСКИ — молчание запрещено (§4.3)")
+    print("\n2. ПРОПУСКИ — молчание запрещено (§4.3)")
     print(f"   рядов без данных: {len(missing)} из {len(r.series)}")
     for st in missing:
         assert st.not_ready is not None
@@ -3536,7 +3662,7 @@ def print_report(r: RunReport) -> int:
     late = sum(s.poll_late for s in r.series.values())
     not_ready = sum(s.poll_not_ready for s in r.series.values())
     catchups = sum(s.poll_catchups for s in r.series.values())
-    print("\n4. ЗАКРЫТАЯ СВЕЧА: ОПРОС ПРОТИВ ЧАСОВ (§6)")
+    print("\n3. ЗАКРЫТАЯ СВЕЧА: ОПРОС ПРОТИВ ЧАСОВ (§6)")
     print(f"   опросов сделано: {requests}, баров добрано: {polled}")
     print(f"   из них ДОГОНЯЮЩИХ (ряд отставал на момент запроса): {catchups}")
     print(f"   биржа опоздала с ожидаемой свечой: {late} из {requests}"
@@ -3545,7 +3671,7 @@ def print_report(r: RunReport) -> int:
     print(f"   отступ опроса POLL_OFFSET_S = {POLL_OFFSET_S} с — НЕ ЗАМЕРЕН, "
           f"верхняя оценка; строка «биржа опоздала» и есть его замер (Ж-1)")
 
-    print("\n4б. ЗАПАДАНИЕ: СКОЛЬКО БАР ИДЁТ ДО РАСЧЁТА (Т-0)")
+    print("\n4. ЗАПАДАНИЕ: СКОЛЬКО БАР ИДЁТ ДО РАСЧЁТА (Т-0)")
     lags = arrival_lag_survey(r)
     if not lags:
         print("   баров опросом не добрано — задержку мерить не на чем "
@@ -3580,10 +3706,13 @@ def print_report(r: RunReport) -> int:
     # Ж-11: после перехода на REST лимит биржи — главный отказ системы. Превышение даёт
     # HTTP 429, продолжение после него — бан по IP на срок до трёх суток. Лимит СПРОШЕН
     # у биржи, а не зашит: 2400/мин во всех прежних расчётах бюджета были «общеизвестным».
-    print(f"   возможности ccxt проверены до прогона: {r.capabilities_checked}, "
-          f"отсутствует 0 — иначе прогона бы не было")
+    print(f"   возможности ccxt СПРОШЕНЫ У КАРТЫ has до прогона: "
+          f"{r.capabilities_checked}, отсутствует {r.capabilities_missing}, "
+          f"эмулируется {r.capabilities_emulated}")
+    if r.capabilities_checked == 0:
+        print("   ⚠ карта возможностей НЕ СПРАШИВАЛАСЬ — строка выше ничего не значит")
 
-    print("\n4а. ЛИМИТ БИРЖИ (Ж-11)")
+    print("\n5. ЛИМИТ БИРЖИ (Ж-11)")
     if r.weight_reads == 0:
         print("   ⚠ заголовок X-MBX-USED-WEIGHT-1M не пришёл НИ РАЗУ — "
               "потребление не измерено, ноль ниже ничего не значит")
@@ -3602,7 +3731,7 @@ def print_report(r: RunReport) -> int:
               f"{', '.join(f'{k} {v}' for k, v in r.rest_errors.items())}")
     else:
         print("   отказов REST по классам: ни одного")
-    print("\n4в. СОСТАВ БИРЖИ ПОСРЕДИ ПРОГОНА (§5, Б-4)")
+    print("\n6. СОСТАВ БИРЖИ ПОСРЕДИ ПРОГОНА (§5, Б-4)")
     print(f"   рынки перечитаны: {r.markets_reloads} раз (каждые {MARKETS_RELOAD_S:.0f} с), "
           f"отказов {r.markets_reload_failures}")
     if not r.markets_reloads:
@@ -3617,7 +3746,7 @@ def print_report(r: RunReport) -> int:
     for s in r.delisted_mid_run:
         print(f"     {s}")
 
-    print("\n5. СДЕЛКИ И ПРОФИЛЬ (§5)")
+    print("\n7. СДЕЛКИ И ПРОФИЛЬ (§5)")
     if not WATCH_TRADES:
         print("   ПОТОК СДЕЛОК ВЫКЛЮЧЕН (Т-1, 2026-08-21): расчёт его не читает — "
               "профиль объёма и уторговка идут по СВЕЧАМ с 2026-08-12. Нули ниже — "
@@ -3645,11 +3774,11 @@ def print_report(r: RunReport) -> int:
         print(f"   из них добрано REST-догоном fromId: {r.trade_gaps_recovered}, "
               f"осталось потерянными: {r.trade_gaps_unrecovered}")
 
-    print("\n6. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
+    print("\n8. КАДРЫ ДЛЯ ПОВТОРА (§10.3)")
     print(f"   файлов parquet записано: {r.frames_written}")
     print(f"   карточек сохранено: {r.cards_written}")
 
-    print("\n5б. СВЕЧИ ПРОФИЛЯ ПОД ОКНА СТРУКТУР")
+    print("\n9. СВЕЧИ ПРОФИЛЯ ПОД ОКНА СТРУКТУР")
     print(f"   окон структур: {r.profile_windows}, "
           f"старше горизонта отброшено: {r.profile_windows_dropped}, "
           f"символов пропущено: {r.profile_symbols_skipped}")
@@ -3667,7 +3796,7 @@ def print_report(r: RunReport) -> int:
     if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
         print("   ⚠ окна есть, а участков профиля НЕТ — уровней не будет ни одного")
 
-    print("\n5в. АРХИВ СДЕЛОК (источником профиля НЕ является с 2026-08-12)")
+    print("\n10. АРХИВ СДЕЛОК (источником профиля НЕ является с 2026-08-12)")
     print(f"   структур в горизонте: {r.backfill_structures}, "
           f"старше горизонта отброшено: {r.backfill_structures_old}")
     print(f"   суток загружено: {r.backfill_days_loaded}, не получено: "
@@ -3681,7 +3810,7 @@ def print_report(r: RunReport) -> int:
               + ", ".join(f"{s} {n}" for s, n in by_sym))
     print(f"   сделок влито: {r.backfill_trades}")
 
-    print("\n7. ЛЕДЖЕР (§8 этап 7)")
+    print("\n11. ЛЕДЖЕР (§8 этап 7)")
     print(f"   сигналов записано ВПЕРВЫЕ: {r.signals_recorded}, "
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
@@ -3706,10 +3835,13 @@ def print_report(r: RunReport) -> int:
               f"цели» у них невозможен по построению; это знаменатель к «по цели 0%»")
     if r.pending_no_bars:
         print(f"   дорешать НЕЛЬЗЯ: без ряда ТФ в этом прогоне {r.pending_no_bars}")
+    if r.pending_degenerate_risk:
+        print(f"   ⚠ ВЫРОЖДЕН РИСК (стоп совпал со входом): "
+              f"{r.pending_degenerate_risk} — в R не измеряются, в леджер не пишутся")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())
-    print("\n7а. ЧТО СТОИТ ЗА СУММОЙ R — знаменатель (§4.3, стр. 9)")
+    print("\n12. ЧТО СТОИТ ЗА СУММОЙ R — знаменатель (§4.3, стр. 9)")
     print(f"   эмиссий всего: {emitted}")
     for kind in OutcomeKind:
         n = r.emitted_outcomes.get(kind.value, 0)
@@ -3727,7 +3859,7 @@ def print_report(r: RunReport) -> int:
               f"{med:.3f}% — это около {0.1 / med * 100:.0f}% риска на сделку")
 
     carried = sum(len(v) for v in r.map_carried.values())
-    print("\n7б. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
+    print("\n13. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
     print(f"   новых уровней: {r.map_added}, подтверждено прежних: {r.map_updated}")
     print(f"   снято по курсу (отработан/пробит): "
           f"{r.map_retired - r.map_stale_calc}")
@@ -3745,7 +3877,7 @@ def print_report(r: RunReport) -> int:
             print(f"     {sym:16} {c.timeframe:>3} {c.side:5} ПОК {c.price} "
                   f"(окно {c.from_ms}…{c.to_ms})")
 
-    print("\n4б. ЗАДАЧИ СБОРА — живы ли (§4.3)")
+    print("\n14. ЗАДАЧИ СБОРА — живы ли (§4.3)")
     print(f"   задач наблюдения умерло: {r.watch_deaths}, из них поднято заново: "
           f"{r.watch_restarts}")
     if r.watch_deaths > len(r.watch_failures):
@@ -3784,8 +3916,11 @@ def print_report(r: RunReport) -> int:
     violations = (r.watch_deaths
                   + len(stale) + len(missing) + unexplained + not_ready
                   + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale))
-    print("\n8. ИТОГ")
-    print(f"   деградаций отмечено: {log.degraded_count()}")
+    print("\n15. ИТОГ")
+    # ⚠ ЗА ЦИКЛ и ВСЕГО — два разных вопроса, и раздел «ИТОГ» задаёт первый. Здесь
+    # стоял только процессный счётчик, монотонно растущий у службы за сутки.
+    print(f"   деградаций отмечено ЗА ЭТОТ ЦИКЛ: {log.degraded_since_mark()} "
+          f"(всего с запуска процесса: {log.degraded_count()})")
     print(f"   нарушений приёмки: {violations}")
     print("=" * 78)
     return violations

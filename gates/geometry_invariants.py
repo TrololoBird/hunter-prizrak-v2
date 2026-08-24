@@ -40,8 +40,13 @@ from hunter.levels import (
     LevelState,
     LevelStatus,
     MappedLevel,
+    build_all,
 )
+from hunter.models import Bar, NotReady
 from hunter.pereprior import Pereprior, PPKind, PPSide
+from hunter.profile_source import CandleWindows
+from hunter.swings import detect as swings_detect
+from hunter.trading_range import detect as range_detect
 
 T0 = 1_700_000_000_000
 HOUR = 3_600_000
@@ -223,6 +228,56 @@ def planted() -> list[tuple[str, list[str]]]:
     ]
 
 
+def _bar(i: int, o: float, h: float, low: float, c: float, v: float = 100.0) -> Bar:
+    return Bar(open_ms=T0 + i * HOUR, open=o, high=h, low=low, close=c, volume=v)
+
+
+def built_levels() -> tuple[list[Level], list[str]]:
+    """Уровни, построенные НАСТОЯЩИМ конвейером: свинги → структуры → профиль → ПОК.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-23, И ЭТО ПОЧИНКА ОХВАТА, А НЕ НОВЫЙ ГЕЙТ. `check_level`
+    применялся ТОЛЬКО к уровням, собранным вручную функцией `level()` в этом же файле,
+    то есть проверял свои же литералы. `levels.build_level` гейт не звал НИ РАЗУ —
+    считалось, что его не позвать без гистограммы. Инвариант «зона внутри базы», ради
+    которого гейт и заведён после капслока владельца 2026-08-18 («ЕСЛИ зона выходит за
+    структуру то СТРУКТУРА ОПРЕДЛЕННА НЕ ВЕРНО»), на боевом расчёте не измерялся вовсе.
+
+    Гистограмма строится тем же классом, что в бою (`profile_source.CandleWindows`), из
+    синтетического ряда: живых данных в CI нет и быть не может (Binance отдаёт раннерам
+    `HTTP 451`), а ряд из литералов проходит РОВНО ТОТ ЖЕ путь — `swings.detect`,
+    `trading_range.detect`, `levels.build_all`, `volume_profile.build_tv`.
+
+    ⚠ `CandleWindows`, а не `TVWindows`: правило TV выбирает intrabar-ТФ по ДЛИНЕ окна и
+    на трёхсуточной структуре требует минуток, которых у синтетического ряда нет. Это
+    ограничение проверки, и оно названо: проверяется путь построения уровня, а не выбор
+    intrabar-ступени.
+
+    Ряд подобран так, чтобы структура ЗАКРЫЛАСЬ и ПОК был ОДНОЗНАЧЕН: шесть колебаний
+    между 100 и 104 с плотным объёмом у 102.4 (иначе `build_tv` законно отказывает
+    ничьёй за ПОК), затем выход вверх двумя телами и спокойный хвост.
+    """
+    shape: list[tuple[float, float, float, float, float]] = []
+    for _ in range(6):
+        shape.append((102.0, 104.0, 101.5, 103.0, 90.0))
+        shape.append((102.4, 102.6, 102.3, 102.5, 900.0))
+        shape += [(102.5, 103.4, 101.6, 102.2, 80.0)] * 4
+        shape.append((101.5, 102.6, 100.0, 101.0, 90.0))
+        shape += [(101.5, 102.4, 100.8, 102.0, 70.0)] * 5
+    shape.append((102.0, 109.0, 101.9, 108.5, 100.0))
+    shape.append((108.5, 113.0, 108.0, 112.0, 100.0))
+    shape += [(112.0, 113.0, 111.0, 112.0, 100.0)] * 30
+    bars: list[Bar] = [_bar(i, *v) for i, v in enumerate(shape)]
+
+    swings = swings_detect(bars)
+    if isinstance(swings, NotReady):
+        return [], [f"свинги не построены: {swings.reason}"]
+    scan = range_detect(bars, swings, "1h")
+    source = CandleWindows("TEST/USDT:USDT", Decimal("0.01"), bars, "1h")
+    built, unbuilt = build_all("TEST/USDT:USDT", {"1h": bars}, source, ("1h",),
+                               {"1h": scan})
+    return list(built), [u.reason for u in unbuilt]
+
+
 def main() -> int:
     violations: list[str] = []
     checked = 0
@@ -234,6 +289,23 @@ def main() -> int:
     for name, ps in real_pp_setups():
         checked += 1
         violations += [f"{name}: {v}" for v in check_pp(ps)]
+
+    # ⚠ УРОВНИ БОЕВОГО КОНВЕЙЕРА — здесь и только здесь `check_level` видит объект,
+    # которого не писал этот файл. Ноль построенных уровней — ПРОВАЛ, а не тишина:
+    # проверка тогда не состоялась (тот же довод, что у «нарушений 0» гейта чистоты,
+    # не открывшего ни одного файла).
+    live, refused = built_levels()
+    for lv in live:
+        checked += 1
+        violations += [f"уровень боевого конвейера {lv.side} {lv.price}: {v}"
+                       for v in check_level(lv)]
+    print(f"уровней БОЕВЫМ путём построено {len(live)}, отказов {len(refused)}")
+    for r in refused:
+        print(f"  отказ построения: {r}")
+    if not live:
+        print("ПРОВАЛ: боевым путём не построено ни одного уровня — инвариант зоны "
+              "на настоящем расчёте не измерен")
+        return 1
 
     # Контроль: подсаженное нарушение ОБЯЗАНО быть поймано. Молчащий здесь гейт
     # неотличим от гейта, который ничего не проверяет.

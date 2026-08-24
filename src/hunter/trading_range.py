@@ -589,6 +589,36 @@ class TradingRange(BaseModel):
     _start: dict[tuple[int, int, int], int] = PrivateAttr(default_factory=dict)
     """Память `start_index()`: отпечаток ряда → первый бар структуры. НЕ поле модели."""
 
+    _volume: dict[tuple[int, int, int], float] = PrivateAttr(default_factory=dict)
+    """Память `bar_volume()`: отпечаток ряда → сумма объёма баров структуры."""
+
+    def bar_volume(self, bars: list[Bar]) -> float:
+        """Сумма объёма БАРОВ СТРУКТУРЫ на этом ряду: считается по разу.
+
+        ⚠⚠ ПЕРЕНЕСЕНО СЮДА 2026-08-23 ИЗ МОДУЛЬНОГО СЛОВАРЯ `stop_volume._VOL_MEMO`.
+        Тот жил между вызовами, рос до 100 000 записей и очищался целиком — то есть
+        `stop_volume.py`, объявленный ЧИСТЫМ МОДУЛЕМ («часы, сеть и глобальное
+        состояние не трогаются»), держал ровно глобальное состояние. `gates/purity.py`
+        этого не видел: он разбирал одни импорты.
+
+        Причина памяти прежняя и остаётся в силе (замер py-spy 2026-08-17): одни и те
+        же накопления младшего ТФ пересуммировались для КАЖДОЙ структуры-хозяина
+        заново — сотни хозяев × сотни спанов × сотни баров за цикл.
+
+        Ключ ушёл вместе с модульным словарём: символ в нём был нужен потому, что ряды
+        РАЗНЫХ символов выровнены одним окном бэкфилла и по длине с краями совпадают.
+        Теперь владелец памяти — сама структура, а она принадлежит ряду своего символа
+        по построению, и спутать нечего. Отпечаток ряда в ключе остаётся по тому же
+        доводу, что у `box()`: `id(bars)` после сборки мусора достаётся другому списку.
+
+        Значение — та же последовательность сложений float, что и без памяти: тот же
+        отрезок в том же порядке, байт-в-байт то же число.
+        """
+        key = _series_key(bars)
+        if key not in self._volume:
+            self._volume[key] = sum(b.volume for b in structure_bars(self, bars))
+        return self._volume[key]
+
     def start_index(self, bars: list[Bar]) -> int:
         """Первый бар структуры на этом ряду: считается по разу.
 
@@ -1092,8 +1122,15 @@ def _attempt(
     Здесь, а не в `repeats`, потому что предикат зовётся на каждой точке.
     """
 
-    def repeats(price: float, first: float, first_index: int) -> bool:
-        del first_index  # подпись сохранена: см. MAX_PAIR_PCT
+    def repeats(price: float, first: float) -> bool:
+        """Повторяется ли цена на границе (стр. 13). Мерка — ПРОЦЕНТ цены первой точки.
+
+        ⚠ ТРЕТИЙ АРГУМЕНТ `first_index` УДАЛЁН 2026-08-23. Он принимался и выбрасывался
+        первой же строкой тела (`del first_index`), а вызывающие его считали и
+        передавали. Осталось от мерки ПО ATR своего ТФ на баре первой точки — та мерка
+        (`MAX_PAIR_ATR = 50.0`) отозвана 2026-08-21 вместе со своим замером, и с тех пор
+        индекс бара здесь не нужен ничему.
+        """
         return abs(price - first) / first * 100.0 <= pair_pct
 
     def upper_zone() -> tuple[float, float]:
@@ -1174,7 +1211,7 @@ def _attempt(
                 continue
             if kind is SwingKind.HIGH:
                 if len(hi_px) < 2:
-                    if hi_px and not repeats(price, hi_px[0], hi_idx[0]):
+                    if hi_px and not repeats(price, hi_px[0]):
                         # Стр. 13: границей называется цена, на которой хаи ПОВТОРЯЮТСЯ.
                         # Пара, разнесённая на десятки ATR, повтором не является —
                         # первая точка принадлежала другой формации и забывается, а
@@ -1259,7 +1296,7 @@ def _attempt(
                     hi_punct = price if hi_punct is None else max(hi_punct, price)
             else:
                 if len(lo_px) < 2:
-                    if lo_px and not repeats(price, lo_px[0], lo_idx[0]):
+                    if lo_px and not repeats(price, lo_px[0]):
                         # Зеркально верхней стороне: см. пояснение выше и `MAX_PAIR_PCT`.
                         lo_px[0], lo_idx[0] = price, index
                         lo_ord0 = ordinal + 1

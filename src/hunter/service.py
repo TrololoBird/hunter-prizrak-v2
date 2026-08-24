@@ -44,7 +44,12 @@ from typing import Any
 from . import clock, engine, levels, log, run
 from .config import Universe
 from .models import NotReady, RunReport, TradeWindows
-from .render import BARS_ON_CHART
+from .profile_source import WindowCache
+
+# ⚠ ИМПОРТ `render` УБРАН 2026-08-23. Служба брала оттуда `BARS_ON_CHART` — ширину
+# КАРТИНКИ бота — и передавала её расчёту рамкой `frame_bars`; рамка не резала состав
+# карты с 2026-08-21, а сам параметр удалён 2026-08-23. Служба 24/7 больше не зависит
+# от модуля рисования: расчёт и представление развязаны в этом месте.
 
 CYCLE_SECONDS = 300
 """Как часто пересчитывать. Число ВЫВЕДЕНО из §2.8, а не подобрано.
@@ -100,8 +105,8 @@ def _install_stop_handlers(stop: asyncio.Event) -> tuple[str, ...]:
     return tuple(installed)
 
 
-async def cycle(c: run.Collector, run_id: str,
-                horizon_days: int) -> tuple[RunReport, int]:
+async def cycle(c: run.Collector, run_id: str, horizon_days: int,
+                windows: WindowCache | None = None) -> tuple[RunReport, int]:
     """Один цикл расчёта на снимке. Возвращает отчёт цикла и число нарушений.
 
     Порядок шагов тот же, что у `hunter run`, и это не совпадение: расходиться им нельзя,
@@ -136,10 +141,13 @@ async def cycle(c: run.Collector, run_id: str,
     def _window(name: str, start_ns: int) -> None:
         c.report.stage_windows_ns[name] = (start_ns, clock.monotonic_ns())
 
-    t_snap = clock.monotonic_ns()
+    # ⚠ ОДНА ЗАСЕЧКА НА ШАГ, а не две. Здесь стояли `t_snap` и `snap_t0` — два чтения
+    # часов подряд под одно и то же начало; у шага `sources` две засечки успели
+    # РАЗОЙТИСЬ (`stage_ms` считался от одной, окно — от другой, и `insts` попадал в
+    # число, но не в окно). Две величины под одним именем «начало шага».
     snap_t0 = clock.monotonic_ns()
     report = c.snapshot()
-    report.stage_ms["snapshot"] = int((clock.monotonic_ns() - t_snap) / 1e6)
+    report.stage_ms["snapshot"] = int((clock.monotonic_ns() - snap_t0) / 1e6)
     _window("snapshot", snap_t0)
 
     # Долив архива — до сборки карточки: без него окна исторических структур не покрыты
@@ -180,6 +188,18 @@ async def cycle(c: run.Collector, run_id: str,
     await run.backfill_profile_bars(c.ex, uni, report, horizon_days,
                                     per_side=levels.LEVELS_PER_SIDE,
                                     detections=detections)
+    # ⚠⚠ ШАГ ЗАКРЫВАЕТСЯ ЗДЕСЬ, А НЕ ПОСЛЕ `sources` (правка 2026-08-23). Две ошибки
+    # разом стояли ниже по файлу:
+    #   * `stage_ms["backfill"]` считался как `now - started`, где `started` — начало
+    #     ЦИКЛА. То есть в «добор» входили и снимок, и построение источников, а сумма
+    #     стадий, которую печатает приёмка, была БОЛЬШЕ самого цикла;
+    #   * `_window("backfill", back_t0)` закрывал окно тем же поздним моментом, и оно
+    #     ЦЕЛИКОМ НАКРЫВАЛО окно `sources`. `run._print_stage_stalls` ищет шаг ПЕРВЫМ
+    #     совпавшим окном по порядку словаря и делит опоздание на длину окна — то есть
+    #     прибор, заведённый 2026-08-21 ровно ради верного приписывания заминки, сам
+    #     стоял на пересекающихся отрезках и приписывал добору чужое время.
+    report.stage_ms["backfill"] = int((clock.monotonic_ns() - back_t0) / 1e6)
+    _window("backfill", back_t0)
     # Источники строятся на цикле: им нужен `market_id` инструмента, а рынки живут на
     # объекте биржи, который задача перечитывания меняет именно здесь.
     # ⚠⚠ ПОСТРОЕНИЕ ИСТОЧНИКОВ УВЕДЕНО С ЦИКЛА СОБЫТИЙ 2026-08-21. Здесь стоял обычный
@@ -201,13 +221,12 @@ async def cycle(c: run.Collector, run_id: str,
     # ⚠ `ex.instrument` остаётся НА ЦИКЛЕ. Это чтение карты рынков, которую задача
     # перечитывания состава меняет тоже на цикле; забрав его в поток, мы бы читали
     # словарь, пока его переписывают. Лукап дешёвый, тяжёлое — ниже, в потоке.
-    t_src = clock.monotonic_ns()
+    src_t0 = clock.monotonic_ns()
     insts = {sym: inst for sym in uni.symbols
              if not isinstance(inst := c.ex.instrument(sym), NotReady)}
-    src_t0 = clock.monotonic_ns()
     sources: dict[str, TradeWindows] = await asyncio.to_thread(
-        run.build_sources, insts, report, uni)
-    report.stage_ms["sources"] = int((clock.monotonic_ns() - t_src) / 1e6)
+        run.build_sources, insts, report, uni, windows)
+    report.stage_ms["sources"] = int((clock.monotonic_ns() - src_t0) / 1e6)
     _window("sources", src_t0)
 
     # ⚠ СТАДИИ РАЗМЕЧЕНЫ ПО ЧАСАМ 2026-08-21 (Т-0). `cycle_seconds` отвечал только
@@ -215,15 +234,12 @@ async def cycle(c: run.Collector, run_id: str,
     # расчёт. Часы монотонные, те же, что у `cycle_seconds`.
     async def stage(name: str, fn: Callable[..., object], *a: object) -> object:
         t0 = clock.monotonic_ns()
-        st0 = clock.monotonic_ns()
         try:
             return await asyncio.to_thread(fn, *a)
         finally:
             report.stage_ms[name] = int((clock.monotonic_ns() - t0) / 1e6)
-            _window(name, st0)
+            _window(name, t0)
 
-    report.stage_ms["backfill"] = int((clock.monotonic_ns() - started) / 1e6)
-    _window("backfill", back_t0)
     await stage("frames", run.persist_frames, run_id, report)
     # ⚠ РАМКА КАДРА (2026-08-19). Служба строила уровни ЗА ВЕСЬ ГОРИЗОНТ, а сборка по
     # запросу в боте — только в кадре ответа. Две карты одного символа по разным
@@ -237,11 +253,14 @@ async def cycle(c: run.Collector, run_id: str,
     # баров своего ТФ), ни цели (`geometry.TARGET_STRUCTURE_FRAME_BARS`, те же 180), ни
     # лестница стр. 32 — вложенность идёт ровно на одну ступень ТФ (`NESTED_MAX_STEPS`),
     # а не на все младшие. Замер BTC: считаемых структур 102 из 1997 (5.1%).
-    t_decide = clock.monotonic_ns()
     dec_t0 = clock.monotonic_ns()
+    # ⚠ ЧЕТВЁРТЫМ АРГУМЕНТОМ СТОЯЛ `BARS_ON_CHART` — ширина КАРТИНКИ бота, приезжавшая
+    # сюда импортом из `render`. Рамка не резала состав карты с 2026-08-21, а параметр
+    # `frame_bars` удалён 2026-08-23; вместе с ним ушёл и импорт `render` из службы:
+    # расчёт больше не зависит от модуля рисования.
     decided = await asyncio.to_thread(run.decide_once, report, uni, sources,
-                                      BARS_ON_CHART, detections, horizon_days)
-    report.stage_ms["decide"] = int((clock.monotonic_ns() - t_decide) / 1e6)
+                                      detections, horizon_days)
+    report.stage_ms["decide"] = int((clock.monotonic_ns() - dec_t0) / 1e6)
     _window("decide", dec_t0)
     log.info("разбор рядов переиспользован", попаданий=detections.hits,
              посчитано=detections.misses)
@@ -275,6 +294,13 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
     # это предел памяти службы, а не глубина истории. Глубину с 2026-08-11 задаёт горизонт
     # отдельно по каждому ТФ (`run.seed_depth`), и она живёт на диске, а не в кольце.
     c = run.Collector(uni, seed_limit, keep_bars=seed_limit, horizon_days=horizon_days)
+    # ⚠ ВЛАДЕЛЕЦ ПАМЯТИ ДОРОГИХ ОКОН — СЛУЖБА (2026-08-23). Раньше эта память жила
+    # модульным словарём в `profile_source`, объявленном ЧИСТЫМ модулем: состояние
+    # переживало циклы, но принадлежало никому и в подписях не значилось. Теперь оно
+    # рождается здесь — ровно там, где живёт дольше одного цикла, — и передаётся вниз.
+    # Разовый прогон (`hunter run`) и повтор кэша не получают, и это их правильность:
+    # у них один цикл, а переживший расчёт объект был бы состоянием между прогонами.
+    windows = WindowCache()
     stop_signals = _install_stop_handlers(c.stop)
     log.info("служба запускается", такт_с=cycle_seconds, циклов=max_cycles or "без предела",
              сигналы_остановки=",".join(stop_signals) or "НИ ОДНОГО")
@@ -291,7 +317,7 @@ async def serve(uni: Universe, seed_limit: int, horizon_days: int, run_id: str,
             # печатается с типом и текстом. Остановка по сигналу (CancelledError)
             # проходит насквозь: это не сбой цикла, а приказ службе.
             try:
-                report, violations = await cycle(c, run_id, horizon_days)
+                report, violations = await cycle(c, run_id, horizon_days, windows)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

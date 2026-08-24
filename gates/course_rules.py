@@ -32,6 +32,7 @@ from decimal import Decimal
 from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
+from hunter.figures import pennant
 from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_setup, build_targets
 from hunter.levels import (
     Level,
@@ -43,9 +44,10 @@ from hunter.levels import (
     status,
     stop_anchor,
 )
-from hunter.models import Bar
+from hunter.models import Bar, NotReady
 from hunter.outcome import OutcomeKind, resolve
-from hunter.swings import ZIGZAG_DEPTH
+from hunter.priority import Priority
+from hunter.swings import ZIGZAG_DEPTH, TrendDirection
 from hunter.swings import detect as detect_swings
 from hunter.trading_range import MIN_BOUNDARY_POINTS, BoundaryZone
 from hunter.trading_range import detect as detect_ranges
@@ -143,6 +145,33 @@ def c_breakout_is_flipped() -> tuple[object, object]:
     """Стр. 43: пробитый уровень становится противоположным, лимитки по нему сняты."""
     b = bars((100, 101, 99, 100), (97, 97.5, 96, 96.5), (96, 96.5, 95, 95.5))
     return status(level(98.0), b).state, LevelState.FLIPPED
+
+
+def c_flipped_level_changes_side() -> tuple[object, object]:
+    """Стр. 43 дословно: «Уровень лонг/шорт менятся для нас на противоположный».
+
+    ⚠ Случай добавлен 2026-08-24, потому что правило было НАПИСАНО и НЕ ИСПОЛНЯЛОСЬ.
+    `Level.flipped()` существовал с давних пор и не вызывался НИ ОТКУДА: единственное
+    упоминание стояло в докстроке `EntryRule.RETEST_FLIPPED`, которая УТВЕРЖДАЛА, что
+    уровень «уже другой стороны». На свежих данных 2026-08-24 в этом состоянии было
+    56 уровней из 132 (42%), и каждый предъявлялся владельцу СТАРОЙ стороной, тогда
+    как соседняя строка той же карточки писала «вход по ретесту в ДРУГУЮ сторону».
+
+    Три плеча, и все нужны:
+      * пробитый — сторона перевёрнута;
+      * активный — сторона НЕ трогается (иначе прибор переворачивает всё подряд);
+      * сторона РОЖДЕНИЯ (`level.side`) остаётся прежней и у пробитого: по ней
+        считается всё «на момент», и подмена задним числом сменила бы историю.
+    """
+    b = bars((100, 101, 99, 100), (97, 97.5, 96, 96.5), (96, 96.5, 95, 95.5))
+    lvl = level(98.0, LevelSide.LONG)
+    broken = MappedLevel(level=lvl, status=status(lvl, b))
+    calm = mapped(level(98.0, LevelSide.LONG))
+    return (
+        (broken.status.state.value, broken.current.side.value, broken.level.side.value,
+         calm.current.side.value),
+        ("flipped", "short", "long", "long"),
+    )
 
 
 def c_late_return_no_bodies_is_puncture() -> tuple[object, object]:
@@ -371,6 +400,61 @@ def c_outcome_not_filled() -> tuple[object, object]:
     return (res.kind, res.r), (OutcomeKind.NOT_FILLED, None)
 
 
+def c_flipped_level_is_target_of_new_side() -> tuple[object, object]:
+    """Стр. 43 + стр. 24: пробитый уровень — уровень НОВОЙ стороны, и как встречный он ЦЕЛЬ.
+
+    ⚠ Добавлен 2026-08-24 вместе с `levels.level_as_of` (разбор критической ошибки целей
+    по требованию владельца). До этого дня пул целей выбрасывал пробитые уровни целиком,
+    как отработанные, — читал стр. 43 («Уровень лонг/шорт менятся для нас на
+    противоположный») как стр. 25 («мы этот уровень удаляем»). Пробитый вниз лонг-уровень
+    — это сопротивление НАД ценой, то есть ровно «шорт уровень», который стр. 24 называет
+    целью лонга.
+
+    Три плеча:
+      * ЛОНГ-уровень на 118, пробитый к as_of (стал шортом), — цель лонга от 100;
+      * тот же уровень, но АКТИВНЫЙ (сторона всё ещё лонг), — НЕ цель: сторона своя;
+      * тот же уровень, но ОТРАБОТАННЫЙ к as_of, — НЕ цель: стр. 25 удаляет, а не
+        переворачивает.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    as_of = src.created_at_ms
+    born = level(118.0, LevelSide.LONG, created=1, born_ms=T0)
+    flipped = mapped(born, LevelState.FLIPPED, resolved_at_ms=as_of - STEP)
+    active = mapped(born)
+    worked = mapped(born, LevelState.WORKED_OFF, resolved_at_ms=as_of - STEP)
+    return (
+        (tuple(float(t.price) for t in build_targets(src, (flipped,))),
+         tuple(float(t.price) for t in build_targets(src, (active,))),
+         tuple(float(t.price) for t in build_targets(src, (worked,)))),
+        ((118.0,), (), ()),
+    )
+
+
+def c_targets_as_of_decision() -> tuple[object, object]:
+    """Дата отбора целей = МОМЕНТ РЕШЕНИЯ, а не рождение уровня (правка 2026-08-24).
+
+    Сигнал уходит в леджер с датой записи; цели, отобранные по миру на момент рождения
+    уровня (на живых данных — медиана 101 бар в прошлом), были бы второй сущностью под
+    именем «момент сигнала». Два плеча:
+      * цель, родившаяся ПОСЛЕ рождения уровня, но ДО решения, — законна (стр. 24
+        живёт в мире, где уровни продолжают рождаться: «ближайшего нового
+        сформированного уровня»);
+      * цель, родившаяся ПОСЛЕ решения, — не существует и целью не является.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    later = level(118.0, LevelSide.SHORT, created=40,
+                  born_ms=src.created_at_ms + 10 * STEP)
+    as_of_yes = src.created_at_ms + 20 * STEP
+    as_of_no = src.created_at_ms + 5 * STEP
+    return (
+        (tuple(float(t.price) for t in
+               build_targets(src, (mapped(later),), as_of_ms=as_of_yes)),
+         tuple(float(t.price) for t in
+               build_targets(src, (mapped(later),), as_of_ms=as_of_no))),
+        ((118.0,), ()),
+    )
+
+
 def c_target_not_from_future() -> tuple[object, object]:
     """Стр. 23: уровня не существует, пока цена не вышла из структуры.
 
@@ -408,6 +492,48 @@ def c_target_retired_later_still_counts() -> tuple[object, object]:
                    LevelState.WORKED_OFF, resolved_at_ms=src.created_at_ms + STEP * 10)
     got = build_targets(src, (later,))
     return tuple(float(t.price) for t in got), (118.0,)
+
+
+def c_target_outside_own_structure() -> tuple[object, object]:
+    """Стр. 24: цель — ДРУГОЙ уровень, а не цена внутри своей же базы.
+
+    ⚠ Случай добавлен 2026-08-24 по замечанию владельца о корректности расчёта целей.
+    Замер того дня (Crypto.com, 23 символа, ТФ 15м/1ч/4ч по 300 баров): у 4 целей из 4,
+    взятых из пула, цена цели лежала ВНУТРИ коробки уровня, от которого открывалась
+    сделка. Пример: AAVE 1ч, структура входа 85.15…88.013, цель 87.983. Стоп при этом
+    ставится за ВСЮ эту структуру — то есть система рисковала целой базой ради куска
+    той же базы, и отсюда медиана РР 0.401 при курсовом «золотом стандарте 1к3».
+
+    Прежний фильтр мерил ЗОНОЙ (узкой полосой вокруг ПОК), а стоп — коробкой: две
+    разные мерки в одной сделке. Рисунок стр. 24 не оставляет выбора: уровень входа там
+    маленькая коробка внизу, «ЦЕЛЬ уровень того же тф» — отдельная коробка много выше.
+
+    Оба плеча обязательны:
+      * уровень ВНУТРИ коробки входа (89…111 у базы 90…110) целью НЕ становится;
+      * уровень СНАРУЖИ (118) — становится, иначе прибор просто запретил бы все цели.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)   # база 90…110
+    inside = mapped(level(105.0, LevelSide.SHORT, created=1, born_ms=T0))
+    outside = mapped(level(118.0, LevelSide.SHORT, created=1, born_ms=T0))
+    got = build_targets(src, (inside, outside))
+    return tuple(float(t.price) for t in got), (118.0,)
+
+
+def c_no_boundary_target_for_level_trade() -> tuple[object, object]:
+    """Стр. 19 — это ТОРГОВЛЯ ВО ФЛЕТЕ, и её тейк по границе сделке от уровня НЕ цель.
+
+    ⚠ Случай добавлен 2026-08-24 ПОСЛЕ СОБСТВЕННОЙ ОШИБКИ. В тот день я выдал границу
+    своей базы целью обычной сделки, опершись на дословную цитату стр. 19 («По верхней
+    границе – делаете тейк 50% - но не 100%»), и замер это подтверждал: сумма R по 132
+    уровням −50.33 → −16.22. Числа улучшились, а сделка подменилась: рисунок стр. 19
+    показывает ход ВНУТРИ коробки от границы к границе со входом У ГРАНИЦЫ, тогда как
+    `build_targets` обслуживает сделку стр. 24/30 со входом на ПОК законченного
+    накопления. Случай стоит здесь, чтобы правку не завели во второй раз.
+
+    Пул ПУСТ — целей нет вовсе, и это законный ответ (§4.3), а не пробел.
+    """
+    got = build_targets(level(100.0, LevelSide.LONG, created=5), ())
+    return tuple(float(t.price) for t in got), ()
 
 
 def c_target_structure_in_frame() -> tuple[object, object]:
@@ -528,6 +654,71 @@ def c_two_candles_are_time_not_index() -> tuple[object, object]:
     return (ev.kind if ev else None), BreachKind.UNRESOLVED
 
 
+def c_pennant_stop_has_margin() -> tuple[object, object]:
+    """Стр. 58: «Стоп всегда прячем за всю структуру с запасом 1-3%».
+
+    что из чего следует: край структуры и сторона фигуры → цена стопа. Слово «всегда»
+    безусловно, и стр. 58 — это страница самого треугольника, а не соседняя тема.
+
+    ⚠ Случай ЗАВЕДЁН 2026-08-24 по дефекту, а не для полноты. `figures.pennant` отдавал
+    наружу только `stop_anchor` — край структуры, — и запаса к нему не прибавлял НИКТО:
+    докстрока модуля поручала это `geometry`, где слова «вымпел» нет ни разу. Карточка
+    печатала край структуры под словом «стоп»: на живом прогоне 2026-08-24 так стояли
+    все 48 вымпелов. Это третий случай одного класса — тот же дефект чинился у уровня
+    2026-08-18 и у ПП 2026-08-19.
+
+    Два плеча, чтобы прибор не был заперт в одном ответе, и они же ловят обращение
+    правила: у ЛОНГА стоп ниже нижнего края (92 − 2.76 = 89.24), у ШОРТА выше верхнего
+    (108 + 3.24 = 111.24). Пропажа запаса даёт 92 и 108, обмен сторон — 89.24 и 111.24
+    местами; ни то, ни другое не совпадает с ожиданием.
+
+    Тренд подаётся `senior`-приоритетом: своего у короткого ряда нет (стр. 47 разрешает
+    брать его со старшего ТФ), а без тренда стр. 57 вымпела не даёт вовсе.
+    """
+    b = _pair_structure(112.0, 110.0, 88.0, 90.0, 108.0, 92.0)
+    sw = detect_swings(b)
+    st = detect_ranges(b, sw, TF).closed[0]  # type: ignore[arg-type]
+    long_pen = pennant(st, sw,  # type: ignore[arg-type]
+                       Priority(timeframe="1d", direction=TrendDirection.UP, holds_for=3))
+    short_pen = pennant(st, sw,  # type: ignore[arg-type]
+                        Priority(timeframe="1d", direction=TrendDirection.DOWN, holds_for=3))
+    assert not isinstance(long_pen, NotReady) and not isinstance(short_pen, NotReady)
+    return (
+        (long_pen.stop_anchor, round(long_pen.stop_price, 6),
+         short_pen.stop_anchor, round(short_pen.stop_price, 6)),
+        (92.0, 89.24, 108.0, 111.24),
+    )
+
+
+def c_no_target_names_reason() -> tuple[object, object]:
+    """Сделка без цели НАЗЫВАЕТ причину со знаменателем (§4.3).
+
+    Заведено 2026-08-24 по слову владельца: «Сделок без цели быть не может. Это
+    означает ошибка в расчетах, геометрии, структурах, поках, объемах или во всем
+    вместе!» Карточка печатала «целей нет» без причины, и пустой пул уровней старших
+    ТФ (отказы покрытия профиля) читался как свойство рынка.
+
+    Три плеча, чтобы прибор не был заперт в одном ответе:
+      * пул пуст → причина «в карте нет ни одного другого уровня»;
+      * пул есть, но встречной стороны нет → причина называет живых и их сторону;
+      * годная цель есть → целей 1, причина ПУСТА.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    empty = build_setup(src)
+    same_side = build_setup(src, (mapped(level(118.0, LevelSide.LONG, created=1,
+                                               born_ms=T0)),))
+    with_target = build_setup(src, (mapped(level(118.0, LevelSide.SHORT, created=1,
+                                                 born_ms=T0)),))
+    return (
+        (len(empty.targets), empty.no_target_reason,
+         len(same_side.targets), same_side.no_target_reason,
+         len(with_target.targets), with_target.no_target_reason),
+        (0, "в карте нет ни одного другого уровня",
+         0, "живых уровней 1, встречной стороны среди них нет",
+         1, ""),
+    )
+
+
 CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("прокол идёт в стоп с 3-й СКВОЗНОЙ точки (стр. 18)", c_puncture_needs_third_point),
     ("прокол — отработка уровня (стр. 6, 55)", c_puncture),
@@ -535,6 +726,7 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("цена за уровень не заходила — уровень жив (стр. 23)", c_no_event),
     ("прокол → уровень отработан (стр. 25)", c_puncture_is_worked_off),
     ("пробой → уровень флипнут (стр. 43)", c_breakout_is_flipped),
+    ("флипнутый уровень СМЕНИЛ сторону (стр. 43)", c_flipped_level_changes_side),
     ("поздний возврат без тел — прокол по классике (стр. 6 + §0.1)",
      c_late_return_no_bodies_is_puncture),
     ("поздний возврат С телом — вердикта нет (стр. 55)",
@@ -547,6 +739,13 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("исход по стопу = −1R (стр. 9)", c_outcome_stop),
     ("стоп и цель в одном баре — вердикта нет (§4.3)", c_outcome_ambiguous),
     ("цена не дошла до входа — это не убыток (стр. 30)", c_outcome_not_filled),
+    ("цель — ДРУГОЙ уровень, не цена внутри своей базы (стр. 24)",
+     c_target_outside_own_structure),
+    ("тейк по границе — это флэт стр. 19, а не сделка от уровня",
+     c_no_boundary_target_for_level_trade),
+    ("пробитый уровень — цель НОВОЙ стороной (стр. 43, 24)",
+     c_flipped_level_is_target_of_new_side),
+    ("цели отбираются на момент РЕШЕНИЯ", c_targets_as_of_decision),
     ("цель не может появиться позже сигнала (стр. 23)", c_target_not_from_future),
     ("снятый уровень целью не является (стр. 25, 43)", c_target_not_retired),
     ("снятый ПОЗЖЕ сигнала — целью являлся (стр. 25)", c_target_retired_later_still_counts),
@@ -558,6 +757,10 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("стоп прячется ЗА якорь с запасом, а не на его цене (стр. 18 + 33/58)",
      c_stop_hidden_beyond_anchor),
     ("«следующая свеча» — это время, а не индекс (стр. 55)", c_two_candles_are_time_not_index),
+    ("стоп вымпела — за структуру С ЗАПАСОМ, а не на её краю (стр. 58)",
+     c_pennant_stop_has_margin),
+    ("сделка без цели называет ПРИЧИНУ со знаменателем (§4.3)",
+     c_no_target_names_reason),
 ]
 
 

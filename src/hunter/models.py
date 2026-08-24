@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Protocol
@@ -117,6 +119,87 @@ class NotReady(BaseModel):
         return f"не готово: {self.reason}"
 
 
+class LruCache[K, V]:
+    """Память с вытеснением самого давнего. ОДНА реализация на проект.
+
+    ⚠⚠ ЗАВЕДЕНА 2026-08-23: `OrderedDict` + `move_to_end` + `popitem(last=False)` были
+    выписаны ТРИЖДЫ — окна профиля (`profile_source.WindowCache`), суточные кадры и их
+    свёртки (`archive.WindowSource._open`, `._grouped`). Три копии одного механизма
+    расходятся не «если», а «через сколько дней»; здесь их одна.
+
+    ⚠ Ёмкость у каждого потребителя СВОЯ и остаётся его решением: она выведена из
+    размера хранимого, а не из механизма. Сгруппированные сутки в сотни раз меньше
+    сырых, и держать их можно годами окон — это довод про данные, а не про кэш.
+
+    ⚠ Класс держит состояние В ЭКЗЕМПЛЯРЕ, а не в модуле. Разница существенна для §10.3:
+    модульный словарь — глобальное состояние расчёта (запрещено, ловится
+    `gates/purity.py`), а память, принадлежащая объекту, живёт ровно столько, сколько
+    её владелец, и видна в его подписи.
+    """
+
+    __slots__ = ("_items", "_max")
+
+    def __init__(self, max_items: int) -> None:
+        if max_items <= 0:
+            raise ValueError(f"ёмкость памяти обязана быть больше нуля, дано {max_items}")
+        self._items: OrderedDict[K, V] = OrderedDict()
+        self._max = max_items
+
+    def get(self, key: K) -> V | None:
+        """Значение по ключу либо `None`. Попадание освежает запись."""
+        hit = self._items.get(key)
+        if hit is not None:
+            self._items.move_to_end(key)
+        return hit
+
+    def put(self, key: K, value: V) -> None:
+        """Положить значение, вытеснив самое давнее при переполнении."""
+        self._items[key] = value
+        while len(self._items) > self._max:
+            self._items.popitem(last=False)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def percentile_rank(values: Sequence[float], x: float) -> float:
+    """Доля значений НЕ ВЫШЕ `x`, в процентах. §4.1: порог — перцентиль своей истории.
+
+    ⚠ Вынесена 2026-08-23 из двух мест, где одна и та же формула была выписана слово в
+    слово: `factors.band_narrowing` (место ширины полос среди прошлых ширин) и
+    `stop_volume.StopVolumeSet.density_percentile` (место плотности среди структур
+    прогона). Обе величины предъявляются, обе меряют одно и то же понятие, и разойтись
+    им ничто не мешало.
+
+    ⚠ Пустая выборка — `ValueError`, а не ноль и не сто: «места среди ничего» не
+    существует, а подставленное число читалось бы как измеренное (§4.3). Вызывающий
+    обязан отсечь пустоту раньше — у обоих потребителей она отсечена по построению.
+    """
+    if not values:
+        raise ValueError("перцентильный ранг по пустой выборке не определён")
+    return sum(1 for v in values if v <= x) / len(values) * 100
+
+
+def all_finite(*values: float) -> bool:
+    """Все значения конечны: ни NaN, ни бесконечности.
+
+    ⚠ Вынесено 2026-08-23 из двух `__post_init__` подряд, где одна и та же цепочка
+    `math.isfinite(...) and ...` была выписана дважды — на пять полей и на восемь.
+
+    ⚠⚠ ЧЕГО ЭТА ФУНКЦИЯ НЕ ЗАМЕНЯЕТ, и это названо, чтобы следующий читатель не свёл
+    сюда лишнего:
+      * `check.py` проверяет бары НЕЗАВИСИМЫМ обходом и с ГЕОМЕТРИЕЙ в том же условии —
+        это ОРАКУЛ, вторая реализация нарочно, и слить её значило бы уничтожить
+        проверку (правило исключения для `gates/`, тот же довод);
+      * `factors._absent` — ДРУГОЙ предикат: `None` или NaN. Он про отсутствие значения
+        индикатора, а не про конечность числа, и совпадает с этим лишь наполовину.
+    """
+    return all(math.isfinite(v) for v in values)
+
+
 @dataclass(slots=True, frozen=True)
 class Bar:
     """Свеча. Не модель pydantic, и это РЕСУРСНОЕ решение с названной ценой.
@@ -157,9 +240,7 @@ class Bar:
         # написаны сравнениями, а сравнение с NaN всегда ложно — NaN-бар проходил их
         # МОЛЧА и дальше отравлял min/max/суммы всего конвейера, где NaN не падает,
         # а тихо съедает результат.
-        if not (math.isfinite(self.open) and math.isfinite(self.high)
-                and math.isfinite(self.low) and math.isfinite(self.close)
-                and math.isfinite(self.volume)):
+        if not all_finite(self.open, self.high, self.low, self.close, self.volume):
             raise ValueError(
                 f"бар {self.open_ms}: неконечное значение "
                 f"(o={self.open} h={self.high} l={self.low} c={self.close} "
@@ -175,8 +256,12 @@ class Bar:
                 f"бар {self.open_ms}: high/low не накрывают open/close "
                 f"(o={self.open} h={self.high} l={self.low} c={self.close})"
             )
-        if self.high < self.low:
-            raise ValueError(f"бар {self.open_ms}: high < low")
+        # ⚠ ЗДЕСЬ СТОЯЛА ПРОВЕРКА `high < low` — НЕДОСТИЖИМАЯ, снята 2026-08-23.
+        # Условие выше её поглощает: после него `high >= max(open, close)` и
+        # `low <= min(open, close)`, а `max(o, c) >= min(o, c)` тождественно, значит
+        # `high >= low` уже доказано. Проверка выглядела защитой, ею не являясь, — и
+        # именно её сообщение («high < low») читатель ждал бы на битом баре, тогда как
+        # он всегда получает сообщение предыдущей.
 
 
 @dataclass(slots=True, frozen=True)
@@ -226,11 +311,9 @@ class BarDetail:
     def __post_init__(self) -> None:
         # Та же проверка конечности, что у `Bar`, и по той же причине: остальные
         # проверки — сравнения, а сравнение с NaN всегда ложно.
-        if not (math.isfinite(self.open) and math.isfinite(self.high)
-                and math.isfinite(self.low) and math.isfinite(self.close)
-                and math.isfinite(self.volume) and math.isfinite(self.quote_volume)
-                and math.isfinite(self.taker_buy_base)
-                and math.isfinite(self.taker_buy_quote)):
+        if not all_finite(self.open, self.high, self.low, self.close, self.volume,
+                          self.quote_volume, self.taker_buy_base,
+                          self.taker_buy_quote):
             raise ValueError(f"бар {self.open_ms}: неконечное значение в полях детали")
         if self.close_ms <= self.open_ms:
             raise ValueError(
@@ -540,6 +623,22 @@ class TradeHistogram(BaseModel):
     qty_by_bin: dict[int, float] = Field(default_factory=dict)
     count_by_bin: dict[int, int] = Field(default_factory=dict)
     trades_seen: int = 0
+    """Сколько СДЕЛОК легло в гистограмму. Ноль у свечного источника — и это правда.
+
+    ⚠⚠ СЮДА КЛАЛИ ЧИСЛО БАРОВ (исправлено 2026-08-23). `profile_source.CandleWindows`
+    писал `h.trades_seen = int(k0s.size)` — количество принятых СВЕЧЕЙ, — а
+    `count_by_bin` при этом не заполнял вовсе. То есть поле с человеческим именем
+    «сделок» несло другую величину, а инвариант «сумма `count_by_bin` равна
+    `trades_seen`» держался только у потокового источника. Число свечей теперь живёт в
+    `bars_seen`, и оба поля отвечают за то, как называются."""
+
+    bars_seen: int = 0
+    """Сколько СВЕЧЕЙ разложено в гистограмму свечным источником профиля.
+
+    Ненулевое ровно там, где `trades_seen` нулевое, и наоборот: источник у окна один.
+    Заведено 2026-08-23 вместе с разделением величин — до него обе жили под именем
+    «сделок»."""
+
     qty_seen: float = 0.0
     """Контроль: сумма по сырью до агрегации. Сверяется с суммой по бинам."""
 
@@ -601,6 +700,7 @@ class TradeHistogram(BaseModel):
         for idx, n in other.count_by_bin.items():
             self.count_by_bin[idx] = self.count_by_bin.get(idx, 0) + n
         self.trades_seen += other.trades_seen
+        self.bars_seen += other.bars_seen
         self.qty_seen += other.qty_seen
         if other.first_ms is not None:
             self.first_ms = (other.first_ms if self.first_ms is None
@@ -614,6 +714,7 @@ class TradeHistogram(BaseModel):
         self.qty_by_bin.clear()
         self.count_by_bin.clear()
         self.trades_seen = 0
+        self.bars_seen = 0
         self.qty_seen = 0.0
         self.first_ms = None
         self.last_ms = None
@@ -670,11 +771,15 @@ class BarBinnedTrades(BaseModel):
                     f"{self.symbol}: корзина архива {bucket} не ложится на сетку "
                     f"{self.bucket_ms} — окно структуры пришлось бы округлять"
                 )
-            own = bucket - bucket % self.bucket_ms
-            self.qty.setdefault(own, {})
-            self.cnt.setdefault(own, {})
-            self.qty[own][idx] = self.qty[own].get(idx, 0.0) + qty
-            self.cnt[own][idx] = self.cnt[own].get(idx, 0) + cnt
+            # ⚠ ЗДЕСЬ СТОЯЛО `own = bucket - bucket % self.bucket_ms` — вычисление-
+            # пустышка, снято 2026-08-23: строкой выше ненулевой остаток уже поднял
+            # исключение, значит `bucket % self.bucket_ms` здесь тождественно ноль и
+            # `own` всегда равно `bucket`. Имя `own` при этом намекало на приведение к
+            # своей сетке, которого не происходило.
+            self.qty.setdefault(bucket, {})
+            self.cnt.setdefault(bucket, {})
+            self.qty[bucket][idx] = self.qty[bucket].get(idx, 0.0) + qty
+            self.cnt[bucket][idx] = self.cnt[bucket].get(idx, 0) + cnt
             self.trades_seen += cnt
             self.qty_seen += qty
 
@@ -1132,8 +1237,17 @@ class RunReport(BaseModel):
     началом и концом прогона."""
 
     capabilities_checked: int = 0
-    """Возможностей ccxt проверено перед прогоном. Знаменатель к «отсутствует 0»:
-    без него строка вердикта неотличима от непроведённой проверки."""
+    """Возможностей ccxt СПРОШЕНО У КАРТЫ `has` перед прогоном. Знаменатель: без него
+    строка вердикта неотличима от непроведённой проверки."""
+
+    capabilities_missing: int = 0
+    capabilities_emulated: int = 0
+    """Сколько из них карта НЕ объявила и сколько объявила эмулируемыми.
+
+    ⚠ Заведены 2026-08-23. Приёмка печатала «отсутствует 0» ЛИТЕРАЛОМ в тексте строки —
+    число проверенных бралось из отчёта, а число отсутствующих было вписано в формат.
+    Довод «иначе прогона бы не было» верен по построению `open()`, но безусловно
+    напечатанное утверждение в этом проекте уже врало однажды (2026-08-03)."""
 
     rest_rate_limited: int = 0
     """Ответов «лимит превышен» (`RateLimitExceeded`/`DDoSProtection`)."""
@@ -1152,6 +1266,14 @@ class RunReport(BaseModel):
 
     pending_no_bars: int = 0
     """Сигналов, которые дорешать нельзя: ряда их ТФ в этом прогоне нет."""
+
+    pending_degenerate_risk: int = 0
+    """Сигналов с ВЫРОЖДЕННЫМ риском: стоп совпал со входом, единицы R не существует.
+
+    ⚠ Заведено 2026-08-23 вместе с `OutcomeKind.UNMEASURABLE`. До того такой сигнал
+    получал исход `not_filled` («цена так и не дошла до входа»), то есть отказ прибора
+    выдавался за вердикт о рынке и портил долю «мимо входа». Ноль здесь — законное
+    состояние; ненулевое значение означает дефект геометрии, а не рынка."""
 
     states_recorded: int = 0
     """Состояний незакрытых сделок записано в леджер (`not_filled`/`open`, схема v4,

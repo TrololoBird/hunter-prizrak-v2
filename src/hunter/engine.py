@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
-from .bars import TIMEFRAME_MS
+from .bars import TF_RANK, TIMEFRAME_MS
 from .geometry import TF_ORDER, Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
@@ -187,6 +187,15 @@ class Decision(BaseModel):
     @property
     def emitted(self) -> bool:
         return self.setup is not None
+
+    @property
+    def current(self) -> Level:
+        """Уровень, каким он стоит СЕЙЧАС: у пробитого сторона другая (стр. 43).
+
+        Та же величина, что `MappedLevel.current`, и та же единственная формула
+        `levels.level_now`. `self.level` остаётся стороной РОЖДЕНИЯ — по ней считается
+        всё «на момент», и подменять её нельзя."""
+        return levels.level_now(self.level, self.status)
 
 
 class PPSignal(BaseModel):
@@ -481,10 +490,10 @@ def _fill_pennants(
     дал, а таких по замеру 2026-08-22 около 43% сужений и порядка процента всех структур.
     """
     for tf, read in list(reads.items()):
-        if tf not in TF_ORDER:
+        if tf not in TF_RANK:
             continue
         bars = series.get(tf) or []
-        higher = [s for s in TF_ORDER[TF_ORDER.index(tf) + 1:]
+        higher = [s for s in TF_ORDER[TF_RANK[tf] + 1:]
                   if s in reads and series.get(s)]
         closed = [
             _pennant_of(acc, read.swings,
@@ -518,7 +527,6 @@ def decide(
     series: dict[str, list[Bar]],
     trades: TradeWindows | None,
     timeframes: tuple[str, ...],
-    frame_bars: int | None = None,
     detections: Detections | None = None,
     horizon_days: int = 0,
 ) -> SymbolDecision:
@@ -537,17 +545,20 @@ def decide(
     tfs = tuple(sorted(timeframes, key=lambda t: TIMEFRAME_MS.get(t, 0)))
     reads, unreadable = read_series(series, tfs, symbol=symbol, detections=detections)
     scans = {tf: r.scan for tf, r in reads.items()}
-    # `frame_bars` — рамка кадра ответа для сборки по запросу (2026-08-18, п. 3 приказа
-    # владельца); боевой прогон передаёт None и строит всё — смысл в `levels.build_all`.
+    # ⚠ `frame_bars` УДАЛЁН 2026-08-23: рамка кадра ответа не резала состав карты с
+    # 2026-08-21, и параметр только передавался дальше, где его выбрасывали `del`-ом.
     frozen, unbuilt = levels.build_all(symbol, series, trades, tfs, scans,
                                        {tf: r.swings for tf, r in reads.items()},
-                                       frame_bars=frame_bars,
                                        horizon_days=horizon_days)
     # `scans` третьим аргументом — иначе `LevelStatus.playout` знает только картины 1,
     # 3, 4 стр. 28 и закреп без ретеста: картины 2, 5, 6 и 7 требуют разбора структур
     # того же ТФ, и без него страница читалась бы наполовину.
     mapped = levels.map_levels(frozen, series, scans)
     trends = {tf: r.trend for tf, r in reads.items()}
+    # «Сейчас» берётся у САМОГО РЯДА, не у часов — тот же приём и тот же довод, что у
+    # горизонта в `levels.build_all`: повтор обязан давать тот же результат на тех же
+    # кадрах. Правый край закрытых баров и есть момент решения.
+    now_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
 
     decisions: list[Decision] = []
     for m in mapped:
@@ -564,7 +575,12 @@ def decide(
             status=m.status,
             priority=pr,
             agreement=priority.agreement(m.level.side, pr),
-            setup=None if hold else geometry.build_setup(m.level, mapped),
+            # ⚠ Цели отбираются НА МОМЕНТ РЕШЕНИЯ — правый край закрытых баров, тот
+            # же `now_ms`, каким `build_all` резал горизонт (правка 2026-08-24, разбор
+            # в докстроке `geometry.build_targets`). До неё цели брались на момент
+            # РОЖДЕНИЯ уровня — на медиану 101 бар в прошлом от записи сигнала.
+            setup=None if hold else geometry.build_setup(
+                m.level, mapped, as_of_ms=now_ms),
             hold=hold,
             mtf_break=_mtf_break(m, series, reads, tfs),
             pressed=_pressed_note(m, reads, series),
@@ -584,7 +600,7 @@ def decide(
             pp_signals.append(PPSignal(
                 timeframe=tf, pp=pp,
                 setup=geometry.build_pp_setup(pp, opposite),
-                structure_note=_pp_structure_note(pp, r.scan),
+                structure_note=_pp_structure_note(pp, r.scan, series[tf]),
                 absorption=absorbed if not isinstance(absorbed, NotReady) else None,
                 absorption_missing=absorbed.reason if isinstance(absorbed, NotReady) else "",
             ))
@@ -596,19 +612,32 @@ def decide(
 
 
 
-def _pp_structure_note(pp: Pereprior, scan: RangeScan) -> str:
+def _pp_structure_note(pp: Pereprior, scan: RangeScan, bars: list[Bar]) -> str:
     """Подтверждение ПП структурой — стр. 53 (реестр, строка 5): закрытое накопление
     того же ТФ, сформированное ПОСЛЕ слома и опирающееся на зону ПП (лонг — над зоной,
-    шорт — под). Пусто — не найдено."""
+    шорт — под). Пусто — не найдено.
+
+    ⚠⚠ КОРОБКА ЗДЕСЬ ТЕПЕРЬ НАСТОЯЩАЯ (2026-08-23). Строка печатала слово «коробка» и
+    подставляла в него ЛИНИИ ДЕТЕКТОРА (`acc.lower.edge`, `acc.upper.edge`), тогда как с
+    2026-08-18 «коробка» в проекте — это ХАЙ…ЛОЙ свечей структуры, и владельцу под одним
+    человеческим именем показывались две разные величины. Свечи выходят за линии
+    детектора у 85.4% структур (замер 2026-08-20, BTC+ETH+SOL, 417 структур), медиана
+    превышения 0.703%. Тем же вопросом решался и САМ ВЕРДИКТ «опирается на зону ПП»:
+    сравнение шло с линией, а опора — это край свечей.
+    """
     for acc in scan.closed:
         if acc.first_index <= pp.confirmed_at_index:
             continue
-        fits = (acc.lower.edge >= pp.zone_lo if pp.side is PPSide.LONG
-                else acc.upper.edge <= pp.zone_hi)
+        box = acc.box(bars)
+        if box is None:
+            continue
+        box_lo, box_hi = box
+        fits = (box_lo >= pp.zone_lo if pp.side is PPSide.LONG
+                else box_hi <= pp.zone_hi)
         if fits:
             where = "над" if pp.side is PPSide.LONG else "под"
             return (f"подтверждён структурой {where} ПП (стр. 53): "
-                    f"коробка {acc.lower.edge:.8g}…{acc.upper.edge:.8g}")
+                    f"коробка {box_lo:.8g}…{box_hi:.8g}")
     return ""
 
 

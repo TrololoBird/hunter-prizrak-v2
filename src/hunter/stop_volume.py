@@ -32,8 +32,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import Bar
-from .trading_range import TradingRange, structure_bars
+from .models import Bar, percentile_rank
+from .trading_range import TradingRange
 
 
 class Placement(StrEnum):
@@ -143,22 +143,42 @@ class StopVolumeSet(BaseModel):
         (новое поле плюс ступень схемы леджера), а цена такой правки выше пользы от
         строки про свойство, которое курс сам называет необязательным.
         """
-        d = sv.density
-        return sum(1 for x in self.densities if x <= d) / len(self.densities) * 100
+        # Формула — общая (`models.percentile_rank`): вторая её копия жила в
+        # `factors.band_narrowing` и мерила то же понятие другими словами.
+        return percentile_rank(self.densities, sv.density)
 
 
-_VOL_MEMO: dict[tuple[str, int, int, int, int, int], float] = {}
-"""Суммы объёма спанов младших накоплений: см. комментарий при использовании."""
+# ⚠⚠ `_VOL_MEMO` УДАЛЁН 2026-08-23. Модульный изменяемый словарь на 100 000 записей жил
+# между вызовами в модуле, чья первая строка объявляет: «ЧИСТЫЙ МОДУЛЬ (§10.3): часы,
+# сеть и глобальное состояние не трогаются». Гейт чистоты этого не ловил, потому что
+# разбирал одни импорты; в тот же день он расширен на модульное состояние.
+# Память переехала к владельцу величины — `TradingRange.bar_volume`, туда же, где уже
+# живут `box()` и `start_index()`. Ключ с символом стал не нужен: структура принадлежит
+# ряду своего символа по построению.
 
 
-def _placement(small: TradingRange, host: TradingRange,
-               small_bars: list[Bar], host_bars: list[Bar]) -> Placement:
-    if small_bars[small.last_index].open_ms < host_bars[host.first_index].open_ms:
+def _placement(small_box: tuple[float, float], host_box: tuple[float, float],
+               small_last_ms: int, host_first_ms: int) -> Placement:
+    """Где стоповый стоит относительно хозяина. Обе геометрии — КОРОБКИ ПО СВЕЧАМ.
+
+    ⚠⚠ ЗДЕСЬ ЖИЛА ТРЕТЬЯ ГЕОМЕТРИЯ ТОЙ ЖЕ СТРУКТУРЫ (исправлено 2026-08-23). Функция
+    брала ЛИНИИ детектора — `small.upper.edge`, `small.lower.edge`, `host.upper.edge`,
+    `host.lower.edge`, — тогда как `price_range`, `box_lo`, `box_hi` и `bar_volume` в
+    том же `classify` с 2026-08-20 считаются по КОРОБКЕ свечей, и сам модуль объявил
+    этот класс закрытым («ОДИН ОТРЕЗОК И ОДНА ГЕОМЕТРИЯ НА СТРУКТУРУ»).
+
+    Расхождение не косметическое: замер 2026-08-20, записанный в поле `box_lo/box_hi`,
+    даёт «свечи выходят за линии детектора у 85.4%, медиана превышения 0.703%, максимум
+    22.42%». `placement` — это то, чем стоповый объём относится к базе (стр. 34/36/37/39),
+    то есть ИМЕННО РАЗЛИЧЕНИЕ "внутри структуры" и "за её границей"; на разнице в 0.7%
+    у границы вердикт переворачивается.
+    """
+    if small_last_ms < host_first_ms:
         return Placement.BEFORE
-    mid = (small.upper.edge + small.lower.edge) / 2
-    if mid > host.upper.edge:
+    mid = (small_box[0] + small_box[1]) / 2
+    if mid > host_box[1]:
         return Placement.ABOVE
-    if mid < host.lower.edge:
+    if mid < host_box[0]:
         return Placement.BELOW
     return Placement.INSIDE
 
@@ -169,29 +189,31 @@ def classify(
     host: TradingRange,
     host_bars: list[Bar],
     host_timeframe: str,
-    *,
-    symbol: str,
 ) -> StopVolumeSet:
     """Отнести накопления младшего ТФ к структуре старшего.
 
     Ничего не отсеивается: курс не даёт признака, по которому накопление младшего ТФ
     НЕ является стоповым. Отсев по выдуманному порогу плотности здесь был бы ровно тем
     «магическим числом», от которого правило §0 и защищает.
+
+    ⚠ АРГУМЕНТ `symbol` УДАЛЁН 2026-08-23 вместе с модульной памятью `_VOL_MEMO`: он был
+    нужен ТОЛЬКО её ключу (ряды разных символов выровнены одним окном бэкфилла и по
+    длине с краями совпадают, поэтому без символа память отдавала бы чужой объём).
+    Память теперь живёт на самой структуре, и вопрос принадлежности решён владением, а
+    не ключом. Оставить аргумент значило бы держать ручку, не соединённую ни с чем.
     """
     items: list[StopVolume] = []
+    # Коробка ХОЗЯИНА считается по разу на вызов, а не на каждое младшее накопление:
+    # `TradingRange.box` держит собственную память, но обращение к ней стоит ключа ряда.
+    host_box = host.box(host_bars)
+    if host_box is None:
+        # Отрезок структуры-хозяина пуст — относить к ней нечего. То же решение, что
+        # строкой ниже для младшего накопления: `None` от `box` означает «отрезка нет»,
+        # а не «коробка нулевой высоты», и подставлять вместо него линии детектора
+        # значило бы вернуть ту самую вторую геометрию.
+        return StopVolumeSet(items=(), densities=())
+    host_first_ms = host_bars[host.first_index].open_ms
     for a in small:
-        # ⚠ МЕМО ПО СПАНУ — правка 2026-08-17 по живому стеку (py-spy): одни и те же
-        # накопления младшего ТФ пересуммировались для КАЖДОЙ структуры-хозяина заново —
-        # сотни хостов × сотни спанов × сотни баров за цикл. Значение в кэше — та же
-        # последовательность сложений float, выполненная один раз: байт-в-байт то же
-        # число (дифф повтора пуст). Ключ несёт отпечаток ряда (края и длина), id не
-        # используется — переиспользование id после сборки мусора дало бы ложное
-        # попадание.
-        #
-        # ⚠ СИМВОЛ В КЛЮЧЕ ОБЯЗАТЕЛЕН (правка 2026-08-18): ряды РАЗНЫХ символов
-        # выровнены одним окном бэкфилла — первый/последний open_ms и длина у них
-        # совпадают, индексы накоплений пересекаются, и без символа кэш отдавал бы
-        # объём спана ЧУЖОГО символа как свой.
         # ⚠ Коробка — из памяти самой структуры (2026-08-21). Прежде здесь стояла
         # четвёртая копия формулы `min(low)/max(high)` по `structure_bars`, и считалась
         # она заново для КАЖДОГО хозяина: 306 вызовов `classify` на символ × сотни
@@ -201,7 +223,6 @@ def classify(
         if box is None:
             continue
         box_lo, box_hi = box
-        seg = structure_bars(a, small_bars)
         # ⚠⚠ ОДИН ОТРЕЗОК И ОДНА ГЕОМЕТРИЯ НА СТРУКТУРУ. Правка 2026-08-20.
         #
         # До неё в этой функции жили ДВЕ разные структуры под одним именем — ровно то, что
@@ -224,19 +245,16 @@ def classify(
         rng = box_hi - box_lo
         if rng <= 0:
             continue
-        memo_key = (symbol, small_bars[0].open_ms, small_bars[-1].open_ms,
-                    len(small_bars), a.first_index, a.exit.first_body_index)
-        vol = _VOL_MEMO.get(memo_key)
-        if vol is None:
-            vol = sum(b.volume for b in seg)
-            if len(_VOL_MEMO) > 100_000:
-                _VOL_MEMO.clear()
-            _VOL_MEMO[memo_key] = vol
+        # Объём — из памяти самой структуры, как и коробка (2026-08-23). Разбор — в
+        # докстроке `TradingRange.bar_volume` и в комментарии на месте `_VOL_MEMO` выше.
+        vol = a.bar_volume(small_bars)
         items.append(
             StopVolume(
                 trading_range=a,
                 host_timeframe=host_timeframe,
-                placement=_placement(a, host, small_bars, host_bars),
+                placement=_placement(
+                    (box_lo, box_hi), host_box,
+                    small_bars[a.last_index].open_ms, host_first_ms),
                 price_range=rng,
                 bar_volume=vol,
                 box_lo=box_lo,

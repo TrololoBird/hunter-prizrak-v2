@@ -21,12 +21,15 @@ from pathlib import Path
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import log
+from . import barstore, log, paths
 from .bars import tf_ms
 from .levels import EntryRule, Level, LevelState
 from .models import Bar, BarBinnedTrades, NotReady, TradeHistogram
 
-DATA_DIR = Path("data")
+# Корень данных — из `paths` (2026-08-23): один на проект и настраиваемый
+# переменной окружения. Прежде здесь стоял относительный `Path("data")`, и
+# место склада зависело от текущего каталога процесса.
+DATA_DIR = paths.DATA_DIR
 FRAMES_DIR = DATA_DIR / "frames"
 LEDGER_PATH = DATA_DIR / "ledger.sqlite3"
 
@@ -178,11 +181,37 @@ CREATE TABLE IF NOT EXISTS levels (
     priority_depth INTEGER,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
+    -- ⚠⚠ ЗОНА ВНУТРИ СТРУКТУРЫ. Ограничение добавлено 2026-08-23 (схема 16), и оно
+    -- ровно то, что владелец зафиксировал капслоком 2026-08-18: «ЕСЛИ зона выходит за
+    -- структуру то СТРУКТУРА ОПРЕДЛЕННА НЕ ВЕРНО». До этого дня инвариант сторожил
+    -- ТОЛЬКО `gates/geometry_invariants.check_level` — то есть гейт на объектах в
+    -- памяти, а карта, которая живёт МЕЖДУ прогонами и питает бота, пропускала
+    -- нарушение молча. Проверка в схеме сильнее любого гейта: её исполняет SQLite на
+    -- КАЖДОЙ настоящей записи, а не наш код на подобранных примерах.
+    CHECK (boundary_lo <= zone_lo AND zone_hi <= boundary_hi),
     CHECK (to_ms > from_ms),
     CHECK (last_seen >= first_seen),
     CHECK ((retired_at IS NULL) = (state = 'active')),
     PRIMARY KEY (symbol, timeframe, from_ms, to_ms)
 );
+
+-- ⚠⚠ ИНДЕКСЫ ЗАВЕДЕНЫ 2026-08-23. До этого дня в проекте не было НИ ОДНОГО
+-- (`grep "CREATE INDEX" src/hunter/store.py` → пусто), при том что бот на каждый ответ
+-- ходит `WHERE symbol=? AND state='active' … ORDER BY price` по таблице, чей первичный
+-- ключ — `(symbol, timeframe, from_ms, to_ms)`: по нему отбор по состоянию и сортировка
+-- по цене не поддерживаются, и SQLite читает все строки символа. Сводки по времени
+-- (`signals.recorded_at`, `outcomes.closed_at`) сканировали таблицу целиком.
+--
+-- `IF NOT EXISTS` и место в общем тексте схемы — не украшение: `executescript(SCHEMA)`
+-- выполняется при КАЖДОМ открытии базы, поэтому индексы появляются и у свежей базы, и
+-- у выросшей миграциями, без отдельной ступени и без риска разойтись с текстом схемы
+-- (тот дефект здесь уже случался — см. комментарий у `stop_price`).
+CREATE INDEX IF NOT EXISTS levels_symbol_state ON levels (symbol, state, price);
+CREATE INDEX IF NOT EXISTS levels_last_seen ON levels (symbol, last_seen);
+CREATE INDEX IF NOT EXISTS levels_retired ON levels (retired_at);
+CREATE INDEX IF NOT EXISTS signals_recorded ON signals (recorded_at);
+CREATE INDEX IF NOT EXISTS signals_lookup ON signals (kind, symbol, timeframe);
+CREATE INDEX IF NOT EXISTS outcomes_closed ON outcomes (closed_at);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
@@ -218,8 +247,16 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
+(`boundary_lo <= zone_lo AND zone_hi <= boundary_hi`) — то самое, что владелец
+зафиксировал капслоком 2026-08-18. До него инвариант сторожил только гейт, то есть
+объекты в памяти, а карта между прогонами пропускала нарушение молча. Прежние строки,
+нарушающие его, УДАЛЯЮТСЯ миграцией и их число НАЗЫВАЕТСЯ в журнале: они построены
+расчётом, про который сам владелец сказал, что он неверен, и оставить их значило бы
+показывать их боту дальше. Той же ступенью заводятся первые в проекте индексы.
 
 8 → 9 (2026-08-19): у исхода появился БЕЗУБЫТОК (`breakeven`, стр. 14). До него схема
 знала три исхода, и `CHECK (kind IN …)` отклонил бы четвёртый — то есть сделка, вышедшая
@@ -287,23 +324,12 @@ def frames_path(run_id: str, symbol: str, timeframe: str) -> Path:
     return FRAMES_DIR / run_id / _safe(symbol) / f"{timeframe}.parquet"
 
 
-def bars_to_frame(bars: list[Bar]) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "open_ms": [b.open_ms for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-        },
-        schema={"open_ms": pl.Int64, "open": pl.Float64, "high": pl.Float64,
-                "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64},
-    )
-
-
-def frame_to_bars(df: pl.DataFrame) -> list[Bar]:
-    return [Bar(**row) for row in df.iter_rows(named=True)]
+# ⚠ Сборка и разбор кадра баров живут в `barstore` — ОДНОЙ парой на проект
+# (2026-08-23). Здесь были ВТОРЫЕ копии обеих, причём прямая несла собственный литерал
+# схемы вместо общего `barstore.SCHEMA`. Имена оставлены прежними: их зовут четыре
+# места этого модуля, и переименование не относится к находке.
+bars_to_frame = barstore.frame_of_bars
+frame_to_bars = barstore.bars_of_frame
 
 
 def write_bars(run_id: str, symbol: str, timeframe: str, bars: list[Bar]) -> Path:
@@ -680,8 +706,15 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     lvl_sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='levels'"
     ).fetchone()
-    if lvl_sql is not None and "stale_calc" not in (lvl_sql[0] or ""):
+    lvl_text = (lvl_sql[0] or "") if lvl_sql is not None else ""
+    if lvl_sql is not None and "stale_calc" not in lvl_text:
         return "14"
+    # 15 → 16 тоже не видно по колонкам: добавляется `CHECK` «зона внутри структуры».
+    # Тот же приём, что у ступеней 8 → 9 и 14 → 15, и та же причина держать ступень
+    # здесь: без неё база версии 15 назвала бы себя шестнадцатой, ограничение не
+    # появилось бы НИ РАЗУ, а `schema_meta` всё равно проштамповалась бы новым числом.
+    if lvl_sql is not None and "zone_hi <= boundary_hi" not in lvl_text:
+        return "15"
     return SCHEMA_VERSION
 
 
@@ -738,7 +771,19 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
     миграций SQLite: DROP старой таблицы при включённых FK отклоняется, хотя новая
     встаёт на её место тем же именем и теми же id).
     """
+    # ⚠ ВОЗВРАТ `foreign_keys = ON` — В `finally` (правка 2026-08-23). Прежде он стоял
+    # СЛЕДУЮЩЕЙ строкой после `executescript`, и всякое исключение внутри перестройки
+    # оставляло соединение БЕЗ внешних ключей. Дальше по этому же соединению работает
+    # весь прогон, а `_tune` объявляет ровно обратное: «§10.2 обещает „записать
+    # бессмысленную строку нельзя“ — обещание держала только схема на бумаге».
     conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        _rebuild_signals_v3(conn)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _rebuild_signals_v3(conn: sqlite3.Connection) -> None:
     conn.executescript(
         "BEGIN;"
         "CREATE TABLE signals_v3 ("
@@ -763,7 +808,6 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
         "ALTER TABLE signals_v3 RENAME TO signals;"
         "COMMIT;"
     )
-    conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
@@ -775,7 +819,15 @@ def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
     `_migrate_2_to_3`: `DROP` таблицы, на которую смотрит `signal_id`, при включённых FK
     отклоняется.
     """
+    # ⚠ Возврат — в `finally`, по той же причине, что в `_migrate_2_to_3`.
     conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        _rebuild_outcomes_v9(conn)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _rebuild_outcomes_v9(conn: sqlite3.Connection) -> None:
     conn.executescript(
         "BEGIN;"
         "CREATE TABLE outcomes_v9 ("
@@ -792,7 +844,82 @@ def _migrate_8_to_9(conn: sqlite3.Connection) -> None:
         "ALTER TABLE outcomes_v9 RENAME TO outcomes;"
         "COMMIT;"
     )
-    conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _check_stamp(conn: sqlite3.Connection, path: Path) -> None:
+    """Сверить ШТАМП базы с версией, ВЫВЕДЕННОЙ ИЗ КОЛОНОК. До миграций, не после.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-23, И ЭТО ДАЁТ `schema_meta` ПОТРЕБИТЕЛЯ. Таблица штамповалась
+    при КАЖДОМ открытии базы и не читалась НИ ОДНОЙ строкой проекта — поле без
+    потребителя, то есть Д-1, и притом ровно там, где сам модуль описывает ловушку:
+    «база помечена мигрированной, не будучи ею».
+
+    ⚠ ПОЧЕМУ ИМЕННО ДО МИГРАЦИЙ, а не после. Первая редакция этой проверки стояла ПОСЛЕ
+    и сравнивала `_schema_version(conn)` с `SCHEMA_VERSION` — и оказалась проверкой,
+    которая НЕ МОЖЕТ СРАБОТАТЬ: последняя строка лестницы возвращает `SCHEMA_VERSION`,
+    поэтому подъём константы без новой ступени двигает ОБЕ величины сразу. Контроль
+    2026-08-23 это и показал: константа поднята до «17», ступени нет, выведено — «17»,
+    расхождения ноль. Проверка, не способная упасть, — тот самый дефект, ради удаления
+    которого весь этот разбор и делается.
+
+    Здесь сравниваются РАЗНЫЕ источники: штамп, ЗАПИСАННЫЙ ПРОШЛЫМ запуском, против
+    состава колонок СЕЙЧАС. Штамп старше состава — след ровно той ловушки: прошлый
+    запуск пометил базу версией, до которой не домигрировал.
+
+    ⚠ Отсутствие штампа — НЕ нарушение: база могла быть создана до появления таблицы
+    либо это первый запуск. Молчим только в этом случае, и он назван.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+    except sqlite3.DatabaseError:
+        return  # таблицы ещё нет — база создаётся сразу свежей
+    if row is None or not str(row[0]).isdigit():
+        return
+    stamped = int(row[0])
+    derived = _schema_version(conn)
+    if derived.isdigit() and stamped > int(derived):
+        log.degraded(
+            "леджер ПОМЕЧЕН версией, до которой не домигрировал — прошлый запуск "
+            "проштамповал базу, не изменив её",
+            штамп=stamped, выведено_из_колонок=derived, файл=str(path))
+
+
+def _backup_before_migration(conn: sqlite3.Connection, path: Path) -> None:
+    """Снимок базы ПЕРЕД миграцией. Ничего не делает, если мигрировать нечего.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-23 ПО РАЗБОРУ АРХИТЕКТУРЫ. Обратных миграций в проекте нет и не
+    предвидится, а ступени 2→3, 8→9, 14→15 и 15→16 ПЕРЕСОЗДАЮТ таблицу: `DROP TABLE`
+    после копирования. Ступень 15→16 вдобавок УДАЛЯЕТ строки, нарушающие новый инвариант
+    зоны. Ошибка в любой из них — и леджер, «единственный будущий источник ответа,
+    работает ли метод» (§8 этап 7), не восстанавливается ничем: он копится только
+    временем.
+
+    Снимок делается штатным `sqlite3.Connection.backup` — он согласован по транзакциям и
+    не требует остановки писателей, в отличие от копирования файла.
+
+    ⚠ Отказ снимка НЕ отменяет миграцию, но и не молчит: диск может быть полон, а
+    прогон обязан состояться. Причина уходит в журнал деградацией (§4.3), и владелец
+    видит, что снимка нет, ДО того, как он понадобится.
+
+    ⚠ Снимок ОДИН на версию: имя несёт версию, с которой уходим. Копить по снимку на
+    каждый запуск нельзя — база растёт только временем, и место кончилось бы быстрее.
+    """
+    was = _schema_version(conn)
+    if was == SCHEMA_VERSION:
+        return
+    dest = path.with_suffix(f".before-v{was}.sqlite3")
+    if dest.exists():
+        return
+    try:
+        with sqlite3.connect(dest) as snap:
+            conn.backup(snap)
+        log.info("снимок леджера перед миграцией сделан", файл=str(dest),
+                 версия_до=was, версия_после=SCHEMA_VERSION)
+    except (sqlite3.Error, OSError) as e:
+        log.degraded("снимок леджера перед миграцией НЕ сделан — миграция всё равно "
+                     "пойдёт, отката не будет", файл=str(dest),
+                     причина=f"{type(e).__name__} {e}")
 
 
 def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
@@ -803,6 +930,8 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     _tune(conn)
+    _check_stamp(conn, path)
+    _backup_before_migration(conn, path)
     if _schema_version(conn) == "1":
         _migrate_1_to_2(conn)
     if _schema_version(conn) == "2":
@@ -939,11 +1068,72 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
             conn.execute("ROLLBACK")
             raise
         conn.commit()
+    if _schema_version(conn) == "15":
+        # 15 → 16: ЗОНА ВНУТРИ СТРУКТУРЫ — ограничение схемы, а не только гейта.
+        #
+        # ⚠ Как и 14→15, `ALTER TABLE` здесь бессилен: меняется `CHECK`, а SQLite их на
+        # месте не правит. Определение новой таблицы берётся ИЗ `SCHEMA` по той же
+        # причине, что и там: вторая копия определения — тот самый дефект, из-за
+        # которого текст схемы уже разъезжался с лестницей миграций.
+        #
+        # ⚠⚠ СТРОКИ, НАРУШАЮЩИЕ ИНВАРИАНТ, УДАЛЯЮТСЯ, И ИХ ЧИСЛО НАЗЫВАЕТСЯ. Молча
+        # перелить их нельзя — новая таблица их не примет; молча упасть тоже нельзя —
+        # база осталась бы немигрированной без объяснения. Довод за удаление принадлежит
+        # владельцу дословно (2026-08-18): «ЕСЛИ зона выходит за структуру то СТРУКТУРА
+        # ОПРЕДЛЕННА НЕ ВЕРНО». Такой уровень построен расчётом, признанным неверным, и
+        # держать его в карте значит и дальше показывать его боту. До слияния границ
+        # (2026-08-18) таких уровней было 51.7% — на базе тех времён удаление будет
+        # массовым, и потому оно ГРОМКОЕ, а не тихое.
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM levels"
+            " WHERE NOT (boundary_lo <= zone_lo AND zone_hi <= boundary_hi)"
+        ).fetchone()[0]
+        head = "CREATE TABLE IF NOT EXISTS levels ("
+        start = SCHEMA.index(head)
+        tail = chr(10) + ");"
+        end = SCHEMA.index(tail, start) + len(tail)
+        create_v16 = SCHEMA[start:end].replace(head, "CREATE TABLE levels_v16 (", 1)
+        live = [r[1] for r in conn.execute("PRAGMA table_info(levels)")]
+        names = ", ".join(live)
+        conn.execute("BEGIN")
+        try:
+            conn.execute(create_v16)
+            conn.execute(
+                f"INSERT INTO levels_v16 ({names}) SELECT {names} FROM levels"
+                f" WHERE boundary_lo <= zone_lo AND zone_hi <= boundary_hi")
+            moved = conn.execute("SELECT COUNT(*) FROM levels_v16").fetchone()[0]
+            had = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+            if moved != had - bad:
+                raise RuntimeError(
+                    f"миграция 15→16: перелито {moved} строк из {had} при {bad} "
+                    f"нарушающих — таблица НЕ заменена, база осталась прежней")
+            conn.execute("DROP TABLE levels")
+            conn.execute("ALTER TABLE levels_v16 RENAME TO levels")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.commit()
+        if bad:
+            log.degraded(
+                "миграция 15→16: из карты УДАЛЕНЫ уровни, чья зона выходит за структуру",
+                удалено=bad, осталось=moved,
+                причина="владелец 2026-08-18: зона вне структуры = структура определена "
+                        "неверно")
+        else:
+            log.info("миграция 15→16: ограничение «зона внутри структуры» добавлено",
+                     нарушающих_строк=0, строк=moved)
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (SCHEMA_VERSION,),
     )
+    # `PRAGMA user_version` — штатный механизм версионирования схемы SQLite, и до
+    # 2026-08-23 он не использовался НИ РАЗУ (`grep user_version` → пусто). Ставится
+    # ради внешних инструментов: `sqlite3 ledger.sqlite3 "PRAGMA user_version"` отвечает
+    # без знания устройства нашей таблицы. Авторитетом он не становится — им остаётся
+    # состав колонок; поэтому и пишется он ПОСЛЕ сверки, а не вместо неё.
+    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
     conn.commit()
     return conn
 

@@ -27,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .bars import TIMEFRAME_MS, tf_ms
+from .bars import TF_RANK, TIMEFRAME_MS, steps_between, tf_ms
 from .breach import (
     CONFIRM_BODIES,
     RETURN_BARS,
@@ -503,7 +503,6 @@ def build_all(
     timeframes: tuple[str, ...],
     scans: dict[str, RangeScan],
     swings: dict[str, SwingSet] | None = None,
-    frame_bars: int | None = None,
     horizon_days: int = 0,
     per_side: int = LEVELS_PER_SIDE,
 ) -> LevelBuild:
@@ -516,7 +515,16 @@ def build_all(
     подпись ТФ — дело печати, и склеивать её здесь значит навязывать формат всем
     вызывающим.
 
-    ⚠⚠ `frame_bars` БОЛЬШЕ НЕ ОТБРАСЫВАЕТ СТРУКТУРУ (2026-08-21). Прежняя редакция
+    ⚠⚠ ПАРАМЕТР `frame_bars` УДАЛЁН ИЗ ПОДПИСИ 2026-08-23. Он перестал что-либо делать
+    2026-08-21 (разбор ниже), но остался ручкой: принимался здесь, передавался из
+    `engine.decide` и `run.decide_once`, а первой же строкой тела шёл `del frame_bars`.
+    Ручка, не соединённая ни с чем, — тот самый класс, ради которого удалены
+    `bars_per_timeframe` и `admission_required_bars` и заведён гейт
+    `config_forbids_unknown`; там он ловится в TOML, здесь его не ловил никто. Вместе с
+    параметром из `service.py` ушёл импорт `render` — служба брала оттуда `BARS_ON_CHART`
+    ровно ради этого аргумента, то есть ширина картинки числилась входом расчёта.
+
+    ⚠⚠ РАМКА БОЛЬШЕ НЕ ОТБРАСЫВАЕТ СТРУКТУРУ (2026-08-21). Прежняя редакция
     пропускала структуру, чей конец старше `frame_bars` баров своего ТФ, доводом «уровень
     всё равно скрыл бы фильтр „у структуры“ (`tgbot.near_structure`, снят 2026-08-21),
     значит строить его — платить профилем за невидимое». Довод был верен ровно до тех
@@ -572,7 +580,6 @@ def build_all(
     # под якорь стопа). Стоят один проход по ряду, экономят миллион с лишним сравнений.
     opens_by_tf: dict[str, list[int]] = {
         stf: [b.open_ms for b in sbars] for stf, sbars in series.items() if sbars}
-    del frame_bars  # состав карты рамкой больше не режется — см. докстроку
 
     # ⚠⚠ ГОРИЗОНТ ДОШЁЛ ДО ПОСТРОЕНИЯ УРОВНЕЙ 2026-08-21. До этого дня он не применялся
     # здесь ВООБЩЕ: слова «horizon» не было ни в этом модуле, ни в `engine`, ни в
@@ -715,7 +722,7 @@ def build_all(
                     if first_ms <= y_bars[a.exit.confirmed_at_index].open_ms
                     and y_bars[a.exit.confirmed_at_index].open_ms + y_step <= born_ms)
                 collected.extend(classify_stop_volume(
-                    known, y_bars, acc, bars, tf, symbol=symbol).items)
+                    known, y_bars, acc, bars, tf).items)
             svs: tuple[StopVolume, ...] = tuple(collected)
             down = lvl.side is LevelSide.LONG
             # Лои своего ТФ и ТФ−1 для лонга, хаи для шорта — вторая половина фразы
@@ -1235,13 +1242,14 @@ def _younger_tfs(tf: str, available: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _tf_rank(tf: str) -> int:
-    """Старшинство ТФ по порядку `TIMEFRAME_MS` — он и есть список курса со стр. 17.
+    """Старшинство ТФ — из общей таблицы `bars.TF_RANK`.
 
-    Своей копии порядка здесь нет умышленно: вторая копия разошлась бы с первой на первой
-    же правке. Неизвестный ТФ падает через `tf_ms`, а не становится молча самым младшим.
+    ⚠ Здесь стоял `list(TIMEFRAME_MS).index(tf)`: список строился ЗАНОВО на каждый
+    вызов, а вызывают её в отборе младших ТФ на каждый уровень. С 2026-08-23 порядок
+    живёт одной таблицей на проект (разбор — в докстроке `bars.TF_RANK`), а неизвестный
+    ТФ по-прежнему падает, а не становится молча самым младшим.
     """
-    tf_ms(tf)
-    return list(TIMEFRAME_MS).index(tf)
+    return TF_RANK[tf]
 
 
 class TakeDepth(StrEnum):
@@ -1328,6 +1336,15 @@ def take_depth(
     run = 0
     for i in range(level.created_at_index + 1, len(bars)):
         bar = bars[i]
+        # ⚠ Дыра в ряду РВЁТ серию. Курс на стр. 55 говорит о полных телах свечей
+        # ЭТОГО ТФ подряд, то есть о ВРЕМЕНИ, а счётчик считал соседей ПО СПИСКУ:
+        # при пропуске в ряду два бара, отстоящих на часы, засчитывались как подряд
+        # идущие и объявляли `BEYOND` — то есть снимали лимитки с уровня. Это Р-2, под
+        # который заведена `bars.steps_between`; `breach.first_breach` и
+        # `trading_range.detect` её соблюдают, а этот счётчик — нет.
+        if i > level.created_at_index + 1 and steps_between(
+                bars[i - 1], bar, level.timeframe) != 1:
+            run = 0
         run = run + 1 if closed_beyond(bar, poc, direction) else 0
         if run >= confirm_bodies:
             return ZoneTake(depth=TakeDepth.BEYOND, first_index=first, deepest_index=i)
@@ -1552,6 +1569,42 @@ class LevelStatus(BaseModel):
         return self.state
 
 
+def flipped_if(lvl: Level, state: LevelState) -> Level:
+    """Уровень в ДАННОМ состоянии: у пробитого сторона противоположна (стр. 43).
+
+    ЕДИНСТВЕННОЕ место формулы переворота. `level_now` и `level_as_of` — две точки
+    доступа к ней с разными датами; вторая копия формулы разошлась бы молча, потому что
+    обе вернули бы законный `Level`, просто разной стороны."""
+    return lvl.flipped() if state is LevelState.FLIPPED else lvl
+
+
+def level_now(lvl: Level, st: LevelStatus) -> Level:
+    """Уровень, каким он стоит СЕЙЧАС. Читают `MappedLevel.current` и
+    `engine.Decision.current`."""
+    return flipped_if(lvl, st.state)
+
+
+def level_as_of(m: MappedLevel, as_of_ms: int) -> Level | None:
+    """Уровень, каким он СТОЯЛ на момент `as_of_ms`. None — его тогда НЕ БЫЛО.
+
+    ⚠ Заведено 2026-08-24 для отбора целей (разбор — `geometry.build_targets`).
+    Три исхода, каждый из курса:
+      * уровень ещё не родился (стр. 23: уровня нет до подтверждения выхода) — None;
+      * уровень отработан к этому моменту (стр. 25: «мы этот уровень удаляем») — None;
+      * уровень пробит к этому моменту (стр. 43: «Уровень лонг/шорт менятся для нас
+        на противоположный») — уровень ПРОТИВОПОЛОЖНОЙ стороны, а не ничто. До этой
+        функции пул целей выбрасывал пробитые уровни целиком, как отработанные, — то
+        есть читал стр. 43 как стр. 25, хотя стр. 43 не удаляет уровень, а меняет
+        его сторону.
+    """
+    if m.level.created_at_ms > as_of_ms:
+        return None
+    st = m.status.state_at(as_of_ms)
+    if st is LevelState.WORKED_OFF:
+        return None
+    return flipped_if(m.level, st)
+
+
 class MappedLevel(BaseModel):
     """Уровень ВМЕСТЕ с его судьбой. Пара, а не два независимых значения.
 
@@ -1575,6 +1628,31 @@ class MappedLevel(BaseModel):
         """
         return (self.level.created_at_ms <= as_of_ms
                 and self.status.state_at(as_of_ms) is LevelState.ACTIVE)
+
+    @property
+    def current(self) -> Level:
+        """Уровень КАКОЙ ОН СЕЙЧАС. У пробитого сторона противоположна (стр. 43).
+
+        ⚠⚠ ЗАВЕДЕНО 2026-08-24, И ЭТО ПОЧИНКА, А НЕ НОВОВВЕДЕНИЕ. Стр. 43 дословно:
+        «Уровень лонг/шорт менятся для нас на противоположный. По возврату цены на
+        ретест уровня - открываем позицию и ставим СТОП за накопление». Метод
+        `Level.flipped()` написан ровно под это правило — и НЕ ВЫЗЫВАЛСЯ НИ ОТКУДА:
+        единственное его упоминание в проекте стояло в докстроке `EntryRule.
+        RETEST_FLIPPED`, которая УТВЕРЖДАЛА, что уровень «уже другой стороны».
+
+        Цена молчания замерена на свежих данных 2026-08-24 (Crypto.com, 23 символа,
+        ТФ 15м/1ч/4ч по 300 баров): в состоянии `flipped` — 56 уровней из 132, то есть
+        42%, и каждый печатался владельцу СТАРОЙ стороной. Карточка при этом рядом
+        писала «вход по ретесту в ДРУГУЮ сторону» — то есть сама себе противоречила.
+
+        ⚠ ПОЧЕМУ ЭТО СВОЙСТВО, А НЕ ПРАВКА `map_levels`. Сторон две, и это РАЗНЫЕ
+        величины, а не одна испорченная: `level.side` — сторона, какой уровень РОДИЛСЯ,
+        и по ней считается всё «на момент» (`alive_at`, отбор целей `build_targets`,
+        историческая разметка). `current.side` — сторона СЕЙЧАС, и по ней уровень
+        предъявляется и торгуется. Перевернуть сторону в самом `map_levels` значило бы
+        задним числом сменить сторону у момента, когда уровень ещё не был пробит.
+        """
+        return level_now(self.level, self.status)
 
 
 def map_levels(
@@ -1788,15 +1866,30 @@ def status(
                            entry_rule=EntryRule.LIMIT, resolved_at_ms=None)
     assert ev.resolved_index is not None  # у разрешившегося события бар есть по построению
     at = bars[ev.resolved_index].open_ms + tf_ms(level.timeframe)
+    # ⚠ ОБЕ ВЕТКИ ЯВНЫЕ, ВЕТКИ «ИНАЧЕ» НЕТ (правка 2026-08-24). Здесь стояло
+    # `if ev.kind is BreachKind.BREAKOUT: … return WORKED_OFF` — то есть ВТОРАЯ копия
+    # правила стр. 6 (прокол — отработка, пробой — нет), записанная отрицанием.
+    # Первая живёт в `Breach.worked_off` и до этого дня не вызывалась НИОТКУДА.
+    #
+    # Сегодня копии согласны: `OPEN` и `UNRESOLVED` отсечены ветками выше, так что сюда
+    # доходят только `PUNCTURE` и `BREAKOUT`. Но согласны они по счастливой случайности —
+    # пятый член `BreachKind` провалился бы в `WORKED_OFF` молча, потому что это была
+    # ветка «иначе». Теперь спрашивается само правило, вторая ветка названа по имени, а
+    # невозможный случай ПАДАЕТ: молчаливое зачисление нового вида события в отработку
+    # ровно та деградация, которую проект запрещает (§4.3).
+    if ev.worked_off:
+        return LevelStatus(state=LevelState.WORKED_OFF, event=ev,
+                           limit_orders_allowed=False, price_in_zone=in_zone,
+                           price_beyond=beyond, take=take, playout=play,
+                           entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
     if ev.kind is BreachKind.BREAKOUT:
         return LevelStatus(state=LevelState.FLIPPED, event=ev, limit_orders_allowed=False,
                            price_in_zone=in_zone, price_beyond=beyond, take=take,
                            playout=play,
                            entry_rule=EntryRule.RETEST_FLIPPED, resolved_at_ms=at)
-    return LevelStatus(state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
-                       price_in_zone=in_zone, price_beyond=beyond, take=take,
-                       playout=play,
-                       entry_rule=EntryRule.CONFIRMATION, resolved_at_ms=at)
+    raise AssertionError(
+        f"разрешившееся событие вида {ev.kind.value} курс не классифицирует: стр. 6 "
+        "знает прокол и пробой, а этот вид не отнесён ни к тому, ни к другому")
 
 
 class PressedKind(StrEnum):

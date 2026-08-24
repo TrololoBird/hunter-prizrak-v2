@@ -20,19 +20,30 @@
 Цены здесь `float`, как в `swings`, `range` и `pereprior`: все они приходят из
 `Bar`, где цена float. Decimal живёт на границе с `Level`, а `Level` сюда не приходит.
 
-Запаса за структуру (стр. 33, 58: 1-3%) этот модуль не считает — он уже есть в
+⚠⚠ ЗДЕСЬ СТОЯЛО ЛОЖНОЕ УТВЕРЖДЕНИЕ, СНЯТО 2026-08-24. Дословно было: «Запаса за
+структуру (стр. 33, 58: 1-3%) этот модуль не считает — он уже есть в
 `geometry.STOP_MARGIN_MIN_PCT`/`STOP_MARGIN_MAX_PCT`. Наружу отдаётся ЯКОРЬ стопа,
-запас накладывает `geometry`.
+запас накладывает `geometry`». Запас не накладывал НИКТО: слова «вымпел», `Pennant` и
+`figures` в `geometry` не встречаются ни разу, единственный потребитель `stop_anchor` —
+карточка, а она ничего не считает. На живых данных 2026-08-24 стоп у всех 48 вымпелов
+стоял РОВНО на краю структуры. Докстрока при этом читалась как «правило исполнено» —
+то есть прикрывала дыру, а не описывала её.
+
+Теперь запас накладывается здесь, вызовом `geometry.stop_beyond_edge` — ОДНОЙ формулы
+на проект, а не второй её копии (её докстрока называет счёт копий). Наружу идут ОБЕ
+цены: `stop_anchor` — за что прячем (стр. 57), `stop_price` — куда ставим (стр. 58).
 """
 
 from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Sequence
+from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .geometry import DEFAULT_MARGIN_PCT, stop_beyond_edge
 from .models import NotReady
 from .pereprior import Pereprior, PPKind, PPSide
 from .priority import Agreement, Priority, agreement_of
@@ -156,10 +167,27 @@ def _alternating(swings: SwingSet) -> list[Swing]:
     `swings.detect`, где сначала идёт HIGH: сортировка устойчива. Из OHLC «что было
     раньше» не следует, значит порядок детерминирован, но произволен, — то же оговорено
     в `pereprior._detect_side`.
+
+    ⚠⚠ ИЗ ДВУХ ОДНОИМЁННЫХ ПОДРЯД ОСТАЁТСЯ БОЛЕЕ КРАЙНИЙ (правка 2026-08-23). До неё
+    здесь стояло `continue`, то есть оставалась точка, ПРИШЕДШАЯ ПЕРВОЙ, — и докстрока
+    при этом ссылалась на `range.detect` как на образец, а тот с 2026-08-20 делает
+    ПРОТИВОПОЛОЖНОЕ: уточняет ожидающую точку до более экстремальной, и там же записано,
+    почему прежнее поведение было дефектом («коробка систематически не доставала до
+    собственных свечей»). Тем же правилом живёт цепочка `swings.ZigzagPrefixes`.
+
+    Цена расхождения замерена не здесь, а на том же примитиве в `swings.zigzag` (BTC,
+    3000 баров каждого ТФ): одноимённых подряд 175/176/150/192/20 на 5м/15м/1ч/4ч/1Д,
+    из них 57%/60%/60%/64%/55% были ЭКСТРЕМАЛЬНЕЕ уже принятой точки; медиана потерянной
+    высоты 0.060%/0.105%/0.338%/1.028%/2.957%. Флаг и клин (стр. 56, 60) строились по
+    вершинам, пришедшим первыми, а не по вершинам фигуры.
     """
     out: list[Swing] = []
     for s in sorted(swings.swings, key=lambda x: x.index):
         if out and out[-1].kind is s.kind:
+            outer = (s.price > out[-1].price if s.kind is SwingKind.HIGH
+                     else s.price < out[-1].price)
+            if outer:
+                out[-1] = s
             continue
         out.append(s)
     return out
@@ -306,15 +334,37 @@ class Pennant(BaseModel):
     """Бар ШЕСТОГО касания — ТВХ по стр. 57. `None` — касаний ещё меньше шести."""
 
     stop_anchor: float
-    """Стр. 57: «прячем за лой всей структуры, или за лой стопового уровня перед структурой».
+    """ЗА ЧТО прячем. Стр. 57: «прячем за лой всей структуры, или за лой стопового
+    уровня перед структурой».
 
     Берётся первое: край РАСШИРЕННОГО диапазона структуры (`extended_lo`/`extended_hi`) —
     самая дальняя цена, до которой доходили точки границы, включая проколы (стр. 18).
     Второй вариант — стоповый уровень ПЕРЕД структурой — этому модулю не виден: он живёт
     в `levels.stop_anchor`, и выбор между двумя якорями делает вызывающий.
 
-    Запас за структуру сюда не входит: стр. 58 «Стоп всегда прячем за всю структуру с
-    запасом 1-3%», и этот запас накладывает `geometry`.
+    ⚠ Это НЕ цена стопа: ставить стоп ровно на край структуры курс нигде не велит.
+    Цена — в `stop_price`.
+    """
+
+    stop_price: float
+    """КУДА ставим. Край структуры плюс курсовой запас — `geometry.stop_beyond_edge`.
+
+    Стр. 58 — страница треугольника с равными границами, то есть про эту самую фигуру:
+    «Стоп всегда прячем за всю структуру с запасом 1-3%». Слово «всегда» безусловно, и
+    стр. 36 распространяет то же правило на фигуры вообще: «Стоп ставим также, как и в
+    торговле накоплений - за структуру 1-3%».
+
+    что из чего следует: край структуры и сторона фигуры → цена стопа.
+
+    ⚠ Заведено 2026-08-24; до этого запаса у вымпела не было ВОВСЕ, и карточка печатала
+    край структуры под словом «стоп» — разбор в докстроке модуля. Это ТРЕТИЙ случай
+    одного класса: тот же дефект чинился у уровня 2026-08-18 (`geometry.beyond_anchor`,
+    приказ владельца «делай все согласно курсу») и у ПП 2026-08-19.
+
+    ⚠ Взят ДАЛЬНИЙ край диапазона (`DEFAULT_MARGIN_PCT` = 3%) — то же число и то же
+    основание, что у сделки от уровня: там оно разобрано в докстроке
+    `geometry.DEFAULT_MARGIN_PCT` вместе с ценой выбора. Разные числа у двух сделок
+    одного метода были бы второй записью одной величины.
     """
 
     upper_edge: float
@@ -438,6 +488,12 @@ def pennant(
     order = sorted(up.point_indices + low.point_indices)
     if order and order[0] not in head:
         order = order[1:]
+    long_side = side is FigureSide.LONG
+    anchor = structure.extended_lo if long_side else structure.extended_hi
+    # Decimal только на этой строке: запас считается ОДНОЙ формулой проекта, а она
+    # живёт на десятичной арифметике `Level` (`geometry.margin_of`). Обратно наружу
+    # уходит float — как и все прочие цены этого модуля.
+    stop = float(stop_beyond_edge(Decimal(str(anchor)), DEFAULT_MARGIN_PCT, up=long_side))
     return Pennant(
         borders=borders,
         side=side,
@@ -445,8 +501,8 @@ def pennant(
         last_point_index=order[-1],
         touches=len(order),
         touch6_index=order[TOUCH_FOR_ENTRY - 1] if len(order) >= TOUCH_FOR_ENTRY else None,
-        stop_anchor=(structure.extended_lo if side is FigureSide.LONG
-                     else structure.extended_hi),
+        stop_anchor=anchor,
+        stop_price=stop,
         upper_edge=up.edge,
         lower_edge=low.edge,
         is_extended=structure.is_extended,

@@ -37,17 +37,21 @@ REST отдаёт сделки не глубже 24 часов, потом — �
 
 from __future__ import annotations
 
-import os
 import re
-from collections import OrderedDict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
 
-from . import log
-from .models import BarBinnedTrades, NotReady, TradeHistogram, tick_scale
+from . import barstore, log, paths
+from .models import (
+    BarBinnedTrades,
+    LruCache,
+    NotReady,
+    TradeHistogram,
+    tick_scale,
+)
 
 
 def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
@@ -66,7 +70,8 @@ def bin_expr(price: pl.Expr, tick: Decimal) -> pl.Expr:
     return (price * scale + 0.5).floor().cast(pl.Int64) // step
 
 
-CACHE_DIR = Path("data/aggcache")
+# Каталог кэша — от общего корня данных (`paths.DATA_DIR`, 2026-08-23).
+CACHE_DIR = paths.DATA_DIR / "aggcache"
 
 GROUPED_MAX = 1024
 """Ёмкость кэша сгруппированных суток `TradeWindows._grouped`. ⚠ ЧИСЛО НЕ ЗАМЕРЕНО, а
@@ -169,24 +174,14 @@ def cache_path(market_id: str, day: date, tick: Decimal) -> Path:
               f"-{CACHE_LAYOUT}.parquet")
 
 
-def _write_atomic(frame: pl.DataFrame, path: Path) -> None:
-    """Запись через временный файл в ТОМ ЖЕ каталоге плюс `os.replace`.
-
-    ⚠ Прежняя редакция писала прямо по целевому пути. Обрыв процесса (а качается до
-    сотен файлов по ~15 МБ, с таймаутом 900 с и тремя попытками) оставлял обрезанный
-    parquet, и дальше читатель видел `path.exists()` и брал его НАВСЕГДА, не переспрашивая,
-    а `cached_days` считал эти сутки собранными. Причина потом выглядела
-    бы как «битый файл», а не как «недокачано».
-
-    `os.replace` атомарна в пределах одной файловой системы — отсюда требование класть
-    временный файл рядом, а не в системный временный каталог.
-    """
-    tmp = path.with_suffix(f".part-{os.getpid()}")
-    try:
-        frame.write_parquet(tmp)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+# ⚠⚠ СОБСТВЕННЫЙ `_write_atomic` УДАЛЁН 2026-08-23: он был ВТОРОЙ КОПИЕЙ
+# `barstore.write_atomic`, и копии успели разойтись — здесь `os.replace` вызывался ОДИН
+# раз, а там повторяется при `PermissionError`. Windows отказывает в замене файла,
+# открытого читателем, и суточный кэш читают те же два процесса, что и склад баров.
+# Повод правки прежний и в силе: обрыв процесса (сотни файлов по ~15 МБ, таймаут 900 с,
+# три попытки) оставлял обрезанный parquet, который `cached_days` считал собранными
+# сутками НАВСЕГДА — читатель видит `path.exists()` и больше не переспрашивает.
+_write_atomic = barstore.write_atomic
 
 
 def frame_from_pairs(
@@ -414,7 +409,7 @@ class WindowSource:
         ровно тот файл, что читался, иначе пересборка разошлась бы на границе покрытия.
         """
 
-        self._open: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        self._open: LruCache[date, pl.DataFrame] = LruCache(max_open)
         self._open_parts: dict[date, tuple[pl.DataFrame, int] | None] = {}
         self._part_idx: dict[str, tuple[Path, int]] | None = None
         """Индекс частичных суток каталога, построенный ОДНИМ обходом при первом
@@ -423,7 +418,7 @@ class WindowSource:
         (evidence/profile-replay-after-2026-08-17.txt). Экземпляр живёт один цикл, а
         частичные файлы пишет только бэкфилл ДО построения источников — устаревание
         индекса внутри цикла невозможно по порядку шагов `service.cycle`."""
-        self._grouped: OrderedDict[date, pl.DataFrame] = OrderedDict()
+        self._grouped: LruCache[date, pl.DataFrame] = LruCache(GROUPED_MAX)
         """Гистограммы ЦЕЛЫХ суток, сгруппированные один раз. Окна структур перекрываются
         по суткам (профиль повтора 2026-08-17: 329 вызовов `window` на 3 символа), и без
         кэша одни и те же сутки группировались заново под каждым окном — 76% времени
@@ -441,29 +436,29 @@ class WindowSource:
         Ёмкость — своя (`GROUPED_MAX`), не `max_open`: сгруппированные сутки в сотни раз
         меньше сырых (~тысяча бинов против сотен тысяч сделок), держать их можно годами
         окон."""
-        if day in self._grouped:
-            self._grouped.move_to_end(day)
-            return self._grouped[day]
+        # ⚠ Вытеснение — общей памятью `models.LruCache` (2026-08-23): своей копии
+        # `OrderedDict` + `move_to_end` + `popitem` здесь больше нет. Копий этого
+        # механизма в проекте было три; ёмкость остаётся своя — она выведена из
+        # размера хранимого, а не из устройства памяти.
+        hit = self._grouped.get(day)
+        if hit is not None:
+            return hit
         g = frame.group_by("bin", maintain_order=True).agg(pl.col("qty").sum(),
                                                            pl.col("n").sum())
-        self._grouped[day] = g
-        while len(self._grouped) > GROUPED_MAX:
-            self._grouped.popitem(last=False)
+        self._grouped.put(day, g)
         return g
 
     def _day(self, day: date) -> pl.DataFrame | None:
         """Сутки из кэша. Скачивания здесь НЕТ: это работа бэкфилла, а не расчёта."""
-        if day in self._open:
-            self._open.move_to_end(day)
-            return self._open[day]
+        hit = self._open.get(day)
+        if hit is not None:
+            return hit
         path = self.cache_dir / cache_path(self.market_id, day, self.tick).name
         if not path.exists():
             return None
         frame = pl.read_parquet(path)
         self.used_paths.add(path)
-        self._open[day] = frame
-        while len(self._open) > self.max_open:
-            self._open.popitem(last=False)
+        self._open.put(day, frame)
         return frame
 
     def _part(self, day: date) -> tuple[pl.DataFrame, int] | None:

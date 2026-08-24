@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import bisect
 from collections.abc import Sequence
 from decimal import Decimal
 from enum import StrEnum
@@ -32,7 +33,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .bars import TIMEFRAME_MS, tf_ms
-from .geometry import Setup
+from .geometry import Setup, breakeven_watch, first_major
 from .levels import Level, LevelSide, LevelState, LevelStatus
 from .models import Bar
 from .outcome import Outcome, resolve
@@ -242,12 +243,24 @@ def first_bar_after(bars: list[Bar], timeframe: str, since_ms: int, not_before: 
 
     `not_before` — нижняя граница поиска (бар появления уровня): раньше неё сделки быть
     не может по стр. 23, даже если момент записи ещё старше.
+
+    ⚠ ДВОИЧНЫЙ ПОИСК, А НЕ ЛИНЕЙНЫЙ (правка 2026-08-23). Здесь стоял проход циклом от
+    `not_before` до конца ряда, при том что `levels`, `figures` и `profile_source` в
+    этом же проекте уже везде на `bisect`. Ряд отсортирован по `open_ms` по построению
+    (`barstore.append` завершается `sort`, кадры пишутся отсортированными), а условие
+    `open_ms + step > since_ms` монотонно по индексу — значит место перехода ищется
+    делением пополам. Зовётся функция на КАЖДЫЙ дорешиваемый сигнал леджера.
+
+    Ответ ТОТ ЖЕ по построению: `bisect_right` по ключу `open_ms` даёт первый бар с
+    `open_ms > since_ms - step`, то есть ровно первый, у которого `open_ms + step >
+    since_ms` (метки целые, строгое неравенство сохраняется).
     """
     step = tf_ms(timeframe)
-    for i in range(max(not_before, 0), len(bars)):
-        if bars[i].open_ms + step > since_ms:
-            return i
-    return len(bars)
+    lo = max(not_before, 0)
+    if lo >= len(bars):
+        return len(bars)
+    return bisect.bisect_right(bars, since_ms - step, lo=lo,
+                               key=lambda b: b.open_ms)
 
 
 def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
@@ -263,13 +276,30 @@ def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
     Следствие честное и неприятное: у только что записанного сигнала исхода нет и быть
     не может. Он дописывается позже, по мере поступления новых баров.
     """
-    primary = [t for t in em.setup.targets if t.role.value == "primary"]
+    # ⚠ Роль сравнивается ПЕРЕЧИСЛЕНИЕМ, а не строкой (правка 2026-08-23). Здесь стояло
+    # `t.role.value == "primary"` — единственное такое место в проекте (`geometry.Setup.rr`
+    # и `card.render` сравнивают члены enum). Переименование значения `TargetRole.PRIMARY`
+    # молча обнулило бы ВСЕ исходы «по цели», и не поймал бы этого ни mypy, ни гейт:
+    # сравнение строки со строкой законно всегда.
+    #
+    # ⚠⚠ СОБСТВЕННЫЙ ФИЛЬТР СНЯТ 2026-08-24: правило «какая цель считается первой» жило
+    # ЗДЕСЬ, в `Setup.rr` и в `run.py` тремя копиями. Теперь оно одно —
+    # `geometry.first_major`.
+    first = first_major(em.setup.targets)
     return resolve(
         side=em.level.side,
         entry=em.setup.entry,
         stop=em.ledger_stop,
-        target=primary[0].price if primary else None,
+        target=first.price if first is not None else None,
         bars=bars,
         from_index=first_bar_after(bars, em.level.timeframe, since_ms,
                                   em.level.created_at_index + 1),
+        # ⚠⚠ БЕЗУБЫТОК ЗДЕСЬ НЕ ПЕРЕДАВАЛСЯ ВОВСЕ (правка 2026-08-24), и это давало ДВА
+        # разных правила под одним именем «исход». Тот же сигнал, дорешанный позже из
+        # леджера (`run._resolve_pending`), считался С безубытком — `breakeven_at`
+        # хранится в таблице с v9, — а посчитанный здесь, в момент записи, БЕЗ него.
+        # Что попадёт в колонку `outcome`, зависело от того, успел ли сигнал разрешиться
+        # в том же прогоне; ни один инвариант этого не ловил, потому что обе ветки
+        # возвращают законный `Outcome`.
+        breakeven_at=breakeven_watch(em.setup.breakeven_rules),
     )

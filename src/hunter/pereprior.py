@@ -73,7 +73,19 @@ class Pereprior(BaseModel):
 
     @property
     def zone_degenerate(self) -> bool:
-        return self.zone_lo == self.zone_hi
+        """Зона ПП схлопнулась в одну цену — у свечи нет тени с этой стороны."""
+        return zone_is_degenerate(self.zone_lo, self.zone_hi)
+
+
+def zone_is_degenerate(lo: float, hi: float) -> bool:
+    """Тот же предикат по двум числам — для тех, у кого самого ПП под рукой нет.
+
+    ⚠ Заведено 2026-08-24. `Pereprior.zone_degenerate` не вызывался НИОТКУДА, а бот
+    печатал вырожденную зону, сравнивая `zone_lo == zone_hi` у себя (`tgbot.pp_zone`):
+    два места, один предикат. Карта бота несёт плоскую строку `ZoneSpec` без объекта ПП,
+    поэтому сравнение по-прежнему делается по числам — но правило теперь одно и его
+    видно."""
+    return lo == hi
 
 
 def _shadow_zone(bar: Bar, kind: SwingKind) -> tuple[float, float]:

@@ -33,7 +33,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from .models import Bar
+from .models import Bar, percentile_rank
 from .swings import SwingKind, SwingSet
 
 
@@ -358,6 +358,16 @@ def band_narrowing(upper: list[float | None], lower: list[float | None],
     в барах до первого следующего закрытия за полосой. Медиана этих ожиданий и есть
     ответ на «как скоро», а `exit_cases` — сколько их было.
     """
+    # ⚠⚠ `close` ПРОВЕРЯЕТСЯ ТОЙ ЖЕ МЕРКОЙ, ЧТО И ТРИ ДРУГИХ РЯДА (правка 2026-08-23).
+    # `strict=True` ниже защищал ровно три ряда из четырёх, а `close` индексировался
+    # отдельно по длине первых трёх — то есть единственный ряд БЕЗ защиты был тот, по
+    # которому считается выход за полосу, а это и есть весь смысл функции. Ряд короче
+    # полос давал бы `IndexError` в середине расчёта, ряд длиннее — молча считал бы
+    # выход по чужому хвосту.
+    if not (len(close) == len(upper) == len(lower) == len(middle)):
+        raise ValueError(
+            f"band_narrowing: ряды разной длины — close {len(close)}, "
+            f"upper {len(upper)}, lower {len(lower)}, middle {len(middle)}")
     widths: list[float | None] = []
     for u, low, m in zip(upper, lower, middle, strict=True):
         if _absent(u) or _absent(low) or _absent(m) or m == 0:
@@ -397,7 +407,7 @@ def band_narrowing(upper: list[float | None], lower: list[float | None],
 
     return BandNarrowingFactor(
         width_pct=last,
-        percentile=sum(1 for w in known if w <= last) / len(known) * 100,
+        percentile=percentile_rank(known, last),
         exit_bars_median=statistics.median(waits) if waits else None,
         exit_cases=len(waits),
     )
@@ -486,8 +496,13 @@ def trendline_breaks(values: list[float | None], name: str) -> tuple[TrendlineBr
         i1, i2 = piv[-2], piv[-1]
         v1, v2 = values[i1], values[i2]
         assert v1 is not None and v2 is not None
-        if i2 <= i1 or i2 >= n - 1:
-            continue
+        # ⚠ ЗДЕСЬ СТОЯЛО `if i2 <= i1 or i2 >= n - 1: continue` — обе половины
+        # НЕДОСТИЖИМЫ, снято 2026-08-23. `_fractal_extremes` возвращает индексы строго
+        # по возрастанию (проход по возрастающему `i`), значит `piv[-1] > piv[-2]`; и
+        # правее `n - 1 - wing` он не возвращает ничего по построению диапазона, а
+        # `wing` равен двум — значит `i2 <= n - 3`. Проверка выглядела защитой, ею не
+        # являясь: под ней читатель полагал, что случай «последний экстремум и есть
+        # последний бар» рассмотрен, тогда как он невозможен.
         if (v2 <= v1) if on_lows else (v2 >= v1):
             continue
         slope = (v2 - v1) / (i2 - i1)

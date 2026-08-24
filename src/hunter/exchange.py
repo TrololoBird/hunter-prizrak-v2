@@ -447,6 +447,28 @@ def desync_s(key: str, base_s: float) -> float:
     return base_s * (0.5 + zlib.crc32(key.encode()) % 1000 / 1000)
 
 
+USED_CCXT_METHODS: tuple[str, ...] = (
+    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchCurrencies", "fetchTicker",
+    "fetchTickers", "fetchTrades", "fetchOrderBook", "fetchBidsAsks",
+    "fetchLastPrices", "fetchMarkPrice", "fetchMarkPrices", "fetchFundingRate",
+    "fetchFundingRates", "fetchFundingRateHistory", "fetchFundingIntervals",
+    "fetchOpenInterest", "fetchOpenInterests", "fetchOpenInterestHistory",
+    "fetchLiquidations", "fetchLongShortRatioHistory", "loadMarkets",
+    "watchTrades", "watchOHLCV",
+)
+"""Методы ccxt, которые проект ДЕЙСТВИТЕЛЬНО вызывает. Знаменатель к «спрошено N».
+
+⚠⚠ ЗАВЕДЕНО 2026-08-23. `REQUIRED_CAPABILITIES` ниже покрывает ТРИ метода, и приёмка
+печатала «возможности проверены: 3» — без знаменателя это читается как «проверено всё»,
+хотя не спрошено большинство. Разрыв теперь НАЗЫВАЕТСЯ числом при открытии соединения.
+
+⚠ Список НЕ становится вторым `REQUIRED_CAPABILITIES`, и это не робость: карта `has`
+врёт в обе стороны (разбор двумя абзацами ниже — объявленные `True` методы отвечают
+`-5000 «Method is invalid»`, а существующий метод объявлен `None`). Жёсткая проверка по
+ней остановила бы прогон на работающем методе. Правило проекта — «проверка возможности
+только вызов»; пока вызова нет, честно назвать разрыв, а не закрыть его объявлением.
+"""
+
 REQUIRED_CAPABILITIES: dict[str, str] = {
     "fetchOHLCV": "бары всех ТФ — без них нет ни структур, ни уровней (§2.4, §2.8)",
     "fetchTime": "сведение часов с биржей — §6 запрещает судить о закрытости по локальным",
@@ -1066,6 +1088,12 @@ class Exchange:
         а без счётчика переподключение неотличимо от бесперебойной работы.
         """
 
+        self.capabilities_missing = 0
+        self.capabilities_emulated = 0
+        """Итог `check_capabilities`: сколько возможностей карта `has` НЕ объявила и
+        сколько объявила эмулируемыми. Заведены 2026-08-23, чтобы приёмка печатала
+        ЗАМЕР, а не литерал «отсутствует 0» в тексте строки."""
+
     def check_capabilities(self) -> tuple[str, ...]:
         """Что из необходимого биржа не умеет. Пустой кортеж — умеет всё.
 
@@ -1080,6 +1108,30 @@ class Exchange:
                 emulated.append(name)
             elif not value:
                 missing.append(f"{name} ({why})")
+        # ⚠ ЧИСЛА ЗАПОМИНАЮТСЯ НА ОБЪЕКТЕ (2026-08-23). Приёмка печатала строку
+        # «возможности ccxt проверены до прогона: N, отсутствует 0 — иначе прогона бы не
+        # было»: число проверенных бралось из отчёта, а число ОТСУТСТВУЮЩИХ было
+        # ЛИТЕРАЛОМ в тексте. Это буквальное повторение дефекта, записанного в
+        # CLAUDE.md: «Строка „гейты зелёные“, напечатанная безусловно, уже один раз
+        # соврала». Довод «иначе прогона бы не было» верен, но печатать надо ЗАМЕР, а не
+        # вывод из рассуждения: рассуждение перестанет быть верным молча.
+        self.capabilities_missing = len(missing)
+        self.capabilities_emulated = len(emulated)
+        # ⚠⚠ ОХВАТ ПРОВЕРКИ НАЗЫВАЕТСЯ ЧИСЛОМ (2026-08-23). `REQUIRED_CAPABILITIES`
+        # покрывает ТРИ метода из тех, что проект реально вызывает; остальные не
+        # спрашиваются вовсе, и до этой строки об этом не говорилось нигде — а «спрошено
+        # 3» без знаменателя читается как «проверено всё». Расширять список нельзя
+        # бездумно: карта `has` ВРЁТ В ОБЕ СТОРОНЫ (разбор в докстроке
+        # `REQUIRED_CAPABILITIES`), и жёсткая проверка по ней остановила бы прогон на
+        # методе, который работает. Поэтому здесь НАЗЫВАЕТСЯ разрыв, а не вводится
+        # отсечка: правило проекта — «проверка возможности только вызов», и настоящее
+        # закрытие этого разрыва в том, чтобы вызвать, а не спросить.
+        unchecked = sorted(set(USED_CCXT_METHODS) - set(REQUIRED_CAPABILITIES))
+        if unchecked:
+            log.info("возможности, которые проект ВЫЗЫВАЕТ, но у карты не спрашивает",
+                     вызываем=len(USED_CCXT_METHODS),
+                     спрошено=len(REQUIRED_CAPABILITIES),
+                     не_спрошено=len(unchecked), методы=", ".join(unchecked))
         # ⚠ «проверено N» здесь означает «спрошено у карты N раз», а НЕ «работает N».
         # Формулировка правится вместе с находкой о лживости `has`: прежняя читалась как
         # утверждение об исправности.
@@ -2157,7 +2209,32 @@ class Exchange:
             async with sem:
                 return await self._fetch_ohlcv_guarded(symbol, timeframe, s, OHLCV_PAGE)
 
-        results = await asyncio.gather(*(one(s) for s in starts))
+        # ⚠⚠ `return_exceptions=True` ОБЯЗАТЕЛЕН (правка 2026-08-23). Без него ЛЮБОЕ
+        # исключение, которого не ждёт `_fetch_ohlcv_guarded` (разбор ответа, `TypeError`
+        # на неожиданной форме, отмена вне дерева ccxt), поднималось из `gather` и
+        # обрушивало ВЕСЬ добор ряда — а остальные страницы оставались неожидаемыми
+        # задачами. Это ровно то, ради отмены чего пагинация и переписывалась 2026-08-17:
+        # «раньше ОДИН таймаут обрывал весь остаток пагинации… теперь падает страница,
+        # она повторяется, а невосполненная — считается и называется». Известные классы
+        # ccxt `_fetch_ohlcv_guarded` превращает в `NotReady` сам; здесь закрывается
+        # ОСТАЛЬНОЕ, и закрывается тем же способом — отказом с НАЗВАННОЙ причиной, а не
+        # молчанием: неизвестное исключение становится `NotReady`, страница уходит в
+        # повтор, и если не восполнится — весь ряд станет несобранным ниже.
+        # ⚠ `CancelledError` пропускается наверх: это приказ остановиться, а не сбой
+        # страницы. Он наследует `BaseException`, поэтому `gather` его и так не
+        # заворачивает в результат, но условие названо, чтобы читатель не гадал.
+        raw = await asyncio.gather(*(one(s) for s in starts), return_exceptions=True)
+        results: list[list[list[Any]] | NotReady] = []
+        for s, item in zip(starts, raw, strict=True):
+            if isinstance(item, BaseException):
+                log.degraded("страница ряда упала НЕОЖИДАННЫМ исключением",
+                             символ=symbol, тф=timeframe, since=s,
+                             причина=f"{type(item).__name__}: {item}")
+                results.append(NotReady(
+                    reason=f"{symbol} {timeframe}: страница since={s} — "
+                           f"{type(item).__name__}: {item}"))
+            else:
+                results.append(item)
         retry = [s for s, r in zip(starts, results, strict=True) if isinstance(r, NotReady)]
         by_open: dict[int, list[Any]] = {}
         for r in results:
