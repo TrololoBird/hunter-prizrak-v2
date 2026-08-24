@@ -181,7 +181,8 @@ def cache_path(market_id: str, day: date, tick: Decimal) -> Path:
 # Повод правки прежний и в силе: обрыв процесса (сотни файлов по ~15 МБ, таймаут 900 с,
 # три попытки) оставлял обрезанный parquet, который `cached_days` считал собранными
 # сутками НАВСЕГДА — читатель видит `path.exists()` и больше не переспрашивает.
-_write_atomic = barstore.write_atomic
+# ⚠ Псевдоним `_write_atomic = barstore.write_atomic` убран 2026-08-24: два имени у
+# одной функции — тот же класс «двух сущностей», вызовы идут по настоящему имени.
 
 
 def frame_from_pairs(
@@ -223,7 +224,7 @@ def write_full_day_from_frame(
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = cache_path(market_id, day, tick)
-    _write_atomic(frame, path)
+    barstore.write_atomic(frame, path)
     for p in CACHE_DIR.glob(f"{path.stem}-part*.parquet"):
         p.unlink(missing_ok=True)
     return path
@@ -282,7 +283,7 @@ def write_part_day(
     root = CACHE_DIR if cache_dir is None else cache_dir
     root.mkdir(parents=True, exist_ok=True)
     path = root / part_path(market_id, day, tick, cover_to_ms).name
-    _write_atomic(frame, path)
+    barstore.write_atomic(frame, path)
     base = cache_path(market_id, day, tick)
     for p in root.glob(f"{base.stem}-part*.parquet"):
         m = re.fullmatch(r".*-part(\d+)", p.stem)

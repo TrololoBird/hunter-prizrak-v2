@@ -32,6 +32,7 @@ from .bars import (
     grid_floor_ms,
     on_grid,
     resample,
+    right_edge_ms,
     tf_ms,
 )
 from .config import Universe
@@ -59,7 +60,7 @@ from .models import (
     TradeWindows,
     bin_index,
 )
-from .outcome import OutcomeKind
+from .outcome import CLOSED_KINDS, OutcomeKind
 from .outcome import resolve as outcome_resolve
 from .profile_source import (
     PROFILE_LADDER,
@@ -1555,7 +1556,7 @@ def needed_days(
     days: set[date] = set()
     used = dropped = 0
     max_hi = 0
-    now = max((b[-1].open_ms for b in series.values() if b), default=0)
+    now = right_edge_ms(series)
     cut = now - horizon_days * 86_400_000
     for tf, bars in series.items():
         if not bars:
@@ -1651,7 +1652,7 @@ def profile_windows(
     """
     out: list[tuple[int, int]] = []
     used = dropped = senior = far = 0
-    now = max((b[-1].open_ms for b in series.values() if b), default=0)
+    now = right_edge_ms(series)
     cut = now - horizon_days * 86_400_000 if horizon_days > 0 else 0
     youngest = min((tf for tf in series if series.get(tf)),
                    key=lambda tf: TIMEFRAME_MS[tf], default="")
@@ -2584,7 +2585,7 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 # долю «мимо входа», то есть в число, которое читает владелец.
                 degenerate += 1
                 continue
-            if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
+            if res.kind in CLOSED_KINDS:
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
                     conn, p.id, res.kind.value, bars[res.closed_at_index].open_ms,
@@ -2845,7 +2846,12 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     report.emitted_stop_pct.append(
                         float(abs(em.setup.entry - em.ledger_stop) / em.setup.entry * 100)
                     )
-                if res.kind.value in ("stop", "target", "ambiguous", "breakeven"):
+                if res.kind is OutcomeKind.UNMEASURABLE:
+                    # Вырожденный риск: в леджер не идёт НИКАК (докстрока
+                    # `OutcomeKind.UNMEASURABLE`); прежде падал в ветку состояний, и
+                    # CHECK схемы отбивал запись с подписью «состояние не записано».
+                    pass
+                elif res.kind in CLOSED_KINDS:
                     assert res.closed_at_index is not None
                     err = store.record_outcome(
                         conn, sig.id, res.kind.value,
@@ -2906,7 +2912,9 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         pbars, pssig.timeframe, row.recorded_at,
                         pssig.pp.confirmed_at_index + 1),
                 )
-                if pres.kind.value in ("stop", "target", "ambiguous", "breakeven"):
+                if pres.kind is OutcomeKind.UNMEASURABLE:
+                    pass  # вырожденный риск: не исход и не состояние (см. докстроку)
+                elif pres.kind in CLOSED_KINDS:
                     assert pres.closed_at_index is not None
                     err = store.record_outcome(
                         conn, row.id, pres.kind.value,

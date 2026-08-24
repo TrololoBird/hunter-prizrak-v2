@@ -66,7 +66,7 @@ import sqlite3
 import tempfile
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -559,7 +559,17 @@ def read_map(symbol: str) -> MapRead | NotReady:
     # Границы структуры идут на график пунктиром рядом с зоной (запрос владельца
     # 2026-08-17): зона — Value Area 70%, структура — боковик, её породивший, и
     # сливать их в одну полосу значит прятать различие.
-    zones = tuple(ZoneSpec(side=r[1], timeframe=r[0], price=float(r[2]),
+    # ⚠⚠ СТОРОНА ПЕРЕВОРАЧИВАЕТСЯ ЗДЕСЬ, У ПРОИЗВОДИТЕЛЯ, — ревизия 2026-08-24.
+    # Леджер хранит сторону РОЖДЕНИЯ, а `ZoneSpec.side` с этого дня всюду означает
+    # ТЕКУЩУЮ сторону (стр. 43): второй производитель, `zones_of`, уже отдаёт её через
+    # `m.current`. Прежде переворот жил в ПОТРЕБИТЕЛЕ (`live_unique`) — и на зонах от
+    # `zones_of` срабатывал ВТОРОЙ раз, возвращая флипнутым сторону рождения: два
+    # переворота гасили друг друга, свежая карта показывала большинство (флипнутых
+    # 20374 против 5177 активных) чужой стороной — ровно дефект, который правка
+    # dafa01b объявила закрытым. Одно имя — одно значение; переворот у читателя удалён.
+    zones = tuple(ZoneSpec(side=(("short" if r[1] == "long" else "long")
+                                 if r[11] == "flipped" else r[1]),
+                           timeframe=r[0], price=float(r[2]),
                            zone_lo=float(r[3]), zone_hi=float(r[4]),
                            entry_rule=r[5] or "",
                            boundary_lo=float(r[7]), boundary_hi=float(r[8]),
@@ -1102,8 +1112,15 @@ def live_unique(
     # ⚠ Возражение прежней редакции («флипнутых 20374 против 5177 активных, перечень
     # BTC вырастет со 124 строк до 282») снято не отменой, а тем, что список и так режется
     # по расстоянию до цены и по `ZONES_PER_SIDE`; свёрнутый хвост называется числом.
-    flipped = [replace(z, side=("short" if z.side == "long" else "long"))
-               for z in zones if z.state == "flipped"]
+    #
+    # ⚠⚠ САМ ПЕРЕВОРОТ ОТСЮДА УДАЛЁН 2026-08-24. Здесь стояло
+    # `replace(z, side=("short" if z.side == "long" else "long"))` — вторая запись
+    # правила стр. 43 в ПОТРЕБИТЕЛЕ. Первую несут производители: `zones_of` через
+    # `m.current`, `read_map` при чтении строки. На зонах свежей сборки два переворота
+    # гасили друг друга, и флипнутые шли читателю стороной РОЖДЕНИЯ — молча, потому что
+    # текст и график считали из одного испорченного списка и согласовывались между
+    # собой. `ZoneSpec.side` теперь всюду означает ТЕКУЩУЮ сторону.
+    flipped = [z for z in zones if z.state == "flipped"]
     pool = alive + flipped
     return pool, _dedupe(pool, price), _dedupe(flipped, price)
 
@@ -1426,6 +1443,16 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
             return "вход по факту — после слома на младшем ТФ"
         return "лимитки; часть — по факту"
 
+    def group_density(g: list[ZoneSpec]) -> float | None:
+        """Сильнейшая ИЗМЕРЕННАЯ плотность группы; None — не измерена ни одна (§4.3).
+
+        ⚠ Одно определение на ответ (ревизия 2026-08-24): выражение стояло трижды —
+        в `span_line`, в отборе `measured` и у `shown_vol`, — и печатаемая сила могла
+        разойтись со сравнением «сильнейший по объёму — не выше» при первой правке.
+        """
+        return max((z.vrvp_density for z in g if z.vrvp_density is not None),
+                   default=None)
+
     def span_line(g: list[ZoneSpec]) -> str:
         by_seniority = sorted(g, key=lambda z: -order.get(z.timeframe, 0))
         tfs = "+".join(dict.fromkeys(
@@ -1487,8 +1514,7 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         # ничем не выделяется», поэтому называется только сгущение. `None` — «не
         # считалось» (композит не построен), и тогда строки нет: печатать «×0» значило
         # бы назвать пустым непосчитанное (§4.3).
-        vol = max((z.vrvp_density for z in g if z.vrvp_density is not None),
-                  default=None)
+        vol = group_density(g)
         strength = (f" · объём ×{vol:.1f} к среднему"
                     if vol is not None and vol >= 1.2 else "")
         return f"{core} · {role(g, g_lo <= price <= g_hi)}{strength}{far}{marks}"
@@ -1559,11 +1585,9 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
             # «не считалось» с числом нечем, а подстановка нуля была бы ложным ответом
             # (§4.3). Группа без единой измеренной плотности в сравнении не участвует.
             measured = [(d, g) for g in rest
-                        if (d := max((z.vrvp_density for z in g
-                                      if z.vrvp_density is not None),
-                                     default=None)) is not None]
-            shown_vol = max((z.vrvp_density for g in shown for z in g
-                             if z.vrvp_density is not None), default=0.0)
+                        if (d := group_density(g)) is not None]
+            shown_vol = max((d for g in shown
+                             if (d := group_density(g)) is not None), default=0.0)
             if measured:
                 rest_vol, best_rest = max(measured, key=lambda p: p[0])
                 if rest_vol > shown_vol and rest_vol >= 1.2:
@@ -3441,9 +3465,8 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         # ⚠ Формула запаса здесь БОЛЬШЕ НЕ ПИШЕТСЯ (2026-08-24): стояло
         # `edge * DEFAULT_MARGIN_PCT / 100` — вторая запись той же величины. Теперь
         # зовётся `geometry.stop_beyond_edge`, одна на проект.
-        fallback = geometry.stop_beyond_edge(
-            Decimal(str(edge)), geometry.DEFAULT_MARGIN_PCT, up=buy)
-        stop = lv.stop_price if lv.stop_price else float(fallback)
+        stop = lv.stop_price or float(geometry.stop_beyond_edge(
+            Decimal(str(edge)), geometry.DEFAULT_MARGIN_PCT, up=buy))
         # РИСК В ПРОЦЕНТАХ — не новая величина, а то же расстояние вход↔стоп, названное
         # так, как его использует читатель. Стр. 9 определяет Р как «один Риск» и
         # единицу измерения сделки; проценты дают посчитать объём позиции, не зная

@@ -25,9 +25,9 @@ from bisect import bisect_left, bisect_right
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from .bars import TF_RANK, TIMEFRAME_MS, steps_between, tf_ms
+from .bars import TF_RANK, TIMEFRAME_MS, right_edge_ms, steps_between, tf_ms
 from .breach import (
     CONFIRM_BODIES,
     RETURN_BARS,
@@ -615,7 +615,7 @@ def build_all(
     # ⚠ «Сейчас» берётся у САМОГО РЯДА (последний бар), а не у часов: `replay` обязан
     # давать тот же результат на тех же кадрах, а `clock.now_ms()` сделал бы расчёт
     # зависящим от момента запуска.
-    now_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
+    now_ms = right_edge_ms(series)
     cut_ms = now_ms - horizon_days * 86_400_000 if horizon_days > 0 else 0
     for tf in timeframes:
         bars = series.get(tf)
@@ -1597,12 +1597,16 @@ def level_as_of(m: MappedLevel, as_of_ms: int) -> Level | None:
         есть читал стр. 43 как стр. 25, хотя стр. 43 не удаляет уровень, а меняет
         его сторону.
     """
+    memo = m._asof_memo
+    if as_of_ms in memo:
+        return memo[as_of_ms]
     if m.level.created_at_ms > as_of_ms:
-        return None
-    st = m.status.state_at(as_of_ms)
-    if st is LevelState.WORKED_OFF:
-        return None
-    return flipped_if(m.level, st)
+        got: Level | None = None
+    else:
+        st = m.status.state_at(as_of_ms)
+        got = None if st is LevelState.WORKED_OFF else flipped_if(m.level, st)
+    memo[as_of_ms] = got
+    return got
 
 
 class MappedLevel(BaseModel):
@@ -1619,6 +1623,16 @@ class MappedLevel(BaseModel):
 
     level: Level
     status: LevelStatus
+
+    _asof_memo: dict[int, Level | None] = PrivateAttr(default_factory=dict)
+    """Память `level_as_of` по моменту решения — приём `TradingRange.box`.
+
+    ⚠ Заведена ревизией 2026-08-24, и повод замерен: `engine.decide` подаёт ВСЕМ
+    уровням символа один `now_ms`, а `build_targets_report` внутри спрашивает
+    `level_as_of` по всему пулу для КАЖДОГО уровня заново — O(L²) вызовов на символ
+    при O(L) различных ответов, с копией pydantic-модели (3 мкс) на каждый флипнутый.
+    На полной доске это порядка секунды процессора на цикл в самом горячем месте.
+    Формула переворота остаётся ОДНА (`flipped_if`) — здесь только память."""
 
     def alive_at(self, as_of_ms: int) -> bool:
         """Существовал ли уровень на момент `as_of_ms` и был ли ещё в силе.

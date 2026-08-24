@@ -158,11 +158,9 @@ class LruCache[K, V]:
         while len(self._items) > self._max:
             self._items.popitem(last=False)
 
-    def __contains__(self, key: object) -> bool:
-        return key in self._items
-
-    def __len__(self) -> int:
-        return len(self._items)
+    # ⚠ `__contains__` и `__len__` удалены 2026-08-24: ни одного вызова у трёх
+    # потребителей кэша (все живут на get/put) — запасной API без потребителя, тот же
+    # класс, что удалённые мёртвые ключи конфига. Вернутся с первым настоящим читателем.
 
 
 def percentile_rank(values: Sequence[float], x: float) -> float:

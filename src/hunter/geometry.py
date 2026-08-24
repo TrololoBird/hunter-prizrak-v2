@@ -36,6 +36,11 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .bars import BARS_ON_CHART, TF_RANK, TIMEFRAME_MS
+
+# `TF_ORDER` с 2026-08-24 живёт в `bars` рядом с `TF_RANK` — двумя формами ОДНОГО
+# порядка стр. 17; здесь остаётся реэкспорт для прежних потребителей (`engine`,
+# `priority`). Разбор переезда — докстрока `bars.TF_ORDER`.
+from .bars import TF_ORDER as TF_ORDER
 from .levels import (
     STOP_ANCHOR_BAND_MAX_PCT,
     Level,
@@ -46,14 +51,6 @@ from .levels import (
 )
 from .models import NotReady
 from .pereprior import Pereprior, PPSide
-
-TF_ORDER = tuple(TIMEFRAME_MS)
-"""Стр. 17: «Мы используем основные ТФ (5м/15м/час/4ч/1Д/1Н)». Порядок задаёт ТФ-1 и ТФ-2.
-
-⚠ Здесь стоял ЛИТЕРАЛ `("5m", "15m", "1h", "4h", "1d", "1w")` — вторая запись того же
-порядка (правка 2026-08-23). Теперь он выводится из `bars.TIMEFRAME_MS`, который и есть
-список курса; разойтись двум записям больше нечем. Кортеж остаётся кортежем: потребители
-берут из него срезы (`TF_ORDER[rank + 1:]` — «все старше этого»)."""
 
 STOP_MARGIN_MIN_PCT = 1.0
 STOP_MARGIN_MAX_PCT = 3.0
@@ -186,6 +183,15 @@ def margin_of(price: Decimal, pct: float) -> Decimal:
     (`figures.pennant`) её не было вовсе, хотя докстрока модуля утверждала, что запас
     «накладывает `geometry`». Три копии совпадали, четвёртая молча отсутствовала —
     ровно тот исход, ради которого CLAUDE.md запрещает вторую копию формулы.
+
+    ⚠⚠ СЧЁТ «ЧЕТЫРЁХ МЕСТ» БЫЛ НЕПОЛОН, ПОПРАВЛЕНО В ТОТ ЖЕ ДЕНЬ РЕВИЗИЕЙ ДИФФА.
+    Перепись перед правкой (правило «грепом перечислить, где величина ещё считается»)
+    пропустила ещё ДВЕ живые копии в этом же файле: `build_stop_volume_setup` (та же
+    формула на Decimal) и `build_pp_setup` (float-вариант `край · (1 ± pct/100)`).
+    Полдня докстрока объявляла «одно определение на весь проект», пока стоп стопового
+    объёма и стоп ПП считались мимо него, — прибор объявлял охват больше настоящего.
+    Обе копии сведены сюда; у ПП float→Decimal→float меняет значение не больше чем на
+    машинный ульп — на печати карточки это не видно ни в одном знаке.
     """
     return price * Decimal(str(pct)) / Decimal(100)
 
@@ -364,8 +370,16 @@ class BreakevenRule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     trigger: BreakevenTrigger
-    watch_price: Decimal
-    """Цена, достижение которой и есть условие. Куда переносится стоп — `breakeven_price`."""
+    watch_price: Decimal | None
+    """Цена, достижение которой и есть условие. Куда переносится стоп — `breakeven_price`.
+
+    ⚠ `None` — условие ЦЕНОЙ НЕ ВЫРАЖАЕТСЯ (ревизия 2026-08-24), и это статус правила
+    стр. 44: "пробой уровня и ретест" — последовательность событий, а не порог. Прежде
+    поле было обязательным, и стр. 44 несла ЦЕНУ ТВХ: условие, «выполненное» в момент
+    входа всегда. Карточка это уже чинила У СЕБЯ (печатала правило словами, без цены) —
+    то есть тип разрешал бессмысленное значение, а слой печати прятал его. Теперь тип
+    заставляет КАЖДОГО потребителя обработать «порога нет», а не переоткрывать уловку
+    карточки заново."""
 
     note: str
     """Слова курса, которыми условие задано, вместе со страницей."""
@@ -818,7 +832,7 @@ def build_targets(
 
 
 def build_breakeven_rules(
-    *, level_price: Decimal, first_take: Decimal | None,
+    *, first_take: Decimal | None,
     inside_base: Decimal | None = None,
 ) -> tuple[BreakevenRule, ...]:
     """Условия перевода стопа в безубыток — те, что курс даёт ЭТОЙ сделке.
@@ -859,8 +873,11 @@ def build_breakeven_rules(
         out.append(BreakevenRule(
             trigger=BreakevenTrigger.PARTIAL_TAKE_DONE, watch_price=first_take,
             note="стр. 15: «Вы сделали тейки по достигнутым целям и передвинули стоп в бу»"))
+    # Ценового порога у стр. 44 НЕТ: ретест — последовательность, а не цена
+    # (разбор — докстрока `BreakevenRule.watch_price`). Параметр `level_price`,
+    # питавший это поле, удалён из подписи вместе с подстановкой.
     out.append(BreakevenRule(
-        trigger=BreakevenTrigger.LEVEL_BREACH_RETEST, watch_price=level_price,
+        trigger=BreakevenTrigger.LEVEL_BREACH_RETEST, watch_price=None,
         note="стр. 44: «быть готовым выйти в б/у при пробое уровня – на ретесте»"))
     return tuple(out)
 
@@ -1070,6 +1087,11 @@ def build_setup(
     # `build_targets`. None оставлен разборам «как было при рождении уровня».
     report = build_targets_report(level, pool, as_of_ms=as_of_ms)
     targets = report.targets
+    # ⚠ ДВЕ «первые цели», и это НАЗВАНО (ревизия 2026-08-24), а не слито: здесь —
+    # ближайшая цель ЛЮБОЙ роли (стр. 15 взводит б/у «по достигнутым целям», то есть и
+    # по промежуточному тейку ТФ-1), а `first_major` — первая ОСНОВНАЯ (стр. 9/24: по
+    # ней считаются РР и цель леджера). Когда targets[0] промежуточная, эти цены
+    # законно разные; сливать их — менять одну из двух величин, которые читает владелец.
     first_take = targets[0].price if targets else None
     return Setup(
         level=level,
@@ -1087,7 +1109,7 @@ def build_setup(
         # ⚠ Правило стр. 19 сюда НЕ подаётся (2026-08-24): оно флэтовое, разбор — в
         # докстроке `build_breakeven_rules`. У сделки от уровня остаются стр. 15 и 44.
         breakeven_rules=build_breakeven_rules(
-            level_price=level.price, first_take=first_take),
+            first_take=first_take),
         add_ons=build_add_ons(entry=level.price, first_take=first_take,
                               repeat_share_pct=ADD_ON_SHARE_PCT),
     )
@@ -1207,8 +1229,10 @@ def build_stop_volume_setup(
     up = base.side is LevelSide.LONG
     entry = found.price
     edge = _sv_edge(found, up)
-    sign = Decimal(-1) if up else Decimal(1)
-    stop = edge + sign * edge * Decimal(str(DEFAULT_MARGIN_PCT)) / Decimal(100)
+    # Запас — ОДНОЙ формулой проекта (2026-08-24): здесь стояла её вторая запись
+    # `edge + sign * edge * pct / 100`, тождественная, но невидимая для правки
+    # `stop_beyond_edge` — счёт копий в докстроке `margin_of`.
+    stop = stop_beyond_edge(edge, DEFAULT_MARGIN_PCT, up=up)
     goal = base.boundary_hi if up else base.boundary_lo
     if (goal <= entry) if up else (goal >= entry):
         return NotReady(reason=f"{base.symbol} {base.timeframe}: граница базы {goal} не впереди "
@@ -1228,7 +1252,7 @@ def build_stop_volume_setup(
         # хозяина от нижней части к верхней границе — механика флэта стр. 19.
         breakeven_rules=build_breakeven_rules(
             inside_base=found.zone_hi if up else found.zone_lo,
-            level_price=entry, first_take=goal),
+            first_take=goal),
         # Стр. 39 велит откупать повторно, но доли для этого случая не называет —
         # в отличие от стр. 19, где названы 50%.
         add_ons=build_add_ons(entry=entry, first_take=goal, repeat_share_pct=None),
@@ -1303,17 +1327,22 @@ def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
     # реализована: накопление в месте слома здесь неизвестно (`build_pp_setup` получает
     # только сам ПП и встречный). Это названо, а не умолчано; ветвь ставит стоп ДАЛЬШЕ,
     # значит нынешний стоп её не нарушает, а недобирает.
-    margin = DEFAULT_MARGIN_PCT / 100
+    # Запас — ОДНОЙ формулой проекта (2026-08-24): здесь стояла её третья запись,
+    # float-вариант `край * (1 ± pct/100)`. Decimal только на этой строке, как у
+    # вымпела (`figures.pennant`): цены ПП — float, формула живёт на Decimal.
+    def beyond(edge: float, *, up: bool) -> float:
+        return float(stop_beyond_edge(Decimal(str(edge)), DEFAULT_MARGIN_PCT, up=up))
+
     if pp.side is PPSide.SHORT:
         entry = pp.zone_lo
-        stop = pp.zone_hi * (1 + margin)
+        stop = beyond(pp.zone_hi, up=False)
         cand = opposite.zone_hi if opposite is not None else None
         target = cand if cand is not None and cand < entry else None
         risk = stop - entry
         rr = (entry - target) / risk if target is not None and risk > 0 else None
     else:
         entry = pp.zone_hi
-        stop = pp.zone_lo * (1 - margin)
+        stop = beyond(pp.zone_lo, up=True)
         cand = opposite.zone_lo if opposite is not None else None
         target = cand if cand is not None and cand > entry else None
         risk = entry - stop

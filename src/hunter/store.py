@@ -1113,7 +1113,8 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        conn.commit()
+        # `conn.commit()` после явного COMMIT не ставится (ревизия 2026-08-24): он был
+        # скопирован из блока 14→15 и не завершал ничего — второй транзакции нет.
         if bad:
             log.degraded(
                 "миграция 15→16: из карты УДАЛЕНЫ уровни, чья зона выходит за структуру",

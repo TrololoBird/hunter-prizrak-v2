@@ -253,9 +253,7 @@ def scan(path: Path, listed: set[str]) -> list[tuple[int, str]]:
         child = SOURCE_ROOT / f"{name}.py"
         if not child.exists():
             continue
-        for line, why in scan_imports(child):
-            out.append((0, f"через импорт {name} ({name}.py:{line}): {why}"))
-        for line, why in scan_module_state(child):
+        for line, why in scan_imports(child) + scan_module_state(child):
             out.append((0, f"через импорт {name} ({name}.py:{line}): {why}"))
         queue.extend(m for m in local_imports(child)
                      if m not in listed and m not in seen)

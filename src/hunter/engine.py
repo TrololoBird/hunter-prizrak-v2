@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import absorption, emit, figures, geometry, levels, pereprior, priority, swings
 from .absorption import AbsorptionRead
-from .bars import TF_RANK, TIMEFRAME_MS
+from .bars import TF_RANK, TIMEFRAME_MS, right_edge_ms
 from .geometry import TF_ORDER, Setup
 from .levels import Level, LevelStatus, MappedLevel, Unbuilt
 from .models import Bar, NotReady, TradeWindows
@@ -555,10 +555,11 @@ def decide(
     # того же ТФ, и без него страница читалась бы наполовину.
     mapped = levels.map_levels(frozen, series, scans)
     trends = {tf: r.trend for tf, r in reads.items()}
-    # «Сейчас» берётся у САМОГО РЯДА, не у часов — тот же приём и тот же довод, что у
-    # горизонта в `levels.build_all`: повтор обязан давать тот же результат на тех же
-    # кадрах. Правый край закрытых баров и есть момент решения.
-    now_ms = max((s[-1].open_ms for s in series.values() if s), default=0)
+    # «Сейчас» берётся у САМОГО РЯДА, не у часов — повтор обязан давать тот же
+    # результат на тех же кадрах. Формула одна на проект: `bars.right_edge_ms`,
+    # ей же режет горизонт `levels.build_all` — момент решения и «сейчас» горизонта
+    # обязаны быть ОДНОЙ величиной, а не двумя совпадающими.
+    now_ms = right_edge_ms(series)
 
     decisions: list[Decision] = []
     for m in mapped:

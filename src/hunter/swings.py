@@ -215,6 +215,19 @@ class Swing(BaseModel):
 
     open_ms: int
     price: float
+
+    def outer_than(self, other: Swing) -> bool:
+        """ЭКСТРЕМАЛЬНЕЕ ли этот свинг другого ТОГО ЖЕ рода: хай выше хая, лой ниже лоя.
+
+        ⚠ ОДНА запись правила на проект (ревизия 2026-08-24). Курс (стр. 13, 18): из
+        двух одноимённых подряд экстремумов границу держит более экстремальный. Прежде
+        предикат был выписан дважды дословно — в `ZigzagPrefixes.__init__` и в
+        `figures._alternating`, причём докстрока второй ССЫЛАЛАСЬ на первую вместо
+        вызова, а их предыдущее расхождение (`continue` против уточнения) уже чинилось.
+        """
+        return (self.price > other.price if self.kind is SwingKind.HIGH
+                else self.price < other.price)
+
     confirmed_at_index: int
     """Индекс бара, после закрытия которого фрактал стал известен: `index + depth`.
 
@@ -584,9 +597,7 @@ class ZigzagPrefixes:
                 chain.append(s)
                 continue
             if chain[-1].kind is s.kind:
-                outer = (s.price > chain[-1].price if s.kind is SwingKind.HIGH
-                         else s.price < chain[-1].price)
-                if outer:
+                if s.outer_than(chain[-1]):
                     chain[-1] = s
                 continue
             fin = chain[-1].model_copy(
