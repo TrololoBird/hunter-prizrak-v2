@@ -451,6 +451,17 @@ class Setup(BaseModel):
 
     targets: tuple[Target, ...]
 
+    no_target_reason: str = ""
+    """Почему целей НЕТ — словами и со знаменателем (§4.3). Пусто — цели есть.
+
+    Заведено 2026-08-24 по слову владельца: «Сделок без цели быть не может. Это
+    означает ошибка в расчетах, геометрии, структурах, поках, объемах или во всем
+    вместе!» До этого карточка печатала «целей нет» БЕЗ причины — и отсутствие цели
+    читалось как свойство рынка, хотя на разобранных сделках 1ч/4ч/1Д причиной был
+    пустой ПУЛ уровней старших ТФ (структуры не построились из-за покрытия профиля).
+    Причину считает `build_targets_report` тем же обходом, что отбирает цели.
+    """
+
     breakeven_rules: tuple[BreakevenRule, ...]
     """Условия перевода стопа в б/у, словами курса (стр. 15, 19, 44). Порядок постоянен."""
 
@@ -520,9 +531,30 @@ docs/audit/video-2026-08-17-btc-review.md, находка №2; сказано �
 того же протокола); мотив — честность пула, а не замеренный рост качества."""
 
 
-def build_targets(
+class TargetsReport(BaseModel):
+    """Цели И причина их отсутствия — одним обходом пула. Заведено 2026-08-24.
+
+    Слово владельца, дословно: «Сделок без цели быть не может. Это означает ошибка в
+    расчетах, геометрии, структурах, поках, объемах или во всем вместе!» — сказано на
+    замер, где у всех сделок 1ч/4ч/1Д целей не было ВОВСЕ, а карточка печатала «целей
+    нет» без причины и без знаменателя. Прибор молчал: отсутствие цели читалось как
+    свойство рынка, хотя на разобранных случаях это был пустой ПУЛ — уровни старших ТФ
+    не построились из-за покрытия профиля («окно не покрыто свечами», на стенде 155 из
+    158 структур 4ч), то есть отказ прибора, а не рынка.
+
+    `why_empty` считается ТЕМ ЖЕ обходом, которым отбираются цели, — вторая копия
+    фильтров запрещена правилом «величина считается в одном месте». Пусто — цели есть.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    targets: tuple[Target, ...]
+    why_empty: str
+
+
+def build_targets_report(
     level: Level, pool: tuple[MappedLevel, ...], *, as_of_ms: int | None = None,
-) -> tuple[Target, ...]:
+) -> TargetsReport:
     """Цели по стр. 24: свой ТФ и старшие — основные, ТФ-1 — промежуточные, ТФ-2 — нет.
 
     Целью служит уровень ПРОТИВОПОЛОЖНОЙ стороны по ходу сделки: от лонгового уровня
@@ -567,13 +599,24 @@ def build_targets(
     as_of = level.created_at_ms if as_of_ms is None else as_of_ms
 
     out: list[Target] = []
+    # Счёт выживших НА КАЖДОМ фильтре — из него собирается `why_empty`. Счётчики стоят
+    # в самом обходе, а не во втором: причина обязана считаться тем же кодом, что отбор.
+    n_pool = n_alive = n_opposite = n_fresh = n_ahead = n_outzone = n_beyond = 0
     for mapped in pool:
+        if mapped.level is level:
+            # Сам уровень сделки — не «другой уровень» стр. 24; в счёт пула не идёт.
+            continue
+        n_pool += 1
         then = level_as_of(mapped, as_of)
         if then is None:
             continue
         other = then
-        if other.symbol != level.symbol or other.side is not want:
+        if other.symbol != level.symbol:
             continue
+        n_alive += 1
+        if other.side is not want:
+            continue
+        n_opposite += 1
         # Чистка пула целей (см. TARGET_STRUCTURE_FRAME_BARS). Исключения — те же, что
         # у прежнего `tgbot.near_structure` (снят 2026-08-21), и по той же причине
         # (§4.3): уровень без записанного
@@ -584,8 +627,10 @@ def build_targets(
                     < as_of - TARGET_STRUCTURE_FRAME_BARS
                     * TIMEFRAME_MS[other.timeframe]):
                 continue
+        n_fresh += 1
         if (other.price > entry) is not up or other.price == entry:
             continue
+        n_ahead += 1
         if level.zone_lo <= other.price <= level.zone_hi:
             # Цель ВНУТРИ ЗОНЫ ВХОДА — не цель: лимитки входа стоят на ПОК и зону
             # (стр. 30), и одно касание исполняло бы вход и «тейк» разом. Найдено
@@ -593,6 +638,7 @@ def build_targets(
             # внутри зоны входа 449.58…450.33 — печаталась как «0.00% от входа».
             # Прежний фильтр отсекал только ТОЧНОЕ равенство цене ПОК.
             continue
+        n_outzone += 1
         far = level.boundary_hi if up else level.boundary_lo
         if (other.price < far) if up else (other.price > far):
             # ⚠⚠ ЦЕЛЬ ВНУТРИ СОБСТВЕННОЙ СТРУКТУРЫ — НЕ ЦЕЛЬ (2026-08-24, по замечанию
@@ -617,6 +663,7 @@ def build_targets(
             # же базы другим уровнем не является — это часть структуры, из которой сделка
             # и открывается.
             continue
+        n_beyond += 1
         step = _tf_step(level.timeframe, other.timeframe)
         if step is None or step >= 2:
             # Стр. 24: «Уровни ТФ-2 (15м и ниже) обычно не берутся в расчёт».
@@ -688,7 +735,39 @@ def build_targets(
         if t.role in MAJOR_TAKE_ROLES and not seen_major:
             first, seen_major = True, True
         final.append(t.model_copy(update={"take": take_share(t.role, first=first)}))
-    return tuple(final)
+    # Причина пустоты — ПЕРВЫЙ фильтр, на котором выжившие кончились, со знаменателем
+    # (§4.3). Порядок ветвей — порядок фильтров обхода, других источников у строки нет.
+    why = ""
+    if not final:
+        if n_pool == 0:
+            why = "в карте нет ни одного другого уровня"
+        elif n_alive == 0:
+            why = (f"уровней в карте {n_pool}, к моменту решения все сняты "
+                   f"отработкой либо ещё не существовали")
+        elif n_opposite == 0:
+            why = f"живых уровней {n_alive}, встречной стороны среди них нет"
+        elif n_fresh == 0:
+            why = (f"встречных {n_opposite}, у всех структура старше кадра "
+                   f"{TARGET_STRUCTURE_FRAME_BARS} баров своего ТФ")
+        elif n_ahead == 0:
+            why = f"встречных в кадре {n_fresh}, все стоят не по ходу сделки"
+        elif n_outzone == 0:
+            why = f"по ходу сделки {n_ahead}, все внутри зоны входа"
+        elif n_beyond == 0:
+            why = (f"по ходу сделки {n_outzone}, все внутри собственной "
+                   f"структуры входа")
+        else:
+            why = (f"годных по месту {n_beyond}, все на ТФ-2 и ниже либо "
+                   f"старше ТФ+1 (стр. 24)")
+    return TargetsReport(targets=tuple(final), why_empty=why)
+
+
+def build_targets(
+    level: Level, pool: tuple[MappedLevel, ...], *, as_of_ms: int | None = None,
+) -> tuple[Target, ...]:
+    """Цели без причины — для потребителей, которым нужна только выборка (гейты,
+    разборы). Обход ОДИН — `build_targets_report`; здесь только распаковка."""
+    return build_targets_report(level, pool, as_of_ms=as_of_ms).targets
 
 
 # ⚠⚠ `RR_EMIT_MIN = 3.0` УДАЛЁН 2026-08-23. Константа объявляла «минимальное РР
@@ -989,7 +1068,8 @@ def build_setup(
         stop, basis = floor, StopBasis.MARGIN
     # `as_of_ms` — момент решения (правый край закрытых баров); разбор — докстрока
     # `build_targets`. None оставлен разборам «как было при рождении уровня».
-    targets = build_targets(level, pool, as_of_ms=as_of_ms)
+    report = build_targets_report(level, pool, as_of_ms=as_of_ms)
+    targets = report.targets
     first_take = targets[0].price if targets else None
     return Setup(
         level=level,
@@ -1003,6 +1083,7 @@ def build_setup(
         stop_basis=basis,
         structural_anchor=anchor,
         targets=targets,
+        no_target_reason=report.why_empty,
         # ⚠ Правило стр. 19 сюда НЕ подаётся (2026-08-24): оно флэтовое, разбор — в
         # докстроке `build_breakeven_rules`. У сделки от уровня остаются стр. 15 и 44.
         breakeven_rules=build_breakeven_rules(

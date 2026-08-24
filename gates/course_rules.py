@@ -690,6 +690,35 @@ def c_pennant_stop_has_margin() -> tuple[object, object]:
     )
 
 
+def c_no_target_names_reason() -> tuple[object, object]:
+    """Сделка без цели НАЗЫВАЕТ причину со знаменателем (§4.3).
+
+    Заведено 2026-08-24 по слову владельца: «Сделок без цели быть не может. Это
+    означает ошибка в расчетах, геометрии, структурах, поках, объемах или во всем
+    вместе!» Карточка печатала «целей нет» без причины, и пустой пул уровней старших
+    ТФ (отказы покрытия профиля) читался как свойство рынка.
+
+    Три плеча, чтобы прибор не был заперт в одном ответе:
+      * пул пуст → причина «в карте нет ни одного другого уровня»;
+      * пул есть, но встречной стороны нет → причина называет живых и их сторону;
+      * годная цель есть → целей 1, причина ПУСТА.
+    """
+    src = level(100.0, LevelSide.LONG, created=5)
+    empty = build_setup(src)
+    same_side = build_setup(src, (mapped(level(118.0, LevelSide.LONG, created=1,
+                                               born_ms=T0)),))
+    with_target = build_setup(src, (mapped(level(118.0, LevelSide.SHORT, created=1,
+                                                 born_ms=T0)),))
+    return (
+        (len(empty.targets), empty.no_target_reason,
+         len(same_side.targets), same_side.no_target_reason,
+         len(with_target.targets), with_target.no_target_reason),
+        (0, "в карте нет ни одного другого уровня",
+         0, "живых уровней 1, встречной стороны среди них нет",
+         1, ""),
+    )
+
+
 CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("прокол идёт в стоп с 3-й СКВОЗНОЙ точки (стр. 18)", c_puncture_needs_third_point),
     ("прокол — отработка уровня (стр. 6, 55)", c_puncture),
@@ -730,6 +759,8 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("«следующая свеча» — это время, а не индекс (стр. 55)", c_two_candles_are_time_not_index),
     ("стоп вымпела — за структуру С ЗАПАСОМ, а не на её краю (стр. 58)",
      c_pennant_stop_has_margin),
+    ("сделка без цели называет ПРИЧИНУ со знаменателем (§4.3)",
+     c_no_target_names_reason),
 ]
 
 
