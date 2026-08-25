@@ -254,6 +254,11 @@ def chart_png(
         i0 = bar_index(z.from_ms) if z.timeframe == timeframe else None
         i1 = bar_index(z.to_ms) if z.timeframe == timeframe else None
         drawn_box = False
+        # РАЗВЕДКА ЗНАЧКОВ СУДЬБЫ по вертикали: несколько уровней, решившихся на
+        # одном баре, ложились стрелка-на-стрелку и крест-на-крест (кластер июня
+        # на BTC 4h, разбор глазами 2026-08-25). Счётчик на бар: каждый следующий
+        # значок поднимается на 2% высоты кадра.
+        fate_at: dict[int, int] = {}
         if i0 is not None and z.boundary_lo > 0 and z.boundary_hi > z.boundary_lo:
             i1 = i1 if i1 is not None else len(bars) - 1
             b_lo, b_hi = max(z.boundary_lo, lo), min(z.boundary_hi, hi)
@@ -337,9 +342,12 @@ def chart_png(
                     # Прежняя редакция красила обе красным — это была моя выдумка.
                     up = z.side == "long"
                     dy = (hi - lo) * 0.055
+                    k = fate_at.get(i_ev, 0)
+                    fate_at[i_ev] = k + 1
+                    off = k * (hi - lo) * 0.02
                     ax.annotate(
-                        "", xy=(i_ev, z.price + (dy if up else -dy)),
-                        xytext=(i_ev, z.price + (-dy if up else dy) * 0.35),
+                        "", xy=(i_ev, z.price + off + (dy if up else -dy)),
+                        xytext=(i_ev, z.price + off + (-dy if up else dy) * 0.35),
                         arrowprops={"arrowstyle": "-|>",
                                     "color": "#2f9e4f" if up else "#d0342c",
                                     "linewidth": 2.4, "mutation_scale": 16},
@@ -352,7 +360,10 @@ def chart_png(
                     # Крестик взят с РАЗМЕТКИ КАНАЛА автора (скриншот владельца
                     # 2026-08-17) — источник второго ряда, и здесь это названо, а не
                     # выдано за курс.
-                    ax.plot([i_ev], [z.price], marker="x", color="#2f6fd0",
+                    k = fate_at.get(i_ev, 0)
+                    fate_at[i_ev] = k + 1
+                    off = k * (hi - lo) * 0.02
+                    ax.plot([i_ev], [z.price + off], marker="x", color="#2f6fd0",
                             markersize=11, markeredgewidth=2.4, zorder=8)
 
         if z.kind == "pp":
@@ -456,7 +467,8 @@ def chart_png(
         ax.plot([x_r], [y1c if edge_y > ref_price else y0c],
                 marker="^" if edge_y > ref_price else "v",
                 color=_TICK, markersize=4, zorder=6)
-        ax.annotate(f"{move:+.2f}%", xy=(x_r, (y0c + y1c) / 2),
+        ax.annotate(f"{ref_price:g} → {edge_y:g} ({move:+.1f}%)",
+                    xy=(x_r, (y0c + y1c) / 2),
                     xytext=(3, 0), textcoords="offset points",
                     va="center", ha="left", fontsize=7.5, color=_TEXT, zorder=6)
 
@@ -491,10 +503,19 @@ def chart_png(
         # съедала кадр и зоны входа ложились ПОВЕРХ профиля — разбор ответа
         # 2026-08-17, замечание владельца о «ужасных графиках».
         width_px = future * 0.32
+        # Порог HVN-ядра видимого профиля — половина пикового ряда: тот же критерий,
+        # что у рабочей зоны уровня (решение владельца 2026-08-25), чтобы картинка и
+        # числа говорили одним языком о «где объём».
+        hvn_cut = max(buckets) / 2
         for k, v in enumerate(buckets):
             if v <= 0:
                 continue
-            colr = "#c8b93a" if k == poc_k else "#2a3a55"
+            if k == poc_k:
+                colr = "#f2f2f2"   # ПОК — белый: жёлтый на карте занят «по факту»
+            elif v >= hvn_cut:
+                colr = "#5a6f96"   # HVN-ядро — светлее фона, темнее полных
+            else:
+                colr = "#2a3a55"
             ax.add_patch(patches.Rectangle(
                 (right - v / vmax * width_px, lo + k * step_px),
                 v / vmax * width_px, step_px * 0.92,
@@ -580,6 +601,24 @@ def chart_png(
         title += f" · {caption}"
     ax.set_title(title, loc="left", fontsize=10.5, color=_TEXT)
     fig.tight_layout()
+
+    # ЛЕГЕНДА — нижний левый угол, мелко, полупрозрачно. Без неё жёлтый/зелёный/
+    # крестик читаются догадкой (разбор глазами 2026-08-25: «жёлтая полоса — это
+    # зона или ПОК?»).
+    from matplotlib.lines import Line2D
+    handles = [
+        patches.Patch(facecolor=_LONG_FILL, edgecolor=_LONG_EDGE, label="лонг"),
+        patches.Patch(facecolor=_SHORT_FILL, edgecolor=_SHORT_EDGE, label="шорт"),
+        patches.Patch(facecolor=_CONF_FILL, edgecolor=_CONF_EDGE, label="по факту"),
+        Line2D([0], [0], color="#f2f2f2", linewidth=3,
+               label="ПОК профиля (белый)"),
+        Line2D([0], [0], color="#2f6fd0", marker="x", linewidth=0,
+               markersize=7, markeredgewidth=2, label="пробит (сторона сменилась)"),
+    ]
+    ax.legend(handles=handles, loc="lower left", fontsize=7,
+              framealpha=0.25, facecolor=_BG, edgecolor=_TICK,
+              labelcolor=_TEXT, borderpad=0.5)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
