@@ -49,7 +49,12 @@ from .trading_range import (
     TradingRange,
     structure_bars,
 )
-from .volume_profile import TV_ROWS, TVProfile, build_tv
+from .volume_profile import (
+    PROFILE_ROW_PRICE_PCT,
+    TVProfile,
+    _ticks_per_row_from_price_pct,
+    build_tv,
+)
 
 
 class LevelSide(StrEnum):
@@ -381,8 +386,11 @@ def build_level(
     """
     # ⚠ С 2026-08-09 профиль строится ПРИБОРОМ АВТОРА — сеткой TV (`build_tv`), а не
     # тиковыми бинами: решение владельца о переносе инструментов TV
-    # (docs/audit/tv-transfer-2026-08-09.md). Число строк — `TV_ROWS`, его источники — в
-    # докстроке константы. Прежний тиковый профиль (`build`) остаётся в модуле для замеров.
+    # (docs/audit/tv-transfer-2026-08-09.md). Режим — Ticks Per Row:
+    # высота строки = `PROFILE_ROW_PRICE_PCT` (0.07%) от цены, число строк выводится
+    # из диапазона. Прежний замороженный `TV_ROWS = 100` (Number of Rows) удалён 2026-08-25
+    # по замеру цены заморозки (сдвиг входа до 7%); см. докстроку `PROFILE_ROW_PRICE_PCT`.
+    # Прежний тиковый профиль (`build`) остаётся в модуле для замеров.
     #
     # ⚠ ДИАПАЗОН СЕТКИ — КРАЙНИЕ ЦЕНЫ БАРОВ. Правка У3 обзора уровней
     # (docs/audit/levels-projects-2026-08-09.md, фаза 6). До 2026-08-10 сюда шли
@@ -402,11 +410,17 @@ def build_level(
     # ПОК уезжает дальше половины строки у 99.8%, а ВНЕ прежней зоны оказывается у 46.4%
     # — у почти половины уровней меняется сама ТВХ. Прижималось при этом 44.39% объёма по
     # медиане, потому что размах баров шире границ в 3.156 раза.
+    ticks_per_row = _ticks_per_row_from_price_pct(
+        bottom=price_range[0],
+        top=price_range[1],
+        tick_size=hist.tick_size,
+        row_price_pct=PROFILE_ROW_PRICE_PCT,
+    )
     profile: TVProfile | NotReady = build_tv(
         hist,
         bottom=price_range[0],
         top=price_range[1],
-        rows=TV_ROWS,
+        ticks_per_row=ticks_per_row,
     )
     if isinstance(profile, NotReady):
         return NotReady(reason=f"{symbol} {acc.timeframe}: ПОК не построен — {profile.reason}")
