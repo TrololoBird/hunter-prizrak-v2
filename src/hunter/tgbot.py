@@ -610,6 +610,8 @@ def zones_of(decision: engine.SymbolDecision,
             side=m.current.side.value, timeframe=m.level.timeframe,
             price=float(m.level.price), zone_lo=float(m.level.zone_lo),
             zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
+            work_lo=float(m.level.zone_work_lo or 0),
+            work_hi=float(m.level.zone_work_hi or 0),
             state=m.status.state.value,
             retired_at_ms=0 if active else resolved,
             boundary_lo=float(m.level.boundary_lo),
@@ -1457,7 +1459,14 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         by_seniority = sorted(g, key=lambda z: -order.get(z.timeframe, 0))
         tfs = "+".join(dict.fromkeys(
             TF_LABEL.get(z.timeframe, z.timeframe) for z in by_seniority))
-        g_lo, g_hi = min(z.zone_lo for z in g), max(z.zone_hi for z in g)
+
+        def eb(z: ZoneSpec) -> tuple[float, float]:
+            """Эффективные границы зоны: рабочие вокруг ПОК (решение владельца
+            2026-08-25), иначе VAL…VAH — уровень старого прогона."""
+            return ((z.work_lo, z.work_hi)
+                    if z.work_hi > z.work_lo > 0 else (z.zone_lo, z.zone_hi))
+
+        g_lo, g_hi = min(eb(z)[0] for z in g), max(eb(z)[1] for z in g)
         if len(g) > 1:
             # Края диапазона — по ЗОНАМ, а не по ПОКам (исправлено 2026-08-18).
             # Прежняя редакция печатала min–max ПОКов, а метку «цена уже здесь»
@@ -1470,8 +1479,9 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                     f" ({tfs})")
         else:
             z = g[0]
+            z_lo, z_hi = eb(z)
             core = (f"— {_fmt_price(z.price)} ({tfs}), зона "
-                    f"{_fmt_price(z.zone_lo)}–{_fmt_price(z.zone_hi)}")
+                    f"{_fmt_price(z_lo)}–{_fmt_price(z_hi)}")
         marks = ""
         # ⚠ Метка "цена уже здесь" НЕ ставится, когда о том же говорит роль зоны
         # (её строка про вход не в приоритет по стр. 44): это ОДИН факт, и печатать его

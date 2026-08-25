@@ -266,6 +266,20 @@ class TVProfile(BaseModel):
     видит вовсе (его диапазон — экстремумы баров); ненулевое значение здесь означает,
     что переданный диапазон у́же реального и это видно, а не молчит."""
 
+    work_lo_price: Decimal
+    work_hi_price: Decimal
+    """РАБОЧАЯ ЗОНА вокруг ПОК — решение владельца 2026-08-25, дословно: «разве не
+    логично в ней расматривать пок уровень и уже вокруг пока строить небольшую зону?».
+    Правило ширины — критерий HVN «объём строки не ниже половины пикового»
+    (quantum-algo.com 30.04.2026 и практики TV-скриптов), с клипом по VAL…VAH:
+    рабочая зона всегда внутри области стоимости. Порог «средний по строкам»
+    отвергнут замером на живых данных (см. комментарий в build_tv). Минимум — сама
+    строка ПОК; для торговых полос это и есть «небольшая зона», тогда как VAL…VAH
+    остаётся контекстом старшего ТФ."""
+
+    work_rows: int = Field(ge=1)
+    """Сколько строк вошло в рабочую зону. Один — вокруг ПОК тихо (узкий пик)."""
+
 
 def build_tv(
     hist: TradeHistogram,
@@ -465,6 +479,24 @@ def build_tv(
     def row_top(r: int) -> Decimal:
         return min(bottom + row_height * (r + 1), top)
 
+    # РАБОЧАЯ ЗОНА — строки вокруг ПОК с объёмом не ниже ПОЛОВИНЫ пикового ряда
+    # (распространённый критерий HVN «bins with volume >= 50% of maximum»,
+    # quantum-algo.com 30.04.2026 и практики TV-скриптов), с клипом по VAL…VAH:
+    # рабочая зона обязана лежать внутри области стоимости.
+    # ⚠ ПЕРВАЯ РЕДАКЦИЯ брала порог «средний объём строки» — ЗАМЕР НА ЖИВЫХ ДАННЫХ
+    # опроверг её в тот же день (BTC, 14 уровней, медиана work/VA = 1.139, у 1Д зона
+    # вышла ШИРЕ контекста): на тиковой сетке тысячи полупустых строк утапливают
+    # среднее. Порог от ПИКА от среднего не зависит.
+    filled = [v for v in vol_by_row.values() if v > 0]
+    threshold = (peak / 2) if filled else 0.0
+    w_lo = w_hi = poc
+    while (w_hi + 1 < rows_built and w_hi + 1 <= hi
+           and vol_by_row.get(w_hi + 1, 0.0) >= threshold):
+        w_hi += 1
+    while (w_lo - 1 >= 0 and w_lo - 1 >= lo
+           and vol_by_row.get(w_lo - 1, 0.0) >= threshold):
+        w_lo -= 1
+
     return TVProfile(
         row_size=mode,
         rows_requested=rows,
@@ -478,6 +510,9 @@ def build_tv(
         covered_volume=covered,
         total_volume=total,
         clamped_volume=clamped,
+        work_lo_price=row_bottom(w_lo),
+        work_hi_price=row_top(w_hi),
+        work_rows=w_hi - w_lo + 1,
     )
 
 

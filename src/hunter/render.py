@@ -87,6 +87,11 @@ class ZoneSpec:
     price: float
     zone_lo: float
     zone_hi: float
+    work_lo: float = 0.0
+    work_hi: float = 0.0
+    """Рабочая зона вокруг ПОК (HVN-ядро, решение владельца 2026-08-25). Ненулевая —
+    боксы входа/наблюдения рисуются по ней; VAL…VAH остаётся контекстом записи.
+    Ноль — уровень старого прогона без рабочей зоны, рисуем как раньше."""
     kind: str = "level"
     entry_rule: str = ""
     """Чем уровень торгуется: limit | confirmation | retest_flipped. Пусто — не записано
@@ -304,15 +309,20 @@ def chart_png(
         if z.kind == "level" and z.state == "active" and tradable_side:
             # НАСТОЯЩИЕ границы, не обрезанные кадром: обрезка — при рисовании.
             # Иначе ценник границы печатал бы край кадра вместо цены зоны.
-            if z.zone_lo <= ref_price <= z.zone_hi:
+            # РАБОЧАЯ ЗОНА предпочтительнее VAL…VAH (решение владельца 2026-08-25):
+            # у старших ТФ область стоимости шире торгуемого диапазона, вход читают
+            # вокруг ПОК. Нулевые рабочие — уровень старого прогона, рисуем VA.
+            e_lo, e_hi = ((z.work_lo, z.work_hi)
+                          if z.work_hi > z.work_lo > 0 else (z.zone_lo, z.zone_hi))
+            if e_lo <= ref_price <= e_hi:
                 # Стр. 44 — то же правило и той же проверкой, что в тексте карточки.
-                inside_boxes.append((z.zone_lo, z.zone_hi))
+                inside_boxes.append((e_lo, e_hi))
             elif z.entry_rule in ("limit", "retest_flipped"):
-                entry_boxes.append((z.side, z.zone_lo, z.zone_hi))
+                entry_boxes.append((z.side, e_lo, e_hi))
             else:
                 # «По факту»-зона: не готовый вход (стр. 25 — лимитки сняты), но у
                 # автора она на карте ЖЁЛТАЯ, а не отсутствует (корпус, раздел 4).
-                conf_boxes.append((z.zone_lo, z.zone_hi))
+                conf_boxes.append((e_lo, e_hi))
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
