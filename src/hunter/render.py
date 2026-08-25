@@ -63,6 +63,23 @@ _TEXT, _TICK = "#d1d4dc", "#787b86"
 _UP, _DN = "#26a69a", "#ef5350"
 _LONG_FILL, _LONG_EDGE = "#1b5e20", "#4caf50"
 _SHORT_FILL, _SHORT_EDGE = "#7f1d1d", "#ef5350"
+
+
+def _price_label(y: float) -> str:
+    """Цена для ценника на шкале. `%g` здесь врал на микропенных монетах:
+    0.0000091 печатался как «9.1e-06» — научная нотация на графике для читателя,
+    который не программист. Формат по порядку величины: тысячи без хвоста,
+    единицы — 4 знака, дро-цены — до 8 без нулей."""
+    a = abs(y)
+    if a >= 1000:
+        s = f"{y:.1f}"
+    elif a >= 1:
+        s = f"{y:.4f}"
+    else:
+        s = f"{y:.8f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 _CONF_FILL, _CONF_EDGE = "#6b5d1c", "#f2c94c"
 """Жёлтый = режим входа «по факту/наблюдение» — семантика цвета у автора
 (корпус tg-prizrak-2026-08.md, разделы 4 и 8: 🟡/жёлтая полоса, id 7654)."""
@@ -227,15 +244,27 @@ def chart_png(
     вход отсюда не приоритет по стр. 44. Два правила для одной величины: картинка брала
     только `entry_rule` из леджера и о стр. 44 не знала вовсе."""
 
+    # ⚠ ВРЕМЯ → ИНДЕКС ТОЛЬКО ПОИСКОМ ПО ФАКТИЧЕСКИМ МЕТКАМ. Прежняя редакция делила
+    # `(ms - bars[0].open_ms) // step`: на ряду БЕЗ пропусков это верно, но ряды с
+    # дырами (а они есть — «засев: дыры внутри окна» в каждом прогоне) сдвигают все
+    # индексы правее первой дыры, и бокс структуры рисовался на ЧУЖИХ свечах —
+    # «выходные» бары попадали в его диапазон, свечи торчали из коробки. Поймано
+    # геометрическим аудитом 2026-08-25 (5 боксов из 25 на живом BTC). Тот же класс,
+    # что убран из `structure_window_ms` (докстрока: «индексная арифметика убрана
+    # совсем») — в рендере она осталась.
+    from bisect import bisect_right
+    _xs = [b.open_ms for b in bars]
+
     def bar_index(ms: int) -> int | None:
-        """Номер бара по метке времени. None — метка вне окна графика."""
-        if ms <= 0 or not bars:
+        """Номер бара по метке времени. None — метка вне окна графика.
+
+        Метка ОТКРЫТИЯ существующего бара даёт его номер; правая граница окна
+        (`последний.open + ТФ`, эксклюзивная) даёт последний бар — боксы и значки
+        рисуются до конца своего последнего бара, как и раньше."""
+        if ms <= 0 or not _xs:
             return None
-        step = bars[1].open_ms - bars[0].open_ms if len(bars) > 1 else 0
-        if step <= 0:
-            return None
-        idx = (ms - bars[0].open_ms) // step
-        return int(idx) if 0 <= idx < len(bars) else None
+        idx = bisect_right(_xs, ms) - 1
+        return idx if 0 <= idx < len(bars) else None
 
     for z in sorted(zones, key=lambda z: z.zone_hi - z.zone_lo, reverse=True):
         if z.zone_lo > hi or z.zone_hi < lo:
@@ -298,7 +327,7 @@ def chart_png(
             if i_ev is None:
                 # Плашка кладётся ОТЛОЖЕННО: сначала собираются все, потом раздвигаются
                 # по вертикали, чтобы не наезжать друг на друга (см. ниже).
-                tags.append((z.price, f"{z.price:g}", edge))
+                tags.append((z.price, _price_label(z.price), edge))
 
         # 3. ЗОНА ВХОДА — бокс кандидатом в `entry_boxes`, рисование ПОСЛЕ цикла со
         # склейкой пересекающихся (см. ниже). Прежняя редакция рисовала бокс каждому
@@ -446,7 +475,7 @@ def chart_png(
             # прибора. Плашки идут в общую раздвижку с дедупликацией.
             for y in (b_lo, b_hi):
                 if lo <= y <= hi:
-                    tags.append((y, f"{y:g}", edge))
+                    tags.append((y, _price_label(y), edge))
             if ref_price > 0 and (ref_price < b_lo or ref_price > b_hi):
                 ruler_edges.append(b_lo if ref_price < b_lo else b_hi)
 
@@ -467,7 +496,7 @@ def chart_png(
         ax.plot([x_r], [y1c if edge_y > ref_price else y0c],
                 marker="^" if edge_y > ref_price else "v",
                 color=_TICK, markersize=4, zorder=6)
-        ax.annotate(f"{ref_price:g} → {edge_y:g} ({move:+.1f}%)",
+        ax.annotate(f"{_price_label(ref_price)} → {_price_label(edge_y)} ({move:+.1f}%)",
                     xy=(x_r, (y0c + y1c) / 2),
                     xytext=(3, 0), textcoords="offset points",
                     va="center", ha="left", fontsize=7.5, color=_TEXT, zorder=6)
@@ -529,7 +558,7 @@ def chart_png(
         ax.plot([-1, right], [last_close, last_close], color=_TEXT,
                 linewidth=0.9, linestyle=(0, (4, 3)), zorder=7)
         # Плашка текущей цены — цветом последней свечи, как в терминале автора.
-        tags.append((last_close, f"{last_close:g}",
+        tags.append((last_close, _price_label(last_close),
                      _UP if bars[-1].close >= bars[-1].open else _DN))
 
     # ПЛАШКИ ЦЕН — с раздвижкой: близкие сдвигаются по вертикали, чтобы каждая
