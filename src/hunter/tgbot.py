@@ -2543,6 +2543,18 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры. Ноль — не записаны."""
 
+    zone_work_lo: float = 0.0
+    zone_work_hi: float = 0.0
+    """Рабочая зона вокруг ПОК (HVN-ядро, решение владельца 2026-08-25). Нули —
+    строка записана до схемы 17 либо расчёт ещё не проставил; тогда события зон
+    считаются по VAL…VAH, как раньше."""
+
+    def work_bounds(self) -> tuple[float, float]:
+        """Границы зоны для СОБЫТИЙ: рабочие вокруг ПОК, если есть, иначе VA."""
+        if self.zone_work_hi > self.zone_work_lo > 0:
+            return (self.zone_work_lo, self.zone_work_hi)
+        return (self.zone_lo, self.zone_hi)
+
     priority_tf: str = ""
     priority_depth: int | None = None
     """ЧЕЙ приоритет старшего ТФ и на скольких экстремумах он держится (схема 14).
@@ -2665,10 +2677,12 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         stop_col = "stop_price" if "stop_price" in have else "NULL"
         ptf_col = "priority_tf" if "priority_tf" in have else "NULL"
         pdp_col = "priority_depth" if "priority_depth" in have else "NULL"
+        wlo_col = "zone_work_lo" if "zone_work_lo" in have else "NULL"
+        whi_col = "zone_work_hi" if "zone_work_hi" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
             f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state,"
-            f" {stop_col}, {ptf_col}, {pdp_col}"
+            f" {stop_col}, {ptf_col}, {pdp_col}, {wlo_col}, {whi_col}"
             # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
             # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
             # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
@@ -2704,7 +2718,9 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             agreement=r[12] or "", state=r[13] or "active",
                             stop_price=None if r[14] is None else float(r[14]),
                             priority_tf=r[15] or "",
-                            priority_depth=None if r[16] is None else int(r[16]))
+                            priority_depth=None if r[16] is None else int(r[16]),
+                            zone_work_lo=0.0 if r[17] is None else float(r[17]),
+                            zone_work_hi=0.0 if r[18] is None else float(r[18]))
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -3119,11 +3135,36 @@ class Notifier:
 
         out: list[str] = []
         if news.signals:
-            lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
-                     f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}, "
-                     f"стоп {_fmt_price(st)}"
-                     + (f", цель {_fmt_price(tg)}" if tg is not None else "")
-                     for s, tf, d, e, st, tg in news.signals]
+            # ФОРМАТ v2 (решение владельца 2026-08-25: рабочая зона вокруг ПОК, R у
+            # цели, одна строка на сигнал). Рабочие границы берутся из карты этого же
+            # такта по ближайшему ПОК; нет карты — строка без зоны, как раньше.
+            by_key: dict[tuple[str, str], list[LevelRow]] = {}
+            for lv in news.levels:
+                by_key.setdefault((lv.symbol, lv.timeframe), []).append(lv)
+
+            def work_of(sym: str, tf: str, entry: float) -> tuple[float, float] | None:
+                cands = by_key.get((sym, tf), ())
+                best = min(cands,
+                           key=lambda lv: abs(lv.price - entry),
+                           default=None)
+                if best is not None and best.zone_work_hi > best.zone_work_lo > 0:
+                    return (best.zone_work_lo, best.zone_work_hi)
+                return None
+
+            lines = []
+            for s, tf, d, e, st, tg in news.signals:
+                head = (f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                        f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}")
+                w = work_of(s, tf, e)
+                if w is not None:
+                    head += f", зона {_fmt_price(w[0])}–{_fmt_price(w[1])}"
+                head += f", стоп {_fmt_price(st)}"
+                if tg is not None:
+                    risk = abs(e - st)
+                    rr = abs(tg - e) / risk if risk > 0 else None
+                    head += (f", цель {_fmt_price(tg)}"
+                             + (f" (R {rr:.1f})" if rr is not None else ""))
+                lines.append(head)
             self.sent_signals += len(news.signals)
             out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines)]))
         if news.outcomes:
@@ -3184,7 +3225,10 @@ class Notifier:
                 continue
             key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
             seen.add(key)
-            pos = zone_position(t.last, lv.zone_lo, lv.zone_hi)
+            # РАБОЧАЯ ЗОНА В СОБЫТИЯХ (решение владельца 2026-08-25): зовём ценой к
+            # входу, а не к контексту старшего ТФ. work_bounds сам падает на VA у
+            # строк без рабочих полей.
+            pos = zone_position(t.last, *lv.work_bounds())
             was = self._zone_state.get(key)
             self._zone_state[key] = pos
             # Событие — только СБЛИЖЕНИЕ (far→near, near→inside, far→inside).
