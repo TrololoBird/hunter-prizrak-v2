@@ -2461,6 +2461,8 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
                  уведомлений_отмены=notifier.sent_cancels,
+                 уведомлений_слом=notifier.sent_breaks,
+                 уведомлений_безубыток=notifier.sent_be,
                  тактов_наблюдателя_с_отказом=notifier.ticks_failed)
         watch.note_recovery()
 
@@ -2614,10 +2616,12 @@ class LedgerNews:
     outcomes: tuple[tuple[str, str, str, str, float | None], ...]
     """(symbol, timeframe, direction, kind, r)"""
 
-    states: tuple[tuple[int, str, str, str, str, float], ...]
-    """(signal_id, symbol, timeframe, direction, state, entry) — состояния ВСЕХ
-    незакрытых сигналов. Наблюдатель ловит переход not_filled→open: «вход
-    состоялся» — событие, о котором просил владелец (2026-08-18)."""
+    states: tuple[tuple[int, str, str, str, str, float,
+                   float | None, float | None, float | None], ...]
+    """(signal_id, symbol, timeframe, direction, state, entry,
+    breakeven_at, stop, target) — состояния ВСЕХ незакрытых сигналов. Наблюдатель
+    ловит переход not_filled→open («вход состоялся», приказ владельца 2026-08-18)
+    и достижение цены взведения безубытка (🎯, стр. 14–15)."""
 
     levels: tuple[LevelRow, ...]
     max_signal_id: int
@@ -2658,10 +2662,14 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                     " FROM outcomes o JOIN signals s ON s.id = o.signal_id"
                     " WHERE o.closed_at > ? ORDER BY o.closed_at", (after_ms,))]
         state_rows = [
-            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]))
+            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]),
+             None if r[6] is None else float(r[6]),
+             None if r[7] is None else float(r[7]),
+             None if r[8] is None else float(r[8]))
             for r in conn.execute(
                 "SELECT st.signal_id, s.symbol, s.timeframe, s.direction, st.state,"
-                " s.entry FROM signal_states st JOIN signals s ON s.id = st.signal_id"
+                " s.entry, s.breakeven_at, s.stop, s.target"
+                " FROM signal_states st JOIN signals s ON s.id = st.signal_id"
                 " ORDER BY st.signal_id")]
         marks = ",".join("?" * len(symbols))
         # ⚠ КОЛОНКА СПРАШИВАЕТСЯ У СХЕМЫ, А НЕ ПРЕДПОЛАГАЕТСЯ (2026-08-19). Наблюдатель
@@ -3113,6 +3121,14 @@ class Notifier:
         self.ticks_failed = 0
         self._alerted: set[tuple[str, str, str, int, int]] = set()
         self.sent_cancels = 0
+        # ⚠ СОБЫТИЯ ФАЗЫ «ЖИЗНЬ СИГНАЛА» (план 25.08, Фаза 1). Оба — ПЕРЕХОДЫ:
+        # слом подтверждён (0→1) и цена взвела безубыток (первое касание). Память в
+        # процессе: после рестарта 🎯 может повториться один раз по живому сигналу —
+        # повтор честнее молчания, а постоянная таблица под это — отдельное решение.
+        self._mtf_state: dict[tuple[str, str, str, int, int], int] = {}
+        self._be_said: set[int] = set()
+        self.sent_breaks = 0
+        self.sent_be = 0
 
     def _cap(self, lines: list[str]) -> list[str]:
         if len(lines) <= NOTIFY_LINES_MAX:
@@ -3181,8 +3197,11 @@ class Notifier:
         # перезапуск бота объявил бы «входами» все давно открытые позиции.
         entry_lines: list[str] = []
         alive: set[int] = set()
-        for sid, sym, tf, d, state, entry in news.states:
+        nf: set[tuple[str, str]] = set()
+        for sid, sym, tf, d, state, entry, _be, _st, _tg in news.states:
             alive.add(sid)
+            if state == "not_filled":
+                nf.add((sym, tf))
             was = self._signal_state.get(sid)
             self._signal_state[sid] = state
             if priming or state != "open":
@@ -3202,6 +3221,34 @@ class Notifier:
             self.sent_entries += len(entry_lines)
             out.append("\n".join(["✅ Входы состоялись:", *self._cap(entry_lines)]))
 
+        # 🔓 СЛОМ ПОДТВЕРЖДЁН (стр. 19/31): уровень ждал слома младшего ТФ, и
+        # `mtf_break` перевёлся 0→1 при живом несостоявшемся сигнале этого символа.
+        # Переход, а не состояние: один раз на уровень, первый такт взводит молча.
+        break_lines: list[str] = []
+        seen_mtf: set[tuple[str, str, str, int, int]] = set()
+        for lv in news.levels:
+            if lv.state != "active" or lv.mtf_break is None:
+                continue
+            key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
+            seen_mtf.add(key)
+            prev = self._mtf_state.get(key)
+            self._mtf_state[key] = lv.mtf_break
+            if priming or prev != 0 or lv.mtf_break != 1:
+                continue
+            if (lv.symbol, lv.timeframe) not in nf:
+                continue
+            base = lv.symbol.split("/")[0]
+            side_word = SIDE_WORD.get(lv.side, lv.side)
+            break_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(lv.timeframe, lv.timeframe)}: "
+                f"слом младшего ТФ подтверждён — вход активен "
+                f"(ПОК {_fmt_price(lv.price)})")
+        for key in [k for k in self._mtf_state if k not in seen_mtf]:
+            del self._mtf_state[key]
+        if break_lines:
+            self.sent_breaks += len(break_lines)
+            out.append("\n".join(["🔓 Подтверждения слома:", *self._cap(break_lines)]))
+
         # ⚠ ЦЕНА ТАКТА ЗАВИСИТ ОТ РАЗМЕРА ВСЕЛЕННОЙ, И ПЕРЕЛОМ ЛЕЖИТ НА СОРОКА. Вес
         # `ticker/24hr` — 1 за символ и 40 за ВСЕ рынки сразу (`fetch_tickers(None)`).
         # На вселенной в 25 поимённый список дешевле (25 против 40); на раскрытой доске
@@ -3214,6 +3261,38 @@ class Notifier:
             log.degraded("наблюдатель: тикеры не получены", причина=tickers.reason)
             self.ticks_failed += 1
             return out
+
+        # 🎯 ЦЕНА ВЗВЕЛА БЕЗУБЫТОК (стр. 14–15): живой сигнал, у которого есть цена
+        # взведения (`breakeven_at`), и цена дошла — стоп переносится в ТВХ. Один раз
+        # на сигнал; после рестарта может повториться один раз (см. память в __init__).
+        be_lines: list[str] = []
+        open_ids: set[int] = set()
+        for sid, sym, tf, d, state, _entry, be, _st, _tg in news.states:
+            if state != "open":
+                continue
+            open_ids.add(sid)
+            if be is None or sid in self._be_said:
+                continue
+            tk = tickers.get(sym)
+            last = float(tk.get("last", 0.0) or 0.0) if isinstance(tk, dict) else 0.0
+            if last <= 0:
+                continue
+            crossed = last >= be if d == "long" else last <= be
+            if not crossed:
+                continue
+            self._be_said.add(sid)
+            base = sym.split("/")[0]
+            side_word = SIDE_WORD.get(d, d)
+            be_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(tf, tf)}: цель тейка достигнута "
+                f"— стоп переносится в безубыток ({_fmt_price(be)}); сейчас "
+                f"{_fmt_price(last)}")
+        for sid in [s for s in self._be_said if s not in open_ids]:
+            self._be_said.discard(sid)
+        if be_lines:
+            self.sent_be += len(be_lines)
+            out.append("\n".join(["🎯 Безубыток взведён:", *self._cap(be_lines)]))
+
         now_ms = clock.now_ms()
         rank = {"far": 0, "near": 1, "inside": 2}
         hits: list[tuple[LevelRow, float, str]] = []
