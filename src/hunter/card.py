@@ -34,6 +34,7 @@ from . import (
     swings,
 )
 from .bars import continuous_tail
+from .levels import LevelState
 from .models import Bar, NotReady
 from .priority import Agreement
 from .swings import TrendDirection
@@ -251,6 +252,65 @@ def _num(x: float | Decimal, digits: int = 8) -> str:
     return trim_zeros(f"{float(x):.{digits}f}")
 
 
+def _what_to_do_now(d: engine.SymbolDecision) -> list[str]:
+    """ГОЛОВА КАРТОЧКИ: что делать сейчас, и ЗНАМЕНАТЕЛЬ к этому ответу.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26, Ф2 плана. Довод — слова владельца, многократные и дословные:
+    «у пользователя нет знаний програмивароиня или торговли и тех анализа». Карточка
+    печатает около 140 строк, и ответ на единственный вопрос оператора — брать или не
+    брать — был рассыпан по ним: сторона в одной строке, стоп в другой, РР в третьей,
+    причина отказа в четвёртой. Это ДАННЫЕ, а не ответ.
+
+    ⚠⚠⚠ НИ ОДНО ЧИСЛО ЗДЕСЬ НЕ СЧИТАЕТСЯ. Все берутся у тех же объектов и теми же
+    помощниками, которыми их печатает подробный разбор ниже: сторона — `dec.current.side`,
+    зона и ПОК — поля уровня, стоп и его процент — `s.stop` и `_pct`, причина отсутствия
+    РР — `_no_rr_reason`, «почему сейчас» — `ENTRY_LABEL[st.entry_rule.value]`. Голова,
+    считающая своё, разошлась бы с телом не «если», а через сколько дней: этот класс в
+    проекте уже ловили ЧЕТЫРЬМЯ копиями коробки структуры (`a971048`).
+
+    ⚠ ЗНАМЕНАТЕЛЬ ПЕЧАТАЕТСЯ ВСЕГДА, в том числе при нулях. «Сделок нет» без него
+    неотличимо от «символ не считался»: первое — вердикт о рынке, второе — отказ прибора.
+    Знаменатель здесь ПОСИМВОЛЬНЫЙ; вселенского («из N рынков карта у K») карточка дать
+    не может и не выдумывает — она чистая функция от кадров ОДНОГО символа
+    (`gates/purity.py`), и это число живёт в приёмке прогона.
+    """
+    out = ["", "ЧТО ДЕЛАТЬ СЕЙЧАС (стр. 30)"]
+    # ⚠ ПРИЗНАК «ТОРГУЕТСЯ» БЕРЁТСЯ У `Decision.emitted`, А НЕ ПИШЕТСЯ ЗАНОВО. Первая
+    # редакция этой строки проверяла `dec.setup is not None` — то есть повторяла ту же
+    # формулу вторым экземпляром рядом со сводкой ТФ, которая уже считает `x.emitted`.
+    # Копия расходится не «если», а через сколько дней; здесь она снята сразу.
+    traded = [(dec, dec.setup) for dec in d.decisions
+              if dec.emitted and dec.setup is not None]
+    for dec, s in traded:
+        lvl, st = dec.level, dec.status
+        rr = s.rr()
+        first = geometry.first_major(s.targets)
+        out.append(
+            f"  {SIDE_LABEL[dec.current.side.value]} "
+            f"{TF_LABEL.get(lvl.timeframe, lvl.timeframe)} — зона "
+            f"{_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}, вход ПОК {_num(s.entry)}"
+        )
+        out.append(
+            f"      стоп {_num(s.stop)} ({_pct(s.entry, s.stop)} от входа) · "
+            + (f"цель {_num(first.price)} ({first.distance_pct:.2f}%), РР {_rr(rr)}"
+               if first is not None and rr is not None
+               else f"РР не считается — {_no_rr_reason(s)}")
+        )
+        out.append(f"      почему сейчас: {ENTRY_LABEL[st.entry_rule.value]}")
+    if not traded:
+        # ⚠ ПУСТО — ТОЖЕ ОТВЕТ, и он называется словами (§4.3). Прежде оператор,
+        # не найдя сделки, не знал, читать ли дальше: причин молчания две — уровней
+        # нет вовсе и уровни есть, но ни один не торгуется, — и лечатся они разным.
+        out.append("  делать нечего: "
+                   + ("уровней в карте нет — почему, сказано в «СВОДКЕ ПО ТФ» ниже"
+                      if not d.mapped
+                      else "ни один уровень не торгуется лимитками; причина у каждого "
+                           "названа ниже строкой «СДЕЛКИ НЕТ»"))
+    out.append(f"  знаменатель: уровней в карте {len(d.mapped)}, "
+               f"торгуется лимитками {len(traded)}")
+    return out
+
+
 def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
     """Карточка символа: ПЕЧАТЬ готового решения. Ничего не считает.
 
@@ -273,6 +333,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
 
     for u in d.unreadable:
         out.append(f"  {TF_LABEL.get(u.timeframe, u.timeframe)}: {u.reason}")
+
+    out.extend(_what_to_do_now(d))
 
     out.append("")
     out.append("ТРЕНД И СТРУКТУРА")
@@ -671,7 +733,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"  {lab}  {FIGURE_KIND_LABEL[ch.kind.value]} "
                        f"{FIGURE_SIDE_LABEL[ch.side.value]}  бары {ch.first_index}…"
                        f"{ch.last_index}  точек {ch.points}  "
-                       f"коридор {_num(ch.lo)}…{_num(ch.hi)}  вход: {_entries(ch.entries)}")
+                       f"коридор {_num(ch.lo)}…{_num(ch.hi)}  "
+                       f"вход: {_entries(ch.entries, ch.side, d.decisions)}")
             out.append(f"        {note}")
         if len(r.channels) > len(shown_ch):
             out.append(f"  {lab}  ещё {len(r.channels) - len(shown_ch)} коридоров раньше "
@@ -679,7 +742,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         shown_pen = r.pennants[-FIGURES_SHOWN:]
         for pen in shown_pen:
             any_fig = True
-            out.append(f"  {lab}  {_pennant(pen)}")
+            out.append(f"  {lab}  {_pennant(pen, d.decisions)}")
         if len(r.pennants) > len(shown_pen):
             out.append(f"  {lab}  ещё {len(r.pennants) - len(shown_pen)} вымпелов раньше "
                        f"по ряду — напечатаны последние {len(shown_pen)}")
@@ -689,7 +752,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"а стр. 57 велит «Торгуем по тренду»")
         if r.open_pennant is not None:
             any_fig = True
-            out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: {_pennant(r.open_pennant)}")
+            out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: "
+                       f"{_pennant(r.open_pennant, d.decisions)}")
         elif r.open_pennant_missing:
             out.append(f"  {lab}  вымпела у незакрытой структуры нет: "
                        f"{r.open_pennant_missing}")
@@ -701,7 +765,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"  {lab}  {name} (стр. 62)  граница выхода {_num(mb.boundary_edge)} "
                        f"внутри зоны ПП {_num(mb.pp_zone_lo)}…{_num(mb.pp_zone_hi)}  "
                        f"второй закуп от {_num(mb.level_side_edge)}  "
-                       f"вход: {_entries(mb.entries)}")
+                       f"вход: {_entries(mb.entries, mb.side, d.decisions)}")
         if len(r.multiple_bases) > len(shown_mb):
             out.append(f"  {lab}  ещё {len(r.multiple_bases) - len(shown_mb)} таких фигур "
                        f"раньше по ряду")
@@ -714,7 +778,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"линия шеи {_num(hs.neckline_lo)}…{_num(hs.neckline_hi)}  "
                        + ("тест был" if hs.tested_at_index is not None
                           else "теста ещё не было")
-                       + f"  вход: {_entries(hs.entries)}")
+                       + f"  вход: {_entries(hs.entries, hs.side, d.decisions)}")
         if len(r.head_shoulders) > len(shown_hs):
             out.append(f"  {lab}  ещё {len(r.head_shoulders) - len(shown_hs)} ГИП раньше "
                        f"по ряду")
@@ -961,12 +1025,51 @@ def _take_share(share: geometry.TakeShare) -> str:
     return f"крыть {share.min_pct:.0f}-{share.max_pct:.0f}% — {share.note}"
 
 
-def _entries(entries: tuple[figures.FigureEntry, ...]) -> str:
-    """Входы, названные курсом для фигуры, в порядке самого курса."""
-    return ", ".join(FIGURE_ENTRY_LABEL[e.value] for e in entries)
+def _entries(entries: tuple[figures.FigureEntry, ...],
+             side: figures.FigureSide,
+             decisions: tuple[engine.Decision, ...]) -> str:
+    """Входы, названные курсом для фигуры, в порядке самого курса.
+
+    ⚠⚠ «ЕСЛИ ОН ЕСТЬ» — ЭТО ЧАСТЬ ПРАВИЛА, А НЕ ОГОВОРКА (правка 2026-08-26, Ф2). Стр. 56
+    задаёт вход «при коррекции к ближайшему уровню в ЛОНГ/ШОРТ "если он есть"», и то же
+    условие повторяют стр. 57, 60, 61, 62 (докстрока `figures.FigureEntry.NEAREST_LEVEL`).
+    Карточка печатала «от ближайшего уровня» БЕЗУСЛОВНО и ни разу не говорила, есть ли
+    такой уровень: замер по 10 символам свежих данных 2026-08-26 — строка встретилась
+    **225 раз**, медиана 22 на символ, и **ни разу** рядом с ней не стояло ни имени
+    уровня, ни ответа «есть/нет». Половина курсового правила не исполнялась вовсе.
+
+    что из чего следует: сторона фигуры → нужен уровень ТОЙ ЖЕ стороны → если живого
+    такого нет, входа стр. 56 у этой фигуры НЕТ. Обратное неверно: наличие уровня входа не
+    даёт, оно лишь снимает запрет.
+
+    ⚠ Уровень считается СНЯТЫМ по курсу, а не по нашему вкусу: отработанный удалён
+    (стр. 25 «мы этот уровень удаляем»), а пробитый сменил сторону (стр. 43) — и потому
+    берётся `dec.current.side`, сторона СЕЙЧАС, той же формулой `levels.level_now`, что и
+    в разделе «УРОВНИ» выше. Второй копии правила стороны здесь нет.
+
+    ⚠ Какой уровень БЛИЖАЙШИЙ — не решается: у четырёх видов фигур своя геометрия
+    (коридор, границы, линия шеи, край выхода), общей точки отсчёта курс не называет, и
+    выдумывать её ради красивой строки нельзя. Печатается СЧЁТ живых уровней нужной
+    стороны; сами они перечислены разделом «УРОВНИ» тремя экранами выше.
+    """
+    txt = ", ".join(FIGURE_ENTRY_LABEL[e.value] for e in entries)
+    if figures.FigureEntry.NEAREST_LEVEL not in entries:
+        return txt
+    live = sum(1 for dec in decisions
+               if dec.current.side.value == side.value
+               and dec.status.state is not LevelState.WORKED_OFF)
+    # ⚠ «В КАРТЕ НЕТ» БЫЛО НЕВЕРНО И ПРОТИВОРЕЧИЛО СОСЕДНЕМУ РАЗДЕЛУ (правка того же дня,
+    # найдена глазами по карточке ETH/USD). Уровень в карте ЕСТЬ — раздел «УРОВНИ» печатал
+    # его строкой «ШОРТ 15м … отработан», — он снят КУРСОМ, а не отсутствует. Читатель,
+    # сверяющий два раздела, видел прямое противоречие там, где расчёт верен.
+    return txt + (f" (живых уровней в {SIDE_LABEL[side.value]} — {live})" if live
+                  else f" — но ЖИВОГО уровня в {SIDE_LABEL[side.value]} нет "
+                       f"(отработанные сняты стр. 25), а стр. 56 разрешает этот вход "
+                       f"только «если он есть»")
 
 
-def _pennant(pen: figures.Pennant) -> str:
+def _pennant(pen: figures.Pennant,
+             decisions: tuple[engine.Decision, ...]) -> str:
     """Вымпел одной строкой: касания, шестое из них (ТВХ стр. 57) и за что прячем стоп.
 
     Источник стороны печатается ВСЕГДА, а не только когда он необычен: сторона, взятая с
@@ -997,5 +1100,5 @@ def _pennant(pen: figures.Pennant) -> str:
             f"прячем за {_num(pen.stop_anchor)} (стр. 57)"
             + ("  структура уже расширялась (стр. 18)" if pen.is_extended else "")
             + against
-            + f"  вход: {_entries(pen.entries)}")
+            + f"  вход: {_entries(pen.entries, pen.side, decisions)}")
 
