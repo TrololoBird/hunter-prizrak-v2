@@ -33,7 +33,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from .bars import TIMEFRAME_MS, tf_ms
-from .geometry import Setup, breakeven_watch, first_major
+from .geometry import Setup, breakeven_watch, first_major, next_major
 from .levels import Level, LevelSide, LevelState, LevelStatus
 from .models import Bar
 from .outcome import Outcome, resolve
@@ -286,6 +286,10 @@ def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
     # ЗДЕСЬ, в `Setup.rr` и в `run.py` тремя копиями. Теперь оно одно —
     # `geometry.first_major`.
     first = first_major(em.setup.targets)
+    # ВТОРАЯ крупная цель — только для модели частичного выхода (Ф5, 2026-08-26): к ней
+    # идёт остаток после первого тейка (стр. 15). Правило «крупности» то же самое, второй
+    # копии фильтра здесь нет — см. `geometry.next_major`.
+    second = next_major(em.setup.targets)
     return resolve(
         side=em.level.side,
         entry=em.setup.entry,
@@ -302,4 +306,5 @@ def outcome_of(em: Emission, bars: list[Bar], since_ms: int) -> Outcome:
         # в том же прогоне; ни один инвариант этого не ловил, потому что обе ветки
         # возвращают законный `Outcome`.
         breakeven_at=breakeven_watch(em.setup.breakeven_rules),
+        target2=second.price if second is not None else None,
     )

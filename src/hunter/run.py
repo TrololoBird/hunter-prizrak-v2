@@ -2577,6 +2577,12 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
                 breakeven_at=p.breakeven_at,
+                # ⚠ Вторая цель берётся ИЗ ЛЕДЖЕРА, а не пересчитывается по свежей карте:
+                # сделка мерится теми целями, что были у неё В МОМЕНТ ЗАПИСИ. Пересчёт
+                # означал бы выбор цели задним числом — тот самый дефект, из-за которого
+                # 2026-08-24 правилась дата отбора целей. У строк схем до 17-й её нет, и
+                # пол там останется на первом тейке (докстрока `PendingSignal.target2`).
+                target2=p.target2,
             )
             if res.kind is OutcomeKind.UNMEASURABLE:
                 # Вырожденный риск (стоп совпал со входом): единицы R не существует, и
@@ -2589,7 +2595,7 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
                     conn, p.id, res.kind.value, bars[res.closed_at_index].open_ms,
-                    res.exit_price, res.r)
+                    res.exit_price, res.r, res.r_partial)
                 if isinstance(err, NotReady):
                     log.degraded("дорешанный исход не записан", причина=err.reason)
                 else:
@@ -2814,6 +2820,10 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 # `role is geometry.TargetRole.PRIMARY`, такой же — в `Setup.rr` и в
                 # `emit.outcome_of`. Правило теперь одно: `geometry.first_major`.
                 first = geometry.first_major(em.setup.targets)
+                # ВТОРАЯ крупная цель — только для модели частичного выхода (Ф5): к ней
+                # идёт остаток после первого тейка (стр. 15). Мерилом РР она не является
+                # и `Setup.rr` её не видит.
+                second = geometry.next_major(em.setup.targets)
                 sig = store.record_signal(
                     conn, sym, em.level.timeframe, em.direction, opened_at,
                     em.setup.entry, em.ledger_stop, run_id, stamp_ms,
@@ -2821,6 +2831,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
                     # ни в одном прогоне, кроме выдавшего сигнал.
                     target=first.price if first is not None else None,
+                    target2=second.price if second is not None else None,
                     # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Правило выбирается ПО
                     # ТРИГГЕРУ (`geometry.breakeven_watch`), а не по номеру в списке:
                     # здесь стояло `breakeven_rules[0]`, и смысл величины держался на
@@ -2871,6 +2882,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     err = store.record_outcome(
                         conn, sig.id, res.kind.value,
                         bars[res.closed_at_index].open_ms, res.exit_price, res.r,
+                        res.r_partial,
                     )
                     if isinstance(err, NotReady):
                         log.degraded("исход не записан", причина=err.reason)

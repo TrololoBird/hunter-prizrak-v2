@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS signals (
     entry       REAL    NOT NULL,
     stop        REAL    NOT NULL,
     target      REAL,
+    -- ВТОРАЯ крупная цель. Нужна ТОЛЬКО модели частичного выхода: остаток позиции после
+    -- первого тейка идёт к ней (стр. 15 «сделали тейки по достигнутым целям»), и она
+    -- поднимает пол `outcomes.r_partial`. NULL — второй крупной цели у сделки не было
+    -- либо строка записана до схемы 17; ноль подставлять нельзя, это цена.
+    target2     REAL,
     -- Цена, по достижении которой стоп переносится в ТВХ (стр. 19, 15, 44). NULL —
     -- правила безубытка у сделки нет. ⚠ Это НЕ цель: до 2026-08-19 дорешивание
     -- подавало сюда `target`, и исход «в безубытке» становился недостижим — взведение
@@ -78,6 +83,15 @@ CREATE TABLE IF NOT EXISTS outcomes (
     closed_at  INTEGER NOT NULL,
     exit_price REAL,
     r          REAL,
+    -- R по модели ЧАСТИЧНОГО выхода, и это ПОЛ, а не точечная оценка. Разбор — в
+    -- докстроке `outcome.Outcome.r_partial`. Коротко: `r` закрывает всю позицию первой
+    -- целью, а курс так не торгует (стр. 15), поэтому `r` есть ВЕРХНЯЯ оценка выигрыша.
+    -- NULL — строка записана до схемы 17; у свежих строк поле есть всегда, когда есть
+    -- `r`, поэтому подвыборки две модели не создают.
+    -- ⚠ `kind` НЕ дублируется второй моделью нарочно: полный выход всегда закрывается на
+    -- первой цели, поэтому вид исхода у обеих моделей ОДИН И ТОТ ЖЕ, различается только
+    -- число. Вторая колонка вида завела бы две сущности под одним именем.
+    r_partial  REAL,
     CHECK ((kind = 'ambiguous') = (r IS NULL)),
     CHECK ((kind = 'ambiguous') = (exit_price IS NULL))
 );
@@ -249,7 +263,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "16"
+SCHEMA_VERSION = "17"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
@@ -717,6 +731,12 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # появилось бы НИ РАЗУ, а `schema_meta` всё равно проштамповалась бы новым числом.
     if lvl_sql is not None and "zone_hi <= boundary_hi" not in lvl_text:
         return "15"
+    # 16 → 17: две колонки модели частичного выхода. Ступень стоит ЗДЕСЬ по той же
+    # причине, что и все выше, — ловушка описана абзацем ниже: без неё база версии 16
+    # назвала бы себя семнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta`
+    # всё равно проштамповалась бы новым числом.
+    if "target2" not in cols:
+        return "16"
     return SCHEMA_VERSION
 
 
@@ -1126,6 +1146,19 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         else:
             log.info("миграция 15→16: ограничение «зона внутри структуры» добавлено",
                      нарушающих_строк=0, строк=moved)
+    if _schema_version(conn) == "16":
+        # 16 → 17: две колонки МОДЕЛИ ЧАСТИЧНОГО ВЫХОДА, обе на месте и NULLABLE.
+        # Перестройка не нужна: ни `UNIQUE`, ни `CHECK` не трогаются, а
+        # `ALTER TABLE ADD COLUMN` в SQLite строк не переписывает.
+        #
+        # NULL у прежних строк ОСОЗНАНЕН и означает «не считалось». Досчитать их задним
+        # числом нельзя: для пола нужна ВТОРАЯ цель, а её не записывали, — и подставить
+        # вместо неё `target` значило бы удвоить первый тейк. Значит две модели
+        # сравниваются только на строках схемы 17 и выше, и это НАЗЫВАЕТСЯ в отчёте
+        # (`store.expectancy`), а не замазывается нулём.
+        conn.execute("ALTER TABLE signals ADD COLUMN target2 REAL")
+        conn.execute("ALTER TABLE outcomes ADD COLUMN r_partial REAL")
+        conn.commit()
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1176,6 +1209,7 @@ def record_signal(
     conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
     opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str, recorded_at: int,
     kind: str = "level", target: Decimal | None = None,
+    target2: Decimal | None = None,
     breakeven_at: Decimal | None = None,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
@@ -1199,11 +1233,12 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, target, breakeven_at, frames_ref)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop),
              None if target is None else float(target),
+             None if target2 is None else float(target2),
              None if breakeven_at is None else float(breakeven_at), frames_ref),
         )
         conn.commit()
@@ -1216,7 +1251,7 @@ def record_signal(
 
 def record_outcome(
     conn: sqlite3.Connection, signal_id: int, kind: str, closed_at: int,
-    exit_price: Decimal | None, r: float | None,
+    exit_price: Decimal | None, r: float | None, r_partial: float | None = None,
 ) -> NotReady | None:
     """Записать исход. Открытые и несостоявшиеся сделки сюда НЕ пишутся (§4.3).
 
@@ -1240,9 +1275,9 @@ def record_outcome(
             f"запрещена, расхождение требует разбора"))
     try:
         conn.execute(
-            "INSERT INTO outcomes (signal_id, kind, closed_at, exit_price, r)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (signal_id, kind, closed_at, px, r),
+            "INSERT INTO outcomes (signal_id, kind, closed_at, exit_price, r,"
+            " r_partial) VALUES (?, ?, ?, ?, ?, ?)",
+            (signal_id, kind, closed_at, px, r, r_partial),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -1266,6 +1301,12 @@ class PendingSignal(BaseModel):
     direction: str
     entry: Decimal
     stop: Decimal
+
+    target2: Decimal | None = None
+    """ВТОРАЯ крупная цель — только модели частичного выхода (Ф5). `None` у строк схем
+    до 17-й: тогда её не записывали, и досчитать задним числом нечем. Значит у таких
+    сигналов пол `r_partial` останется на первом тейке — это НЕ ошибка расчёта, а
+    названное ограничение старых строк."""
     target: Decimal | None
     breakeven_at: Decimal | None = None
     """Цена взведения безубытка (стр. 19, 15, 44). None — правила у сделки нет либо
@@ -1286,7 +1327,7 @@ def pending_signals(
     следующих барах может смениться исходом. Отменяет только сам исход.
     """
     sql = ("SELECT s.id, s.symbol, s.timeframe, s.direction, s.entry, s.stop,"
-           " s.target, s.recorded_at, s.breakeven_at FROM signals s"
+           " s.target, s.recorded_at, s.breakeven_at, s.target2 FROM signals s"
            " LEFT JOIN outcomes o ON o.signal_id = s.id"
            " WHERE o.signal_id IS NULL")
     args: tuple[str, ...] = ()
@@ -1301,6 +1342,7 @@ def pending_signals(
             target=None if r[6] is None else Decimal(str(r[6])),
             recorded_at=int(r[7]),
             breakeven_at=None if r[8] is None else Decimal(str(r[8])),
+            target2=None if r[9] is None else Decimal(str(r[9])),
         )
         for r in rows
     )
@@ -2007,6 +2049,24 @@ class Expectancy(BaseModel):
     win_ci_half: float | None
     """Полуширина 95% интервала ВИНРЕЙТА по всем ТФ. `None` при нуле сделок."""
 
+    partial: ExpectancyCell
+    """То же среднее, но по модели ЧАСТИЧНОГО выхода — и это ПОЛ (Ф5, 2026-08-26).
+
+    ⚠⚠ ЗАЧЕМ ВТОРАЯ СТРОКА. `total` считает сделку так, будто на первой крупной цели
+    закрывается ВСЯ позиция. Курс так не торгует: стр. 15 о сделке от уровня говорит
+    «Вы сделали тейки по достигнутым целям и передвинули стоп в бу. Далее актив пошел на
+    коррекцию и просто остаток позиции закрылся в безубыток». Значит `total` есть ВЕРХНЯЯ
+    оценка, а не результат метода, и вся статистика на ней завышена.
+
+    ⚠ Числа ДВУХ строк НЕСРАВНИМЫ С ПРЕЖНИМИ отчётами: до схемы 17 второй модели не было
+    вовсе. Знаменатели у строк тоже могут расходиться — у строк схем до 17-й `r_partial`
+    пуст, — поэтому `trades` печатается у каждой свой.
+
+    Разбор, почему пол, а не точка: докстрока `outcome.Outcome.r_partial`. Коротко —
+    доли для сделки от уровня курс не называет ни на одной странице, а нижняя граница
+    выдумки не требует: после первого тейка стоп в безубытке, остаток не проигрывает.
+    """
+
     fingerprint: str
     verdict: str
 
@@ -2050,6 +2110,18 @@ def expectancy(conn: sqlite3.Connection) -> Expectancy:
         )
 
     cells = tuple(cell(tf, rs, amb_by_tf.get(tf, 0)) for tf, rs in sorted(per_tf.items()))
+    # ⚠ ТОТ ЖЕ `cell`, а не вторая формула рядом: среднее и полуширина у обеих моделей
+    # считаются одинаково, и вторая их запись разошлась бы с первой (Ф5).
+    # ⚠ ТОЛЬКО СДЕЛКИ ОТ УРОВНЯ (`kind='level'`), и это НАЗВАНО, а не выпало само.
+    # Модель частичного выхода стоит на стр. 15, а та говорит о сделке от уровня («Актив
+    # пришел к лонг уровню»). Сделке от ПП (стр. 50) это правило не адресовано, и
+    # распространять его на неё значило бы повторить перенос чужой страницы, которым
+    # проект уже дважды ошибался. Без явного фильтра ПП-строки молча выпали бы из
+    # знаменателя пола (у них `r_partial` пуст), и расхождение строк объяснялось бы
+    # неверно — «старые строки», хотя причина другая.
+    partial_rs = [float(r[0]) for r in conn.execute(
+        "SELECT o.r_partial FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+        " WHERE o.r_partial IS NOT NULL AND s.kind = 'level'")]
     all_r = [x for rs in per_tf.values() for x in rs]
     total = cell("ВСЕ", all_r, sum(amb_by_tf.values()))
     wins = conn.execute(
@@ -2061,6 +2133,7 @@ def expectancy(conn: sqlite3.Connection) -> Expectancy:
     n_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     return Expectancy(
         total=total, by_timeframe=cells, win_ci_half=win_half,
+        partial=cell("частичный", partial_rs, sum(amb_by_tf.values())),
         fingerprint=f"сигналов {n_signals}, завершённых сделок {total.trades}",
         verdict=sample_verdict(total.trades),
     )
@@ -2082,6 +2155,29 @@ def format_expectancy(e: Expectancy) -> list[str]:
             span = f"от {c.r_mean - c.r_ci_half:+.3f} до {c.r_mean + c.r_ci_half:+.3f}"
         out.append(f"   {c.timeframe:6} {c.trades:6} {c.r_sum:+9.2f} {mean:>10}   "
                    f"{span:26} {c.ambiguous:5}")
+    # ⚠⚠ ВТОРАЯ МОДЕЛЬ ПЕЧАТАЕТСЯ РЯДОМ, А НЕ ВМЕСТО (Ф5, 2026-08-26). Строка выше
+    # закрывает всю позицию первой целью — курс так не торгует (стр. 15), значит она
+    # ВЕРХНЯЯ оценка. Строка ниже — ПОЛ модели частичного выхода. Настоящий результат
+    # лежит между ними, и это честнее одного числа с выдуманной долей.
+    pc = e.partial
+    if pc.trades:
+        pmean = "     —" if pc.r_mean is None else f"{pc.r_mean:+.3f}"
+        pspan = ("по одной сделке не определён"
+                 if pc.r_ci_half is None or pc.r_mean is None else
+                 f"от {pc.r_mean - pc.r_ci_half:+.3f} до {pc.r_mean + pc.r_ci_half:+.3f}")
+        out.append(f"   {'ПОЛ':6} {pc.trades:6} {pc.r_sum:+9.2f} {pmean:>10}   "
+                   f"{pspan:26}")
+        out.append("   строка ПОЛ — модель ЧАСТИЧНОГО выхода (стр. 15): у первой цели "
+                   "фиксируется часть, остаток идёт под стопом в безубытке. Настоящий "
+                   "результат НЕ НИЖЕ этой строки и НЕ ВЫШЕ строки «ВСЕ»")
+        if pc.trades != e.total.trades:
+            out.append(f"   ⚠ знаменатели РАЗНЫЕ: {e.total.trades} против {pc.trades}, и "
+                       f"причин ДВЕ: сделки от ПП (стр. 50) в пол не входят вовсе — стр. "
+                       f"15 говорит о сделке от УРОВНЯ; и у строк, записанных до схемы "
+                       f"17, второй цели нет. Сравнивать средние этих строк нельзя")
+    else:
+        out.append("   ПОЛ модели частичного выхода не считался ни у одной сделки: все "
+                   "строки записаны до схемы 17 (стр. 15, Ф5)")
     if e.win_ci_half is not None:
         out.append(f"   интервал ВИНРЕЙТА по всем ТФ: ±{e.win_ci_half:.1f} п.п. — "
                    f"столько же значит и сама доля")
