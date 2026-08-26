@@ -34,7 +34,7 @@ from . import absorption, emit, figures, geometry, levels, pereprior, priority, 
 from .absorption import AbsorptionRead
 from .bars import TF_RANK, TIMEFRAME_MS, right_edge_ms
 from .geometry import TF_ORDER, Setup
-from .levels import Level, LevelStatus, MappedLevel, Unbuilt
+from .levels import Level, LevelStatus, MappedLevel, Unbuilt, UnbuiltKind
 from .models import Bar, NotReady, TradeWindows
 from .pereprior import Pereprior, PPSide
 from .priority import Agreement, CounterLevel, Priority
@@ -271,6 +271,18 @@ class SymbolDecision(BaseModel):
             for d in self.decisions if d.setup is not None
         )
 
+    def levels_by_tf(self) -> dict[str, int]:
+        """Построенных уровней по ТФ. ЗНАМЕНАТЕЛЬ к непостроенным (Ф7, 2026-08-26).
+
+        Проекция карты, а не второй счёт: складывается ровно то, что уже разобрано.
+        Вместе с `unbuilt` даёт число РАЗОБРАННЫХ структур этого ТФ — без него «десять
+        отказов» неотличимы у символа с десятью структурами и у символа с тысячей.
+        """
+        out: dict[str, int] = {}
+        for m in self.mapped:
+            out[m.level.timeframe] = out.get(m.level.timeframe, 0) + 1
+        return out
+
     @property
     def tf_balance(self) -> emit.TFBalance:
         """Сколько отложек по каждому ТФ и по каждой корзине стр. 48. Со знаменателем.
@@ -354,7 +366,8 @@ def read_series(
     for tf in timeframes:
         bars = series.get(tf)
         if not bars:
-            bad.append(Unbuilt(timeframe=tf, index=None, reason="кадров нет"))
+            bad.append(Unbuilt(kind=UnbuiltKind.NO_FRAMES, timeframe=tf, index=None,
+                               reason="кадров нет"))
             continue
         got: SwingSet | NotReady
         maybe_scan: RangeScan | None
@@ -364,13 +377,14 @@ def read_series(
         else:
             got, maybe_scan = detections.get(symbol, tf, bars)
         if isinstance(got, NotReady):
-            bad.append(Unbuilt(timeframe=tf, index=None, reason=got.reason))
+            bad.append(Unbuilt(kind=UnbuiltKind.NO_SCAN, timeframe=tf, index=None,
+                               reason=got.reason))
             continue
         if maybe_scan is None:
             # Недостижимо по построению `Detections.get`, но проверяется, а не
             # утверждается: `assert` вырезается ключом `-O`, а отказ обязан быть НАЗВАН
             # (§4.3), а не превратиться в `AttributeError` этажом ниже.
-            bad.append(Unbuilt(timeframe=tf, index=None,
+            bad.append(Unbuilt(kind=UnbuiltKind.NO_SCAN, timeframe=tf, index=None,
                                reason="свинги есть, а разбора структур нет — "
                                       "переносчик разбора отдал неполную пару"))
             continue

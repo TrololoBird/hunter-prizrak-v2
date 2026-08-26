@@ -499,10 +499,53 @@ def build_level(
     )
 
 
+class UnbuiltKind(StrEnum):
+    """КЛАСС причины, по которой структура не дала уровня — ключом, а не текстом.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26 РАДИ Ф7 плана, и без него фаза неисполнима В ПРИНЦИПЕ. Ф7
+    требует «долю структур, не давших уровня ПО ПРИЧИНЕ ПОКРЫТИЯ, в разрезе по ТФ, за
+    неделю боевых прогонов». Причина существовала СТРОКОЙ и притом свободной: в неё
+    подставлялись символ, цены и числа баров, поэтому две одинаковые по смыслу причины
+    были разными строками. Сложить их было нечем — ни за неделю, ни за день.
+
+    Тот же класс и то же лечение, что у `geometry.TargetSink` (Ф1): текст остаётся
+    человеку, ключ появляется рядом и считается ОДНИМ И ТЕМ ЖЕ местом.
+
+    ⚠ Класс НЕ ВСЕГДА ОЗНАЧАЕТ ОТКАЗ. `FAR` и `DUPLICATE` — это ФИЛЬТРЫ: структура была
+    разобрана верно, уровень построен и снят нарочно. Складывать их с отказами прибора в
+    одно число «потеряно» значило бы соврать. Поэтому классы раздельные, а не флаг
+    «построен / не построен».
+    """
+
+    NO_FRAMES = "кадров нет"
+    """Ряда этого ТФ в прогоне нет вовсе. Отказ СНАБЖЕНИЯ, до структур не дошли."""
+
+    NO_SCAN = "разбор ряда не состоялся"
+    """Ряд есть, но свинги или структуры по нему не построились."""
+
+    NO_TRADES = "сделок не собрано"
+    NO_COVERAGE = "окно профиля не покрыто"
+    """⚠ ЭТО И ЕСТЬ КЛАСС, РАДИ КОТОРОГО ЗАВЕДЕНА Ф7. Свечей под окно структуры не
+    хватило — целиком или частично. Отказ снабжения, а не рынка: структура найдена, а
+    профиль по ней построить не из чего."""
+
+    OLD = "структура старше горизонта"
+    EMPTY_BOX = "отрезок структуры пуст"
+    NO_POC = "ПОК не построен"
+    FAR = "далеко от цены — отбор ближайших"
+    """⚠ НЕ ОТКАЗ: уровень построен и снят ФИЛЬТРОМ (`LEVELS_PER_SIDE`)."""
+
+    DUPLICATE = "та же цена уже уровнем старшего ТФ"
+    """⚠ НЕ ОТКАЗ: склейка уровней между ТФ (стр. 23, 24), решение проекта 2026-08-19."""
+
+
 class Unbuilt(BaseModel):
     """Почему уровень не построен. §4.3: пропуск обязан дойти до оператора с причиной."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: UnbuiltKind
+    """Тот же ответ КЛЮЧОМ — чтобы прогон мог сложить причины. Разбор — `UnbuiltKind`."""
 
     timeframe: str
     index: int | None
@@ -675,19 +718,24 @@ def build_all(
         younger = _younger_tfs(tf, timeframes)
         for acc in accs:
             if trades is None:
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                unbuilt.append(Unbuilt(kind=UnbuiltKind.NO_TRADES, timeframe=tf,
+                                       index=acc.first_index,
                                        reason="сделок не собрано"))
                 continue
             lo, hi = structure_window_ms(acc, bars, TIMEFRAME_MS[tf])
             if cut_ms and hi < cut_ms:
                 # Не «пропущено», а НАЗВАНО: структура старше горизонта — это ответ,
                 # а не отсутствие ответа (§4.3). Число таких видно в карточке.
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                unbuilt.append(Unbuilt(kind=UnbuiltKind.OLD, timeframe=tf,
+                                       index=acc.first_index,
                                        reason="структура закрылась раньше горизонта"))
                 continue
             hist = trades.window(lo, hi)
             if isinstance(hist, NotReady):
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                # ⚠ КЛАСС ПОКРЫТИЯ — тот, ради которого заведена Ф7: окно структуры
+                # свечами не покрыто, целиком или частично. Отказ снабжения, не рынка.
+                unbuilt.append(Unbuilt(kind=UnbuiltKind.NO_COVERAGE, timeframe=tf,
+                                       index=acc.first_index,
                                        reason=hist.reason))
                 continue
             # Те же бары, что ушли в гистограмму профиля: иначе сетка натягивается
@@ -696,14 +744,16 @@ def build_all(
             # потребителей вместо четырёх копий, см. `_structure_box`.
             _box = acc.box(bars)
             if _box is None:
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                unbuilt.append(Unbuilt(kind=UnbuiltKind.EMPTY_BOX, timeframe=tf,
+                                       index=acc.first_index,
                                        reason="отрезок структуры пуст — коробки нет"))
                 continue
             lvl = build_level(acc, hist, symbol, (lo, hi),
                               created_at_ms(acc, bars, TIMEFRAME_MS[tf]),
                               (Decimal(str(_box[0])), Decimal(str(_box[1]))))
             if isinstance(lvl, NotReady):
-                unbuilt.append(Unbuilt(timeframe=tf, index=acc.first_index,
+                unbuilt.append(Unbuilt(kind=UnbuiltKind.NO_POC, timeframe=tf,
+                                       index=acc.first_index,
                                        reason=lvl.reason))
                 continue
             # Стоповый объём — накопления ВСЕХ младших ТФ, отнесённые к этой структуре
@@ -911,7 +961,7 @@ def _nearest_by_side(built: list[Level], series: dict[str, list[Bar]],
         for lv in above[per_side:] + below[per_side:]:
             where = "выше" if lv.price > price else "ниже"
             unbuilt.append(Unbuilt(
-                timeframe=tf, index=0,
+                kind=UnbuiltKind.FAR, timeframe=tf, index=0,
                 reason=f"дальше {per_side}-го {where} цены — отбор ближайших"))
     return keep
 
@@ -1035,6 +1085,7 @@ def _one_level_per_range(
             keep.append(lvl)
             continue
         unbuilt.append(Unbuilt(
+            kind=UnbuiltKind.DUPLICATE,
             timeframe=lvl.timeframe, index=lvl.structure_first_index,
             reason=(f"эта цена уже есть уровнем на {senior.timeframe} "
                     f"(ПОК {senior.price:.8g}, ПОК каждого в зоне другого): стр. 23 — "

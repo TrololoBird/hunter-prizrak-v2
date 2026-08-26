@@ -2424,6 +2424,21 @@ def decide_once(report: RunReport, uni: Universe,
         log.degraded("профиль: окнам не хватило ряда intrabar-ТФ",
                      всего=sum(by_tf.values()), по_тф=by_tf,
                      символов=len(refused))
+    # ⚠⚠ СТРУКТУРЫ, НЕ ДАВШИЕ УРОВНЯ — ПО КЛАССУ И ПО ТФ (Ф7, 2026-08-26). До этого дня
+    # `unbuilt` не читал в `run.py` НИКТО: причины печатались покарточно и в отчёт не
+    # попадали ни одним числом. Значит меру Ф7 — «доля структур, не давших уровня по
+    # причине покрытия, за неделю боевых прогонов» — нельзя было получить и в бою.
+    for dec in out.values():
+        for tf, n in dec.levels_by_tf().items():
+            report.structures_by_tf[tf] = report.structures_by_tf.get(tf, 0) + n
+        for ub in dec.unbuilt:
+            report.unbuilt_by_kind[ub.kind.value] = (
+                report.unbuilt_by_kind.get(ub.kind.value, 0) + 1)
+            report.structures_by_tf[ub.timeframe] = (
+                report.structures_by_tf.get(ub.timeframe, 0) + 1)
+            if ub.kind is levels.UnbuiltKind.NO_COVERAGE:
+                report.unbuilt_coverage_by_tf[ub.timeframe] = (
+                    report.unbuilt_coverage_by_tf.get(ub.timeframe, 0) + 1)
     # ⚠ ДВА ОСТАЛЬНЫХ КЛАССА ОТКАЗА — В ОТЧЁТ, А НЕ В ЖУРНАЛ (Ф6, 2026-08-26). Они
     # считались внутри `CandleWindows` и наружу не выходили вовсе: владелец видел строку
     # про недостающие ряды и не видел строки про дыры в покрытии, хотя уровень теряется
@@ -3021,6 +3036,7 @@ CYCLE_FIELDS = (
     "backfill_missing_by_symbol",
     "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
     "profile_windows_no_bars_by_tf", "profile_windows_partial_by_tf",
+    "unbuilt_by_kind", "unbuilt_coverage_by_tf", "structures_by_tf",
     "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
@@ -3901,6 +3917,31 @@ def print_report(r: RunReport) -> int:
         if cov_data:
             cov_rows = ", ".join(f"{tf}: {n}" for tf, n in sorted(cov_data.items()))
             print(f"   {cov_label}: {sum(cov_data.values())} — {cov_rows}  ({cov_note})")
+    # ⚠⚠ МЕРА Ф7 — ДОЛЯ СТРУКТУР, ПОТЕРЯННЫХ НА ПОКРЫТИИ, В РАЗРЕЗЕ ПО ТФ (2026-08-26).
+    # Сама фаза требует НЕДЕЛЮ БОЕВЫХ прогонов и отсюда неисполнима; здесь заведён
+    # ПРИБОР, без которого её нельзя было бы посчитать и в бою: причины непостроения
+    # существовали свободной строкой и не складывались.
+    #
+    # ⚠ Смотреть надо на ДИНАМИКУ доли за неделю, а не на одно число: если добор
+    # покрытия работает, доля падает; если нет — это первый кандидат в следующую фазу,
+    # потому что теряются ровно те ТФ, которым курс обещает лучший винрейт (стр. 48).
+    if r.structures_by_tf:
+        print("   СТРУКТУРЫ → УРОВНИ по ТФ, и потери на ПОКРЫТИИ (мера Ф7):")
+        for tf in sorted(r.structures_by_tf):
+            seen = r.structures_by_tf[tf]
+            lost = r.unbuilt_coverage_by_tf.get(tf, 0)
+            share = f"{lost / seen * 100:.1f}%" if seen else "—"
+            print(f"     {tf:>3}  структур {seen:5}  потеряно покрытием {lost:5}  {share:>7}")
+    if r.unbuilt_by_kind:
+        # Перечислением, а не по словарю: новый класс появится в сводке сам, а не
+        # забудется (тот же приём, что у воронки целей и у исходов).
+        print("   уровень НЕ построен, по классу причины:")
+        for k in levels.UnbuiltKind:
+            n = r.unbuilt_by_kind.get(k.value, 0)
+            if n:
+                mark = "  ⚠ ФИЛЬТР, не отказ" if k in (
+                    levels.UnbuiltKind.FAR, levels.UnbuiltKind.DUPLICATE) else ""
+                print(f"     {k.value:38} {n:5d}{mark}")
     if not (r.profile_windows_no_bars_by_tf or r.profile_windows_partial_by_tf):
         print("   отказов покрытия окон нет ни одного класса"
               + ("" if r.profile_windows else " — но и окон не было, число пусто"))
