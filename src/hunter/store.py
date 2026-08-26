@@ -195,6 +195,12 @@ CREATE TABLE IF NOT EXISTS levels (
     stop_price   REAL,
     priority_tf  TEXT,
     priority_depth INTEGER,
+    -- ⚠ РАСШИРЕННЫЙ КРАЙ (прокол стр. 18) — схема 18, 2026-08-26. Заведён вместе с
+    -- возвратом `boundary_*` на линию по первым двум точкам: без него запись уровня
+    -- потеряла бы цену, за которую курс велит ставить стоп. Порядок тот же, в каком
+    -- их дописывает `ALTER TABLE`, — чтобы состав свежей и мигрированной базы совпадал.
+    stop_edge_lo REAL,
+    stop_edge_hi REAL,
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     -- ⚠⚠ ЗОНА ВНУТРИ СТРУКТУРЫ. Ограничение добавлено 2026-08-23 (схема 16), и оно
@@ -205,6 +211,13 @@ CREATE TABLE IF NOT EXISTS levels (
     -- нарушение молча. Проверка в схеме сильнее любого гейта: её исполняет SQLite на
     -- КАЖДОЙ настоящей записи, а не наш код на подобранных примерах.
     CHECK (boundary_lo <= zone_lo AND zone_hi <= boundary_hi),
+    -- ⚠ ПРОКОЛ НЕ БЛИЖЕ ГРАНИЦЫ (стр. 18, схема 18). Прокол записывается только ЗА
+    -- границей, значит расширенный край не может оказаться внутри базы. Колонки
+    -- необязательные: у строк, доживших с прежних схем, их нет, и `NULL` в SQLite
+    -- делает `CHECK` неопределённым, то есть проходимым, — старьё не ломается, а
+    -- всякая новая запись проверяется.
+    CHECK (stop_edge_lo IS NULL OR stop_edge_lo <= boundary_lo),
+    CHECK (stop_edge_hi IS NULL OR boundary_hi <= stop_edge_hi),
     CHECK (to_ms > from_ms),
     CHECK (last_seen >= first_seen),
     CHECK ((retired_at IS NULL) = (state = 'active')),
@@ -263,8 +276,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "17"
+SCHEMA_VERSION = "18"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+17 → 18 (2026-08-26): `boundary_lo/hi` СМЕНИЛИ СМЫСЛ — с коробки ХАЙ…ЛОЙ всех баров на
+линию по первым двум точкам (стр. 18); рядом заведён расширенный край `stop_edge_lo/hi`
+(прокол стр. 18), за который курс велит ставить стоп. Прежние строки УДАЛЯЮТСЯ и их
+число НАЗЫВАЕТСЯ в журнале — по той же причине, что на ступени 15→16: колонка с двумя
+смыслами есть дефект по построению. Обоснование прежней конвенции опровергнуто по
+источнику, разбор — в докстроке `levels.Level.boundary_lo`.
 
 15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
 (`boundary_lo <= zone_lo AND zone_hi <= boundary_hi`) — то самое, что владелец
@@ -737,6 +757,12 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # всё равно проштамповалась бы новым числом.
     if "target2" not in cols:
         return "16"
+    # 17 → 18: у `levels` появляется расширенный край (прокол стр. 18). Ступень стоит
+    # ЗДЕСЬ по той же причине, что и все выше, — иначе база версии 17 назвала бы себя
+    # восемнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta` всё равно
+    # проштамповалась бы новым числом.
+    if lvl_cols and "stop_edge_lo" not in lvl_cols:
+        return "17"
     return SCHEMA_VERSION
 
 
@@ -1159,6 +1185,42 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         conn.execute("ALTER TABLE signals ADD COLUMN target2 REAL")
         conn.execute("ALTER TABLE outcomes ADD COLUMN r_partial REAL")
         conn.commit()
+    if _schema_version(conn) == "17":
+        # 17 → 18: расширенный край (прокол стр. 18) двумя NULLABLE-колонками.
+        #
+        # ⚠⚠ И ВМЕСТЕ С НИМИ МЕНЯЕТСЯ СМЫСЛ `boundary_lo/hi`. С 2026-08-18 по 2026-08-26
+        # там лежала КОРОБКА ХАЙ…ЛОЙ всех баров структуры; теперь — линия по первым двум
+        # точкам (стр. 18, разбор в докстроке `levels.Level.boundary_lo`). Одна колонка
+        # с двумя смыслами — тот самый дефект «две сущности под одним именем», от
+        # которого проект уже пострадал, поэтому прежние строки УДАЛЯЮТСЯ, а их число
+        # НАЗЫВАЕТСЯ в журнале. Тот же выбор, что на ступени 15→16, и по той же причине:
+        # они построены расчётом, который признан неверным, а показывать их боту дальше
+        # значило бы выдавать коробку за границы. Уровни выводятся из баров заново на
+        # первом же прогоне символа; теряется только `first_seen`.
+        # ⚠⚠ ТАБЛИЦА СНОСИТСЯ ЦЕЛИКОМ, а не дополняется `ALTER TABLE`. Причина —
+        # ловушка SQLite, пойманная ПРОБНИКОМ на копии 2026-08-26, а не вычитанная:
+        # `ALTER TABLE ADD COLUMN` колонки добавляет, но ОГРАНИЧЕНИЯ из текста
+        # `CREATE TABLE IF NOT EXISTS` к уже существующей таблице не применяет — а
+        # `executescript(SCHEMA)` ниже для неё пустышка. Первый прогон миграции так и
+        # вышел: колонки появились, `CHECK` про прокол НЕ появился, и подсадка строки с
+        # проколом ВНУТРИ границы прошла. Тот же класс, что у ступени 15→16, где таблицу
+        # ради нового `CHECK` пришлось перестраивать.
+        #
+        # Здесь снос дешевле перестройки: строки всё равно удаляются целиком (см. абзац
+        # выше про смену смысла `boundary_*`), а `executescript(SCHEMA)` создаёт таблицу
+        # заново — со всеми ограничениями и индексами.
+        dropped = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+        conn.execute("DROP TABLE levels")
+        conn.commit()
+        if dropped:
+            log.degraded(
+                "миграция 17→18: карта уровней ОЧИЩЕНА — `boundary_*` сменили смысл",
+                удалено=dropped,
+                причина="границы вернулись на линию по первым двум точкам (стр. 18); "
+                        "прежние строки хранят коробку ХАЙ…ЛОЙ и означали бы другое")
+        else:
+            log.info("миграция 17→18: расширенный край добавлен, карта была пуста",
+                     удалено=0)
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1444,14 +1506,15 @@ def sync_levels(
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
                     " last_seen, state, retired_at, entry_rule, resolved_at,"
                     " vrvp_density, mtf_break, agreement, stop_price, priority_tf,"
-                    " priority_depth)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " priority_depth, stop_edge_lo, stop_edge_hi)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
                      None if active else now_ms, rule.value, resolved,
-                     lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth),
+                     lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth,
+                     float(lvl.stop_edge_lo), float(lvl.stop_edge_hi)),
                 )
                 added += 1
                 retired += not active
@@ -1480,13 +1543,15 @@ def sync_levels(
             # нарушений, пока леджер держал 50%. Две геометрии под одним уровнем.
             conn.execute(
                 "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
-                " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
+                " boundary_lo=?, boundary_hi=?, stop_edge_lo=?, stop_edge_hi=?,"
+                " volume=?, vrvp_density=?, state=?,"
                 " retired_at=?, entry_rule=?, resolved_at=?, mtf_break=?,"
                 " agreement=?, stop_price=?, priority_tf=?, priority_depth=?"
                 " WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
                 (now_ms, lvl.side.value, float(lvl.price),
                  float(lvl.zone_lo), float(lvl.zone_hi),
-                 float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
+                 float(lvl.boundary_lo), float(lvl.boundary_hi),
+                 float(lvl.stop_edge_lo), float(lvl.stop_edge_hi), lvl.structure_volume,
                  lvl.vrvp_density,
                  state.value, retired_at, rule.value, resolved, mtf, agree,
                  stop_px, pr_tf, pr_depth, *key),

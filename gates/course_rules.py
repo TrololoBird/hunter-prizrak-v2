@@ -102,6 +102,9 @@ def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
         # константу значило бы завести здесь вторую сущность под тем же именем.
         row_height=Decimal(str((hi - lo) / TV_ROWS)),
         boundary_lo=Decimal(str(lo)), boundary_hi=Decimal(str(hi)),
+        # Прокола у синтетической базы нет — расширенный край СОВПАДАЕТ с границей,
+        # ровно как `BoundaryZone.extended_edge` при `puncture is None`.
+        stop_edge_lo=Decimal(str(lo)), stop_edge_hi=Decimal(str(hi)),
         boundary_narrowed=narrowed,
         boundary_ladder=ladder,
     )

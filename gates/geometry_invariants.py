@@ -150,6 +150,12 @@ def level(side: LevelSide, poc: str, lo: str, hi: str, *, tf: str = "4h",
                      - Decimal(b_lo if b_lo is not None else lo)) / TV_ROWS),
         boundary_lo=Decimal(b_lo if b_lo is not None else lo),
         boundary_hi=Decimal(b_hi if b_hi is not None else hi),
+        # Прокола у синтетической базы нет — расширенный край СОВПАДАЕТ с границей
+        # (`BoundaryZone.extended_edge` возвращает `edge`, когда `puncture is None`).
+        # Не ноль и не «шире на глазок»: инвариант «прокол не ближе границы» обязан
+        # держаться и на пробнике, иначе он проверял бы поблажку.
+        stop_edge_lo=Decimal(b_lo if b_lo is not None else lo),
+        stop_edge_hi=Decimal(b_hi if b_hi is not None else hi),
         boundary_narrowed=0, boundary_ladder=False,
     )
 
