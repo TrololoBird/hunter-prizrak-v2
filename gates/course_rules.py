@@ -51,6 +51,7 @@ from hunter.swings import ZIGZAG_DEPTH, TrendDirection
 from hunter.swings import detect as detect_swings
 from hunter.trading_range import MIN_BOUNDARY_POINTS, BoundaryZone
 from hunter.trading_range import detect as detect_ranges
+from hunter.volume_profile import TV_ROWS
 
 TF = "1h"
 STEP = TIMEFRAME_MS[TF]
@@ -91,6 +92,11 @@ def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
         structure_first_index=0, structure_last_index=max(created - 1, 0),
         structure_from_ms=T0, structure_to_ms=T0 + max(created, 1) * STEP,
         structure_volume=100.0,
+        # Высота строки профиля: боевой режим — `TV_ROWS` строк на размах коробки,
+        # поэтому берётся ТОЙ ЖЕ формулой, а не выдуманным числом. Пробнику она
+        # безразлична (правила курса о разрешении профиля не говорят), но подставлять
+        # константу значило бы завести здесь вторую сущность под тем же именем.
+        row_height=Decimal(str((hi - lo) / TV_ROWS)),
         boundary_lo=Decimal(str(lo)), boundary_hi=Decimal(str(hi)),
         boundary_narrowed=narrowed,
         boundary_ladder=ladder,

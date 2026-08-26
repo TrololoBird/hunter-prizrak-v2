@@ -47,6 +47,7 @@ from hunter.pereprior import Pereprior, PPKind, PPSide
 from hunter.profile_source import CandleWindows
 from hunter.swings import detect as swings_detect
 from hunter.trading_range import detect as range_detect
+from hunter.volume_profile import TV_ROWS
 
 T0 = 1_700_000_000_000
 HOUR = 3_600_000
@@ -138,6 +139,11 @@ def level(side: LevelSide, poc: str, lo: str, hi: str, *, tf: str = "4h",
         structure_first_index=0, structure_last_index=9,
         structure_from_ms=T0, structure_to_ms=T0 + born_h * HOUR,
         structure_volume=1000.0,
+        # Высота строки профиля — ТОЙ ЖЕ формулой боевого режима (`TV_ROWS` строк на
+        # размах коробки), а не выдуманной константой: инварианты геометрии о разрешении
+        # профиля не говорят, но второй сущности под тем же именем здесь не заводится.
+        row_height=((Decimal(b_hi if b_hi is not None else hi)
+                     - Decimal(b_lo if b_lo is not None else lo)) / TV_ROWS),
         boundary_lo=Decimal(b_lo if b_lo is not None else lo),
         boundary_hi=Decimal(b_hi if b_hi is not None else hi),
         boundary_narrowed=0, boundary_ladder=False,
