@@ -616,6 +616,8 @@ def zones_of(decision: engine.SymbolDecision,
             side=m.current.side.value, timeframe=m.level.timeframe,
             price=float(m.level.price), zone_lo=float(m.level.zone_lo),
             zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
+            work_lo=float(m.level.zone_work_lo or 0),
+            work_hi=float(m.level.zone_work_hi or 0),
             state=m.status.state.value,
             retired_at_ms=0 if active else resolved,
             boundary_lo=float(m.level.boundary_lo),
@@ -1477,7 +1479,14 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         by_seniority = sorted(g, key=lambda z: -order.get(z.timeframe, 0))
         tfs = "+".join(dict.fromkeys(
             TF_LABEL.get(z.timeframe, z.timeframe) for z in by_seniority))
-        g_lo, g_hi = min(z.zone_lo for z in g), max(z.zone_hi for z in g)
+
+        def eb(z: ZoneSpec) -> tuple[float, float]:
+            """Эффективные границы зоны: рабочие вокруг ПОК (решение владельца
+            2026-08-25), иначе VAL…VAH — уровень старого прогона."""
+            return ((z.work_lo, z.work_hi)
+                    if z.work_hi > z.work_lo > 0 else (z.zone_lo, z.zone_hi))
+
+        g_lo, g_hi = min(eb(z)[0] for z in g), max(eb(z)[1] for z in g)
         if len(g) > 1:
             # Края диапазона — по ЗОНАМ, а не по ПОКам (исправлено 2026-08-18).
             # Прежняя редакция печатала min–max ПОКов, а метку «цена уже здесь»
@@ -1490,8 +1499,9 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                     f" ({tfs})")
         else:
             z = g[0]
+            z_lo, z_hi = eb(z)
             core = (f"— {_fmt_price(z.price)} ({tfs}), зона "
-                    f"{_fmt_price(z.zone_lo)}–{_fmt_price(z.zone_hi)}")
+                    f"{_fmt_price(z_lo)}–{_fmt_price(z_hi)}")
         marks = ""
         # ⚠ Метка "цена уже здесь" НЕ ставится, когда о том же говорит роль зоны
         # (её строка про вход не в приоритет по стр. 44): это ОДИН факт, и печатать его
@@ -2471,6 +2481,8 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
                  уведомлений_отмены=notifier.sent_cancels,
+                 уведомлений_слом=notifier.sent_breaks,
+                 уведомлений_безубыток=notifier.sent_be,
                  тактов_наблюдателя_с_отказом=notifier.ticks_failed)
         watch.note_recovery()
 
@@ -2553,6 +2565,18 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры. Ноль — не записаны."""
 
+    zone_work_lo: float = 0.0
+    zone_work_hi: float = 0.0
+    """Рабочая зона вокруг ПОК (HVN-ядро, решение владельца 2026-08-25). Нули —
+    строка записана до схемы 17 либо расчёт ещё не проставил; тогда события зон
+    считаются по VAL…VAH, как раньше."""
+
+    def work_bounds(self) -> tuple[float, float]:
+        """Границы зоны для СОБЫТИЙ: рабочие вокруг ПОК, если есть, иначе VA."""
+        if self.zone_work_hi > self.zone_work_lo > 0:
+            return (self.zone_work_lo, self.zone_work_hi)
+        return (self.zone_lo, self.zone_hi)
+
     priority_tf: str = ""
     priority_depth: int | None = None
     """ЧЕЙ приоритет старшего ТФ и на скольких экстремумах он держится (схема 14).
@@ -2612,10 +2636,12 @@ class LedgerNews:
     outcomes: tuple[tuple[str, str, str, str, float | None], ...]
     """(symbol, timeframe, direction, kind, r)"""
 
-    states: tuple[tuple[int, str, str, str, str, float], ...]
-    """(signal_id, symbol, timeframe, direction, state, entry) — состояния ВСЕХ
-    незакрытых сигналов. Наблюдатель ловит переход not_filled→open: «вход
-    состоялся» — событие, о котором просил владелец (2026-08-18)."""
+    states: tuple[tuple[int, str, str, str, str, float,
+                   float | None, float | None, float | None], ...]
+    """(signal_id, symbol, timeframe, direction, state, entry,
+    breakeven_at, stop, target) — состояния ВСЕХ незакрытых сигналов. Наблюдатель
+    ловит переход not_filled→open («вход состоялся», приказ владельца 2026-08-18)
+    и достижение цены взведения безубытка (🎯, стр. 14–15)."""
 
     levels: tuple[LevelRow, ...]
     max_signal_id: int
@@ -2656,10 +2682,14 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                     " FROM outcomes o JOIN signals s ON s.id = o.signal_id"
                     " WHERE o.closed_at > ? ORDER BY o.closed_at", (after_ms,))]
         state_rows = [
-            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]))
+            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]),
+             None if r[6] is None else float(r[6]),
+             None if r[7] is None else float(r[7]),
+             None if r[8] is None else float(r[8]))
             for r in conn.execute(
                 "SELECT st.signal_id, s.symbol, s.timeframe, s.direction, st.state,"
-                " s.entry FROM signal_states st JOIN signals s ON s.id = st.signal_id"
+                " s.entry, s.breakeven_at, s.stop, s.target"
+                " FROM signal_states st JOIN signals s ON s.id = st.signal_id"
                 " ORDER BY st.signal_id")]
         marks = ",".join("?" * len(symbols))
         # ⚠ КОЛОНКА СПРАШИВАЕТСЯ У СХЕМЫ, А НЕ ПРЕДПОЛАГАЕТСЯ (2026-08-19). Наблюдатель
@@ -2675,10 +2705,12 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         stop_col = "stop_price" if "stop_price" in have else "NULL"
         ptf_col = "priority_tf" if "priority_tf" in have else "NULL"
         pdp_col = "priority_depth" if "priority_depth" in have else "NULL"
+        wlo_col = "zone_work_lo" if "zone_work_lo" in have else "NULL"
+        whi_col = "zone_work_hi" if "zone_work_hi" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
             f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state,"
-            f" {stop_col}, {ptf_col}, {pdp_col}"
+            f" {stop_col}, {ptf_col}, {pdp_col}, {wlo_col}, {whi_col}"
             # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
             # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
             # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
@@ -2714,7 +2746,9 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             agreement=r[12] or "", state=r[13] or "active",
                             stop_price=None if r[14] is None else float(r[14]),
                             priority_tf=r[15] or "",
-                            priority_depth=None if r[16] is None else int(r[16]))
+                            priority_depth=None if r[16] is None else int(r[16]),
+                            zone_work_lo=0.0 if r[17] is None else float(r[17]),
+                            zone_work_hi=0.0 if r[18] is None else float(r[18]))
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
@@ -3107,6 +3141,14 @@ class Notifier:
         self.ticks_failed = 0
         self._alerted: set[tuple[str, str, str, int, int]] = set()
         self.sent_cancels = 0
+        # ⚠ СОБЫТИЯ ФАЗЫ «ЖИЗНЬ СИГНАЛА» (план 25.08, Фаза 1). Оба — ПЕРЕХОДЫ:
+        # слом подтверждён (0→1) и цена взвела безубыток (первое касание). Память в
+        # процессе: после рестарта 🎯 может повториться один раз по живому сигналу —
+        # повтор честнее молчания, а постоянная таблица под это — отдельное решение.
+        self._mtf_state: dict[tuple[str, str, str, int, int], int] = {}
+        self._be_said: set[int] = set()
+        self.sent_breaks = 0
+        self.sent_be = 0
 
     def _cap(self, lines: list[str]) -> list[str]:
         if len(lines) <= NOTIFY_LINES_MAX:
@@ -3129,11 +3171,36 @@ class Notifier:
 
         out: list[str] = []
         if news.signals:
-            lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
-                     f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}, "
-                     f"стоп {_fmt_price(st)}"
-                     + (f", цель {_fmt_price(tg)}" if tg is not None else "")
-                     for s, tf, d, e, st, tg in news.signals]
+            # ФОРМАТ v2 (решение владельца 2026-08-25: рабочая зона вокруг ПОК, R у
+            # цели, одна строка на сигнал). Рабочие границы берутся из карты этого же
+            # такта по ближайшему ПОК; нет карты — строка без зоны, как раньше.
+            by_key: dict[tuple[str, str], list[LevelRow]] = {}
+            for lv in news.levels:
+                by_key.setdefault((lv.symbol, lv.timeframe), []).append(lv)
+
+            def work_of(sym: str, tf: str, entry: float) -> tuple[float, float] | None:
+                cands = by_key.get((sym, tf), ())
+                best = min(cands,
+                           key=lambda lv: abs(lv.price - entry),
+                           default=None)
+                if best is not None and best.zone_work_hi > best.zone_work_lo > 0:
+                    return (best.zone_work_lo, best.zone_work_hi)
+                return None
+
+            lines = []
+            for s, tf, d, e, st, tg in news.signals:
+                head = (f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                        f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}")
+                w = work_of(s, tf, e)
+                if w is not None:
+                    head += f", зона {_fmt_price(w[0])}–{_fmt_price(w[1])}"
+                head += f", стоп {_fmt_price(st)}"
+                if tg is not None:
+                    risk = abs(e - st)
+                    rr = abs(tg - e) / risk if risk > 0 else None
+                    head += (f", цель {_fmt_price(tg)}"
+                             + (f" (R {rr:.1f})" if rr is not None else ""))
+                lines.append(head)
             self.sent_signals += len(news.signals)
             out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines)]))
         if news.outcomes:
@@ -3150,8 +3217,11 @@ class Notifier:
         # перезапуск бота объявил бы «входами» все давно открытые позиции.
         entry_lines: list[str] = []
         alive: set[int] = set()
-        for sid, sym, tf, d, state, entry in news.states:
+        nf: set[tuple[str, str]] = set()
+        for sid, sym, tf, d, state, entry, _be, _st, _tg in news.states:
             alive.add(sid)
+            if state == "not_filled":
+                nf.add((sym, tf))
             was = self._signal_state.get(sid)
             self._signal_state[sid] = state
             if priming or state != "open":
@@ -3171,6 +3241,34 @@ class Notifier:
             self.sent_entries += len(entry_lines)
             out.append("\n".join(["✅ Входы состоялись:", *self._cap(entry_lines)]))
 
+        # 🔓 СЛОМ ПОДТВЕРЖДЁН (стр. 19/31): уровень ждал слома младшего ТФ, и
+        # `mtf_break` перевёлся 0→1 при живом несостоявшемся сигнале этого символа.
+        # Переход, а не состояние: один раз на уровень, первый такт взводит молча.
+        break_lines: list[str] = []
+        seen_mtf: set[tuple[str, str, str, int, int]] = set()
+        for lv in news.levels:
+            if lv.state != "active" or lv.mtf_break is None:
+                continue
+            key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
+            seen_mtf.add(key)
+            prev = self._mtf_state.get(key)
+            self._mtf_state[key] = lv.mtf_break
+            if priming or prev != 0 or lv.mtf_break != 1:
+                continue
+            if (lv.symbol, lv.timeframe) not in nf:
+                continue
+            base = lv.symbol.split("/")[0]
+            side_word = SIDE_WORD.get(lv.side, lv.side)
+            break_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(lv.timeframe, lv.timeframe)}: "
+                f"слом младшего ТФ подтверждён — вход активен "
+                f"(ПОК {_fmt_price(lv.price)})")
+        for key in [k for k in self._mtf_state if k not in seen_mtf]:
+            del self._mtf_state[key]
+        if break_lines:
+            self.sent_breaks += len(break_lines)
+            out.append("\n".join(["🔓 Подтверждения слома:", *self._cap(break_lines)]))
+
         # ⚠ ЦЕНА ТАКТА ЗАВИСИТ ОТ РАЗМЕРА ВСЕЛЕННОЙ, И ПЕРЕЛОМ ЛЕЖИТ НА СОРОКА. Вес
         # `ticker/24hr` — 1 за символ и 40 за ВСЕ рынки сразу (`fetch_tickers(None)`).
         # На вселенной в 25 поимённый список дешевле (25 против 40); на раскрытой доске
@@ -3183,6 +3281,38 @@ class Notifier:
             log.degraded("наблюдатель: тикеры не получены", причина=tickers.reason)
             self.ticks_failed += 1
             return out
+
+        # 🎯 ЦЕНА ВЗВЕЛА БЕЗУБЫТОК (стр. 14–15): живой сигнал, у которого есть цена
+        # взведения (`breakeven_at`), и цена дошла — стоп переносится в ТВХ. Один раз
+        # на сигнал; после рестарта может повториться один раз (см. память в __init__).
+        be_lines: list[str] = []
+        open_ids: set[int] = set()
+        for sid, sym, tf, d, state, _entry, be, _st, _tg in news.states:
+            if state != "open":
+                continue
+            open_ids.add(sid)
+            if be is None or sid in self._be_said:
+                continue
+            tk = tickers.get(sym)
+            last = float(tk.get("last", 0.0) or 0.0) if isinstance(tk, dict) else 0.0
+            if last <= 0:
+                continue
+            crossed = last >= be if d == "long" else last <= be
+            if not crossed:
+                continue
+            self._be_said.add(sid)
+            base = sym.split("/")[0]
+            side_word = SIDE_WORD.get(d, d)
+            be_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(tf, tf)}: цель тейка достигнута "
+                f"— стоп переносится в безубыток ({_fmt_price(be)}); сейчас "
+                f"{_fmt_price(last)}")
+        for sid in [s for s in self._be_said if s not in open_ids]:
+            self._be_said.discard(sid)
+        if be_lines:
+            self.sent_be += len(be_lines)
+            out.append("\n".join(["🎯 Безубыток взведён:", *self._cap(be_lines)]))
+
         now_ms = clock.now_ms()
         rank = {"far": 0, "near": 1, "inside": 2}
         hits: list[tuple[LevelRow, float, str]] = []
@@ -3194,7 +3324,10 @@ class Notifier:
                 continue
             key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
             seen.add(key)
-            pos = zone_position(t.last, lv.zone_lo, lv.zone_hi)
+            # РАБОЧАЯ ЗОНА В СОБЫТИЯХ (решение владельца 2026-08-25): зовём ценой к
+            # входу, а не к контексту старшего ТФ. work_bounds сам падает на VA у
+            # строк без рабочих полей.
+            pos = zone_position(t.last, *lv.work_bounds())
             was = self._zone_state.get(key)
             self._zone_state[key] = pos
             # Событие — только СБЛИЖЕНИЕ (far→near, near→inside, far→inside).

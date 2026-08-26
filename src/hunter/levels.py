@@ -49,7 +49,12 @@ from .trading_range import (
     TradingRange,
     structure_bars,
 )
-from .volume_profile import TV_ROWS, TVProfile, build_tv
+from .volume_profile import (
+    PROFILE_ROW_PRICE_PCT,
+    TVProfile,
+    _ticks_per_row_from_price_pct,
+    build_tv,
+)
 
 
 class LevelSide(StrEnum):
@@ -89,7 +94,9 @@ class Level(BaseModel):
 
     zone_lo: Decimal
     zone_hi: Decimal
-    """Объёмная зона (стр. 30: «цена забирает объемную зону, (выделено желтым цветом)»).
+    """Объёмная зона VAL…VAH (стр. 30: «цена забирает объемную зону, (выделено желтым
+    цветом)»). Контекст структуры; у старших ТФ бывает шире торгуемого диапазона —
+    тогда вход читают по `zone_work_*` (решение владельца 2026-08-25).
 
     Числа «70%» в тексте курса нет (греп по всем 69 страницам: «70», «value», «VAH»,
     «VAL», «область стоимости» → пусто). Но зона вводится не правилом, а указанием на
@@ -112,6 +119,15 @@ class Level(BaseModel):
 
     created_at_index: int
     """Бар подтверждения выхода. Раньше него уровня не существует (стр. 23)."""
+
+    zone_work_lo: Decimal | None = None
+    zone_work_hi: Decimal | None = None
+    """РАБОЧАЯ ЗОНА вокруг ПОК. Решение владельца 2026-08-25, дословно: «разве не
+    логично в ней расматривать пок уровень и уже вокруг пока строить небольшую зону?».
+    Правило ширины — HVN-ядро профиля: строки вокруг ПОК с объёмом не ниже половины
+    пикового ряда, клип по VAL…VAH (докстрока `TVProfile.work_lo_price`). Карточка и
+    график рисуют ЭТУ зону входа; VAL…VAH остаётся записанным контекстом старшего ТФ.
+    None — профиль не дошёл до рабочей зоны (уровни старых прогонов)."""
 
     created_at_ms: int
     """ЗАКРЫТИЕ бара подтверждения — момент, с которого уровень известен, в биржевом времени.
@@ -532,8 +548,11 @@ def build_level(
     """
     # ⚠ С 2026-08-09 профиль строится ПРИБОРОМ АВТОРА — сеткой TV (`build_tv`), а не
     # тиковыми бинами: решение владельца о переносе инструментов TV
-    # (docs/audit/tv-transfer-2026-08-09.md). Число строк — `TV_ROWS`, его источники — в
-    # докстроке константы. Прежний тиковый профиль (`build`) остаётся в модуле для замеров.
+    # (docs/audit/tv-transfer-2026-08-09.md). Режим — Ticks Per Row:
+    # высота строки = `PROFILE_ROW_PRICE_PCT` (0.07%) от цены, число строк выводится
+    # из диапазона. Прежний замороженный `TV_ROWS = 100` (Number of Rows) удалён 2026-08-25
+    # по замеру цены заморозки (сдвиг входа до 7%); см. докстроку `PROFILE_ROW_PRICE_PCT`.
+    # Прежний тиковый профиль (`build`) остаётся в модуле для замеров.
     #
     # ⚠ ДИАПАЗОН СЕТКИ — КРАЙНИЕ ЦЕНЫ БАРОВ. Правка У3 обзора уровней
     # (docs/audit/levels-projects-2026-08-09.md, фаза 6). До 2026-08-10 сюда шли
@@ -557,11 +576,17 @@ def build_level(
     # ПОК уезжает дальше половины строки у 99.8%, а ВНЕ прежней зоны оказывается у 46.4%
     # — у почти половины уровней меняется сама ТВХ. Прижималось при этом 44.39% объёма по
     # медиане, потому что размах баров шире границ в 3.156 раза.
+    ticks_per_row = _ticks_per_row_from_price_pct(
+        bottom=price_range[0],
+        top=price_range[1],
+        tick_size=hist.tick_size,
+        row_price_pct=PROFILE_ROW_PRICE_PCT,
+    )
     profile: TVProfile | NotReady = build_tv(
         hist,
         bottom=price_range[0],
         top=price_range[1],
-        rows=TV_ROWS,
+        ticks_per_row=ticks_per_row,
     )
     if isinstance(profile, NotReady):
         return LevelRefusal(kind=UnbuiltKind.NO_POC,
@@ -624,6 +649,8 @@ def build_level(
         price=profile.poc_price,
         zone_lo=profile.val_price,
         zone_hi=profile.vah_price,
+        zone_work_lo=profile.work_lo_price,
+        zone_work_hi=profile.work_hi_price,
         created_at_index=acc.exit.confirmed_at_index,
         created_at_ms=born_ms,
         structure_first_index=acc.first_index,

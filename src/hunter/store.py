@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS signals (
     -- срабатывало тем же баром, что и закрытие по цели, а цель проверяется первой.
     breakeven_at REAL,
     frames_ref  TEXT    NOT NULL,
+    -- ⚠ МЕТКА ЭПОХИ КОДА (схема 17, открытый вопрос №10). Леджер копит исходы разных
+    -- редакций расчёта, и накопленный R смеси не приписать методу. Пишется писателем
+    -- сигнала из `CODE_EPOCH`; у строк до ведения отметок — пустая строка, которая
+    -- читается «эпоха неизвестна», а НЕ относится ни к одной эпохе.
+    epoch       TEXT    NOT NULL DEFAULT '',
     CHECK (stop != entry),
     CHECK (entry > 0),
     CHECK (stop > 0),
@@ -195,12 +200,20 @@ CREATE TABLE IF NOT EXISTS levels (
     stop_price   REAL,
     priority_tf  TEXT,
     priority_depth INTEGER,
+
+    -- ⚠ РАБОЧАЯ ЗОНА ВОКРУГ ПОК (схема 17, решение владельца 2026-08-25: «уже вокруг
+    -- ПОК строить небольшую зону?»). NULLABLE: у строк до этой версии рабочей зоны не
+    -- считалось; подставить VAL…VAH значило бы записать фальшивую узость.
+    zone_work_lo REAL,
+    zone_work_hi REAL,
+
     -- ⚠ РАСШИРЕННЫЙ КРАЙ (прокол стр. 18) — схема 18, 2026-08-26. Заведён вместе с
     -- возвратом `boundary_*` на линию по первым двум точкам: без него запись уровня
     -- потеряла бы цену, за которую курс велит ставить стоп. Порядок тот же, в каком
     -- их дописывает `ALTER TABLE`, — чтобы состав свежей и мигрированной базы совпадал.
     stop_edge_lo REAL,
     stop_edge_hi REAL,
+
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     -- ⚠⚠ ЗОНА ВНУТРИ СТРУКТУРЫ. Ограничение добавлено 2026-08-23 (схема 16), и оно
@@ -211,6 +224,13 @@ CREATE TABLE IF NOT EXISTS levels (
     -- нарушение молча. Проверка в схеме сильнее любого гейта: её исполняет SQLite на
     -- КАЖДОЙ настоящей записи, а не наш код на подобранных примерах.
     CHECK (boundary_lo <= zone_lo AND zone_hi <= boundary_hi),
+
+    -- Рабочая зона обязана лежать внутри области стоимости (NULL проходит проверку:
+    -- у старых строк её нет — это «не считалось», а не нарушение).
+    CHECK (zone_work_lo IS NULL OR
+           (zone_lo <= zone_work_lo AND zone_work_hi <= zone_hi
+            AND zone_work_lo < zone_work_hi)),
+
     -- ⚠ ПРОКОЛ НЕ БЛИЖЕ ГРАНИЦЫ (стр. 18, схема 18). Прокол записывается только ЗА
     -- границей, значит расширенный край не может оказаться внутри базы. Колонки
     -- необязательные: у строк, доживших с прежних схем, их нет, и `NULL` в SQLite
@@ -218,6 +238,7 @@ CREATE TABLE IF NOT EXISTS levels (
     -- всякая новая запись проверяется.
     CHECK (stop_edge_lo IS NULL OR stop_edge_lo <= boundary_lo),
     CHECK (stop_edge_hi IS NULL OR boundary_hi <= stop_edge_hi),
+
     CHECK (to_ms > from_ms),
     CHECK (last_seen >= first_seen),
     CHECK ((retired_at IS NULL) = (state = 'active')),
@@ -276,15 +297,46 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "18"
+
+CODE_EPOCH = "2026-08-25-ticks0.07"
+"""Метка эпохи расчёта для `signals.epoch` (вопрос №10). Меняется при смене РАСЧЁТА,
+который двигает вход/стоп/цели, — не при каждой правке кода. Состав даты и сути:
+с 2026-08-25 боевой профиль считается Ticks Per Row 0.07% цены строки. Статистика
+`/stats` обязана разделять «по этой эпохе» и «за всё время» — прежние строки леджера
+несут пустую метку («эпоха неизвестна») и к новой статистике не прибавляются."""
+
+SCHEMA_VERSION = "19"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
-17 → 18 (2026-08-26): `boundary_lo/hi` СМЕНИЛИ СМЫСЛ — с коробки ХАЙ…ЛОЙ всех баров на
+⚠ СТУПЕНИ 17 И 18 ПЕРЕНУМЕРОВАНЫ ПРИ СЛИЯНИИ 2026-08-26. Две ветки независимо друг от друга
+объявили себя семнадцатой схемой: `main` — рабочей зоной вокруг ПОК (25 августа), ветка
+Ф5/Ф8 — моделью частичного выхода (26 августа). Номер один, содержимое разное, и лестница
+`_schema_version` различает ступени ПО КОЛОНКАМ, а не по записанному числу, — значит база,
+поднятая одной веткой, у другой прошла бы мимо своей ступени молча. Ступени разведены по
+ДАТАМ: рабочая зона осталась семнадцатой, частичный выход стал восемнадцатой, границы
+стр. 18 — девятнадцатой.
+
+18 → 19 (2026-08-26): `boundary_lo/hi` СМЕНИЛИ СМЫСЛ — с коробки ХАЙ…ЛОЙ всех баров на
 линию по первым двум точкам (стр. 18); рядом заведён расширенный край `stop_edge_lo/hi`
 (прокол стр. 18), за который курс велит ставить стоп. Прежние строки УДАЛЯЮТСЯ и их
 число НАЗЫВАЕТСЯ в журнале — по той же причине, что на ступени 15→16: колонка с двумя
 смыслами есть дефект по построению. Обоснование прежней конвенции опровергнуто по
 источнику, разбор — в докстроке `levels.Level.boundary_lo`.
+
+17 → 18 (2026-08-26): модель ЧАСТИЧНОГО ВЫХОДА — `signals.target2` и `outcomes.r_partial`
+(ПОЛ рядом с полным выходом). Обе колонки NULLABLE: у прежних строк второй цели не
+записывали, и досчитать пол задним числом нечем. Значит две модели сравниваются только на
+строках схемы 18 и выше, и это НАЗЫВАЕТСЯ в отчёте (`store.expectancy`), а не замазывается
+нулём. ⚠ Ступень записана здесь при слиянии: в своей ветке она была реализована кодом, но
+в этой лестнице описана не была.
+
+16 → 17 (2026-08-25): рабочая зона вокруг ПОК в `levels` (`zone_work_lo/hi`, NULLABLE,
+CHECK «внутри VAL…VAH») — решение владельца: «уже вокруг ПОК строить небольшую зону?»;
+и метка эпохи кода в `signals` (`epoch`) — открытый вопрос №10: леджер копил исходы
+разных редакций расчёта, и накопленный R смеси нельзя было приписать методу. Пустая
+строка у прежних строк читается «эпоха неизвестна», подставлять им что-то другое —
+записать фальшивую принадлежность.
+
 
 15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
 (`boundary_lo <= zone_lo AND zone_hi <= boundary_hi`) — то самое, что владелец
@@ -751,18 +803,22 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # появилось бы НИ РАЗУ, а `schema_meta` всё равно проштамповалась бы новым числом.
     if lvl_sql is not None and "zone_hi <= boundary_hi" not in lvl_text:
         return "15"
-    # 16 → 17: две колонки модели частичного выхода. Ступень стоит ЗДЕСЬ по той же
-    # причине, что и все выше, — ловушка описана абзацем ниже: без неё база версии 16
-    # назвала бы себя семнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta`
+    # 16 → 17 видно по колонкам: `zone_work_lo` добавляется дешёвым ALTER, текст
+    # CREATE при этом не меняет ограничений, которые не видны колонками.
+    if lvl_cols and "zone_work_lo" not in lvl_cols:
+        return "16"
+    # 17 → 18: две колонки модели частичного выхода. Ступень стоит ЗДЕСЬ по той же
+    # причине, что и все выше, — ловушка описана абзацем ниже: без неё база версии 17
+    # назвала бы себя восемнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta`
     # всё равно проштамповалась бы новым числом.
     if "target2" not in cols:
-        return "16"
-    # 17 → 18: у `levels` появляется расширенный край (прокол стр. 18). Ступень стоит
-    # ЗДЕСЬ по той же причине, что и все выше, — иначе база версии 17 назвала бы себя
-    # восемнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta` всё равно
-    # проштамповалась бы новым числом.
-    if lvl_cols and "stop_edge_lo" not in lvl_cols:
         return "17"
+    # 18 → 19: у `levels` появляется расширенный край (прокол стр. 18). Ступень стоит
+    # ЗДЕСЬ по той же причине, что и все выше, — иначе база версии 18 назвала бы себя
+    # девятнадцатой, колонки не появились бы НИ РАЗУ.
+    if lvl_cols and "stop_edge_lo" not in lvl_cols:
+        return "18"
+
     return SCHEMA_VERSION
 
 
@@ -1173,20 +1229,36 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
             log.info("миграция 15→16: ограничение «зона внутри структуры» добавлено",
                      нарушающих_строк=0, строк=moved)
     if _schema_version(conn) == "16":
-        # 16 → 17: две колонки МОДЕЛИ ЧАСТИЧНОГО ВЫХОДА, обе на месте и NULLABLE.
+
+        # 16 → 17: две дешёвые правки НА МЕСТЕ (обе колонки NULLABLE — перестройка
+        # таблиц не нужна).
+        #
+        # Рабочая зона: у прежних строк её НЕ СЧИТАЛИ; подставить VAL…VAH значило бы
+        # записать фальшивую узость там, где расчёт ничего не говорил. NULL = «не
+        # считалось» (§4.3), читатель обязан обрабатывать отсутствие сам.
+        conn.execute("ALTER TABLE levels ADD COLUMN zone_work_lo REAL")
+        conn.execute("ALTER TABLE levels ADD COLUMN zone_work_hi REAL")
+        # Метка эпохи: у прежних сигналов эпоха НЕИЗВЕСТНА. Пустая строка — честный
+        # ответ «до ведения отметок», а не выдуманная принадлежность.
+        conn.execute("ALTER TABLE signals ADD COLUMN epoch TEXT"
+                     " NOT NULL DEFAULT ''")
+        conn.commit()
+        log.info("миграция 16→17: рабочая зона уровня и метка эпохи сигнала добавлены")
+    if _schema_version(conn) == "17":
+        # 17 → 18: две колонки МОДЕЛИ ЧАСТИЧНОГО ВЫХОДА, обе на месте и NULLABLE.
         # Перестройка не нужна: ни `UNIQUE`, ни `CHECK` не трогаются, а
         # `ALTER TABLE ADD COLUMN` в SQLite строк не переписывает.
         #
         # NULL у прежних строк ОСОЗНАНЕН и означает «не считалось». Досчитать их задним
         # числом нельзя: для пола нужна ВТОРАЯ цель, а её не записывали, — и подставить
         # вместо неё `target` значило бы удвоить первый тейк. Значит две модели
-        # сравниваются только на строках схемы 17 и выше, и это НАЗЫВАЕТСЯ в отчёте
+        # сравниваются только на строках схемы 18 и выше, и это НАЗЫВАЕТСЯ в отчёте
         # (`store.expectancy`), а не замазывается нулём.
         conn.execute("ALTER TABLE signals ADD COLUMN target2 REAL")
         conn.execute("ALTER TABLE outcomes ADD COLUMN r_partial REAL")
         conn.commit()
-    if _schema_version(conn) == "17":
-        # 17 → 18: расширенный край (прокол стр. 18) двумя NULLABLE-колонками.
+    if _schema_version(conn) == "18":
+        # 18 → 19: расширенный край (прокол стр. 18) двумя NULLABLE-колонками.
         #
         # ⚠⚠ И ВМЕСТЕ С НИМИ МЕНЯЕТСЯ СМЫСЛ `boundary_lo/hi`. С 2026-08-18 по 2026-08-26
         # там лежала КОРОБКА ХАЙ…ЛОЙ всех баров структуры; теперь — линия по первым двум
@@ -1214,13 +1286,14 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         conn.commit()
         if dropped:
             log.degraded(
-                "миграция 17→18: карта уровней ОЧИЩЕНА — `boundary_*` сменили смысл",
+                "миграция 18→19: карта уровней ОЧИЩЕНА — `boundary_*` сменили смысл",
                 удалено=dropped,
                 причина="границы вернулись на линию по первым двум точкам (стр. 18); "
                         "прежние строки хранят коробку ХАЙ…ЛОЙ и означали бы другое")
         else:
-            log.info("миграция 17→18: расширенный край добавлен, карта была пуста",
+            log.info("миграция 18→19: расширенный край добавлен, карта была пуста",
                      удалено=0)
+
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1273,6 +1346,7 @@ def record_signal(
     kind: str = "level", target: Decimal | None = None,
     target2: Decimal | None = None,
     breakeven_at: Decimal | None = None,
+    epoch: str = CODE_EPOCH,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -1295,13 +1369,14 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref, epoch)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop),
              None if target is None else float(target),
              None if target2 is None else float(target2),
-             None if breakeven_at is None else float(breakeven_at), frames_ref),
+             None if breakeven_at is None else float(breakeven_at), frames_ref,
+             epoch),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -1506,15 +1581,18 @@ def sync_levels(
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
                     " last_seen, state, retired_at, entry_rule, resolved_at,"
                     " vrvp_density, mtf_break, agreement, stop_price, priority_tf,"
-                    " priority_depth, stop_edge_lo, stop_edge_hi)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " priority_depth, stop_edge_lo, stop_edge_hi, zone_work_lo, zone_work_hi)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    " ?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
                      None if active else now_ms, rule.value, resolved,
                      lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth,
-                     float(lvl.stop_edge_lo), float(lvl.stop_edge_hi)),
+                     float(lvl.stop_edge_lo), float(lvl.stop_edge_hi),
+                     None if lvl.zone_work_lo is None else float(lvl.zone_work_lo),
+                     None if lvl.zone_work_hi is None else float(lvl.zone_work_hi)),
                 )
                 added += 1
                 retired += not active
