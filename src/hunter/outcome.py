@@ -161,6 +161,40 @@ def _filled(bar: Bar, price: Decimal, *, long: bool) -> bool:
     return (bar.low <= float(price)) if long else (bar.high >= float(price))
 
 
+def partial_floor(*, long: bool, entry: Decimal, risk: Decimal, target: Decimal,
+                  target2: Decimal | None, bars: list[Bar], closed_at: int) -> float:
+    """ПОЛ модели частичного выхода: s·RR₁, поднятый до s·RR₁ + (1−s)·RR₂ второй целью.
+
+    Ниже этого сделка дать не может: после первого тейка стоп остатка стоит в безубытке
+    (стр. 15). Почему именно пол, а не точка, — в докстроке `Outcome.r_partial`.
+
+    ⚠ Отдельной функцией, а не замыканием внутри `resolve` (правка того же дня): `resolve`
+    и без того длинна, а эта величина ни одного её состояния не меняет — ей нужны только
+    параметры сделки. Правила входа и стопа остаются в `resolve` в единственном
+    экземпляре: сюда переносится ТОЛЬКО арифметика остатка.
+    """
+    share = PARTIAL_TAKE_PCT / 100.0
+    gain1 = (target - entry) if long else (entry - target)
+    out = share * float(gain1 / risk)
+    if target2 is None:
+        return out
+    # Остаток ведётся СО СЛЕДУЮЩЕГО бара — то же ограничение OHLC, что у переноса стопа:
+    # внутри бара первой цели порядок касаний неизвестен.
+    for b in bars[closed_at + 1:]:
+        back = (b.low <= float(entry)) if long else (b.high >= float(entry))
+        if back:
+            # Возврат к ТВХ закрывает остаток в безубытке (стр. 15) — пол не растёт.
+            # ⚠ И если ТОТ ЖЕ бар накрыл вторую цель, она НЕ засчитывается: порядок
+            # касаний внутри бара неизвестен, а пол обязан оставаться полом. Отдельной
+            # ветки под этот случай нет НАРОЧНО — она возвращала бы ровно то же самое,
+            # то есть была бы дублем, читающимся как отдельное правило.
+            return out
+        if (b.high >= float(target2)) if long else (b.low <= float(target2)):
+            gain2 = (target2 - entry) if long else (entry - target2)
+            return out + (1.0 - share) * float(gain2 / risk)
+    return out
+
+
 def resolve(
     side: LevelSide,
     entry: Decimal,
@@ -208,33 +242,10 @@ def resolve(
     be_armed = False
 
     def floor_r(closed_at: int) -> float:
-        """ПОЛ модели частичного выхода на момент закрытия по первой цели.
-
-        s·RR₁ плюс (1−s)·RR₂, если остаток дошёл до второй цели ПОСЛЕ первой. Ниже этого
-        сделка дать не может: стоп остатка стоит в безубытке (стр. 15). Разбор и почему
-        именно пол — в докстроке `Outcome.r_partial`.
-        """
+        """ПОЛ частичного выхода на момент закрытия по первой цели. Разбор — ниже."""
         assert target is not None
-        share = PARTIAL_TAKE_PCT / 100.0
-        gain1 = (target - entry) if long else (entry - target)
-        out = share * float(gain1 / risk)
-        if target2 is None:
-            return out
-        # Остаток ведётся СО СЛЕДУЮЩЕГО бара — то же ограничение OHLC, что у переноса
-        # стопа: внутри бара первой цели порядок касаний неизвестен.
-        for b in bars[closed_at + 1:]:
-            reached = ((b.high >= float(target2)) if long else (b.low <= float(target2)))
-            back = (b.low <= float(entry)) if long else (b.high >= float(entry))
-            if reached and back:
-                # Оба события в одном баре — вторая цель НЕ засчитывается: порядок
-                # неизвестен, а пол обязан быть полом.
-                return out
-            if back:
-                return out
-            if reached:
-                gain2 = (target2 - entry) if long else (entry - target2)
-                return out + (1.0 - share) * float(gain2 / risk)
-        return out
+        return partial_floor(long=long, entry=entry, risk=risk, target=target,
+                             target2=target2, bars=bars, closed_at=closed_at)
 
     for i in range(from_index, len(bars)):
         bar = bars[i]
