@@ -2842,6 +2842,17 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 rr = em.setup.rr(em.ledger_stop)
                 if rr is not None:
                     report.emitted_rr.append(rr)
+                # ВОРОНКА ЦЕЛЕЙ (Ф1, 2026-08-26). РР отсутствует РОВНО у сделок без
+                # крупной цели — до сих пор они молча выпадали из `emitted_rr`, и
+                # разница между числом эмиссий и длиной списка ничем не объяснялась.
+                # Сток берётся ГОТОВЫМ у `Setup`: он посчитан тем же обходом, который
+                # отбирал цели (`build_targets_report`), и второй копии каскада
+                # фильтров здесь не заводится — величина считается в одном месте.
+                sink = em.setup.no_target_sink
+                if sink is not geometry.TargetSink.NONE:
+                    report.no_target_by_sink[sink.value] = (
+                        report.no_target_by_sink.get(sink.value, 0) + 1
+                    )
                 if em.setup.entry:
                     report.emitted_stop_pct.append(
                         float(abs(em.setup.entry - em.ledger_stop) / em.setup.entry * 100)
@@ -2966,7 +2977,7 @@ CYCLE_FIELDS = (
     "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
     "pp_degenerate_risk",
     "emitted_outcomes",
-    "emitted_rr", "emitted_stop_pct",
+    "emitted_rr", "emitted_stop_pct", "no_target_by_sink",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "map_stale_calc",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
@@ -3907,6 +3918,35 @@ def print_report(r: RunReport) -> int:
     golden = sum(1 for x in r.emitted_rr if x >= geometry.GOLDEN_RR)
     print(f"     из них ≥ 1к{geometry.GOLDEN_RR:.0f} — «золотым стандартом» стр. 9: "
           f"{golden} из {len(r.emitted_rr)}")
+    # ⚠⚠ ВОРОНКА ЦЕЛЕЙ (Ф1, 2026-08-26) — ЗНАМЕНАТЕЛЬ К СТРОКЕ РР ВЫШЕ. До этой правки
+    # «{golden} из {len(emitted_rr)}» печаталось по подвыборке, которую никто не называл:
+    # у сделки без КРУПНОЙ цели РР не существует (`Setup.rr` → None), и она молча
+    # выпадала из списка. Долю таких сделок дважды считали разовым замером — 96.6% и
+    # 52.5% на разных выборках, — и сравнить их было нечем. Теперь её печатает прогон.
+    no_target = sum(r.no_target_by_sink.values())
+    print(f"   БЕЗ КРУПНОЙ ЦЕЛИ: {no_target} из {emitted}"
+          + (f" ({no_target / emitted * 100:.0f}%)" if emitted else "")
+          + " — у них РР не существует, а не равен нулю")
+    for sink in geometry.TargetSink:
+        if sink is geometry.TargetSink.NONE:
+            continue
+        n = r.no_target_by_sink.get(sink.value, 0)
+        if not n:
+            continue
+        share = f"{n / emitted * 100:.0f}%" if emitted else "—"
+        print(f"     {sink.value:38} {n:5d}  {share:>5}")
+    # КОНТРОЛЬ СХОДИМОСТИ, и он печатается, а не подразумевается: три ветви обязаны
+    # покрыть все эмиссии без остатка. Ненулевой остаток есть потерянная строка —
+    # ровно тот дефект, ради которого воронка и заведена. Остаток законен только один:
+    # крупная цель ЕСТЬ, но риск вырожден (стоп совпал со входом), и тогда РР тоже нет.
+    residual = emitted - no_target - len(r.emitted_rr)
+    print(f"     сходимость: {no_target} без цели + {len(r.emitted_rr)} с РР "
+          f"+ {residual} вырожден риск при цели = {emitted}"
+          + ("" if residual >= 0 else "  ⚠ ОТРИЦАТЕЛЬНЫЙ ОСТАТОК — СЧЁТ РАСХОДИТСЯ"))
+    if no_target:
+        print("     ⚠ сток — НЕ дефект сам по себе: снятый по стр. 25 уровень целью быть "
+              "не может, а несостоявшаяся структура старшего ТФ — отказ прибора. Фильтры "
+              "ради «появления целей» не ослабляются.")
     print(f"   дистанция стопа, % цены: {_spread(r.emitted_stop_pct)}")
     print("   КОМИССИИ, ФАНДИНГ И ПРОСКАЛЬЗЫВАНИЕ НЕ МОДЕЛИРУЮТСЯ НИГДЕ.")
     if r.emitted_stop_pct:
@@ -3969,9 +4009,16 @@ def print_report(r: RunReport) -> int:
     # Устаревшее сведение часов — тоже нарушение, а не замечание: §6 строит на нём ВСЁ
     # сравнение «сейчас против биржевой метки», и просроченный якорь означает, что
     # свежесть кадров выше измерялась неизвестно чем.
+    # ⚠ РАСХОЖДЕНИЕ ВОРОНКИ ЦЕЛЕЙ — НАРУШЕНИЕ, А НЕ ЗАМЕЧАНИЕ (Ф1, 2026-08-26). Строка
+    # сходимости в разделе 12 печатается, а печать гейтом не является: контроль, который
+    # только печатает, проверяет прибор ровно один раз — в тот день, когда его читали.
+    # Отрицательный остаток означает, что сток и РР посчитаны по РАЗНЫМ множествам
+    # эмиссий, то есть строка потеряна. По построению это невозможно (сток непуст ⇒
+    # крупной цели нет ⇒ РР нет), поэтому здесь растяжка, а не ожидаемый счёт.
     violations = (r.watch_deaths
                   + len(stale) + len(missing) + unexplained + not_ready
-                  + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale))
+                  + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale)
+                  + int(residual < 0))
     print("\n15. ИТОГ")
     # ⚠ ЗА ЦИКЛ и ВСЕГО — два разных вопроса, и раздел «ИТОГ» задаёт первый. Здесь
     # стоял только процессный счётчик, монотонно растущий у службы за сутки.
