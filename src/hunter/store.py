@@ -1945,13 +1945,21 @@ SAMPLE_FLOORS: tuple[tuple[int, str], ...] = (
 
 
 def sample_verdict(trades: int) -> str:
-    """Что такое напечатанное число при такой выборке — словами, а не молчанием."""
+    """Что такое напечатанное число при такой выборке — словами, а не молчанием.
+
+    ⚠ Хвост цикла НЕ возвращает пустую строку: нижняя ступень `SAMPLE_FLOORS` — единица,
+    а ноль и меньше отсечены выше, поэтому досюда дойти нельзя. Пустая строка на этом
+    месте была бы тихой деградацией — вердикт исчез бы, а число осталось; невозможный
+    случай обязан ПАДАТЬ с объяснением (тот же приём, что у `Breach.worked_off`).
+    """
     if trades <= 0:
         return "ЗАКРЫТЫХ СДЕЛОК НЕТ — считать нечего, и это данные, а не ноль"
     for floor, words in SAMPLE_FLOORS:
         if trades >= floor:
             return words
-    return ""
+    raise AssertionError(
+        f"вердикт о выборке не назначен при {trades} сделках: нижняя ступень "
+        f"SAMPLE_FLOORS перестала быть единицей")
 
 
 class ExpectancyCell(BaseModel):
@@ -2077,11 +2085,12 @@ def format_expectancy(e: Expectancy) -> list[str]:
     if e.win_ci_half is not None:
         out.append(f"   интервал ВИНРЕЙТА по всем ТФ: ±{e.win_ci_half:.1f} п.п. — "
                    f"столько же значит и сама доля")
+    crosses = (e.total.r_mean is not None and e.total.r_ci_half is not None
+               and abs(e.total.r_mean) <= e.total.r_ci_half)
     out.append("   ⚠ ИНТЕРВАЛ ПЕРЕСЁК НОЛЬ — преимущество НЕ ПОКАЗАНО этой выборкой"
-               if (e.total.r_mean is not None and e.total.r_ci_half is not None
-                   and abs(e.total.r_mean) <= e.total.r_ci_half)
-               else "   интервал среднего ноль НЕ пересекает — знак результата выборкой "
-                    "подтверждён")
+               if crosses else
+               "   интервал среднего ноль НЕ пересекает — знак результата выборкой "
+               "подтверждён")
     out.append("   правило проекта: правка МЕТОДА не обосновывается выборкой ниже "
                "названной черты")
     return out
