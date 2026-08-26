@@ -169,6 +169,25 @@ class TVWindows:
         """Отказы «ряда нужного ТФ не собрано» ПО ТФ — измерение, вдоль которого
         возможен перекос (правило сводки отказов); читает `run.decide_once`."""
 
+    def refused_no_bars_by_tf(self) -> dict[str, int]:
+        """Окна, не покрытые свечами ВОВСЕ, по ТФ разрешения. Проекция источников."""
+        return {tf: src.refused_no_bars for tf, src in self._sources.items()
+                if src.refused_no_bars}
+
+    def refused_partial_by_tf(self) -> dict[str, int]:
+        """Окна, покрытые НЕ ПОЛНОСТЬЮ, по ТФ разрешения (Ф6, 2026-08-26).
+
+        ⚠⚠ ЭТОТ КЛАСС РЕЖЕТ УРОВНИ И ДО СИХ ПОР НЕ СВОДИЛСЯ НИ ПО КАКОМУ ИЗМЕРЕНИЮ.
+        Отказ считался внутри `CandleWindows` и наружу не выходил: в отчёт прогона шёл
+        только третий класс — «ряда нужного ТФ не собрано». Правило сводки отказов
+        требует обратного: «сто отказов, все на одном ТФ, — дефект, а не рынок», — а
+        увидеть этот перекос было НЕЧЕМ.
+
+        Проекция, а не второй счёт: числа берутся у самих источников.
+        """
+        return {tf: src.refused_partial for tf, src in self._sources.items()
+                if src.refused_partial}
+
     def series_by_tf(self) -> dict[str, list[Bar]]:
         """Ряды, которыми РЕАЛЬНО строятся профили, по ТФ. Читает `run.persist_source`:
         повтор (§10.6) обязан получить те же свечи, а не перечитать хранилище, которое
@@ -218,6 +237,20 @@ class CandleWindows:
         """Сколько окон построено и сколько отвергнуто. Ноль отказов при ненулевых
         построениях — свидетельство покрытия, а не отсутствия проверки."""
 
+        self.refused_no_bars = 0
+        """Окон, не покрытых свечами ВОВСЕ. Класс «данных за этот период нет»."""
+
+        self.refused_partial = 0
+        """Окон, покрытых НЕ ПОЛНОСТЬЮ. ⚠ ЭТО И ЕСТЬ КЛАСС, КОТОРЫЙ РЕЖЕТ УРОВНИ, и до
+        2026-08-26 он не сводился НИГДЕ: оба класса складывались в `windows_refused`, а
+        наружу, в отчёт прогона, уходил только третий — «ряда нужного ТФ не собрано»
+        (`TVWindows.refused_by_tf`). Владелец видел строку про ряды и не видел строки про
+        дыры, хотя уровень теряется одинаково.
+
+        Разделены они потому, что лечатся ПРОТИВОПОЛОЖНО: пустое окно означает, что
+        период не качали, а неполное — что качали и не докачали. Сумма обоих осталась в
+        `windows_refused`, чтобы прежние читатели не изменили смысла."""
+
     def window(self, from_ms: int, to_ms: int) -> TradeHistogram | NotReady:
         i = bisect.bisect_left(self._keys, from_ms)
         j = bisect.bisect_left(self._keys, to_ms)
@@ -232,12 +265,14 @@ class CandleWindows:
         chunk = self.bars[i:j]
         if not chunk:
             self.windows_refused += 1
+            self.refused_no_bars += 1
             return NotReady(
                 reason=f"{self.symbol}: окно {from_ms}..{to_ms} не покрыто свечами "
                        f"{self.timeframe}")
         want = max(1, (to_ms - from_ms) // self.step)
         if len(chunk) < want:
             self.windows_refused += 1
+            self.refused_partial += 1
             return NotReady(
                 reason=f"{self.symbol}: окно {from_ms}..{to_ms} покрыто свечами "
                        f"{self.timeframe} не полностью — {len(chunk)} из {want}")

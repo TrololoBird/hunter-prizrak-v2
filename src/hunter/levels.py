@@ -203,6 +203,13 @@ class Level(BaseModel):
     неверно: постоянная высота не сделала бы постоянным число строк.
     """
 
+    outside_peak_share: float = Field(ge=0)
+    """Доля ВТОРОГО скопления объёма: крупнейшая строка профиля ВНЕ зоны стоимости,
+    делённая на строку ПОК. Разбор и почему без порога — `volume_profile.TVProfile`.
+
+    что из чего следует: доля близка к единице → ПОК выбран из двух почти равных
+    скоплений, и вход мог оказаться на другой цене. Обратное неверно."""
+
     structure_volume: float = Field(gt=0)
     """Объём структуры. Стр. 22: сила = ТФ И объём, РАЗДЕЛЬНО.
 
@@ -483,6 +490,7 @@ def build_level(
         structure_from_ms=window_ms[0],
         structure_to_ms=window_ms[1],
         row_height=profile.row_height,
+        outside_peak_share=profile.outside_peak_share,
         structure_volume=profile.total_volume,
         boundary_lo=price_range[0],
         boundary_hi=price_range[1],

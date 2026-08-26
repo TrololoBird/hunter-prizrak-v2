@@ -2424,6 +2424,19 @@ def decide_once(report: RunReport, uni: Universe,
         log.degraded("профиль: окнам не хватило ряда intrabar-ТФ",
                      всего=sum(by_tf.values()), по_тф=by_tf,
                      символов=len(refused))
+    # ⚠ ДВА ОСТАЛЬНЫХ КЛАССА ОТКАЗА — В ОТЧЁТ, А НЕ В ЖУРНАЛ (Ф6, 2026-08-26). Они
+    # считались внутри `CandleWindows` и наружу не выходили вовсе: владелец видел строку
+    # про недостающие ряды и не видел строки про дыры в покрытии, хотя уровень теряется
+    # одинаково. Сводятся ПО ТФ — по тому измерению, вдоль которого возможен перекос.
+    for src in sources.values():
+        for name, dest in (("refused_no_bars_by_tf", report.profile_windows_no_bars_by_tf),
+                           ("refused_partial_by_tf",
+                            report.profile_windows_partial_by_tf)):
+            fn = getattr(src, name, None)
+            if fn is None:
+                continue
+            for tf, n in fn().items():
+                dest[tf] = dest.get(tf, 0) + n
     return out
 
 
@@ -3007,6 +3020,7 @@ CYCLE_FIELDS = (
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
     "backfill_missing_by_symbol",
     "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
+    "profile_windows_no_bars_by_tf", "profile_windows_partial_by_tf",
     "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
@@ -3873,6 +3887,23 @@ def print_report(r: RunReport) -> int:
         spans = ", ".join(f"{tf}: {n}"
                           for tf, n in sorted(r.profile_spans_by_tf.items()))
         print(f"   добрано по ТФ (перекос виден здесь): {spans}")
+    # ⚠⚠ ДВА КЛАССА ОТКАЗА ПОКРЫТИЯ — ПЕРВОКЛАССНЫМИ СТРОКАМИ (Ф6, 2026-08-26). Прежде
+    # они считались внутри `profile_source.CandleWindows` и наружу не выходили: приёмка
+    # называла только третий класс — «ряда нужного ТФ не собрано», — а уровень теряется
+    # одинаково от всех трёх. Сводятся ПО ТФ: правило сводки отказов требует показывать
+    # измерение, вдоль которого возможен перекос.
+    for cov_label, cov_data, cov_note in (
+        ("окно НЕ ПОКРЫТО свечами вовсе", r.profile_windows_no_bars_by_tf,
+         "период не качали"),
+        ("окно покрыто НЕ ПОЛНОСТЬЮ", r.profile_windows_partial_by_tf,
+         "качали и не докачали — ЭТОТ класс и режет уровни"),
+    ):
+        if cov_data:
+            cov_rows = ", ".join(f"{tf}: {n}" for tf, n in sorted(cov_data.items()))
+            print(f"   {cov_label}: {sum(cov_data.values())} — {cov_rows}  ({cov_note})")
+    if not (r.profile_windows_no_bars_by_tf or r.profile_windows_partial_by_tf):
+        print("   отказов покрытия окон нет ни одного класса"
+              + ("" if r.profile_windows else " — но и окон не было, число пусто"))
     print(f"   свечей записано: {r.profile_bars_stored}, "
           f"ПЕРЕЗАПИСАНО: {r.profile_bars_rewritten}")
     if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
