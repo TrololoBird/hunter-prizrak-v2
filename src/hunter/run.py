@@ -2951,6 +2951,15 @@ def record(run_id: str, report: RunReport, uni: Universe,
                                      причина=serr.reason)
                     else:
                         report.states_recorded += 1
+        # ⚠ НАСЛОЕНИЕ ВСТРЕЧНЫХ ЗОН — по НАКОПЛЕННОЙ карте и ПОСЛЕ всех символов
+        # (2026-08-26). Класс нашёл владелец глазами 2026-08-18, чинили четырежды, и ни
+        # один прогон не назвал числа. Считается здесь, а не по свежим уровням символа:
+        # число владельца пришло из карты, а карта копит между прогонами — именно это
+        # накопление класс и порождало. Разбор — в докстроке `store.ZoneOverlaps`.
+        ov = store.zone_overlaps(conn)
+        report.zone_overlap_pairs = ov.pairs
+        report.zone_overlap_by_symbol = dict(ov.by_symbol)
+        report.zone_overlap_levels = ov.levels
     finally:
         conn.close()
 
@@ -2980,6 +2989,7 @@ CYCLE_FIELDS = (
     "emitted_rr", "emitted_stop_pct", "no_target_by_sink",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
     "map_stale_calc",
+    "zone_overlap_pairs", "zone_overlap_by_symbol", "zone_overlap_levels",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
@@ -3963,6 +3973,20 @@ def print_report(r: RunReport) -> int:
           + ("  — структуры под ними в свежем разборе НЕТ, хотя её время внутри "
              "собранного ряда; это про НАС, а не про рынок"
              if r.map_stale_calc else "  (ноль: карта построена тем же расчётом)"))
+    # ⚠⚠ НАСЛОЕНИЕ ВСТРЕЧНЫХ ЗОН (2026-08-26) — величина, которую нашёл ВЛАДЕЛЕЦ
+    # ГЛАЗАМИ 2026-08-18, а проект чинил четырежды, ни разу не назвав числа. Теперь его
+    # называет каждый прогон. Ноль — законное состояние; смотреть надо на РОСТ при
+    # неизменном расчёте. Разбор — в докстроке `store.ZoneOverlaps`.
+    print(f"   наслоение ВСТРЕЧНЫХ зон: {r.zone_overlap_pairs} пар "
+          f"на {r.zone_overlap_levels} активных уровней карты")
+    if r.zone_overlap_by_symbol:
+        top = sorted(r.zone_overlap_by_symbol.items(), key=lambda kv: -kv[1])
+        print("     по символам (перекос виден здесь): "
+              + ", ".join(f"{sym} {n}" for sym, n in top[:8])
+              + (f" … и ещё {len(top) - 8}" if len(top) > 8 else ""))
+        print("     ⚠ пара — НЕ дефект сама по себе: стр. 25 велит «мы этот уровень "
+              "удаляем и ищем новые», и встречный уровень на тех же ценах бывает "
+              "законным. Дефект — РОСТ числа при неизменном расчёте.")
     print(f"   отклонено схемой карты: {len(r.map_rejected)}")
     for why in r.map_rejected[:5]:
         print(f"     ОТКЛОНЕНО {why}")
