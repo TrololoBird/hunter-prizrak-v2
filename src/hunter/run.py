@@ -2850,6 +2850,10 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     # Вырожденный риск: в леджер не идёт НИКАК (докстрока
                     # `OutcomeKind.UNMEASURABLE`); прежде падал в ветку состояний, и
                     # CHECK схемы отбивал запись с подписью «состояние не записано».
+                    # ⚠ Из отчёта он при этом НЕ пропадает: строкой выше сделка уже
+                    # учтена в `emitted_outcomes` своим членом перечисления и видна в
+                    # разделе 12 приёмки. Второго счётчика здесь не заводится —
+                    # величина считается в одном месте.
                     pass
                 elif res.kind in CLOSED_KINDS:
                     assert res.closed_at_index is not None
@@ -2913,7 +2917,11 @@ def record(run_id: str, report: RunReport, uni: Universe,
                         pssig.pp.confirmed_at_index + 1),
                 )
                 if pres.kind is OutcomeKind.UNMEASURABLE:
-                    pass  # вырожденный риск: не исход и не состояние (см. докстроку)
+                    # Вырожденный риск: не исход и не состояние (докстрока
+                    # `OutcomeKind.UNMEASURABLE`). ⚠ И ОН НАЗЫВАЕТСЯ ЧИСЛОМ (2026-08-26):
+                    # у ПП-сигнала нет `emitted_outcomes`, поэтому без этого счётчика
+                    # сделка не увеличивала НИЧЕГО и исчезала из отчёта целиком (§4.3).
+                    report.pp_degenerate_risk += 1
                 elif pres.kind in CLOSED_KINDS:
                     assert pres.closed_at_index is not None
                     err = store.record_outcome(
@@ -2956,6 +2964,7 @@ CYCLE_FIELDS = (
     "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
     "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
+    "pp_degenerate_risk",
     "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
@@ -3487,12 +3496,44 @@ OUTCOME_LABEL = {
     # правки — KeyError через 79 минут расчёта. Защита сработала как обещает докстрока
     # ниже, но цена ошибки — потерянный круг по всей вселенной.
     "breakeven": "в безубытке",
+    # ⚠⚠ ЭТОЙ СТРОКИ НЕ БЫЛО, И ПРИЁМКА ПАДАЛА НА КАЖДОМ ПРОГОНЕ (найдено 2026-08-26).
+    # `OutcomeKind.UNMEASURABLE` заведён 2026-08-23 (коммит 32869e7), подпись к нему —
+    # нет, а раздел 12 обходит ВСЕ члены перечисления независимо от их счёта. То есть
+    # `print_report` бросал `KeyError: 'unmeasurable'` ВСЕГДА — и у `hunter run`, и у
+    # службы, — уже после того, как весь расчёт круга сделан.
+    #
+    # Это ВТОРОЙ случай того же класса в этом же словаре: комментарий трёмя строками
+    # выше описывает первый (2026-08-19, `breakeven`, «уронило первый же цикл службы —
+    # KeyError через 79 минут расчёта»). Защита «падает по KeyError, а не печатает
+    # пустую строку» сработала оба раза как обещано и оба раза ПОЗЖЕ, чем нужно:
+    # ценой круга по всей вселенной. Поэтому ниже полнота проверяется ПРИ ИМПОРТЕ.
+    "unmeasurable": "вырожден риск (стоп на цене входа)",
 }
 """Подписи исходов для владельца, который не программист (§7.6).
 
-Полнота обеспечена не глазами: ключи сверяются с `OutcomeKind` при печати, и отсутствие
-подписи падает по `KeyError`, а не печатает пустую строку.
+Полнота обеспечена не глазами: состав ключей сверяется с `OutcomeKind` ПРИ ИМПОРТЕ
+(`_check_outcome_labels`), а не при печати. Прежняя редакция полагалась на `KeyError` в
+момент печати — он и случился дважды, каждый раз после полного круга расчёта.
 """
+
+
+def _check_outcome_labels() -> None:
+    """У каждого исхода есть подпись по-русски, и это проверено ДО расчёта.
+
+    ⚠ Падает ПРИ ИМПОРТЕ — тот же приём и тот же довод, что у `_check_fields_split`:
+    ломается сразу и ловится гейтом `smoke_import` на каждом коммите, а не строкой
+    приёмки после часа работы. Новый член `OutcomeKind` обязан ЛОМАТЬ ровно одно место.
+    """
+    kinds = {k.value for k in OutcomeKind}
+    lost = sorted(kinds - set(OUTCOME_LABEL))
+    extra = sorted(set(OUTCOME_LABEL) - kinds)
+    if lost or extra:
+        raise RuntimeError(
+            f"подписи исходов неполны: без подписи {lost}; подписаны, но в OutcomeKind "
+            f"отсутствуют {extra}. Раздел 12 приёмки обходит ВСЕ члены перечисления")
+
+
+_check_outcome_labels()
 
 
 # Самописная `_median` удалена 2026-08-17 (правило библиотеки): она дословно
@@ -3843,9 +3884,16 @@ def print_report(r: RunReport) -> int:
               f"цели» у них невозможен по построению; это знаменатель к «по цели 0%»")
     if r.pending_no_bars:
         print(f"   дорешать НЕЛЬЗЯ: без ряда ТФ в этом прогоне {r.pending_no_bars}")
-    if r.pending_degenerate_risk:
-        print(f"   ⚠ ВЫРОЖДЕН РИСК (стоп совпал со входом): "
-              f"{r.pending_degenerate_risk} — в R не измеряются, в леджер не пишутся")
+    # ⚠ ВЫРОЖДЕННЫЙ РИСК НАЗЫВАЕТСЯ ПО ВСЕМ ТРЁМ ПУТЯМ (2026-08-26). Строка печатала
+    # ОДИН из них — дорешивание, — а прочитывалась как весь счёт. Свежая эмиссия от
+    # уровня живёт в `emitted_outcomes` (раздел 12), от ПП — в `pp_degenerate_risk`, и
+    # до этой правки не жила нигде. Числа берутся у своих счётчиков, второй копии
+    # величины здесь не заводится.
+    fresh_degenerate = r.emitted_outcomes.get(OutcomeKind.UNMEASURABLE.value, 0)
+    if r.pending_degenerate_risk or fresh_degenerate or r.pp_degenerate_risk:
+        print(f"   ⚠ ВЫРОЖДЕН РИСК (стоп совпал со входом) — в R не измеряются, в "
+              f"леджер не пишутся: дорешанных {r.pending_degenerate_risk} · свежих от "
+              f"уровня {fresh_degenerate} · от ПП {r.pp_degenerate_risk}")
     print("   исход считается ТОЛЬКО по барам, закрывшимся после записи сигнала:")
     print("   у свежего сигнала исхода нет и быть не может — это журнал, а не бэктест.")
     emitted = sum(r.emitted_outcomes.values())

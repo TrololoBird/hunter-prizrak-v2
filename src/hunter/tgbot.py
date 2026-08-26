@@ -100,7 +100,7 @@ from .bars import (
 from .card import TF_LABEL, trim_zeros
 from .config import DEFAULT_PATH, BotConfig, Universe, load_bot_config, load_universe
 from .exchange import CapabilityMissing, Exchange, shared
-from .levels import LevelState
+from .levels import LevelState, flipped_side
 from .models import Bar, NotReady
 from .render import ZoneSpec, chart_png
 
@@ -567,8 +567,14 @@ def read_map(symbol: str) -> MapRead | NotReady:
     # переворота гасили друг друга, свежая карта показывала большинство (флипнутых
     # 20374 против 5177 активных) чужой стороной — ровно дефект, который правка
     # dafa01b объявила закрытым. Одно имя — одно значение; переворот у читателя удалён.
-    zones = tuple(ZoneSpec(side=(("short" if r[1] == "long" else "long")
-                                 if r[11] == "flipped" else r[1]),
+    #
+    # ⚠ САМО ПРАВИЛО ЗДЕСЬ БОЛЬШЕ НЕ ЗАПИСАНО (2026-08-26). Стоял тернарник
+    # `("short" if r[1] == "long" else "long") if r[11] == "flipped" else r[1]` — вторая,
+    # НЕЗАВИСИМАЯ запись стр. 43 рядом с `levels.flipped_if`: перенос переворота к
+    # производителям дефект снял, а копию формулы оставил. Теперь оба производителя
+    # зовут одно правило — `levels.flipped_side` для строки, `MappedLevel.current` для
+    # объекта, и обе точки внутри сводятся к `levels.other_side`.
+    zones = tuple(ZoneSpec(side=flipped_side(r[1], r[11]),
                            timeframe=r[0], price=float(r[2]),
                            zone_lo=float(r[3]), zone_hi=float(r[4]),
                            entry_rule=r[5] or "",
