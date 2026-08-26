@@ -12,9 +12,11 @@ SQLite — состояние и исходы, со схемой и ограни
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sqlite3
+import statistics
 from decimal import Decimal
 from pathlib import Path
 
@@ -1916,6 +1918,172 @@ def format_win_rate(w: WinRate) -> list[str]:
                + ", ".join(f"{c.timeframe} {100 / c.trades:.1f} п.п."
                            for c in w.by_timeframe if c.trades)
                + (f"; по всем {100 / w.total.trades:.1f} п.п."))
+    return out
+
+
+SAMPLE_FLOORS: tuple[tuple[int, str], ...] = (
+    (500, "статистически сильная выборка"),
+    (200, "убедительно; сильной значимость становится от 500 сделок"),
+    (100, "минимум набран, число можно читать; убедительным оно станет от 200"),
+    (30, "ПРЕДВАРИТЕЛЬНОЕ ЧТЕНИЕ, а не вывод; минимум для чтения — 100 сделок"),
+    (1, "ПЕРВЫЕ НАБЛЮДЕНИЯ, выводов из них не делают: внешний порог даже "
+        "предварительного чтения — 30 сделок"),
+)
+"""Черта, ниже которой число не читается как вывод. Пороги ВНЕШНИЕ, не наши.
+
+Ни курс, ни корпус размера выборки не называют — здесь работает роль «ВЕРНО ЛИ
+посчитано», то есть статистика. Внешний консенсус сходится на четырёх ступенях: 30 —
+предварительное чтение, 100 — минимум, при котором число вообще что-то значит, 200 —
+убедительно, 500 — сильная значимость (edgeflo, Traders Second Brain, разбор
+статистической значимости в бэктесте; ссылки — в плане
+`docs/audit/plan-2026-08-26-product-and-edge.md`, раздел 7).
+
+⚠ Это НЕ ОТСЕЧКА и не фильтр: ни одна строка из-за малой выборки не прячется. Порог
+только НАЗЫВАЕТ словами, чем является напечатанное число, — ровно то, чего не хватало
+проекту, когда решения принимались по срезу на 300 барах.
+"""
+
+
+def sample_verdict(trades: int) -> str:
+    """Что такое напечатанное число при такой выборке — словами, а не молчанием."""
+    if trades <= 0:
+        return "ЗАКРЫТЫХ СДЕЛОК НЕТ — считать нечего, и это данные, а не ноль"
+    for floor, words in SAMPLE_FLOORS:
+        if trades >= floor:
+            return words
+    return ""
+
+
+class ExpectancyCell(BaseModel):
+    """Экспектанси одного разреза — средний результат сделки в единицах R.
+
+    Метрика взята у литературы и совпадает с нашей: «(Win Rate × Average Win in R) −
+    (Loss Rate × Average Loss in R)», что тождественно среднему R по завершённым
+    сделкам. Считается ВТОРЫМ способом — прямым средним, — и это не копия формулы, а
+    та же величина в один шаг: перемножать доли и средние, уже посчитанные из тех же
+    строк, значило бы завести вторую запись одного числа.
+
+    ⚠ ЗНАМЕНАТЕЛЬ ТОТ ЖЕ, ЧТО У ВИНРЕЙТА (`WinRateCell`): завершённые сделки — цель,
+    стоп, безубыток. Неоднозначные не входят: у них `r IS NULL` по схеме, и назначить
+    им число значило бы придумать исход. Их счёт печатается рядом.
+
+    ⚠ ИНТЕРВАЛ — НЕ УКРАШЕНИЕ. Среднее по 12 сделкам и по 500 читаются одинаково, а
+    значат разное; без интервала владелец не может отличить преимущество от шума.
+    Полуширина 95%: `1.96 · σ / √n` для среднего R и `1.96 · √(p(1−p)/n)` для доли.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    trades: int
+    r_sum: float
+    r_mean: float | None
+    """`None` при нуле сделок. Ноль означал бы «в среднем сделка не даёт ничего» —
+    другое утверждение (§4.3)."""
+
+    r_ci_half: float | None
+    """Полуширина 95% интервала среднего. `None` при `trades < 2`: по одной сделке
+    разброс не определён вовсе."""
+
+    ambiguous: int
+    """Вне знаменателя: исход не назначен, `r` не существует."""
+
+
+class Expectancy(BaseModel):
+    """Экспектанси целиком и в разрезе по ТФ, с вердиктом о выборке."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total: ExpectancyCell
+    by_timeframe: tuple[ExpectancyCell, ...]
+    win_ci_half: float | None
+    """Полуширина 95% интервала ВИНРЕЙТА по всем ТФ. `None` при нуле сделок."""
+
+    fingerprint: str
+    verdict: str
+
+
+def expectancy(conn: sqlite3.Connection) -> Expectancy:
+    """Средний результат сделки в R по НАКОПЛЕННОМУ леджеру. Только на чтение.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26 ПО ПРИКАЗУ ВЛАДЕЛЬЦА «начинай с Ф0». До этого дня о качестве
+    сигналов проект знал только из СРЕЗОВ на 300 барах, и сам же назвал такой срез ложью
+    окна: медленное движение в окно не попадает, быстрое попадает, и средний R по срезу
+    систематически хуже правды. Леджер копит ВПЕРЁД и этой ошибки не имеет — не хватало
+    ровно отчёта.
+
+    ТФ берутся из `signals`, как и у винрейта: ТФ без единой завершённой сделки обязан
+    попасть в разрез со своим нулём, иначе перекос будет съеден соединением.
+    """
+    rows = conn.execute(
+        "SELECT s.timeframe,"
+        " SUM(CASE WHEN o.r IS NOT NULL THEN 1 ELSE 0 END) AS trades,"
+        " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS amb"
+        " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
+        " GROUP BY s.timeframe ORDER BY s.timeframe"
+    ).fetchall()
+    per_tf: dict[str, list[float]] = {str(r[0]): [] for r in rows}
+    amb_by_tf = {str(r[0]): int(r[2]) for r in rows}
+    for tf, r in conn.execute(
+        "SELECT s.timeframe, o.r FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+        " WHERE o.r IS NOT NULL"
+    ).fetchall():
+        per_tf.setdefault(str(tf), []).append(float(r))
+
+    def cell(tf: str, rs: list[float], amb: int) -> ExpectancyCell:
+        n = len(rs)
+        half = None
+        if n >= 2:
+            half = 1.96 * statistics.stdev(rs) / math.sqrt(n)
+        return ExpectancyCell(
+            timeframe=tf, trades=n, r_sum=sum(rs),
+            r_mean=None if n == 0 else sum(rs) / n,
+            r_ci_half=half, ambiguous=amb,
+        )
+
+    cells = tuple(cell(tf, rs, amb_by_tf.get(tf, 0)) for tf, rs in sorted(per_tf.items()))
+    all_r = [x for rs in per_tf.values() for x in rs]
+    total = cell("ВСЕ", all_r, sum(amb_by_tf.values()))
+    wins = conn.execute(
+        "SELECT COUNT(*) FROM outcomes WHERE kind='target'").fetchone()[0]
+    win_half = None
+    if total.trades:
+        p = wins / total.trades
+        win_half = 1.96 * math.sqrt(p * (1 - p) / total.trades) * 100
+    n_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    return Expectancy(
+        total=total, by_timeframe=cells, win_ci_half=win_half,
+        fingerprint=f"сигналов {n_signals}, завершённых сделок {total.trades}",
+        verdict=sample_verdict(total.trades),
+    )
+
+
+def format_expectancy(e: Expectancy) -> list[str]:
+    """Экспектанси словами для владельца (§7.5). Вердикт о выборке — ПЕРВОЙ строкой."""
+    out = [f"ЭКСПЕКТАНСИ — средний результат сделки в R. ОТПЕЧАТОК: {e.fingerprint}",
+           f"   ВЫБОРКА: {e.verdict}"]
+    if e.total.trades == 0:
+        out.append("   леджер копит вперёд: у свежего сигнала исхода нет и быть не может")
+        return out
+    out.append("   ТФ     сделок   сумма R   средний R    95% интервал среднего   неодн.")
+    for c in (e.total, *e.by_timeframe):
+        mean = "     —" if c.r_mean is None else f"{c.r_mean:+.3f}"
+        if c.r_ci_half is None or c.r_mean is None:
+            span = "по одной сделке не определён"
+        else:
+            span = f"от {c.r_mean - c.r_ci_half:+.3f} до {c.r_mean + c.r_ci_half:+.3f}"
+        out.append(f"   {c.timeframe:6} {c.trades:6} {c.r_sum:+9.2f} {mean:>10}   "
+                   f"{span:26} {c.ambiguous:5}")
+    if e.win_ci_half is not None:
+        out.append(f"   интервал ВИНРЕЙТА по всем ТФ: ±{e.win_ci_half:.1f} п.п. — "
+                   f"столько же значит и сама доля")
+    out.append("   ⚠ ИНТЕРВАЛ ПЕРЕСЁК НОЛЬ — преимущество НЕ ПОКАЗАНО этой выборкой"
+               if (e.total.r_mean is not None and e.total.r_ci_half is not None
+                   and abs(e.total.r_mean) <= e.total.r_ci_half)
+               else "   интервал среднего ноль НЕ пересекает — знак результата выборкой "
+                    "подтверждён")
+    out.append("   правило проекта: правка МЕТОДА не обосновывается выборкой ниже "
+               "названной черты")
     return out
 
 

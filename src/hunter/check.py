@@ -418,6 +418,23 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         wr = store.win_rate(conn)
         for row in store.format_win_rate(wr):
             print(f"   {row}" if not row.startswith(" ") else row)
+        # ЭКСПЕКТАНСИ — Ф0 плана 2026-08-26, по приказу владельца «начинай с Ф0».
+        # Винрейт говорит, КАК ЧАСТО сделка удаётся; экспектанси — СКОЛЬКО она приносит
+        # в среднем. Без второго числа первое не отвечает на вопрос «есть ли
+        # преимущество»: 70% побед при среднем убытке вдвое больше среднего выигрыша —
+        # убыточная система. Интервал печатается рядом, потому что среднее по 12 сделкам
+        # и по 500 читаются одинаково, а значат разное.
+        ex = store.expectancy(conn)
+        for row in store.format_expectancy(ex):
+            print(f"   {row}" if not row.startswith(" ") else row)
+        lines.append((
+            "Экспектанси названа вместе с выборкой и интервалом (Ф0)",
+            ex.total.trades == 0 or ex.total.r_mean is not None,
+            (f"закрытых сделок {ex.total.trades} — {ex.verdict}"
+             if ex.total.trades == 0 else
+             f"средний R {ex.total.r_mean:+.3f} при {ex.total.trades} закрытых сделках; "
+             f"{ex.verdict}"),
+        ))
         lines.append((
             "Винрейт назван вместе со знаменателем (стр. 9)",
             wr.total.win_rate_pct is not None,
