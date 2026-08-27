@@ -2883,9 +2883,49 @@ def record(run_id: str, report: RunReport, uni: Universe,
             report.map_rejected.extend(sync.rejected)
             report.map_carried[sym] = carried
 
+            # ⚠⚠⚠ ЦЕНА ДЛЯ УСЛОВИЯ ЗАПИСИ — самый свежий закрытый бар СИМВОЛА, а не
+            # своего ТФ: ряды закрываются в разное время, и брать закрытие 1Д значило бы
+            # судить о «сейчас» по вчерашнему числу.
+            live_bar = max((b[-1] for b in series.values() if b),
+                           key=lambda b: b.open_ms, default=None)
+            live_px = float(live_bar.close) if live_bar is not None else 0.0
             for em in d.emissions:
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
+                # ⚠⚠⚠ СДЕЛКА ЗАПИСЫВАЕТСЯ, ТОЛЬКО КОГДА ЦЕНА ПРИШЛА К ЕЁ ЗОНЕ ВХОДА.
+                # Правка 2026-08-27. До неё сигнал писался для КАЖДОГО годного уровня
+                # карты независимо от того, где цена: замер по живому леджеру (300
+                # последних сигналов рода `level`, цена — бар 5м на момент записи) дал
+                # медиану расстояния до входа 25.1%, дальше 10% — 228 записей (76%),
+                # дальше 50% — 84 (28%), худшая `#754 PIPPIN 1ч шорт` — цена 0.01964
+                # против входа 0.601255, тридцатикратно.
+                #
+                # Карта при этом ВЕРНА: уровень далеко от цены остаётся уровнем. Неверно
+                # называть его СДЕЛКОЙ — «вход, стоп, цель» означает ордер, а ордера на
+                # 2961% не бывает. Стр. 48 говорит об отложках как об ограниченном
+                # ресурсе: «Важно не выставлять сразу много отложек по МТФ – с большой
+                # вероятностью они откроются одновременно, сложно будет их сразу все
+                # контролировать и при дампе они все получат стоп».
+                #
+                # Цена этого дефекта — не косметика: экспектанси по леджеру есть
+                # ЕДИНСТВЕННЫЙ ответ проекта на вопрос «работает ли метод», и она
+                # считалась по сделкам, которых не было.
+                #
+                # Порог не выдуман и не введён здесь заново: `geometry.zone_position`
+                # мерит близость ШИРИНОЙ САМОЙ ЗОНЫ, и той же мерой молчит слой
+                # доставки. Одно условие, одно место.
+                # ⚠ МЕРИТСЯ ПО ЗОНЕ УРОВНЯ (VAL…VAH), А НЕ ПО УЗКОМУ ЯДРУ ВХОДА.
+                # Первая редакция этой правки брала `entry_zone_*` — HVN-ядро — и
+                # отсекла ВСЕ 13 сделок кадров `zonesplit`, включая ETH 15м в 1.0% от
+                # входа, то есть ровно действенную. Ядро у́же зоны в разы, а «ближе одной
+                # ширины» от узкого ядра — это доли процента. Слой доставки той же
+                # функцией мерит именно ЗОНУ (`board_setups`), и величина обязана быть
+                # одна: уровень — это зона (стр. 23-26), ею и меряется приход цены.
+                if live_px > 0 and geometry.zone_position(
+                        live_px, float(em.level.zone_lo),
+                        float(em.level.zone_hi)) == "far":
+                    report.signal_far_from_price += 1
+                    continue
                 # ⚠ ТРЕТЬЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24. Здесь стоял свой
                 # `role is geometry.TargetRole.PRIMARY`, такой же — в `Setup.rr` и в
                 # `emit.outcome_of`. Правило теперь одно: `geometry.first_major`.
@@ -3075,7 +3115,7 @@ CYCLE_FIELDS = (
     "emitted_outcomes",
     "emitted_rr", "emitted_stop_pct", "no_target_by_sink",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
-    "map_stale_calc",
+    "map_stale_calc", "signal_far_from_price",
     "zone_overlap_pairs", "zone_overlap_by_symbol", "zone_overlap_levels",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
@@ -4035,6 +4075,11 @@ def print_report(r: RunReport) -> int:
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
           f"известно раньше: {r.pp_signals_known}")
+    # МОЛЧАНИЕ НАЗЫВАЕТСЯ ЧИСЛОМ: без этой строки «сигналов мало» читалось бы как
+    # свойство рынка, тогда как это наш собственный отказ записывать сделку, к чьей
+    # зоне входа цена ещё не подошла. Знаменатель рядом — сколько записано.
+    print(f"   НЕ записано, цена далеко от зоны входа: {r.signal_far_from_price}"
+          f"   (мера близости — ширина зоны, `geometry.zone_position`)")
     if r.absorption_measured_by_tf or r.absorption_refused_by_tf:
         # Сводка по измерению, вдоль которого возможен перекос: отказ меры уторговки
         # идёт по ТФ (окно от подтверждения слома длиннее собранного ряда минуток).

@@ -2808,24 +2808,6 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                       max_signal_id=max_id, max_closed_ms=max_closed)
 
 
-def zone_position(price: float, lo: float, hi: float) -> str:
-    """Где цена относительно зоны: `inside` | `near` | `far`.
-
-    «Близко» — ближе ОДНОЙ ШИРИНЫ зоны от её края. Порог не выдуман числом в
-    процентах: курс строит уровень ЗОНОЙ (стр. 23–26), и ширина зоны — единственная
-    мера того, сколько это близко, которая лежит в самой карте. Узкая зона зовёт цену с
-    малого расстояния, широкая — с большого: масштаб задаёт сама структура, а не
-    константа. Зона нулевой ширины (вырожденный профиль) отвечает `far` всюду, кроме
-    точного равенства, — и это честно: у неё нет собственной меры расстояния.
-    """
-    if lo <= price <= hi:
-        return "inside"
-    width = hi - lo
-    if width > 0 and min(abs(price - lo), abs(price - hi)) <= width:
-        return "near"
-    return "far"
-
-
 BOARD_SHOW_MAX = 7
 """Сколько сетапов доски показывать в сводке. Хвост НАЗЫВАЕТСЯ числом, а не молчит.
 
@@ -2932,7 +2914,7 @@ def rank_board(levels: tuple[LevelRow, ...],
                 if risk > 0:
                     rr = abs(target - lv.price) / risk
             out.append(BoardSetup(level=lv, price=price,
-                                  where=zone_position(price, lv.zone_lo, lv.zone_hi),
+                                  where=geometry.zone_position(price, lv.zone_lo, lv.zone_hi),
                                   rr=rr, target=target))
     return tuple(sorted(out, key=_board_key))
 
@@ -3407,7 +3389,7 @@ class Notifier:
             # РАБОЧАЯ ЗОНА В СОБЫТИЯХ (решение владельца 2026-08-25): зовём ценой к
             # входу, а не к контексту старшего ТФ. work_bounds сам падает на VA у
             # строк без рабочих полей.
-            pos = zone_position(t.last, *lv.work_bounds())
+            pos = geometry.zone_position(t.last, *lv.work_bounds())
             was = self._zone_state.get(key)
             self._zone_state[key] = pos
             # Событие — только СБЛИЖЕНИЕ (far→near, near→inside, far→inside).
