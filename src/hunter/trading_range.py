@@ -1288,6 +1288,21 @@ def _attempt(
                 hi_idx.append(index)
                 last_kind = kind
                 if price > up_edge and ordinal >= MIN_PUNCTURE_ORDINAL:
+                    # ✅ ПОДТВЕРЖДЕНО КЛАССИКОЙ 2026-08-28, а не только курсом. Я
+                    # предположил обратное — что граница обязана расширяться по проколам,
+                    # — и опроверг это двумя источниками. Вайкофф: "The SC low and AR high
+                    # set the range boundaries", а пробитие границы есть ТЕСТ: "A spring
+                    # is the phase C event where price briefly undercuts the range support
+                    # established by the selling climax… and recovers back into the range.
+                    # It works as a final test" (luxalgo.com/library/concept/
+                    # wyckoff-accumulation-schematic). Spring снизу и upthrust сверху —
+                    # диагностические события, ради которых граница и стоит на месте:
+                    # сдвинь её, и тест станет неотличим от продолжения диапазона.
+                    #
+                    # ЗАМЕР, из-за которого гипотеза и возникла: у 2323 структур из 4229
+                    # (55%) хотя бы одна точка лежит вне своих линий. Это не дефект, а
+                    # ожидаемая доля структур с проколами.
+                    #
                     # Прокол за границу (стр. 18): точка засчитана, граница НЕ сдвинута,
                     # глубина прокола запомнена — за неё ставится стоп. Условие по номеру
                     # здесь выполнено всегда: третья точка стороны при чередовании имеет
