@@ -3532,37 +3532,45 @@ def _target_by_course(lv: LevelRow, pool: list[LevelRow]) -> tuple[float, str] |
     ⚠ Цели нет — строки нет. Подставить сюда «ближайший любой уровень» значило бы
     нарушить последнее правило страницы ради непустого поля.
     """
-    order = list(TIMEFRAME_MS)
-    if lv.timeframe not in order:
-        return None
-    own = order.index(lv.timeframe)
     long = lv.side == "long"
+    # ⚠⚠ КОПИЯ ПРАВИЛА СТР. 24 УДАЛЕНА 2026-08-27. Здесь стояла своя реализация ярусов
+    # ТФ, хода сделки и зоны входа, и она сама признавалась копией: «здесь оно повторено,
+    # а не вызвано… при правке править ОБА места». Копии разошлись — сверка на 13 сделках
+    # одних и тех же кадров дала 10 расхождений, у пяти цель была РАЗНАЯ (BCH 1ч: 237.465
+    # против 425.5 — в противоположную сторону), и правила «цель внутри собственной
+    # структуры — не цель» здесь не было вовсе.
+    #
+    # Правило теперь одно: `geometry.page24_tier` и `geometry.page24_reachable`. Что
+    # остаётся РАЗНЫМ законно — МОМЕНТ: движок отбирает цели на момент решения сделки,
+    # бот отвечает про СЕЙЧАС и берёт живую карту.
+    far = lv.boundary_hi if long else lv.boundary_lo
     best_main: tuple[float, float] | None = None
     best_mid: tuple[float, float] | None = None
     for other in pool:
         if other.symbol != lv.symbol or other.side == lv.side:
             continue
-        if other.timeframe not in order:
+        # ⚠⚠ ОТРАБОТАННЫЙ УРОВЕНЬ ЦЕЛЬЮ НЕ СЛУЖИТ — стр. 25: «мы этот уровень удаляем».
+        # Правка 2026-08-27: здесь судьба уровня не проверялась ВООБЩЕ, и бот предлагал
+        # целями уровни, которых на карте уже нет. Движок это делает давно
+        # (`levels.level_as_of` внутри `build_targets_report`), и расхождение двух
+        # поверхностей на одних кадрах было 10 из 13.
+        #
+        # ПРОБИТЫЙ (`flipped`) остаётся: стр. 43 не удаляет уровень, а МЕНЯЕТ ЕГО
+        # СТОРОНУ, и как встречный он целью служит — то же решение, что у движка.
+        if other.state == "worked_off":
             continue
-        rank = order.index(other.timeframe)
-        if rank < own - 1:
-            continue                      # ТФ−2 и ниже: «не берутся в расчет»
-        if rank > own + 1:
-            # ТФ+2 и выше: то же ограничение, что в `geometry.build_targets` (вывод из
-            # стр. 24 и стр. 48 — см. пояснение там). Правится ВМЕСТЕ с ним.
+        slot = geometry.page24_tier(lv.timeframe, other.timeframe)
+        if slot is None:
             continue
         goal = other.price
+        if far and not geometry.page24_reachable(
+                up=long, entry=Decimal(str(lv.price)),
+                zone_lo=Decimal(str(lv.zone_lo)), zone_hi=Decimal(str(lv.zone_hi)),
+                far_edge=Decimal(str(far)), goal=Decimal(str(goal))):
+            continue
         dist = (goal - lv.price) if long else (lv.price - goal)
         if dist <= 0:
-            continue                      # цель обязана лежать ПО ХОДУ сделки
-        if lv.zone_lo <= goal <= lv.zone_hi:
-            # Цель ВНУТРИ ЗОНЫ ВХОДА — не цель. То же правило и по тому же основанию,
-            # что в `geometry.build_targets`: лимитки входа стоят на ПОК и зону (стр. 30),
-            # и одно касание исполняло бы вход и «тейк» разом. Здесь оно повторено, а не
-            # вызвано, потому что у бота на руках строки леджера, а не объекты уровня;
-            # разойтись им нельзя — при правке править ОБА места.
             continue
-        slot = "main" if rank >= own else "mid"
         cur = best_main if slot == "main" else best_mid
         if cur is None or dist < cur[1]:
             if slot == "main":
