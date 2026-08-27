@@ -496,10 +496,19 @@ def chart_png(
         ax.plot([x_r], [y1c if edge_y > ref_price else y0c],
                 marker="^" if edge_y > ref_price else "v",
                 color=_TICK, markersize=4, zorder=6)
-        ax.annotate(f"{_price_label(ref_price)} → {_price_label(edge_y)} ({move:+.1f}%)",
+        # ⚠⚠ ПОДПИСЬ УХОДИТ ВЛЕВО И НЕСЁТ ТОЛЬКО ПРОЦЕНТ — правка 2026-08-27 по разбору
+        # ГЛАЗАМИ отправленного графика. Здесь стояло `ha="left"` с полным текстом
+        # «78801.2 → 77207.6 (-1.4%)»: линейка стоит на 0.78 поля будущего, а ценовые
+        # плашки — ЗА краем оси, и текст въезжал прямо под них. На живой картинке BTC 4ч
+        # читалось «78801.» слева от плашки и «2 (-1.4%)» справа — цена как число
+        # пропадала. Обе цены линейки И ТАК подписаны плашками на шкале, поэтому
+        # повторять их незачем: уникальное содержание линейки — РАССТОЯНИЕ.
+        ax.annotate(f"{move:+.1f}%",
                     xy=(x_r, (y0c + y1c) / 2),
-                    xytext=(3, 0), textcoords="offset points",
-                    va="center", ha="left", fontsize=7.5, color=_TEXT, zorder=6)
+                    xytext=(-4, 0), textcoords="offset points",
+                    va="center", ha="right", fontsize=7.5, color=_TEXT, zorder=7,
+                    bbox={"boxstyle": "square,pad=0.15", "facecolor": _BG,
+                          "edgecolor": "none", "alpha": 0.75})
 
     w = 0.62
     for i, b in enumerate(bars):
@@ -630,6 +639,9 @@ def chart_png(
         title += f" · {caption}"
     ax.set_title(title, loc="left", fontsize=10.5, color=_TEXT)
     fig.tight_layout()
+    # Место под вынесенную легенду освобождается ПОСЛЕ `tight_layout`: он о
+    # фигурных легендах не знает и вернул бы поле обратно.
+    fig.subplots_adjust(bottom=0.11)
 
     # ЛЕГЕНДА — нижний левый угол, мелко, полупрозрачно. Без неё жёлтый/зелёный/
     # крестик читаются догадкой (разбор глазами 2026-08-25: «жёлтая полоса — это
@@ -644,9 +656,16 @@ def chart_png(
         Line2D([0], [0], color="#2f6fd0", marker="x", linewidth=0,
                markersize=7, markeredgewidth=2, label="пробит (сторона сменилась)"),
     ]
-    ax.legend(handles=handles, loc="lower left", fontsize=7,
-              framealpha=0.25, facecolor=_BG, edgecolor=_TICK,
-              labelcolor=_TEXT, borderpad=0.5)
+    # ⚠⚠ ЛЕГЕНДА ВЫНЕСЕНА ЗА ПОЛЕ ГРАФИКА — правка 2026-08-27 по разбору ГЛАЗАМИ.
+    # Стояло `loc="lower left"` ВНУТРИ осей, и на живой картинке BTC 4ч коробка легенды
+    # легла прямо на свечи накопления, а нижняя граница структуры прошла сквозь строку
+    # «по факту». То есть подпись закрывала ровно ту базу, ради которой уровень и
+    # построен, — а свод требует, чтобы предъявляемое проверялось глазами.
+    # Строкой ПОД осью времени легенда не может пересечься с данными ни при какой
+    # раскладке свечей, тогда как любой угол внутри осей рано или поздно занят.
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=7,
+               frameon=False, labelcolor=_TEXT, bbox_to_anchor=(0.5, 0.0),
+               columnspacing=1.6, handlelength=1.6)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
