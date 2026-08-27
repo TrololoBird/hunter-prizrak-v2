@@ -715,6 +715,22 @@ def saved_runs() -> tuple[str, ...]:
     return tuple(d.name for d in sorted(runs, key=lambda p: p.stat().st_mtime))
 
 
+def dir_name(symbol: str) -> str:
+    """Имя каталога кадров для символа. Одно место: по нему сверяются чистка и чтение."""
+    return _safe(symbol)
+
+
+def clear_run_dir(run_id: str, dir_name_: str) -> None:
+    """Стереть каталог кадров ПО ИМЕНИ КАТАЛОГА, а не по символу.
+
+    Нужен там, где символа уже нет: кадры чужого прогона под тем же `--run-id`. Символ по
+    имени каталога не восстанавливается однозначно (`_safe` необратим), поэтому чистка
+    берёт имя как есть."""
+    d = FRAMES_DIR / run_id / dir_name_
+    if d.is_dir():
+        shutil.rmtree(d)
+
+
 def saved_symbols(run_id: str) -> tuple[str, ...]:
     """Символы, у которых в прогоне есть кадры. Порядок — алфавитный, для дет-повтора."""
     root = FRAMES_DIR / run_id
