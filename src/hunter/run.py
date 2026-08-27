@@ -3196,7 +3196,7 @@ def _check_fields_split() -> None:
 _check_fields_split()
 
 
-def _copy_series(st: SeriesState) -> SeriesState:
+def _copy_series(st: SeriesState, decide_bars: int = 0) -> SeriesState:
     """Копия состояния ряда для снимка: изменяемые списки отвязываются от живых.
 
     Копируются именно списки, не бары: `Bar` заморожен, и делить его между снимком и
@@ -3220,8 +3220,20 @@ def _copy_series(st: SeriesState) -> SeriesState:
     Правило для всякого нового поля: изменяемый контейнер — в `update`, иначе снимок
     перестаёт быть снимком молча, без единого исключения.
     """
+    # ⚠⚠ РЕЗ ГЛУБИНЫ РЕШЕНИЯ — ЗДЕСЬ, а не в опросе. Правка 2026-08-27, и она вторая:
+    # первая редакция посадила ручку на `keep_bars`, который режет ряд ПРИ ПРИХОДЕ бара.
+    # Контроль поймал это до коммита — прогон `--decide-bars 300` дал в кадрах 1637
+    # баров на 15м, потому что за 30 секунд наблюдения новый 15-минутный бар не пришёл
+    # ни разу, и резать было нечего. Снимок же берётся ВСЕГДА, значит и рез обязан быть
+    # здесь: глубина решения не может зависеть от того, повезло ли бару закрыться.
+    #
+    # Правый край сохраняется — режется левый: сравнивать две глубины можно только у
+    # одного и того же правого края (свод, правило о зависимости разметки от глубины).
+    bars = list(st.bars)
+    if decide_bars > 0 and len(bars) > decide_bars:
+        bars = bars[-decide_bars:]
     return st.model_copy(update={
-        "bars": list(st.bars),
+        "bars": bars,
         "gaps": list(st.gaps),
         "rejected_bars": list(st.rejected_bars),
         "rejected_at_ms": list(st.rejected_at_ms),
@@ -3250,6 +3262,7 @@ class Collector:
     """
 
     def __init__(self, uni: Universe, seed_limit: int, *, keep_bars: int = 0,
+                 decide_bars: int = 0,
                  keep_trade_days: int = LIVE_TRADES_KEEP_DAYS,
                  horizon_days: int = 0) -> None:
         self.uni = uni
@@ -3259,6 +3272,13 @@ class Collector:
         выводится глубина каждого ряда (`seed_depth`). Ноль означает «глубину задаёт
         `seed_limit`», то есть прежнее поведение."""
         self.keep_bars = keep_bars
+        self.decide_bars = decide_bars
+        """Предел длины ряда В СНИМКЕ, то есть в том, что идёт в расчёт. Ноль — весь ряд.
+
+        ⚠ ОТЛИЧАЕТСЯ ОТ `keep_bars`, и различие механическое: тот режет живой ряд при
+        приходе бара (память службы 24/7), а этот — снимок, который берётся всегда. Для
+        контроля глубины годится только второй: первый не срезал ничего в прогоне, где
+        за время наблюдения новый бар не закрылся."""
         self.keep_trade_days = keep_trade_days
         self.ex = shared(uni.venue)
         """⚠ ОБЩИЙ НА ПРОЦЕСС, А НЕ СВОЙ. До 2026-08-23 здесь стоял `Exchange(...)`, и
@@ -3521,7 +3541,8 @@ class Collector:
         rep.loop_late_total_ms = 0
         rep.loop_late_events = []
         rep.stage_windows_ns = {}
-        snap.series = {k: _copy_series(st) for k, st in rep.series.items()}
+        snap.series = {k: _copy_series(st, self.decide_bars)
+                       for k, st in rep.series.items()}
         snap.histograms = cycle_hist
         snap.binned = self.binned
         for name in CYCLE_FIELDS:
@@ -3568,6 +3589,7 @@ class Collector:
 async def collect(uni: Universe, seconds: int, seed_limit: int,
                   horizon_days: int = 90,
                   per_side: int = 0,
+                  decide_bars: int = 0,
                   ) -> tuple[RunReport, dict[str, TradeWindows], engine.Detections]:
     """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
 
@@ -3580,7 +3602,21 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
     Оба построены на `Collector`, и различаются ровно тем, сколько раз берётся снимок:
     здесь один, там — по одному на цикл, бесконечно.
     """
-    c = Collector(uni, seed_limit, horizon_days=horizon_days)
+    # ⚠⚠ `decide_bars` — ПРЕДЕЛ ДЛИНЫ РЯДА, КОТОРЫЙ ПОЙДЁТ В РАСЧЁТ. Заведён
+    # 2026-08-27, и заведён по дефекту ПРИБОРА, а не расчёта.
+    #
+    # Свод требует проверять, что «разметка не смеет быть функцией того, СКОЛЬКО баров
+    # скачали»: прогон на ДВУХ глубинах одного правого края. Ручкой для этого считался
+    # `--seed-limit` — и он глубину решения НЕ РЕЖЕТ. Замер 2026-08-27: два прогона,
+    # `--seed-limit 300` и `--seed-limit 200`, дали в кадрах 15м по 1629 и 1630 баров,
+    # 1ч по 1415 и 1415 — то есть одинаково, потому что ключ задаёт размер ПЕРВОГО
+    # запроса к бирже, а решение читает НАКОПЛЕННЫЙ КЭШ целиком. Я провёл на нём ложный
+    # контроль глубины и едва не предъявил его пройденным.
+    #
+    # Механизм под рукой уже был: `keep_bars` режет ряд, идущий в решение, — но наружу
+    # он выведен не был, и правило свода оставалось непроверяемым. Второй сущности не
+    # заводится: ручка садится на существующее поле.
+    c = Collector(uni, seed_limit, horizon_days=horizon_days, decide_bars=decide_bars)
     try:
         await c.start()
         log.info("наблюдение", потоков=len(c.tasks), секунд=seconds)

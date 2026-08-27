@@ -138,7 +138,8 @@ def _run(args: argparse.Namespace) -> int:
 
     t_collect = time.perf_counter()
     report, sources, detections = asyncio.run(
-        collect(uni, args.seconds, args.seed_limit, args.horizon_days)
+        collect(uni, args.seconds, args.seed_limit, args.horizon_days,
+                decide_bars=args.decide_bars)
     )
     report.stage_ms["collect"] = int((time.perf_counter() - t_collect) * 1000)
     _stage("frames", lambda: persist_frames(args.run_id, report))
@@ -466,8 +467,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--seconds", type=int, default=90)
     run.add_argument("--seed-limit", type=int, default=0,
                      help="баров на ряд — и запроса, И ряда решения; НЕ МЕНЬШЕ пола "
-                          "прогрева (1400), меньшее число молча поднимается до него; "
+                          "прогрева (1400), меньшее число молча поднимается до него — "
+                          "значит КОНТРОЛЬ ГЛУБИНЫ им не делается, для него --decide-bars; "
                           "0 = вывести из --horizon-days отдельно по каждому ТФ")
+    run.add_argument("--decide-bars", type=int, default=0,
+                     help="предел длины ряда, идущего в РАСЧЁТ, БЕЗ пола прогрева — "
+                          "ручка контроля глубины (свод: разметка не смеет быть функцией "
+                          "того, сколько баров скачали); 0 = весь накопленный ряд")
     run.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     run.add_argument("--run-id", default="last")
     # ⚠ Раньше здесь было `--trade-days` = «сколько ПОСЛЕДНИХ суток скачать», умолчание 3.
