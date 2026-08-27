@@ -47,7 +47,7 @@ from hunter.pereprior import Pereprior, PPKind, PPSide
 from hunter.profile_source import CandleWindows
 from hunter.swings import detect as swings_detect
 from hunter.trading_range import detect as range_detect
-from hunter.volume_profile import TV_ROWS
+from hunter.volume_profile import row_height_of
 
 T0 = 1_700_000_000_000
 HOUR = 3_600_000
@@ -80,6 +80,23 @@ def check_level(lv: Level) -> list[str]:
     if lv.zone_lo < lv.boundary_lo or lv.zone_hi > lv.boundary_hi:
         bad.append(f"зона [{lv.zone_lo}, {lv.zone_hi}] ШИРЕ базы "
                    f"[{lv.boundary_lo}, {lv.boundary_hi}] — на стр. 30 зона внутри коробки")
+    # ⚠⚠ РАБОЧАЯ ЗОНА. Заведено 2026-08-27: с 2026-08-25 вход рисуется по HVN-ядру
+    # вокруг ПОК (`zone_work_*`, решение владельца), а сторожил его ТОЛЬКО `CHECK` схемы
+    # леджера — то есть на записи и после того, как график уже нарисован. Ни один из 23
+    # гейтов слова `zone_work` не знал вовсе: предъявляемая величина без прибора, ровно
+    # тот класс, из-за которого зона вылезала за границы у половины уровней.
+    lo, hi = lv.zone_work_lo, lv.zone_work_hi
+    if (lo is None) != (hi is None):
+        bad.append(f"рабочая зона задана наполовину: lo {lo}, hi {hi}")
+    elif lo is not None and hi is not None:
+        if lo >= hi:
+            bad.append(f"рабочая зона вывернута либо пуста: [{lo}, {hi}]")
+        if lo < lv.zone_lo or hi > lv.zone_hi:
+            bad.append(f"рабочая зона [{lo}, {hi}] выходит за область стоимости "
+                       f"[{lv.zone_lo}, {lv.zone_hi}] — ядро клипится по VAL…VAH")
+        if not (lo <= lv.price <= hi):
+            bad.append(f"ПОК {lv.price} вне СВОЕЙ рабочей зоны [{lo}, {hi}] — "
+                       f"ядро строится ВОКРУГ ПОК")
     return bad
 
 
@@ -143,11 +160,12 @@ def level(side: LevelSide, poc: str, lo: str, hi: str, *, tf: str = "4h",
         # поэтому ноль — это «вне зоны непустых строк не найдено», а не
         # «проверено и не нашлось». Пробникам величина безразлична.
         outside_peak_share=0.0,
-        # Высота строки профиля — ТОЙ ЖЕ формулой боевого режима (`TV_ROWS` строк на
-        # размах коробки), а не выдуманной константой: инварианты геометрии о разрешении
-        # профиля не говорят, но второй сущности под тем же именем здесь не заводится.
-        row_height=((Decimal(b_hi if b_hi is not None else hi)
-                     - Decimal(b_lo if b_lo is not None else lo)) / TV_ROWS),
+        # Высота строки профиля — БОЕВОЙ формулой, ссылкой на единственное её место
+        # (`volume_profile.row_height_of`). ⚠ До 2026-08-27 здесь стояла своя копия по
+        # удалённому из боя режиму `TV_ROWS`; разбор — в докстроке самой константы.
+        row_height=row_height_of(Decimal(b_lo if b_lo is not None else lo),
+                                 Decimal(b_hi if b_hi is not None else hi),
+                                 Decimal("0.1")),
         boundary_lo=Decimal(b_lo if b_lo is not None else lo),
         boundary_hi=Decimal(b_hi if b_hi is not None else hi),
         # Прокола у синтетической базы нет — расширенный край СОВПАДАЕТ с границей
@@ -232,6 +250,22 @@ def planted() -> list[tuple[str, list[str]]]:
     pp_target_back = pp_good.model_copy(update={"target": 130.0})  # цель позади входа шорта
     pp_rr_no_target = pp_good.model_copy(update={"target": None, "rr": 2.0})
     pp_stop_ahead = pp_good.model_copy(update={"stop": 95.0})  # стоп НИЖЕ входа шорта
+    # ⚠ РАБОЧАЯ ЗОНА подсаживается `model_construct` В ОБХОД ВАЛИДАТОРА: с 2026-08-27
+    # `Level._work_zone_inside_value_area` такие объекты не даёт построить вовсе, и это
+    # правильно — но проверять надо САМУ ПРОВЕРКУ, а не валидатор. Обход намеренный.
+    ok_lv = level(LevelSide.LONG, "100", "95", "105", b_lo="90", b_hi="110")
+    work_out = ok_lv.model_construct(**{**ok_lv.__dict__,
+                                        "zone_work_lo": Decimal("94"),
+                                        "zone_work_hi": Decimal("102")})
+    work_inverted = ok_lv.model_construct(**{**ok_lv.__dict__,
+                                             "zone_work_lo": Decimal("102"),
+                                             "zone_work_hi": Decimal("98")})
+    work_half = ok_lv.model_construct(**{**ok_lv.__dict__,
+                                         "zone_work_lo": Decimal("98"),
+                                         "zone_work_hi": None})
+    work_no_poc = ok_lv.model_construct(**{**ok_lv.__dict__,
+                                           "zone_work_lo": Decimal("101"),
+                                           "zone_work_hi": Decimal("104")})
     return [
         ("уровень: ПОК вне зоны", check_level(bad_level)),
         ("уровень: ПОК вне БАЗЫ (стр. 30)", check_level(poc_outside)),
@@ -241,6 +275,10 @@ def planted() -> list[tuple[str, list[str]]]:
         ("ПП: цель позади входа", check_pp(pp_target_back)),
         ("ПП: РР без цели", check_pp(pp_rr_no_target)),
         ("ПП: стоп впереди входа", check_pp(pp_stop_ahead)),
+        ("уровень: рабочая зона вне VAL…VAH", check_level(work_out)),
+        ("уровень: рабочая зона вывернута", check_level(work_inverted)),
+        ("уровень: рабочая зона задана наполовину", check_level(work_half)),
+        ("уровень: ПОК вне своей рабочей зоны", check_level(work_no_poc)),
     ]
 
 

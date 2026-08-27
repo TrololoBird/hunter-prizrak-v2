@@ -448,15 +448,21 @@ def desync_s(key: str, base_s: float) -> float:
 
 
 USED_CCXT_METHODS: tuple[str, ...] = (
-    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchCurrencies", "fetchTicker",
-    "fetchTickers", "fetchTrades", "fetchOrderBook", "fetchBidsAsks",
-    "fetchLastPrices", "fetchMarkPrice", "fetchMarkPrices", "fetchFundingRate",
-    "fetchFundingRates", "fetchFundingRateHistory", "fetchFundingIntervals",
-    "fetchOpenInterest", "fetchOpenInterests", "fetchOpenInterestHistory",
-    "fetchLiquidations", "fetchLongShortRatioHistory", "loadMarkets",
-    "watchTrades", "watchOHLCV",
+    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchTicker", "fetchTickers",
+    "fetchTrades", "fetchOrderBook", "loadMarkets", "watchTrades", "watchOHLCV",
 )
-"""Методы ccxt, которые проект ДЕЙСТВИТЕЛЬНО вызывает. Знаменатель к «спрошено N».
+"""Методы ccxt, ДОСТИЖИМЫЕ ИЗ ЖИВОГО ПУТИ. Знаменатель к «спрошено N».
+
+⚠⚠ СПИСОК СОКРАЩЁН С 24 ДО 10 — 2026-08-27, ПО ЗАМЕРУ ДОСТИЖИМОСТИ. Здесь стояли ещё
+четырнадцать имён, и строка отчёта говорила владельцу «проект ВЫЗЫВАЕТ 24». Замер
+обходом дерева вызовов: у каждого из тех четырнадцати ЕДИНСТВЕННЫЙ вызывающий — обёртка
+`exchange.py`, которую не зовёт никто (`fetch_currencies`, `fetch_quotes`,
+`fetch_last_prices`, `fetch_mark_price(s)`, `fetch_funding*`, `fetch_open_interest*`,
+`fetch_liquidations`, `fetch_long_short_ratio`). Они перечислены ниже в
+`WRAPPED_ONLY_CCXT_METHODS`: поверхность у нас написана, но бой её не проходит, и
+называть это «вызываем» значило бы завысить охват в 2.4 раза. Тот же класс, что
+разобран в комментарии к `capabilities_missing`: печатать надо ЗАМЕР, а не вывод из
+рассуждения.
 
 ⚠⚠ ЗАВЕДЕНО 2026-08-23. `REQUIRED_CAPABILITIES` ниже покрывает ТРИ метода, и приёмка
 печатала «возможности проверены: 3» — без знаменателя это читается как «проверено всё»,
@@ -467,6 +473,20 @@ USED_CCXT_METHODS: tuple[str, ...] = (
 `-5000 «Method is invalid»`, а существующий метод объявлен `None`). Жёсткая проверка по
 ней остановила бы прогон на работающем методе. Правило проекта — «проверка возможности
 только вызов»; пока вызова нет, честно назвать разрыв, а не закрыть его объявлением.
+"""
+
+WRAPPED_ONLY_CCXT_METHODS: tuple[str, ...] = (
+    "fetchCurrencies", "fetchBidsAsks", "fetchLastPrices", "fetchMarkPrice",
+    "fetchMarkPrices", "fetchFundingRate", "fetchFundingRates",
+    "fetchFundingRateHistory", "fetchFundingIntervals", "fetchOpenInterest",
+    "fetchOpenInterests", "fetchOpenInterestHistory", "fetchLiquidations",
+    "fetchLongShortRatioHistory",
+)
+"""Методы, у которых обёртка НАПИСАНА, но живой путь её не зовёт (замер 2026-08-27).
+
+Держатся отдельным списком, а не удаляются: обёртки — готовая поверхность под будущие
+признаки, и стереть их значило бы писать заново. Но и в «вызываем» им не место —
+владелец читает это число как охват боя.
 """
 
 REQUIRED_CAPABILITIES: dict[str, str] = {
@@ -1134,7 +1154,11 @@ class Exchange:
         log.info("возможности, которые проект ВЫЗЫВАЕТ, но у карты не спрашивает",
                  вызываем=len(USED_CCXT_METHODS),
                  спрошено=len(REQUIRED_CAPABILITIES),
-                 не_спрошено=len(unchecked), методы=", ".join(unchecked))
+                 не_спрошено=len(unchecked), методы=", ".join(unchecked),
+                 # ⚠ Второе число заведено 2026-08-27: до него «вызываем» включало и
+                 # методы, достижимые ТОЛЬКО через обёртки, которых не зовёт никто, —
+                 # охват был завышен с 10 до 24. Разрыв называется, а не прячется.
+                 обёрнуто_но_не_зовём=len(WRAPPED_ONLY_CCXT_METHODS))
         # ⚠ «проверено N» здесь означает «спрошено у карты N раз», а НЕ «работает N».
         # Формулировка правится вместе с находкой о лживости `has`: прежняя читалась как
         # утверждение об исправности.

@@ -51,7 +51,7 @@ from hunter.swings import ZIGZAG_DEPTH, TrendDirection
 from hunter.swings import detect as detect_swings
 from hunter.trading_range import MIN_BOUNDARY_POINTS, BoundaryZone
 from hunter.trading_range import detect as detect_ranges
-from hunter.volume_profile import TV_ROWS
+from hunter.volume_profile import row_height_of
 
 TF = "1h"
 STEP = TIMEFRAME_MS[TF]
@@ -96,11 +96,13 @@ def level(price: float, side: LevelSide = LevelSide.LONG, *, created: int = 0,
         # поэтому ноль — это «вне зоны непустых строк не найдено», а не
         # «проверено и не нашлось». Пробникам величина безразлична.
         outside_peak_share=0.0,
-        # Высота строки профиля: боевой режим — `TV_ROWS` строк на размах коробки,
-        # поэтому берётся ТОЙ ЖЕ формулой, а не выдуманным числом. Пробнику она
-        # безразлична (правила курса о разрешении профиля не говорят), но подставлять
-        # константу значило бы завести здесь вторую сущность под тем же именем.
-        row_height=Decimal(str((hi - lo) / TV_ROWS)),
+        # Высота строки профиля — БОЕВОЙ формулой, ссылкой на единственное её место
+        # (`volume_profile.row_height_of`, режим Ticks Per Row: 0.07% цены на строку).
+        # ⚠ До 2026-08-27 здесь стояло `(hi - lo) / TV_ROWS` с комментарием «боевой
+        # режим — TV_ROWS строк»: утверждение перестало быть верным 2026-08-25, когда
+        # бой перешёл на постоянную ЦЕНУ строки, и гейт три дня сторожил сетку вчетверо
+        # мельче боевой (55.2 против 14.4 на коробке BTC 78100…79540 при тике 0.1).
+        row_height=row_height_of(Decimal(str(lo)), Decimal(str(hi)), Decimal("0.1")),
         boundary_lo=Decimal(str(lo)), boundary_hi=Decimal(str(hi)),
         # Прокола у синтетической базы нет — расширенный край СОВПАДАЕТ с границей,
         # ровно как `BoundaryZone.extended_edge` при `puncture is None`.

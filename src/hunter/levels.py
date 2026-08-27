@@ -25,7 +25,7 @@ from bisect import bisect_left, bisect_right
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .bars import TF_RANK, TIMEFRAME_MS, right_edge_ms, steps_between, tf_ms
 from .breach import (
@@ -127,7 +127,15 @@ class Level(BaseModel):
     Правило ширины — HVN-ядро профиля: строки вокруг ПОК с объёмом не ниже половины
     пикового ряда, клип по VAL…VAH (докстрока `TVProfile.work_lo_price`). Карточка и
     график рисуют ЭТУ зону входа; VAL…VAH остаётся записанным контекстом старшего ТФ.
-    None — профиль не дошёл до рабочей зоны (уровни старых прогонов)."""
+    None — профиль не дошёл до рабочей зоны (уровни старых прогонов).
+
+    ⚠⚠ ИНВАРИАНТ ЖИЛ ТОЛЬКО В СУБД ДО 2026-08-27. `CHECK (zone_lo <= zone_work_lo AND
+    zone_work_hi <= zone_hi AND zone_work_lo < zone_work_hi)` стоял в схеме `levels`, а
+    объект в ПАМЯТИ не проверялся ничем. Значит график (`render.ZoneSpec`, поле
+    `work_lo`) мог нарисовать владельцу рабочую зону, которую леджер той же строкой
+    отверг бы `IntegrityError`-ом, — картинка и запись разошлись бы молча. Проверка
+    перенесена В ТИП (`_work_zone_inside_value_area`): тип заставляет обработать
+    случай, а СУБД ловит поздно и только на записи."""
 
     created_at_ms: int
     """ЗАКРЫТИЕ бара подтверждения — момент, с которого уровень известен, в биржевом времени.
@@ -390,6 +398,31 @@ class Level(BaseModel):
 
     ⚠ Признака «граница с другого ТФ» здесь БОЛЬШЕ НЕТ: механизм внесён и откачен
     2026-08-08, причина — в докстроке `range.BorderSource`."""
+
+    @model_validator(mode="after")
+    def _work_zone_inside_value_area(self) -> Level:
+        """Рабочая зона обязана лежать внутри VAL…VAH и быть непустой.
+
+        ⚠ ЗАВЕДЕНО 2026-08-27. До этого дня инвариант держал ТОЛЬКО `CHECK` схемы
+        `levels`, то есть срабатывал на ЗАПИСИ и не мешал графику нарисовать зону,
+        которую леджер отверг бы. Тот же довод, по которому 2026-08-26 в тип был
+        перенесён `Setup.no_target_reason`: тип заставляет обработать случай, а не
+        оставляет уловку потребителю.
+        """
+        lo, hi = self.zone_work_lo, self.zone_work_hi
+        if lo is None and hi is None:
+            return self
+        if lo is None or hi is None:
+            raise ValueError(
+                "рабочая зона задана наполовину: "
+                f"lo={lo}, hi={hi} — половина зоны не зона")
+        if not lo < hi:
+            raise ValueError(f"рабочая зона вывернута либо пуста: [{lo}, {hi}]")
+        if lo < self.zone_lo or hi > self.zone_hi:
+            raise ValueError(
+                f"рабочая зона [{lo}, {hi}] выходит за область стоимости "
+                f"[{self.zone_lo}, {self.zone_hi}] — ядро HVN клипится по VAL…VAH")
+        return self
 
     @property
     def breach_direction(self) -> Direction:

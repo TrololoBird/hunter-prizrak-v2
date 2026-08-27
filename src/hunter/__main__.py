@@ -465,7 +465,9 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="живой прогон и сводка приёмки")
     run.add_argument("--seconds", type=int, default=90)
     run.add_argument("--seed-limit", type=int, default=0,
-                     help="баров на ряд; 0 = вывести из --horizon-days отдельно по каждому ТФ")
+                     help="баров на ряд — и запроса, И ряда решения; НЕ МЕНЬШЕ пола "
+                          "прогрева (1400), меньшее число молча поднимается до него; "
+                          "0 = вывести из --horizon-days отдельно по каждому ТФ")
     run.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     run.add_argument("--run-id", default="last")
     # ⚠ Раньше здесь было `--trade-days` = «сколько ПОСЛЕДНИХ суток скачать», умолчание 3.
@@ -485,7 +487,9 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--cycles", type=int, default=0,
                      help="остановиться после N циклов; 0 = работать до сигнала")
     srv.add_argument("--seed-limit", type=int, default=0,
-                     help="баров на ряд; 0 = вывести из --horizon-days отдельно по каждому ТФ")
+                     help="баров на ряд — и запроса, И ряда решения; НЕ МЕНЬШЕ пола "
+                          "прогрева (1400), меньшее число молча поднимается до него; "
+                          "0 = вывести из --horizon-days отдельно по каждому ТФ")
     srv.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     srv.add_argument("--run-id", default="serve",
                      help="куда класть кадры и карточки; каждый цикл ПЕРЕЗАПИСЫВАЕТ их")
