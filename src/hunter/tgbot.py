@@ -2757,7 +2757,21 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
     finally:
         conn.close()
-    levels = tuple(LevelRow(symbol=r[0], timeframe=r[1], side=r[2], price=float(r[3]),
+    # ⚠⚠ СТОРОНА ПЕРЕВОРАЧИВАЕТСЯ ПО СТР. 43 — правка 2026-08-27. Здесь стояло
+    # `side=r[2]`, сырая колонка леджера, тогда как соседний читатель того же леджера
+    # (`read_map` → `ZoneSpec`) с 2026-08-26 зовёт `flipped_side`. Один файл, одна
+    # таблица, два ответа: у пробитых уровней стороны выходили ПРОТИВОПОЛОЖНЫМИ.
+    #
+    # Цена дефекта: в карте 254 пробитых уровня из 630 (40%). Отбор целей
+    # (`_target_by_course`) работает именно с `LevelRow`, поэтому для 40% карты он брал
+    # чужую сторону — сверка с движком на 13 сделках одних кадров давала 8 расхождений,
+    # у BCH 1ч бот предлагал целью 425.5 ВЫШЕ входа шортовой сделки.
+    #
+    # Правило одно на проект: `levels.flipped_side` (стр. 43 «Уровень лонг/шорт менятся
+    # для нас на противоположный»). Третьей записи здесь не заводится — только вызов.
+    levels = tuple(LevelRow(symbol=r[0], timeframe=r[1],
+                            side=flipped_side(r[2], r[13] or "active"),
+                            price=float(r[3]),
                             zone_lo=float(r[4]), zone_hi=float(r[5]),
                             from_ms=int(r[6]), to_ms=int(r[7]),
                             entry_rule=r[8] or "",
