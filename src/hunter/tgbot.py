@@ -2501,6 +2501,7 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_сигналы=notifier.sent_signals,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
+                 повторов_погашено=notifier.suppressed_repeats,
                  уведомлений_отмены=notifier.sent_cancels,
                  уведомлений_слом=notifier.sent_breaks,
                  уведомлений_безубыток=notifier.sent_be,
@@ -3184,6 +3185,22 @@ class Notifier:
         self.sent_zone_events = 0
         self.ticks_failed = 0
         self._alerted: set[tuple[str, str, str, int, int]] = set()
+        self.suppressed_repeats = 0
+        """Сколько дословных повторов «Цена у зон» погашено (2026-08-27).
+
+        Молчание НАЗЫВАЕТСЯ числом: иначе «бот молчал» и «бот погасил повтор»
+        выглядят в сводке одинаково."""
+
+        self._last_zone_text = ""
+        """Текст ПРЕДЫДУЩЕГО сообщения «Цена у зон».
+
+        ⚠ Дословный повтор не несёт читателю ничего: состояние не изменилось. За
+        окно 05:50–09:50 UTC 2026-08-27 из 34 сообщений канала 7 (21%) были
+        дословными повторами — ZEC трижды, THETA трижды, SAND и CHZ по два раза.
+        `_alerted` их не гасил: он держит ключи ради ОТМЕН, а не ради повторов.
+
+        Гасится ТЕКСТ, а не ключ уровня: переход «цена подходит 0.5%» → «цена
+        ВОШЛА в зону» — другое сообщение, и его слать надо."""
         self.sent_cancels = 0
         # ⚠ СОБЫТИЯ ФАЗЫ «ЖИЗНЬ СИГНАЛА» (план 25.08, Фаза 1). Оба — ПЕРЕХОДЫ:
         # слом подтверждён (0→1) и цена взвела безубыток (первое касание). Память в
@@ -3490,8 +3507,13 @@ class Notifier:
             for h in hits:
                 self._alerted.add((h[0].symbol, h[0].timeframe, h[0].side,
                                    h[0].from_ms, h[0].to_ms))
-            self.sent_zone_events += len(zone_lines)
-            out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
+            text = "\n".join(["📍 Цена у зон:", *self._cap(zone_lines)])
+            if text == self._last_zone_text:
+                self.suppressed_repeats += 1
+            else:
+                self._last_zone_text = text
+                self.sent_zone_events += len(zone_lines)
+                out.append(text)
         return out
 
 
