@@ -1766,6 +1766,26 @@ def _fmt_age(minutes: int) -> str:
 
 
 SENT_DIR = paths.DATA_DIR / "sent"
+WATERMARK_PATH = paths.DATA_DIR / "watcher-watermark.json"
+"""Докуда наблюдатель уже доложил в канал. ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК.
+
+⚠⚠⚠ ЗАВЕДЕНО 2026-08-27 ПО НАБЛЮДЕНИЮ ВЛАДЕЛЬЦА: «пришло уведомление что входы
+состоялись, но при этом не было никаких о них уведомлениях, а просто пришли исходы и
+входы состоялись».
+
+Механизм был такой. Водяной знак жил только в памяти процесса, и на первом такте после
+запуска взводился по текущему максимуму — «иначе перезапуск вылил бы в канал всю
+историю». Довод верен, а следствие не было названо: КАЖДЫЙ сигнал, записанный расчётом
+пока бот лежал, не объявлялся НИКОГДА. Его вход и исход объявлялись — они считаются по
+времени, а не по номеру сигнала.
+
+Замер по журналу отправленного (`data/sent/*.jsonl`, 22-27 августа): входов объявлено
+121, из них БЕЗ предшествующего «⚡ Новые сигналы» — 79, то есть 65%. По ТФ: 4ч 30,
+1ч 30, 1Д 15, 15м 3, 5м 1 — семьдесят пять из семидесяти девяти на СТАРШИХ ТФ, где
+владелец и заметил пропажу.
+
+Прибора, который поймал бы это, в проекте не было: молчание канала не мерилось ничем.
+"""
 """Куда складывается ТЕКСТ каждого отправленного сообщения, по суткам.
 
 ⚠ ЗАВЕДЕНО 2026-08-19 по вопросу владельца: "почему у тебя нигде не сохраняется
@@ -2502,6 +2522,9 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
                  повторов_погашено=notifier.suppressed_repeats,
+                 # МОЛЧАНИЕ НАЗЫВАЕТСЯ ЧИСЛОМ: сигналы, которых читатель не
+                 # увидел, потому что наблюдатель их догонял после простоя.
+                 сигналов_пропущено_после_простоя=notifier.skipped_backlog,
                  уведомлений_отмены=notifier.sent_cancels,
                  уведомлений_слом=notifier.sent_breaks,
                  уведомлений_безубыток=notifier.sent_be,
@@ -2673,6 +2696,40 @@ class LedgerNews:
     levels: tuple[LevelRow, ...]
     max_signal_id: int
     max_closed_ms: int
+
+
+def _read_watermark() -> tuple[int | None, int | None]:
+    """Докуда доложено, с диска. `(None, None)` — знака нет: ПЕРВЫЙ запуск.
+
+    Отсутствие файла и битый файл отвечают ОДИНАКОВО и НАЗЫВАЮТ себя в журнале: тихо
+    подставить ноль значило бы вылить в канал всю историю, тихо подставить максимум —
+    повторить дефект, ради которого файл и заведён.
+    """
+    try:
+        raw = json.loads(WATERMARK_PATH.read_text(encoding="utf-8"))
+        sid = raw.get("last_signal_id")
+        cms = raw.get("last_closed_ms")
+        return (int(sid) if sid is not None else None,
+                int(cms) if cms is not None else None)
+    except FileNotFoundError:
+        return (None, None)
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        log.degraded("наблюдатель: знак не прочитан — считаем первым запуском",
+                     файл=str(WATERMARK_PATH), причина=f"{type(e).__name__} {e}")
+        return (None, None)
+
+
+def _write_watermark(signal_id: int | None, closed_ms: int | None) -> None:
+    """Записать знак. Отказ записи НАЗЫВАЕТСЯ, а не глотается: без него следующий
+    перезапуск снова потеряет объявления, и потеря будет молчаливой."""
+    try:
+        WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WATERMARK_PATH.write_text(json.dumps(
+            {"last_signal_id": signal_id, "last_closed_ms": closed_ms}),
+            encoding="utf-8")
+    except OSError as e:
+        log.degraded("наблюдатель: знак НЕ записан — перезапуск потеряет объявления",
+                     файл=str(WATERMARK_PATH), причина=f"{type(e).__name__} {e}")
 
 
 def _read_ledger_news(after_id: int | None, after_ms: int | None,
@@ -3148,9 +3205,19 @@ class Notifier:
     его рождение уже видно в публикации закреплённых, событие здесь — движение цены.
     """
 
+    CATCHUP_LIMIT = 20
+    """Сколько пропущенных сигналов доложить после простоя. Остаток НАЗЫВАЕТСЯ числом.
+
+    Предел нужен ровно по той причине, по какой прежде взводился водяной знак: после
+    долгого простоя весь журнал в канал не выливается. Разница в том, что теперь остаток
+    не исчезает молча, а печатается строкой «ещё N пропущено за время простоя»."""
+
     def __init__(self) -> None:
-        self._last_signal_id: int | None = None
-        self._last_closed_ms: int | None = None
+        mark = _read_watermark()
+        self._last_signal_id: int | None = mark[0]
+        self._last_closed_ms: int | None = mark[1]
+        self.skipped_backlog = 0
+        """Сигналов пропущено как хвост длинного простоя. Печатается сводкой службы."""
         self._zone_state: dict[tuple[str, str, str, int, int], str] = {}
         self._zone_said: dict[tuple[str, str, str, int, int], tuple[int, int]] = {}
         """Что и КОГДА уже сказано про уровень: (ранг, момент). Гасит дребезг у границы.
@@ -3219,9 +3286,20 @@ class Notifier:
         prev_max_id = self._last_signal_id or 0
         self._last_signal_id = news.max_signal_id
         self._last_closed_ms = news.max_closed_ms
+        # ⚠ ЗНАК СОХРАНЯЕТСЯ НА ДИСК КАЖДЫЙ ТАКТ. Пока он жил в памяти, перезапуск бота
+        # стирал 65% объявлений о сигналах (разбор — в докстроке `WATERMARK_PATH`).
+        _write_watermark(self._last_signal_id, self._last_closed_ms)
 
         out: list[str] = []
         if news.signals:
+            # ⚠⚠ ХВОСТ ДОЛГОГО ПРОСТОЯ ОБРЕЗАЕТСЯ, НО НАЗЫВАЕТСЯ ЧИСЛОМ (2026-08-27).
+            # Знак теперь переживает перезапуск, и после долгого простоя накопленных
+            # сигналов может быть много. Весь журнал в канал не выливается — это и был
+            # исходный довод, — но остаток больше не исчезает молча: он печатается
+            # отдельной строкой и считается в `skipped_backlog`.
+            backlog = max(0, len(news.signals) - self.CATCHUP_LIMIT)
+            fresh_signals = news.signals[-self.CATCHUP_LIMIT:] if backlog else news.signals
+            self.skipped_backlog += backlog
             # ФОРМАТ v2 (решение владельца 2026-08-25: рабочая зона вокруг ПОК, R у
             # цели, одна строка на сигнал).
             #
@@ -3250,7 +3328,7 @@ class Notifier:
                 return None
 
             lines = []
-            for s, tf, d, e, st, tg, lf, lt in news.signals:
+            for s, tf, d, e, st, tg, lf, lt in fresh_signals:
                 head = (f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
                         f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}")
                 w = work_of(s, tf, lf, lt)
@@ -3263,8 +3341,11 @@ class Notifier:
                     head += (f", цель {_fmt_price(tg)}"
                              + (f" (R {rr:.1f})" if rr is not None else ""))
                 lines.append(head)
-            self.sent_signals += len(news.signals)
-            out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines)]))
+            self.sent_signals += len(fresh_signals)
+            tail = ([f"⚠ ещё {backlog} пропущено за время простоя наблюдателя — "
+                     f"они есть в леджере, но в канал не выливаются"]
+                    if backlog else [])
+            out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines), *tail]))
         if news.outcomes:
             lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
                      f"{TF_LABEL.get(tf, tf)}: {OUTCOME_WORD.get(k, k)}"
