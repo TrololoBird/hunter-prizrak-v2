@@ -2480,6 +2480,7 @@ def decide_once(report: RunReport, uni: Universe,
             lv = m.level
             if lv.box_to_base > 0:
                 report.levels_box_to_base.append(lv.box_to_base)
+            report.levels_volume_outside_base.append(lv.volume_outside_base)
             if lv.row_height and (lv.zone_hi - lv.zone_lo) <= 2 * lv.row_height:
                 report.levels_zone_one_row += 1
             if (lv.zone_work_lo is not None and lv.zone_work_hi is not None
@@ -3139,6 +3140,7 @@ CYCLE_FIELDS = (
     "profile_windows_no_bars_by_tf", "profile_windows_partial_by_tf",
     "unbuilt_by_kind", "unbuilt_coverage_by_tf", "structures_by_tf",
     "levels_zone_one_row", "levels_work_zone_not_narrowed", "levels_box_to_base",
+    "levels_volume_outside_base",
     "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
@@ -4091,6 +4093,17 @@ def print_report(r: RunReport) -> int:
               f"{r.levels_zone_one_row} из {built}")
         print(f"   рабочая зона НЕ сузила VAL…VAH (ядро = вся зона): "
               f"{r.levels_work_zone_not_narrowed} из {built}")
+    if r.levels_volume_outside_base:
+        # МЕРА ВЗАМЕН ИСЧЕЗНУВШИХ ОТКАЗОВ. С 2026-08-28 сетка профиля натянута на базу,
+        # поэтому ПОК лежит внутри ПО ПОСТРОЕНИЮ и классы `ZONE_OUT`/`POC_OUT` больше не
+        # срабатывают. Негодность структуры от этого не исчезла — она стала выброшенным
+        # объёмом, и печатается здесь. Печатается ХВОСТОМ, а не одним числом: медиана и
+        # максимум — разные вести.
+        v = sorted(r.levels_volume_outside_base)
+        big = sum(1 for x in v if x > 0.25)
+        print(f"   объём ВНЕ базы (точки не поймали свои свечи): медиана "
+              f"{statistics.median(v) * 100:.1f}%, p90 {v[int(len(v) * 0.9)] * 100:.1f}%, "
+              f"максимум {max(v) * 100:.1f}%; больше четверти теряют {big} из {len(v)}")
     if r.levels_box_to_base:
         xs = sorted(r.levels_box_to_base)
         # ⚠ Референт назван РЯДОМ С ЧИСЛОМ, иначе оно ни о чём не говорит: 1.31 снято
