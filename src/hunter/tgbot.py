@@ -2695,6 +2695,14 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         sig_rows: list[tuple[str, str, str, float, float, float | None,
                              int | None, int | None]] = []
         out_rows: list[tuple[str, str, str, str, float | None]] = []
+        # ⚠ Колонки ССЫЛКИ НА УРОВЕНЬ спрашиваются у базы, а не предполагаются:
+        # бот открывает леджер `mode=ro` и мигрировать не может, поэтому между
+        # выкладкой кода и первым боевым прогоном схема остаётся прежней. Без
+        # этого запрос отвечает `no such column`, и наблюдатель не читает леджер
+        # ВОВСЕ — поймано живым запуском 2026-08-27. Приём тот же, что у карты.
+        sig_have = store.table_columns(conn, "signals")
+        lfm_col = "level_from_ms" if "level_from_ms" in sig_have else "NULL"
+        ltm_col = "level_to_ms" if "level_to_ms" in sig_have else "NULL"
         if after_id is not None:
             sig_rows = [
                 (r[0], r[1], r[2], float(r[3]), float(r[4]),
@@ -2703,7 +2711,7 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                  None if r[7] is None else int(r[7]))
                 for r in conn.execute(
                     "SELECT symbol, timeframe, direction, entry, stop, target,"
-                    " level_from_ms, level_to_ms"
+                    f" {lfm_col}, {ltm_col}"
                     " FROM signals WHERE id > ? ORDER BY id", (after_id,))]
         if after_ms is not None:
             out_rows = [
