@@ -2908,6 +2908,11 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     # порядке `append` в `build_breakeven_rules`. Разбор — в докстроке
                     # `breakeven_watch`.
                     breakeven_at=geometry.breakeven_watch(em.setup.breakeven_rules),
+                    # ССЫЛКА НА СВОЙ УРОВЕНЬ (схема 20): вместе с символом и ТФ это
+                    # полный ключ таблицы `levels`. Без неё сообщение канала подбирало
+                    # зону сигналу ближайшим ПОКом и показывало вход вне его же зоны.
+                    level_from_ms=em.level.structure_from_ms,
+                    level_to_ms=em.level.structure_to_ms,
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)

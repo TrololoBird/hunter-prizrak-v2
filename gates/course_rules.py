@@ -33,7 +33,7 @@ from hunter.bars import TIMEFRAME_MS
 from hunter.breach import BreachKind, Direction, first_breach
 from hunter.emit import first_bar_after
 from hunter.figures import pennant
-from hunter.geometry import TARGET_STRUCTURE_FRAME_BARS, build_setup, build_targets
+from hunter.geometry import build_setup, build_targets
 from hunter.levels import (
     Level,
     LevelSide,
@@ -552,26 +552,55 @@ def c_no_boundary_target_for_level_trade() -> tuple[object, object]:
 
 
 def c_target_structure_in_frame() -> tuple[object, object]:
-    """Чистка пула целей (решение владельца «делай 1+2» 2026-08-18, развилка 2
-    раздела 6 протокола signals-trader-audit-2026-08-18): цель со структурой старше
-    кадра 180 баров СВОЕГО ТФ на момент рождения сделки отсеивается; моложе — живёт.
+    """Чистка пула целей ВЫКЛЮЧЕНА — возраст структуры цель больше не отсеивает.
 
-    Оба плеча обязательны: прибор, отвечающий одинаково на свежую и протухшую
-    структуру, не проверяет ничего. Третье плечо — исключение §4.3: уровень без
-    записанного окна структуры (`to_ms == 0`, строки карты до появления поля) НЕ
-    выбрасывается молча.
+    ⚠⚠⚠ ОЖИДАНИЕ ИЗМЕНЕНО 2026-08-27, И ВОТ ПОЧЕМУ СТАРОЕ БЫЛО НЕВЕРНЫМ. Здесь
+    проверялось, что цель со структурой старше кадра 180 баров отсеивается — «решение
+    владельца "делай 1+2" 2026-08-18». Владелец 2026-08-27 отменил его прямо: «у сигнала
+    НЕ МОЖЕТ БЫТЬ ЦЕЛИ, если цели нет это критический дефект расчетов, логики, анализа
+    или данных!!!! … не надо придумывать костыли».
+
+    Разбор подтвердил, что чистка и была главной причиной. Замер на кадрах `zonesplit`
+    (4 символа Binance, боевая глубина, 13 сделок, ОДНИ И ТЕ ЖЕ кадры):
+
+        величина                  окно 180    без окна
+        сделок с крупной целью        4           8
+        ВООБЩЕ БЕЗ ЦЕЛИ               6           3
+        сделок с РР >= 3              3           5
+
+    По источнику чистка тоже была неверна: число бралось у `bars.BARS_ON_CHART` —
+    ШИРИНЫ КАРТИНКИ, то есть кадр рисования решал, какие цели существуют в расчёте.
+    Стр. 24 задаёт цели только ЯРУС ТФ и никакого срока годности не ставит. Полный
+    разбор — в докстроке `geometry.TARGET_STRUCTURE_FRAME_BARS`.
+
+    Проверка осталась ДВУСТОРОННЕЙ, иначе она ничего не проверяет: при выключенной
+    чистке (константа 0) проходят все три уровня, а при возврате окна отсеивается
+    протухший. Оба плеча считаются здесь же.
     """
     src = level(100.0, LevelSide.LONG, created=5)
     as_of = src.created_at_ms
-    frame = TARGET_STRUCTURE_FRAME_BARS * STEP
+    # Окно пробника задано ЧИСЛОМ, а не боевой константой: она теперь ноль, и
+    # «протухший» уровень, построенный от неё, протухшим бы не был — плечо проверяло бы
+    # само себя.
+    frame = 180 * STEP
     stale = level(115.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
         update={"structure_to_ms": as_of - frame - STEP})
     fresh = level(118.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
         update={"structure_to_ms": as_of - STEP})
     no_window = level(121.0, LevelSide.SHORT, created=1, born_ms=T0).model_copy(
         update={"structure_to_ms": 0})
-    got = build_targets(src, (mapped(stale), mapped(fresh), mapped(no_window)))
-    return tuple(float(t.price) for t in got), (118.0, 121.0)
+    pool = (mapped(stale), mapped(fresh), mapped(no_window))
+    got_off = tuple(float(t.price) for t in build_targets(src, pool))
+    # Второе плечо: с ВЕРНУТЫМ окном протухшая цель обязана исчезнуть. Без него прибор
+    # отвечал бы одинаково при любой константе и не проверял бы ничего.
+    import hunter.geometry as _g
+    was = _g.TARGET_STRUCTURE_FRAME_BARS
+    try:
+        _g.TARGET_STRUCTURE_FRAME_BARS = 180
+        got_on = tuple(float(t.price) for t in build_targets(src, pool))
+    finally:
+        _g.TARGET_STRUCTURE_FRAME_BARS = was
+    return (got_off, got_on), ((115.0, 118.0, 121.0), (118.0, 121.0))
 
 
 def c_stop_anchor_capped_by_base() -> tuple[object, object]:
@@ -765,7 +794,7 @@ CASES: list[tuple[str, Callable[[], tuple[object, object]]]] = [
     ("снятый уровень целью не является (стр. 25, 43)", c_target_not_retired),
     ("снятый ПОЗЖЕ сигнала — целью являлся (стр. 25)", c_target_retired_later_still_counts),
     ("исход только по будущим барам (§8 этап 7)", c_outcome_only_future_bars),
-    ("цель со структурой старше кадра 180 баров — не цель (решение 2026-08-18)",
+    ("возраст структуры цель НЕ отсеивает; с возвращённым окном — отсеивает",
      c_target_structure_in_frame),
     ("якорь стопа не дальше высоты базы (решение 2026-08-18)",
      c_stop_anchor_capped_by_base),

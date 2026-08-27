@@ -431,6 +431,32 @@ def _spaced(s: str) -> str:
     return s.replace(",", " ")
 
 
+def tick_price(x: float, tick: Decimal | None = None, *, away: str = "") -> float:
+    """Цена, ОКРУГЛЁННАЯ К ШАГУ ИНСТРУМЕНТА, — то самое число, что печатается.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-27 ПО РАЗБОРУ СООБЩЕНИЙ КАНАЛА. Округление к тику жило ВНУТРИ
+    `_fmt_price` и наружу не выходило: печаталась округлённая цена, а проценты рядом
+    считались по СЫРОЙ. Владелец с калькулятором получал другое число — на живых
+    сообщениях 4 сигнала из 13 не воспроизводились (CHZ: ПОК 0.013845 печатался как
+    0.01385, стоп 0.0131532 как 0.01315; «до лимитки» выходило 1.5% против 1.42% по
+    напечатанному; UNI: ПОК 4.2925 печатался как 4.2930).
+
+    что из чего следует: выставима ТОЛЬКО округлённая цена → и риск читатель несёт по
+    ней же. Считать проценты по сырому ПОКу значит описывать сделку, которую нельзя
+    поставить. Поэтому величина одна, и она эта.
+    """
+    if tick is None or tick <= 0:
+        return x
+    d = Decimal(str(x)) / tick
+    if away == "down":
+        q = d.to_integral_value(rounding=ROUND_FLOOR)
+    elif away == "up":
+        q = d.to_integral_value(rounding=ROUND_CEILING)
+    else:
+        q = d.to_integral_value(rounding=ROUND_HALF_UP)
+    return float(q * tick)
+
+
 def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     """Цена так, как её читает человек: 63 460, 3.691, 0.00385.
 
@@ -457,14 +483,9 @@ def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     Вход и текущая цена такого требования не несут и округляются к ближайшему.
     """
     if tick is not None and tick > 0:
-        d = Decimal(str(x)) / tick
-        if away == "down":
-            q = d.to_integral_value(rounding=ROUND_FLOOR)
-        elif away == "up":
-            q = d.to_integral_value(rounding=ROUND_CEILING)
-        else:
-            q = d.to_integral_value(rounding=ROUND_HALF_UP)
-        exact = q * tick
+        # Округление считает `tick_price` — ЕДИНСТВЕННОЕ место этой величины: пока оно
+        # жило здесь, печать знала округлённую цену, а проценты рядом — сырую.
+        exact = Decimal(str(tick_price(x, tick, away=away)))
         if exact >= 10_000:
             return _spaced(f"{float(exact):,.0f}")
         # Знаков ровно столько, сколько их у тика: лишние — обещание точности, которой
@@ -3600,9 +3621,22 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     #
     # Порог по-прежнему НЕ ТРОГАЕТСЯ и константы не заводится: печатаются оба расстояния
     # и названы порознь, решает читатель.
-    near_edge = lv.zone_hi if price > lv.zone_hi else lv.zone_lo
-    edge_pct = abs(price - near_edge) / price * 100 if price > 0 else 0.0
-    gap_pct = abs(price - lv.price) / price * 100 if price > 0 else 0.0
+    # ⚠⚠ ВСЕ ПРОЦЕНТЫ СЧИТАЮТСЯ ПО ЦЕНАМ, ОКРУГЛЁННЫМ К ТИКУ, — то есть по ТЕМ ЖЕ
+    # числам, что печатаются строкой ниже. Правка 2026-08-27 по разбору сообщений
+    # канала: округление жило только в печати, а проценты брали сырые значения, и
+    # владелец с калькулятором получал другое число. На живых сообщениях не
+    # воспроизводились 4 сигнала из 13 — разбор в
+    # docs/audit/plan-2026-08-27-telegram-messages.md, дефект Д-1.
+    #
+    # Округлённая цена — не косметика: выставить на бирже можно ТОЛЬКО её, значит и
+    # риск читатель несёт по ней. Сырой ПОК описывает сделку, которую не поставить.
+    p_now = tick_price(price, tick)
+    p_lim = tick_price(lv.price, tick)
+    z_lo = tick_price(lv.zone_lo, tick)
+    z_hi = tick_price(lv.zone_hi, tick)
+    near_edge = z_hi if p_now > z_hi else z_lo
+    edge_pct = abs(p_now - near_edge) / p_now * 100 if p_now > 0 else 0.0
+    gap_pct = abs(p_now - p_lim) / p_now * 100 if p_now > 0 else 0.0
     out = [f"• {base} · {act} · цена подходит {_fmt_price(price, tick)}",
            f"    до зоны {edge_pct:.1f}% (по ней и вердикт), до лимитки {gap_pct:.1f}%",
            f"    лимитка {_fmt_price(lv.price, tick)}, зона "
@@ -3625,7 +3659,11 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         # единицу измерения сделки; проценты дают посчитать объём позиции, не зная
         # депозита. Печатается рядом со стопом, чтобы не разводить одну величину по
         # двум строкам.
-        risk_pct = abs(lv.price - stop) / lv.price * 100 if lv.price > 0 else 0.0
+        # Стоп печатается НАРУЖУ от структуры (`away`), поэтому и в счёт риска идёт
+        # округлённый той же стороной: иначе процент описывал бы не тот стоп, что
+        # выставит читатель.
+        p_stop = tick_price(stop, tick, away="down" if buy else "up")
+        risk_pct = abs(p_lim - p_stop) / p_lim * 100 if p_lim > 0 else 0.0
         out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}"
                    + (f" · риск {risk_pct:.1f}%" if risk_pct > 0 else ""))
         # ЦЕЛЬ И РР — стр. 24 и стр. 9. Без них сообщение не даёт посчитать сделку:
@@ -3637,8 +3675,11 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         goal = _target_by_course(lv, pool or [])
         if goal is not None:
             price_t, word = goal
-            risk = abs(lv.price - stop)
-            reward = abs(price_t - lv.price)
+            # РР — тем же округлением, что вход, стоп и цель на печати (Д-1): иначе
+            # читатель, поделив напечатанное, получит не напечатанное отношение.
+            p_goal = tick_price(price_t, tick)
+            risk = abs(p_lim - p_stop)
+            reward = abs(p_goal - p_lim)
             rr = f" · РР 1к{reward / risk:.1f}" if risk > 0 else ""
             out.append(f"    {word} {_fmt_price(price_t, tick)}{rr}")
         # ⚠⚠ СТРОКА Б/У ПО КРАЮ ЗОНЫ УДАЛЕНА 2026-08-24 — ВМЕСТЕ С ПРАВИЛОМ. Здесь бот

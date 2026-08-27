@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS signals (
     -- поднимает пол `outcomes.r_partial`. NULL — второй крупной цели у сделки не было
     -- либо строка записана до схемы 17; ноль подставлять нельзя, это цена.
     target2     REAL,
+    -- ⚠⚠ ССЫЛКА СИГНАЛА НА СВОЙ УРОВЕНЬ — схема 20, 2026-08-27. Вместе с `symbol` и
+    -- `timeframe` эти две колонки дают ПОЛНЫЙ ключ таблицы `levels`
+    -- (symbol, timeframe, from_ms, to_ms). До них связи не было вовсе, и сообщение
+    -- канала подбирало зону сигналу ПО БЛИЗОСТИ ПОКа: в эфир ушло «вход 2 488.1, зона
+    -- 2 489.3-2 496.3», где вход лежит ВНЕ своей зоны. NULL — сигнал записан прежней
+    -- схемой, связь неизвестна; подставлять ближайший уровень значило бы записать
+    -- выдуманную принадлежность.
+    level_from_ms INTEGER,
+    level_to_ms   INTEGER,
     -- Цена, по достижении которой стоп переносится в ТВХ (стр. 19, 15, 44). NULL —
     -- правила безубытка у сделки нет. ⚠ Это НЕ цель: до 2026-08-19 дорешивание
     -- подавало сюда `target`, и исход «в безубытке» становился недостижим — взведение
@@ -305,7 +314,7 @@ CODE_EPOCH = "2026-08-25-ticks0.07"
 `/stats` обязана разделять «по этой эпохе» и «за всё время» — прежние строки леджера
 несут пустую метку («эпоха неизвестна») и к новой статистике не прибавляются."""
 
-SCHEMA_VERSION = "19"
+SCHEMA_VERSION = "20"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
 
 ⚠ СТУПЕНИ 17 И 18 ПЕРЕНУМЕРОВАНЫ ПРИ СЛИЯНИИ 2026-08-26. Две ветки независимо друг от друга
@@ -315,6 +324,12 @@ SCHEMA_VERSION = "19"
 поднятая одной веткой, у другой прошла бы мимо своей ступени молча. Ступени разведены по
 ДАТАМ: рабочая зона осталась семнадцатой, частичный выход стал восемнадцатой, границы
 стр. 18 — девятнадцатой.
+
+19 → 20 (2026-08-27): у сигнала появилась ССЫЛКА НА УРОВЕНЬ (`level_from_ms`,
+`level_to_ms`) — вместе с `symbol` и `timeframe` это полный ключ таблицы `levels`. До неё
+связи не существовало, и сообщение канала подбирало зону сигналу ближайшим ПОКом, отчего
+вход мог оказаться вне показанной рядом зоны. Прежние строки получают NULL — «связь
+неизвестна», а не ближайший уровень.
 
 18 → 19 (2026-08-26): `boundary_lo/hi` СМЕНИЛИ СМЫСЛ — с коробки ХАЙ…ЛОЙ всех баров на
 линию по первым двум точкам (стр. 18); рядом заведён расширенный край `stop_edge_lo/hi`
@@ -818,6 +833,11 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # девятнадцатой, колонки не появились бы НИ РАЗУ.
     if lvl_cols and "stop_edge_lo" not in lvl_cols:
         return "18"
+    # 19 → 20: ссылка сигнала на уровень. Ступень стоит ЗДЕСЬ по той же причине, что и
+    # все выше: без неё база версии 19 назвала бы себя двадцатой, колонки не появились
+    # бы ни разу, а `schema_meta` всё равно проштамповалась бы новым числом.
+    if "level_from_ms" not in cols:
+        return "19"
 
     return SCHEMA_VERSION
 
@@ -1294,6 +1314,14 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
             log.info("миграция 18→19: расширенный край добавлен, карта была пуста",
                      удалено=0)
 
+    if _schema_version(conn) == "19":
+        # 19 → 20: две дешёвые колонки НА МЕСТЕ, обе NULLABLE. NULL у прежних сигналов
+        # означает «уровень неизвестен»: досчитать его задним числом нельзя, карта с
+        # тех пор пересобиралась.
+        conn.execute("ALTER TABLE signals ADD COLUMN level_from_ms INTEGER")
+        conn.execute("ALTER TABLE signals ADD COLUMN level_to_ms INTEGER")
+        conn.commit()
+        log.info("миграция 19→20: у сигнала появилась ссылка на свой уровень")
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1347,6 +1375,8 @@ def record_signal(
     target2: Decimal | None = None,
     breakeven_at: Decimal | None = None,
     epoch: str = CODE_EPOCH,
+    level_from_ms: int | None = None,
+    level_to_ms: int | None = None,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -1369,14 +1399,15 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref, epoch)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref,"
+            " epoch, level_from_ms, level_to_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop),
              None if target is None else float(target),
              None if target2 is None else float(target2),
              None if breakeven_at is None else float(breakeven_at), frames_ref,
-             epoch),
+             epoch, level_from_ms, level_to_ms),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
