@@ -2460,6 +2460,15 @@ def decide_once(report: RunReport, uni: Universe,
     # попадали ни одним числом. Значит меру Ф7 — «доля структур, не давших уровня по
     # причине покрытия, за неделю боевых прогонов» — нельзя было получить и в бою.
     for dec in out.values():
+        # Две меры, найденные ГЛАЗАМИ по карточке 2026-08-27; разбор — в докстроках
+        # полей. Считаются здесь же, одним обходом, чтобы не заводить второй проход.
+        for m in dec.mapped:
+            lv = m.level
+            if lv.row_height and (lv.zone_hi - lv.zone_lo) <= 2 * lv.row_height:
+                report.levels_zone_one_row += 1
+            if (lv.zone_work_lo is not None and lv.zone_work_hi is not None
+                    and lv.zone_work_lo <= lv.zone_lo and lv.zone_work_hi >= lv.zone_hi):
+                report.levels_work_zone_not_narrowed += 1
         for tf, n in dec.levels_by_tf().items():
             report.structures_by_tf[tf] = report.structures_by_tf.get(tf, 0) + n
         for ub in dec.unbuilt:
@@ -3068,6 +3077,7 @@ CYCLE_FIELDS = (
     "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
     "profile_windows_no_bars_by_tf", "profile_windows_partial_by_tf",
     "unbuilt_by_kind", "unbuilt_coverage_by_tf", "structures_by_tf",
+    "levels_zone_one_row", "levels_work_zone_not_narrowed",
     "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
@@ -3975,6 +3985,15 @@ def print_report(r: RunReport) -> int:
                 mark = "  ⚠ ФИЛЬТР, не отказ" if k in (
                     levels.UnbuiltKind.FAR, levels.UnbuiltKind.DUPLICATE) else ""
                 print(f"     {k.value:38} {n:5d}{mark}")
+    # ⚠ ДВЕ МЕРЫ, НАЙДЕННЫЕ ГЛАЗАМИ ПО КАРТОЧКЕ 2026-08-27. Печатаются СО
+    # ЗНАМЕНАТЕЛЕМ и БЕЗУСЛОВНО, пока уровни есть: «ноль» здесь — результат, а не
+    # молчание, и отличить его от «не считалось» иначе нельзя.
+    built = sum(r.structures_by_tf.values()) - sum(r.unbuilt_by_kind.values())
+    if built > 0:
+        print(f"   зона в одну-две строки профиля (разрешения нет): "
+              f"{r.levels_zone_one_row} из {built}")
+        print(f"   рабочая зона НЕ сузила VAL…VAH (ядро = вся зона): "
+              f"{r.levels_work_zone_not_narrowed} из {built}")
     if not (r.profile_windows_no_bars_by_tf or r.profile_windows_partial_by_tf):
         print("   отказов покрытия окон нет ни одного класса"
               + ("" if r.profile_windows else " — но и окон не было, число пусто"))
