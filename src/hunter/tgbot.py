@@ -2651,8 +2651,13 @@ class LevelRow:
 class LedgerNews:
     """Что появилось в леджере со прошлого такта, плюс новые водяные знаки."""
 
-    signals: tuple[tuple[str, str, str, float, float, float | None], ...]
-    """(symbol, timeframe, direction, entry, stop, target)"""
+    signals: tuple[tuple[str, str, str, float, float, float | None,
+                        int | None, int | None], ...]
+    """(symbol, timeframe, direction, entry, stop, target, level_from_ms, level_to_ms)
+
+    ⚠ Последние два — ССЫЛКА НА СВОЙ УРОВЕНЬ (схема 20, 2026-08-27). Вместе с символом и
+    ТФ это полный ключ таблицы `levels`. `None` — сигнал записан прежней схемой, связь
+    неизвестна; тогда зона рядом с ним НЕ печатается вовсе, а не подбирается на глаз."""
 
     outcomes: tuple[tuple[str, str, str, str, float | None], ...]
     """(symbol, timeframe, direction, kind, r)"""
@@ -2686,14 +2691,18 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
             "SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()[0])
         max_closed = int(conn.execute(
             "SELECT COALESCE(MAX(closed_at), 0) FROM outcomes").fetchone()[0])
-        sig_rows: list[tuple[str, str, str, float, float, float | None]] = []
+        sig_rows: list[tuple[str, str, str, float, float, float | None,
+                             int | None, int | None]] = []
         out_rows: list[tuple[str, str, str, str, float | None]] = []
         if after_id is not None:
             sig_rows = [
                 (r[0], r[1], r[2], float(r[3]), float(r[4]),
-                 None if r[5] is None else float(r[5]))
+                 None if r[5] is None else float(r[5]),
+                 None if r[6] is None else int(r[6]),
+                 None if r[7] is None else int(r[7]))
                 for r in conn.execute(
-                    "SELECT symbol, timeframe, direction, entry, stop, target"
+                    "SELECT symbol, timeframe, direction, entry, stop, target,"
+                    " level_from_ms, level_to_ms"
                     " FROM signals WHERE id > ? ORDER BY id", (after_id,))]
         if after_ms is not None:
             out_rows = [
@@ -3207,26 +3216,37 @@ class Notifier:
         out: list[str] = []
         if news.signals:
             # ФОРМАТ v2 (решение владельца 2026-08-25: рабочая зона вокруг ПОК, R у
-            # цели, одна строка на сигнал). Рабочие границы берутся из карты этого же
-            # такта по ближайшему ПОК; нет карты — строка без зоны, как раньше.
-            by_key: dict[tuple[str, str], list[LevelRow]] = {}
+            # цели, одна строка на сигнал).
+            #
+            # ⚠⚠ ЗОНА БЕРЁТСЯ ПО ССЫЛКЕ СИГНАЛА НА СВОЙ УРОВЕНЬ (схема 20, 2026-08-27),
+            # а не подбором ближайшего ПОКа. Здесь стояло
+            # `min(cands, key=lambda lv: abs(lv.price - entry))` — и после пересборки
+            # карты сигналу приписывалась зона ЧУЖОГО уровня. В канал ушло
+            # «ETH шорт 5м: вход 2 488.1, зона 2 489.3–2 496.3»: вход ВНЕ показанной
+            # зоны, что невозможно, если бы они принадлежали одному уровню (сигнал
+            # #1129 имел вход 2488.07, а ближайший ETH 5м шорт — ПОК 2493.685).
+            #
+            # Ссылки нет (строки прежней схемы) — зона НЕ ПЕЧАТАЕТСЯ ВОВСЕ. Подобрать
+            # «похожий» уровень значило бы показать выдуманную принадлежность, а §4.3
+            # требует называть отсутствие, а не подменять его значением.
+            by_link: dict[tuple[str, str, int, int], LevelRow] = {}
             for lv in news.levels:
-                by_key.setdefault((lv.symbol, lv.timeframe), []).append(lv)
+                by_link[(lv.symbol, lv.timeframe, lv.from_ms, lv.to_ms)] = lv
 
-            def work_of(sym: str, tf: str, entry: float) -> tuple[float, float] | None:
-                cands = by_key.get((sym, tf), ())
-                best = min(cands,
-                           key=lambda lv: abs(lv.price - entry),
-                           default=None)
+            def work_of(sym: str, tf: str,
+                        lf: int | None, lt: int | None) -> tuple[float, float] | None:
+                if lf is None or lt is None:
+                    return None
+                best = by_link.get((sym, tf, lf, lt))
                 if best is not None and best.zone_work_hi > best.zone_work_lo > 0:
                     return (best.zone_work_lo, best.zone_work_hi)
                 return None
 
             lines = []
-            for s, tf, d, e, st, tg in news.signals:
+            for s, tf, d, e, st, tg, lf, lt in news.signals:
                 head = (f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
                         f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}")
-                w = work_of(s, tf, e)
+                w = work_of(s, tf, lf, lt)
                 if w is not None:
                     head += f", зона {_fmt_price(w[0])}–{_fmt_price(w[1])}"
                 head += f", стоп {_fmt_price(st)}"

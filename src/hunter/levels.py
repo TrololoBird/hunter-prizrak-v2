@@ -706,6 +706,37 @@ def build_level(
             reason=f"{symbol} {acc.timeframe}: границы стр. 18 вывернуты "
                    f"[{b_lo}, {b_hi}] — базы нет"
         )
+    # ⚠⚠⚠ РАСШИРЕНИЕ БАЗЫ ПО СТР. 18 — БАЗА РАЗДВИГАЕТСЯ, А НЕ ОТКАЗЫВАЕТСЯ.
+    # Правка 2026-08-27, и она отменяет мою же правку того же дня.
+    #
+    # Стр. 18 дословно: "Но если на 3++ точках были проколы за границы - стоп всегда
+    # ставится за этот прокол, т.к. это может быть расширением базы и в будущем цена
+    # может ходить уже в этом расширенном диапазоне."
+    #
+    # что из чего следует: проколы на 3++ точках → база МОЖЕТ БЫТЬ ШИРЕ, и цена ходит
+    # уже в расширенном диапазоне. Утром 27-го я прочитал эту фразу как «правило про
+    # стоп, а не про границы» и оставил отказ, отделив лишь класс. Прочитано было
+    # неверно: страница говорит не о том, куда ставить стоп ВНУТРИ той же базы, а о
+    # том, что БАЗА ДРУГАЯ — расширенная. Отказывать структуре за то, что её объём лёг
+    # в тот самый расширенный диапазон, значит спорить с процитированной фразой.
+    #
+    # ЦЕНА ОТКАЗА, замеренная на кадрах `zonesplit` (4 символа Binance, боевая глубина,
+    # одни и те же кадры): 461 отказ `ZONE_OUT_PUNCTURE`; сделок с целью 10 из 13, а
+    # ТРИ не выпускались вовсе, потому что ярусы стр. 24 оставались пусты — у ETH в
+    # карте не было НИ ОДНОГО уровня 1н и ни одного шортового 1Д при 997 отказанных
+    # структурах. После приёма расширения: уровней 133 → 136, сделок с целью 13 из 13,
+    # сделок с РР >= 3: 5 → 6.
+    #
+    # Границы уровня становятся расширенными — это и есть «цена ходит уже в этом
+    # расширенном диапазоне». Стоп по той же фразе прячется за прокол и так
+    # (`stop_edge_*` ниже), второй копии правила здесь не заводится.
+    ext_lo = min(b_lo, Decimal(str(acc.lower.extended_edge)))
+    ext_hi = max(b_hi, Decimal(str(acc.upper.extended_edge)))
+    if (profile.val_price < b_lo or profile.vah_price > b_hi
+            or not b_lo <= profile.poc_price <= b_hi):
+        if (ext_lo <= profile.val_price and profile.vah_price <= ext_hi
+                and ext_lo <= profile.poc_price <= ext_hi):
+            b_lo, b_hi = ext_lo, ext_hi
     if not b_lo <= profile.poc_price <= b_hi:
         return LevelRefusal(
             kind=UnbuiltKind.POC_OUT,
@@ -713,14 +744,8 @@ def build_level(
                    f"[{b_lo}, {b_hi}] (стр. 18) — структура определена неверно"
         )
     if profile.val_price < b_lo or profile.vah_price > b_hi:
-        # Прокол (стр. 18) решает ТОЛЬКО КЛАСС отказа, не сам отказ: разбор — в
-        # докстроке `UnbuiltKind.ZONE_OUT_PUNCTURE`.
-        ext_lo = min(b_lo, Decimal(str(acc.lower.extended_edge)))
-        ext_hi = max(b_hi, Decimal(str(acc.upper.extended_edge)))
-        inside_puncture = ext_lo <= profile.val_price and profile.vah_price <= ext_hi
         return LevelRefusal(
-            kind=(UnbuiltKind.ZONE_OUT_PUNCTURE if inside_puncture
-                  else UnbuiltKind.ZONE_OUT),
+            kind=UnbuiltKind.ZONE_OUT,
             reason=f"{symbol} {acc.timeframe}: зона [{profile.val_price}, "
                    f"{profile.vah_price}] выходит за границы базы [{b_lo}, {b_hi}] "
                    f"(стр. 18) — структура определена неверно"
