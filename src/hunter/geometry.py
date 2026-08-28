@@ -72,8 +72,9 @@ from .levels import (
     StopAnchorSource,
     level_as_of,
 )
-from .models import NotReady
+from .models import Bar, NotReady
 from .pereprior import Pereprior, PPSide
+from .trading_range import RangeScan
 
 STOP_MARGIN_MIN_PCT = 1.0
 STOP_MARGIN_MAX_PCT = 3.0
@@ -1570,8 +1571,44 @@ class PPSetup(BaseModel):
     rr: float | None
 
 
-def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
-    """Сделка от ПП. `opposite` — последний ПП противоположной стороны того же ТФ."""
+def base_at_break(pp: Pereprior, scan: RangeScan | None,
+                  bars: list[Bar] | None) -> tuple[float, float] | None:
+    """Коробка базы В МЕСТЕ СЛОМА — вторая ветвь стопа стр. 50. `None` — базы там нет.
+
+    Стр. 50 дословно: «Торговля ПП – точкой входа является тест ПП, со стопом за хай/лой
+    ИЛИ БАЗУ В МЕСТЕ СЛОМА, ЕСЛИ ОНА ЕСТЬ».
+
+    что из чего следует: сломанный экстремум → стоп за него; если этот экстремум
+    принадлежал накоплению → стоп за ВСЁ накопление. Ищется структура того же ТФ, чьи
+    бары СОДЕРЖАТ сломанный экстремум (`broken_index`), — то есть та самая база, чью
+    границу цена и сломала.
+
+    ⚠ Это НЕ структура подтверждения стр. 53 (`engine._pp_structure_note`): та ищется
+    ПОСЛЕ слома и опирается на зону ПП, а эта — та, что сломана. Разные объекты, разные
+    страницы; второй копии поиска здесь нет.
+
+    Коробка берётся у `TradingRange.box` — единственного места этой величины в проекте.
+    """
+    if scan is None or not bars:
+        return None
+    for acc in scan.closed:
+        if not (acc.first_index <= pp.broken_index <= acc.exit.confirmed_at_index):
+            continue
+        box = acc.box(bars)
+        if box is not None:
+            return box
+    return None
+
+
+def build_pp_setup(pp: Pereprior, opposite: Pereprior | None,
+                   scan: RangeScan | None = None,
+                   bars: list[Bar] | None = None) -> PPSetup:
+    """Сделка от ПП. `opposite` — последний ПП противоположной стороны того же ТФ.
+
+    `scan` и `bars` нужны второй ветви стопа стр. 50 — «или базу в месте слома, если она
+    есть» (`base_at_break`). Без них ветвь молчит и стоп ставится за тень сломанного
+    экстремума, как было до 2026-08-28; умолчания оставлены, чтобы вызов без карты
+    структур не падал, а честно недобирал."""
     # Цель законна только ПО НАПРАВЛЕНИЮ сделки: противоположный ПП, стоящий позади
     # входа, целью не является — маршрут «от ПП до ПП» идёт вперёд, а не назад. Первая
     # редакция это не проверяла и печатала отрицательный РР — поймано первым же диффом.
@@ -1596,9 +1633,37 @@ def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
     def beyond(edge: float, *, up: bool) -> float:
         return float(stop_beyond_edge(Decimal(str(edge)), DEFAULT_MARGIN_PCT, up=up))
 
+    # ⚠⚠⚠ ВТОРАЯ ВЕТВЬ СТР. 50 РЕАЛИЗОВАНА 2026-08-28 (приказ владельца «реализуй вторую
+    # ветвь стопа ПП»). До неё стоп всегда прятался за тень сломанного экстремума, а
+    # правило говорит: «со стопом за хай/лой ИЛИ БАЗУ В МЕСТЕ СЛОМА, ЕСЛИ ОНА ЕСТЬ».
+    # Пробел был назван в этой же докстроке и там же сказано, что ветвь ставит стоп
+    # ДАЛЬШЕ, то есть прежний стоп её не нарушал, а недобирал.
+    #
+    # Выбирается ДАЛЬНИЙ из двух — это и есть «прятать»: стоп за всю базу защищает от
+    # возврата цены внутрь неё, тогда как стоп за одну тень выносится первым же заходом
+    # в ту базу. Тот же принцип, что у уровня (`build_setup`: `floor` против `anchored`).
+    # Слова «если она есть» на странице привязаны к базе, то есть при её наличии стоп
+    # прячется за неё; практически это и есть дальний из двух, потому что сломанный
+    # экстремум лежит ВНУТРИ своей базы по построению.
+    #
+    # ⚠⚠ ЦЕНА ИСПОЛНЕНИЯ НАЗВАНА, А ПРАВИЛО НЕ ОТМЕНЕНО — тот же порядок, что 2026-08-18
+    # при слиянии границ. Замер на кадрах `zonesplit`, 47 сделок от ПП:
+    #
+    #     база в месте слома найдена            32 из 47 (68%)
+    #     стоп отодвинулся у                    32, медиана 7.75% от входа, макс 58.74%
+    #     риск вход→стоп     БЫЛО медиана 3.58%, макс 25.76%
+    #                        СТАЛО медиана 6.07%, макс 72.00%
+    #     РР до встречного ПП   БЫЛО медиана 1.62  →  СТАЛО 0.67
+    #     сделок с РР >= 3      3 → 2        с РР >= 1      4 → 3
+    #
+    # РР упал вдвое. Резать запас обратно значило бы проверять правило курса замером —
+    # ровно то, что свод запрещает. Число сказано, чтобы владелец видел плату.
+    base = base_at_break(pp, scan, bars)
     if pp.side is PPSide.SHORT:
         entry = pp.zone_lo
         stop = beyond(pp.zone_hi, up=False)
+        if base is not None:
+            stop = max(stop, beyond(base[1], up=False))
         cand = opposite.zone_hi if opposite is not None else None
         target = cand if cand is not None and cand < entry else None
         risk = stop - entry
@@ -1606,6 +1671,8 @@ def build_pp_setup(pp: Pereprior, opposite: Pereprior | None) -> PPSetup:
     else:
         entry = pp.zone_hi
         stop = beyond(pp.zone_lo, up=True)
+        if base is not None:
+            stop = min(stop, beyond(base[0], up=True))
         cand = opposite.zone_lo if opposite is not None else None
         target = cand if cand is not None and cand > entry else None
         risk = entry - stop

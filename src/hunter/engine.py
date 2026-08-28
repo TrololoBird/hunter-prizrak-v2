@@ -640,7 +640,7 @@ def decide(
             absorbed = absorption.measure(pp, series[tf], tf, trades)
             pp_signals.append(PPSignal(
                 timeframe=tf, pp=pp,
-                setup=geometry.build_pp_setup(pp, opposite),
+                setup=geometry.build_pp_setup(pp, opposite, r.scan, series[tf]),
                 structure_note=_pp_structure_note(pp, r.scan, series[tf]),
                 absorption=absorbed if not isinstance(absorbed, NotReady) else None,
                 absorption_missing=absorbed.reason if isinstance(absorbed, NotReady) else "",
