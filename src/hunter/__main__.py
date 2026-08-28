@@ -138,7 +138,8 @@ def _run(args: argparse.Namespace) -> int:
 
     t_collect = time.perf_counter()
     report, sources, detections = asyncio.run(
-        collect(uni, args.seconds, args.seed_limit, args.horizon_days)
+        collect(uni, args.seconds, args.seed_limit, args.horizon_days,
+                decide_bars=args.decide_bars)
     )
     report.stage_ms["collect"] = int((time.perf_counter() - t_collect) * 1000)
     _stage("frames", lambda: persist_frames(args.run_id, report))
@@ -182,6 +183,60 @@ def _serve(args: argparse.Namespace) -> int:
     bad = asyncio.run(serve(uni, args.seed_limit, args.horizon_days, args.run_id,
                             cycle_seconds=args.cycle_seconds, max_cycles=args.cycles))
     return 1 if bad else 0
+
+
+async def _live_both(uni: Universe, args: argparse.Namespace) -> int:
+    """Служба и бот в ОДНОМ процессе, обе задачи разом.
+
+    ⚠⚠⚠ ЗАВЕДЕНО 2026-08-28 ПО ВОЗРАЖЕНИЮ ВЛАДЕЛЬЦА, дословно: «зачем нам бот без серва?
+    или серв без бота? ЭТо абсурд!»
+
+    Он прав, и это дефект не удобства, а устройства. Разделение ПРОЦЕССОВ было обосновано
+    (единственный писатель §10.2, дележ лимита `IpShare`), но из него не следует
+    разделение КОМАНД: в боевом режиме одна без другой бессмысленна. Служба считает и
+    пишет в леджер, бот из него доставляет; запущенная в одиночку служба нема, а бот в
+    одиночку сутки слал уведомления по старой карте и молчал о том, что расчёт стоит.
+
+    ⚠ ГАРАНТИИ НЕ ПОТЕРЯНЫ, А ОДНА УЛУЧШЕНА:
+      * единственный писатель — прежний: пишет только путь службы, бот открывает базу
+        `open_readonly()`, и от общего процесса это не меняется;
+      * лимит биржи — стало ЛУЧШЕ. Два процесса делили бюджет пополам через `IpShare`
+        (в живом прогоне это давало `процессов_на_IP=2` и вдвое медленнее темп); в одном
+        процессе объект площадки ОБЩИЙ через `exchange._LIVE`, ради чего он и заведён.
+
+    ⚠ ПОЛОВИННАЯ ЖИЗНЬ ЗАПРЕЩЕНА ЯВНО. Если любая из двух задач кончилась — по отказу или
+    сама, — вторая снимается, и процесс выходит с ненулевым кодом. Молча продолжать
+    вполсилы значило бы вернуть ровно тот дефект, ради которого команда и заведена.
+    """
+    from .service import serve
+    from .tgbot import main as bot_main
+
+    tasks = {
+        "служба": asyncio.create_task(serve(
+            uni, args.seed_limit, args.horizon_days, args.run_id,
+            cycle_seconds=args.cycle_seconds, max_cycles=args.cycles)),
+        "бот": asyncio.create_task(bot_main(
+            horizon_days=args.horizon_days, universe=args.universe)),
+    }
+    done, pending = await asyncio.wait(tasks.values(),
+                                       return_when=asyncio.FIRST_COMPLETED)
+    name = next((n for n, t in tasks.items() if t in done), "?")
+    err = next((t.exception() for t in done if t.exception() is not None), None)
+    log.degraded("половина живого контура кончилась — снимаю вторую",
+                 кончилась=name,
+                 причина=f"{type(err).__name__} {err}" if err else "вышла сама")
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    return 1
+
+
+def _live(args: argparse.Namespace) -> int:
+    """ЖИВОЙ КОНТУР ЦЕЛИКОМ: служба считает и пишет, бот доставляет. Одна команда."""
+    uni = load_universe(args.universe)
+    if args.symbols:
+        uni = uni.model_copy(update={"cap": args.symbols})
+    return asyncio.run(_live_both(uni, args))
 
 
 def _check(args: argparse.Namespace) -> int:
@@ -465,7 +520,14 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="живой прогон и сводка приёмки")
     run.add_argument("--seconds", type=int, default=90)
     run.add_argument("--seed-limit", type=int, default=0,
-                     help="баров на ряд; 0 = вывести из --horizon-days отдельно по каждому ТФ")
+                     help="баров на ряд — и запроса, И ряда решения; НЕ МЕНЬШЕ пола "
+                          "прогрева (1400), меньшее число молча поднимается до него — "
+                          "значит КОНТРОЛЬ ГЛУБИНЫ им не делается, для него --decide-bars; "
+                          "0 = вывести из --horizon-days отдельно по каждому ТФ")
+    run.add_argument("--decide-bars", type=int, default=0,
+                     help="предел длины ряда, идущего в РАСЧЁТ, БЕЗ пола прогрева — "
+                          "ручка контроля глубины (свод: разметка не смеет быть функцией "
+                          "того, сколько баров скачали); 0 = весь накопленный ряд")
     run.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     run.add_argument("--run-id", default="last")
     # ⚠ Раньше здесь было `--trade-days` = «сколько ПОСЛЕДНИХ суток скачать», умолчание 3.
@@ -479,13 +541,28 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--symbols", type=int, default=0,
                      help="взять только первые N символов вселенной")
 
-    srv = sub.add_parser("serve", help="СЛУЖБА 24/7: сбор без остановки, расчёт циклами")
+    live = sub.add_parser(
+        "live", help="ЖИВОЙ КОНТУР ЦЕЛИКОМ: служба считает и пишет, бот доставляет")
+    live.add_argument("--cycle-seconds", type=int, default=service.CYCLE_SECONDS)
+    live.add_argument("--cycles", type=int, default=0,
+                      help="остановиться после N циклов службы; 0 = работать до сигнала")
+    live.add_argument("--seed-limit", type=int, default=0)
+    live.add_argument("--universe", type=Path, default=DEFAULT_PATH)
+    live.add_argument("--run-id", default="serve")
+    live.add_argument("--horizon-days", type=int, default=HORIZON_DAYS)
+    live.add_argument("--symbols", type=int, default=0,
+                      help="взять только первые N символов вселенной")
+
+    srv = sub.add_parser("serve", help="СЛУЖБА 24/7: сбор без остановки, расчёт циклами "
+                                       "(без доставки — обычно нужен `live`)")
     srv.add_argument("--cycle-seconds", type=int, default=service.CYCLE_SECONDS,
                      help="такт расчёта; умолчание — младший ТФ проекта (§2.8)")
     srv.add_argument("--cycles", type=int, default=0,
                      help="остановиться после N циклов; 0 = работать до сигнала")
     srv.add_argument("--seed-limit", type=int, default=0,
-                     help="баров на ряд; 0 = вывести из --horizon-days отдельно по каждому ТФ")
+                     help="баров на ряд — и запроса, И ряда решения; НЕ МЕНЬШЕ пола "
+                          "прогрева (1400), меньшее число молча поднимается до него; "
+                          "0 = вывести из --horizon-days отдельно по каждому ТФ")
     srv.add_argument("--universe", type=Path, default=DEFAULT_PATH)
     srv.add_argument("--run-id", default="serve",
                      help="куда класть кадры и карточки; каждый цикл ПЕРЕЗАПИСЫВАЕТ их")
@@ -538,6 +615,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "live":
+        return _live(args)
     if args.cmd == "serve":
         return _serve(args)
     if args.cmd == "check":

@@ -101,9 +101,17 @@ def seed_warmup() -> int:
 def seed_depth(timeframe: str, horizon_days: int, seed_limit: int) -> int:
     """Сколько баров просить на этом ТФ. Единственное место, где решается глубина ряда.
 
-    `seed_limit > 0` — прямое указание оператора, действует как раньше и одинаково для
-    всех ТФ. `seed_limit <= 0` — глубина ВЫВОДИТСЯ из горизонта отдельно для каждого ТФ
-    (`bars.bars_needed`): ПРОГРЕВ ПЛЮС ОХВАТ.
+    `seed_limit > 0` — прямое указание оператора, одинаковое для всех ТФ, НО НЕ НИЖЕ
+    пола прогрева. `seed_limit <= 0` — глубина ВЫВОДИТСЯ из горизонта отдельно для
+    каждого ТФ (`bars.bars_needed`): ПРОГРЕВ ПЛЮС ОХВАТ.
+
+    ⚠⚠ ПОЛ ПРОГРЕВА ГЛОТАЕТ МАЛЫЕ ЧИСЛА, И ЭТО НАДО ЗНАТЬ ЗАМЕРЩИКУ (найдено
+    2026-08-27). `seed_warmup()` = 1400, поэтому `--seed-limit 200`, `300` и `500` дают
+    ОДНУ И ТУ ЖЕ глубину 1400, а боевое умолчание (`0`) даёт на 15м 18680 баров. Значит
+    «контроль глубины 300 против 200» меряет режим, в котором бой не работает никогда, и
+    расхождение между такими прогонами есть свойство замера, а не расчёта. Пол здесь не
+    прихоть: ema200 и прочие рекурсивные признаки без прогрева считаются по неполному
+    состоянию (разбор — в докстроке `bars.bars_needed`).
 
     ⚠⚠ ДО 2026-08-23 ЗДЕСЬ БЫЛО `max(прогрев, охват)`, И СТАРШИЕ ТФ ГОЛОДАЛИ. Разбор и
     цена — в докстроке `bars.bars_needed`; коротко: на 1Д ряд из 201 бара при горизонте
@@ -553,6 +561,10 @@ async def seed(ex: Exchange, uni: Universe, report: RunReport, limit: int,
             # Глубина решается ЗДЕСЬ и по каждому ТФ отдельно: одна цифра на все ТФ
             # делала карту несопоставимой самой с собой (см. `seed_depth`).
             depth = seed_depth(tf, horizon_days, limit)
+            # Глубина ЗАПОМИНАЕТСЯ на ряду: без этого она оставалась размером запроса
+            # к бирже и терялась, а расчёт брал накопленный кэш целиком (разбор — в
+            # докстроке `SeriesState.decided_depth`).
+            st.decided_depth = depth
             want_from = seed_start_ms(tf, depth, clock.now_ms())
             # ⚠ ЛЕВЫЙ КРАЙ ОБРЕЗАЕТСЯ ДАТОЙ СОЗДАНИЯ КОНТРАКТА — правка 2026-08-23,
             # парная к снятию условия у поиска дыр ниже. Без неё пролёт «от начала
@@ -2325,8 +2337,19 @@ def build_sources(insts: dict[str, Instrument], report: RunReport,
 
 
 def bars_of(report: RunReport, sym: str) -> dict[str, list[Bar]]:
-    """Готовые ряды символа. Один фильтр на все три шага — иначе они разойдутся."""
-    return {tf: st.bars for (s, tf), st in report.series.items()
+    """Готовые ряды символа, ОБРЕЗАННЫЕ до решённой глубины. Один фильтр на три шага.
+
+    ⚠⚠ СРЕЗ ЗАВЕДЁН 2026-08-27. До него сюда шёл накопленный кэш ЦЕЛИКОМ, и длина ряда
+    решения определялась историей закачек, а не объявленным окном: `--seed-limit 300` и
+    `--seed-limit 200` давали в кадрах 1629 и 1630 баров на 15м. Это ровно то, что
+    правило свода запрещает — «разметка не смеет быть функцией того, СКОЛЬКО баров
+    скачали». Режется ЛЕВЫЙ край: правый есть факт рынка и остаётся на месте.
+
+    `decided_depth == 0` — кадры сняты до этой правки либо глубина не решалась; тогда
+    ряд идёт целиком, как раньше, и это НАЗЫВАЕТСЯ отсутствием, а не подменяется нулём.
+    """
+    return {tf: (st.bars[-st.decided_depth:] if st.decided_depth > 0 else st.bars)
+            for (s, tf), st in report.series.items()
             if s == sym and st.not_ready is None and st.bars}
 
 
@@ -2341,12 +2364,34 @@ def persist_frames(run_id: str, report: RunReport) -> None:
     Каталог символа СТИРАЕТСЯ перед записью: `--run-id` по умолчанию `last`, и кадры
     прошлого прогона иначе остаются рядом с новыми (А-4).
     """
-    for sym in {s for s, _ in report.series}:
+    fresh = {s for s, _ in report.series}
+    for sym in fresh:
         store.clear_run(run_id, sym)
+    # ⚠⚠ ЧУЖИЕ СИМВОЛЫ ЭТОГО ЖЕ `run-id` ТОЖЕ СТИРАЮТСЯ (правка 2026-08-27). Строка выше
+    # чистит только символы ТЕКУЩЕГО прогона, и прогон с другой вселенной под тем же
+    # `--run-id` оставлял чужие кадры лежать рядом. Поймано на своём же замере: в
+    # `depth300` после перезапуска с четырьмя символами остались AEVO и ASTR от прежней
+    # шестёрки, и замер по этому прогону молча смешал бы две выборки — ровно тот класс,
+    # ради которого каталог символа и чистится.
+    stale = [d for d in store.saved_symbols(run_id)
+             if d not in {store.dir_name(s) for s in fresh}]
+    for d in stale:
+        store.clear_run_dir(run_id, d)
+    if stale:
+        log.info("кадры прежнего прогона под тем же run-id стёрты",
+                 прогон=run_id, стёрто=len(stale), символы="; ".join(stale[:5]))
+    # ⚠⚠ КАДРЫ ПИШУТСЯ ТЕМ ЖЕ СРЕЗОМ, ЧТО КОРМИТ РАСЧЁТ (`bars_of`), а не сырым
+    # `st.bars`. Заведено 2026-08-27 вместе со срезом глубины: повтор §10.6 строит
+    # карточку ИЗ КАДРОВ и обязан получить ту же, что живой прогон. Пиши мы сюда полный
+    # ряд, повтор считал бы на другой глубине и печатал «расчёт изменился» при
+    # неизменном коде — ровно тот отказ, который уже случался дважды (манифест
+    # источника 2026-08-18, горизонт 2026-08-23).
+    cut = {sym: bars_of(report, sym) for sym in {s for s, _ in report.series}}
     for (sym, tf), st in report.series.items():
         if st.not_ready is not None or not st.bars:
             continue
-        store.write_bars(run_id, sym, tf, st.bars)
+        bars = cut.get(sym, {}).get(tf, st.bars)
+        store.write_bars(run_id, sym, tf, bars)
         report.frames_written += 1
     for h in report.histograms.values():
         if h.trades_seen:
@@ -2424,6 +2469,49 @@ def decide_once(report: RunReport, uni: Universe,
         log.degraded("профиль: окнам не хватило ряда intrabar-ТФ",
                      всего=sum(by_tf.values()), по_тф=by_tf,
                      символов=len(refused))
+    # ⚠⚠ СТРУКТУРЫ, НЕ ДАВШИЕ УРОВНЯ — ПО КЛАССУ И ПО ТФ (Ф7, 2026-08-26). До этого дня
+    # `unbuilt` не читал в `run.py` НИКТО: причины печатались покарточно и в отчёт не
+    # попадали ни одним числом. Значит меру Ф7 — «доля структур, не давших уровня по
+    # причине покрытия, за неделю боевых прогонов» — нельзя было получить и в бою.
+    for dec in out.values():
+        # Две меры, найденные ГЛАЗАМИ по карточке 2026-08-27; разбор — в докстроках
+        # полей. Считаются здесь же, одним обходом, чтобы не заводить второй проход.
+        for m in dec.mapped:
+            lv = m.level
+            if lv.box_to_base > 0:
+                report.levels_box_to_base.append(lv.box_to_base)
+            report.levels_volume_outside_base.append(lv.volume_outside_base)
+            if lv.row_height and (lv.zone_hi - lv.zone_lo) <= 2 * lv.row_height:
+                report.levels_zone_one_row += 1
+            # ⚠ МЕРА РАБОЧЕЙ ЗОНЫ СНЯТА 2026-08-28 вместе с самой зоной (приказ
+            # владельца «верни вход на VAL…VAH»). Условие ниже осталось бы истинным
+            # НИКОГДА — `zone_work_*` теперь всегда `None`, — и печать «0 из N»
+            # читалась бы как «ядро всегда у́же зоны», хотя ядра нет вовсе. Ноль,
+            # который значит «не считается», и ноль, который значит «нарушений нет», —
+            # разные вести, и путать их запрещено (§4.3).
+        for tf, n in dec.levels_by_tf().items():
+            report.structures_by_tf[tf] = report.structures_by_tf.get(tf, 0) + n
+        for ub in dec.unbuilt:
+            report.unbuilt_by_kind[ub.kind.value] = (
+                report.unbuilt_by_kind.get(ub.kind.value, 0) + 1)
+            report.structures_by_tf[ub.timeframe] = (
+                report.structures_by_tf.get(ub.timeframe, 0) + 1)
+            if ub.kind is levels.UnbuiltKind.NO_COVERAGE:
+                report.unbuilt_coverage_by_tf[ub.timeframe] = (
+                    report.unbuilt_coverage_by_tf.get(ub.timeframe, 0) + 1)
+    # ⚠ ДВА ОСТАЛЬНЫХ КЛАССА ОТКАЗА — В ОТЧЁТ, А НЕ В ЖУРНАЛ (Ф6, 2026-08-26). Они
+    # считались внутри `CandleWindows` и наружу не выходили вовсе: владелец видел строку
+    # про недостающие ряды и не видел строки про дыры в покрытии, хотя уровень теряется
+    # одинаково. Сводятся ПО ТФ — по тому измерению, вдоль которого возможен перекос.
+    for src in sources.values():
+        for name, dest in (("refused_no_bars_by_tf", report.profile_windows_no_bars_by_tf),
+                           ("refused_partial_by_tf",
+                            report.profile_windows_partial_by_tf)):
+            fn = getattr(src, name, None)
+            if fn is None:
+                continue
+            for tf, n in fn().items():
+                dest[tf] = dest.get(tf, 0) + n
     return out
 
 
@@ -2577,6 +2665,12 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 side=side, entry=p.entry, stop=p.stop, target=p.target, bars=bars,
                 from_index=emit.first_bar_after(bars, p.timeframe, p.recorded_at, 0),
                 breakeven_at=p.breakeven_at,
+                # ⚠ Вторая цель берётся ИЗ ЛЕДЖЕРА, а не пересчитывается по свежей карте:
+                # сделка мерится теми целями, что были у неё В МОМЕНТ ЗАПИСИ. Пересчёт
+                # означал бы выбор цели задним числом — тот самый дефект, из-за которого
+                # 2026-08-24 правилась дата отбора целей. У строк схем до 17-й её нет, и
+                # пол там останется на первом тейке (докстрока `PendingSignal.target2`).
+                target2=p.target2,
             )
             if res.kind is OutcomeKind.UNMEASURABLE:
                 # Вырожденный риск (стоп совпал со входом): единицы R не существует, и
@@ -2589,7 +2683,7 @@ def _resolve_pending(conn: sqlite3.Connection, report: RunReport,
                 assert res.closed_at_index is not None
                 err = store.record_outcome(
                     conn, p.id, res.kind.value, bars[res.closed_at_index].open_ms,
-                    res.exit_price, res.r)
+                    res.exit_price, res.r, res.r_partial)
                 if isinstance(err, NotReady):
                     log.degraded("дорешанный исход не записан", причина=err.reason)
                 else:
@@ -2671,12 +2765,23 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # наблюдателю недоступны.
             broke: dict[tuple[str, int, int], int] = {}
             for one in d.decisions:
-                note = one.mtf_break or ""
-                if not note:
+                # ⚠⚠ РЕШАЕТ СОСТОЯНИЕ, А НЕ ПОДСТРОКА (правка A-5, 2026-08-28). Здесь
+                # стояло `1 if "подтверждён" in note else 0`: русская фраза, которую в
+                # этом проекте переписывают постоянно, управляла целым числом леджера, а
+                # оно — объявлением бота «вход активен». Ложного срабатывания на тот день
+                # не было; защиты от него не было тоже.
+                #
+                # ⚠⚠ И В НОЛЬ ПАДАЛИ ТРИ РАЗНЫЕ ВЕЩИ (правка A-2). «Слома не было»,
+                # «ряд не разобран» и «младшего ТФ у курса нет» получали один ответ на
+                # троих. Бот читает ноль как «слома ещё нет, ЖДЁМ» — для двух последних
+                # это ложь, и ждать там нечего. В леджер идут только два НАСТОЯЩИХ
+                # ответа; остальное остаётся NULL — «неизвестно», а не «нет» (§4.3).
+                st = one.mtf_break_state
+                if st not in (engine.MtfBreak.CONFIRMED, engine.MtfBreak.ABSENT):
                     continue
                 k = (one.level.timeframe, one.level.structure_from_ms,
                      one.level.structure_to_ms)
-                broke[k] = 1 if "подтверждён" in note else 0
+                broke[k] = 1 if st is engine.MtfBreak.CONFIRMED else 0
             # Шестым — СОГЛАСИЕ СО СТАРШИМ ТФ (схема 12): доставке нужно сказать, что
             # сделка встречная (стр. 47), а тренды наблюдателю недоступны.
             agree: dict[tuple[str, int, int], str] = {}
@@ -2796,6 +2901,35 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     cl.side, float(cl.price), cl.timeframe, after)
                 if verdict is not None:
                     resolved.append((cl.timeframe, cl.from_ms, cl.to_ms, verdict))
+                    continue
+                # ⚠⚠⚠ ЧЕТВЁРТЫЙ СЛУЧАЙ, ЗАВЕДЁН 2026-08-28 ПО ПРИКАЗУ ВЛАДЕЛЬЦА
+                # «сними 18 несвежих строк с карты». Здесь была ветка «иначе» без
+                # ветки: уровень, который расчёт не построил и которому свежие бары не
+                # дали вердикта, оставался `active` НАВСЕГДА.
+                #
+                # Держалось это на выдуманной цитате автора («зона остаётся актуальна»)
+                # в докстроке `store.sync_levels` — грепом по 69 страницам таких слов
+                # НЕТ, а единственное «актуальн» стоит на стр. 25 и говорит обратное:
+                # «этот уровень становиться больше не актуальным, т.е. мы этот уровень
+                # удаляем и ищем новые».
+                #
+                # Замер устойчивости, три независимых прогона одних символов: из 12
+                # непересчитанных уровней не построен НИ В ОДНОМ — 12, построен хотя бы
+                # в одном — НОЛЬ. Значит это не мигание одного цикла, а стойкое
+                # состояние. Контроль: тот же прибор строит 16–17 уровней на символ в
+                # каждом прогоне, то есть ответить «построен» способен.
+                #
+                # Причина названа СВОИМ именем: не `worked_off` (рынок его не
+                # отрабатывал) и не `flipped` (не пробивал), а `stale_calc` — расчёт
+                # его больше не производит. Ровно то, ради чего в схеме заведено
+                # четвёртое состояние.
+                #
+                # ⚠ СНЯТИЕ ОБРАТИМО: если расчёт снова построит этот уровень,
+                # `sync_levels` вернёт `state='active'` и обнулит `retired_at` тем же
+                # UPDATE. Поэтому ошибка в сторону «сняли рано» самоисправляется на
+                # следующем прогоне, а ошибка в сторону «оставили» — нет.
+                resolved.append((cl.timeframe, cl.from_ms, cl.to_ms, "stale_calc"))
+                report.map_unbuilt += 1
             if resolved:
                 report.map_retired += store.retire_levels(conn, sym, resolved, stamp_ms)
                 done = {(t, f, u) for t, f, u, _ in resolved}
@@ -2807,13 +2941,57 @@ def record(run_id: str, report: RunReport, uni: Universe,
             report.map_rejected.extend(sync.rejected)
             report.map_carried[sym] = carried
 
+            # ⚠⚠⚠ ЦЕНА ДЛЯ УСЛОВИЯ ЗАПИСИ — самый свежий закрытый бар СИМВОЛА, а не
+            # своего ТФ: ряды закрываются в разное время, и брать закрытие 1Д значило бы
+            # судить о «сейчас» по вчерашнему числу.
+            live_bar = max((b[-1] for b in series.values() if b),
+                           key=lambda b: b.open_ms, default=None)
+            live_px = float(live_bar.close) if live_bar is not None else 0.0
             for em in d.emissions:
                 bars = series[em.level.timeframe]
                 opened_at = bars[em.level.created_at_index].open_ms
+                # ⚠⚠⚠ СДЕЛКА ЗАПИСЫВАЕТСЯ, ТОЛЬКО КОГДА ЦЕНА ПРИШЛА К ЕЁ ЗОНЕ ВХОДА.
+                # Правка 2026-08-27. До неё сигнал писался для КАЖДОГО годного уровня
+                # карты независимо от того, где цена: замер по живому леджеру (300
+                # последних сигналов рода `level`, цена — бар 5м на момент записи) дал
+                # медиану расстояния до входа 25.1%, дальше 10% — 228 записей (76%),
+                # дальше 50% — 84 (28%), худшая `#754 PIPPIN 1ч шорт` — цена 0.01964
+                # против входа 0.601255, тридцатикратно.
+                #
+                # Карта при этом ВЕРНА: уровень далеко от цены остаётся уровнем. Неверно
+                # называть его СДЕЛКОЙ — «вход, стоп, цель» означает ордер, а ордера на
+                # 2961% не бывает. Стр. 48 говорит об отложках как об ограниченном
+                # ресурсе: «Важно не выставлять сразу много отложек по МТФ – с большой
+                # вероятностью они откроются одновременно, сложно будет их сразу все
+                # контролировать и при дампе они все получат стоп».
+                #
+                # Цена этого дефекта — не косметика: экспектанси по леджеру есть
+                # ЕДИНСТВЕННЫЙ ответ проекта на вопрос «работает ли метод», и она
+                # считалась по сделкам, которых не было.
+                #
+                # Порог не выдуман и не введён здесь заново: `geometry.zone_position`
+                # мерит близость ШИРИНОЙ САМОЙ ЗОНЫ, и той же мерой молчит слой
+                # доставки. Одно условие, одно место.
+                # ⚠ МЕРИТСЯ ПО ЗОНЕ УРОВНЯ (VAL…VAH), А НЕ ПО УЗКОМУ ЯДРУ ВХОДА.
+                # Первая редакция этой правки брала `entry_zone_*` — HVN-ядро — и
+                # отсекла ВСЕ 13 сделок кадров `zonesplit`, включая ETH 15м в 1.0% от
+                # входа, то есть ровно действенную. Ядро у́же зоны в разы, а «ближе одной
+                # ширины» от узкого ядра — это доли процента. Слой доставки той же
+                # функцией мерит именно ЗОНУ (`board_setups`), и величина обязана быть
+                # одна: уровень — это зона (стр. 23-26), ею и меряется приход цены.
+                if live_px > 0 and geometry.zone_position(
+                        live_px, float(em.level.zone_lo),
+                        float(em.level.zone_hi)) == "far":
+                    report.signal_far_from_price += 1
+                    continue
                 # ⚠ ТРЕТЬЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24. Здесь стоял свой
                 # `role is geometry.TargetRole.PRIMARY`, такой же — в `Setup.rr` и в
                 # `emit.outcome_of`. Правило теперь одно: `geometry.first_major`.
                 first = geometry.first_major(em.setup.targets)
+                # ВТОРАЯ крупная цель — только для модели частичного выхода (Ф5): к ней
+                # идёт остаток после первого тейка (стр. 15). Мерилом РР она не является
+                # и `Setup.rr` её не видит.
+                second = geometry.next_major(em.setup.targets)
                 sig = store.record_signal(
                     conn, sym, em.level.timeframe, em.direction, opened_at,
                     em.setup.entry, em.ledger_stop, run_id, stamp_ms,
@@ -2821,12 +2999,18 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     # В леджер она пошла с v5: без неё исход сделки нельзя досчитать
                     # ни в одном прогоне, кроме выдавшего сигнал.
                     target=first.price if first is not None else None,
+                    target2=second.price if second is not None else None,
                     # ⚠ ЦЕНА ВЗВЕДЕНИЯ БЕЗУБЫТКА — НЕ ЦЕЛЬ. Правило выбирается ПО
                     # ТРИГГЕРУ (`geometry.breakeven_watch`), а не по номеру в списке:
                     # здесь стояло `breakeven_rules[0]`, и смысл величины держался на
                     # порядке `append` в `build_breakeven_rules`. Разбор — в докстроке
                     # `breakeven_watch`.
                     breakeven_at=geometry.breakeven_watch(em.setup.breakeven_rules),
+                    # ССЫЛКА НА СВОЙ УРОВЕНЬ (схема 20): вместе с символом и ТФ это
+                    # полный ключ таблицы `levels`. Без неё сообщение канала подбирало
+                    # зону сигналу ближайшим ПОКом и показывало вход вне его же зоны.
+                    level_from_ms=em.level.structure_from_ms,
+                    level_to_ms=em.level.structure_to_ms,
                 )
                 if isinstance(sig, NotReady):
                     log.degraded("сигнал не записан", причина=sig.reason)
@@ -2842,6 +3026,17 @@ def record(run_id: str, report: RunReport, uni: Universe,
                 rr = em.setup.rr(em.ledger_stop)
                 if rr is not None:
                     report.emitted_rr.append(rr)
+                # ВОРОНКА ЦЕЛЕЙ (Ф1, 2026-08-26). РР отсутствует РОВНО у сделок без
+                # крупной цели — до сих пор они молча выпадали из `emitted_rr`, и
+                # разница между числом эмиссий и длиной списка ничем не объяснялась.
+                # Сток берётся ГОТОВЫМ у `Setup`: он посчитан тем же обходом, который
+                # отбирал цели (`build_targets_report`), и второй копии каскада
+                # фильтров здесь не заводится — величина считается в одном месте.
+                sink = em.setup.no_target_sink
+                if sink is not geometry.TargetSink.NONE:
+                    report.no_target_by_sink[sink.value] = (
+                        report.no_target_by_sink.get(sink.value, 0) + 1
+                    )
                 if em.setup.entry:
                     report.emitted_stop_pct.append(
                         float(abs(em.setup.entry - em.ledger_stop) / em.setup.entry * 100)
@@ -2860,6 +3055,7 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     err = store.record_outcome(
                         conn, sig.id, res.kind.value,
                         bars[res.closed_at_index].open_ms, res.exit_price, res.r,
+                        res.r_partial,
                     )
                     if isinstance(err, NotReady):
                         log.degraded("исход не записан", причина=err.reason)
@@ -2892,6 +3088,25 @@ def record(run_id: str, report: RunReport, uni: Universe,
                     continue
                 pbars = series.get(pssig.timeframe)
                 if not pbars:
+                    continue
+                # ⚠⚠⚠ ТОТ ЖЕ ЗАСЛОН, ЧТО У СИГНАЛОВ ОТ УРОВНЯ (заведён 2026-08-27, сюда
+                # распространён 2026-08-28 по приказу владельца «проверь переприор»).
+                # Вчерашняя правка закрыла ветку `d.emissions` и НЕ ТРОНУЛА эту: сделки
+                # от ПП писались в леджер независимо от того, где цена.
+                #
+                # Замер по живому леджеру, 400 последних сигналов рода `pp` (цена — бар
+                # 5м на момент записи): медиана расстояния до входа 4.6%, p90 25.1%,
+                # максимум 728.1%; дальше 10% от цены — 112 записей (28%), дальше 50% —
+                # 24 (6%). Худшая `#233 SEI 1н шорт`: цена 0.03986 против входа 0.3301.
+                #
+                # Вход сделки от ПП есть ТЕСТ сломанного экстремума (стр. 50: «точкой
+                # входа является тест ПП»), то есть его зона. Ею и меряется приход цены —
+                # той же функцией и тем же смыслом, что у уровня. Второго условия не
+                # заводится.
+                if live_px > 0 and geometry.zone_position(
+                        live_px, float(pssig.pp.zone_lo),
+                        float(pssig.pp.zone_hi)) == "far":
+                    report.signal_far_from_price += 1
                     continue
                 opened_at = pbars[pssig.pp.confirmed_at_index].open_ms
                 row = store.record_signal(
@@ -2940,6 +3155,89 @@ def record(run_id: str, report: RunReport, uni: Universe,
                                      причина=serr.reason)
                     else:
                         report.states_recorded += 1
+            # СДЕЛКА ПО СЛОМУ МЛАДШЕГО ТФ (правка A-3, 2026-08-28, решение
+            # владельца). Стр. 25 и 31 разрешают вход от отработанного уровня «только по
+            # факту слома структуры на младшем ТФ»; стр. 49 называет слом переприором;
+            # стр. 50 описывает торговлю переприора целиком. Значит это НЕ новый тип
+            # сделки, а тот же род `pp` — просто найденный от уровня, а не сам по себе,
+            # и потому связанный с ним ключом `level_from_ms/level_to_ms`.
+            #
+            # До этой правки расчёт слом проверял и НАЗЫВАЛ, а сделку не строил: бот
+            # объявлял «вход активен», не имея ни стопа, ни цели, ни РР. Теперь
+            # объявление обеспечено записью, а не обещанием.
+            for one in d.decisions:
+                bs = one.break_setup
+                if bs is None or one.break_pp is None:
+                    continue
+                if bs.target is None:
+                    # Та же причина, что у сделок от уровня и от ПП: сделка без цели
+                    # НЕИЗМЕРИМА, у неё нет исхода, по которому считается R.
+                    report.break_signals_no_target += 1
+                    continue
+                bbars = series.get(one.break_timeframe)
+                if not bbars:
+                    continue
+                # Тот же заслон по расстоянию, что у сделок от уровня и от ПП: вход есть
+                # ТЕСТ сломанного экстремума, его зоной и меряется приход цены.
+                if live_px > 0 and geometry.zone_position(
+                        live_px, float(one.break_pp.zone_lo),
+                        float(one.break_pp.zone_hi)) == "far":
+                    report.break_signals_far += 1
+                    continue
+                b_open = bbars[one.break_pp.confirmed_at_index].open_ms
+                brow = store.record_signal(
+                    conn, sym, one.break_timeframe, bs.side, b_open,
+                    Decimal(str(bs.entry)), Decimal(str(bs.stop)), run_id, stamp_ms,
+                    kind="pp", target=Decimal(str(bs.target)),
+                    level_from_ms=one.level.structure_from_ms,
+                    level_to_ms=one.level.structure_to_ms,
+                )
+                if isinstance(brow, NotReady):
+                    log.degraded("сделка по слому не записана", причина=brow.reason)
+                    continue
+                if brow.fresh:
+                    report.break_signals_recorded += 1
+                else:
+                    report.break_signals_known += 1
+                bres = outcome_resolve(
+                    side=(levels.LevelSide.LONG if bs.side == "long"
+                          else levels.LevelSide.SHORT),
+                    entry=Decimal(str(bs.entry)), stop=Decimal(str(bs.stop)),
+                    target=Decimal(str(bs.target)), bars=bbars,
+                    from_index=emit.first_bar_after(
+                        bbars, one.break_timeframe, brow.recorded_at,
+                        one.break_pp.confirmed_at_index + 1),
+                )
+                if bres.kind is OutcomeKind.UNMEASURABLE:
+                    report.pp_degenerate_risk += 1
+                elif bres.kind in CLOSED_KINDS:
+                    assert bres.closed_at_index is not None
+                    berr = store.record_outcome(
+                        conn, brow.id, bres.kind.value,
+                        bbars[bres.closed_at_index].open_ms, bres.exit_price, bres.r,
+                    )
+                    if isinstance(berr, NotReady):
+                        log.degraded("исход сделки по слому не записан",
+                                     причина=berr.reason)
+                    else:
+                        report.outcomes_recorded += 1
+                else:
+                    bserr = store.record_signal_state(
+                        conn, brow.id, bres.kind.value, bbars[-1].open_ms)
+                    if isinstance(bserr, NotReady):
+                        log.degraded("состояние сделки по слому не записано",
+                                     причина=bserr.reason)
+                    else:
+                        report.states_recorded += 1
+        # ⚠ НАСЛОЕНИЕ ВСТРЕЧНЫХ ЗОН — по НАКОПЛЕННОЙ карте и ПОСЛЕ всех символов
+        # (2026-08-26). Класс нашёл владелец глазами 2026-08-18, чинили четырежды, и ни
+        # один прогон не назвал числа. Считается здесь, а не по свежим уровням символа:
+        # число владельца пришло из карты, а карта копит между прогонами — именно это
+        # накопление класс и порождало. Разбор — в докстроке `store.ZoneOverlaps`.
+        ov = store.zone_overlaps(conn)
+        report.zone_overlap_pairs = ov.pairs
+        report.zone_overlap_by_symbol = dict(ov.by_symbol)
+        report.zone_overlap_levels = ov.levels
     finally:
         conn.close()
 
@@ -2961,19 +3259,26 @@ CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
     "profile_series_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
+    "break_signals_recorded", "break_signals_known", "break_signals_no_target",
+    "break_signals_far",
     "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
     "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
     "pp_degenerate_risk",
     "emitted_outcomes",
-    "emitted_rr", "emitted_stop_pct",
+    "emitted_rr", "emitted_stop_pct", "no_target_by_sink",
     "map_added", "map_updated", "map_retired", "map_rejected", "map_carried",
-    "map_stale_calc",
+    "map_stale_calc", "map_unbuilt", "signal_far_from_price",
+    "zone_overlap_pairs", "zone_overlap_by_symbol", "zone_overlap_levels",
     "backfill_days_loaded", "backfill_days_missing", "backfill_trades",
     "backfill_structures", "backfill_structures_old", "backfill_days_capped",
     "backfill_rest_days", "backfill_rest_partial", "backfill_rest_trades",
     "backfill_missing_by_symbol",
     "profile_windows", "profile_windows_dropped", "profile_windows_senior_tf",
+    "profile_windows_no_bars_by_tf", "profile_windows_partial_by_tf",
+    "unbuilt_by_kind", "unbuilt_coverage_by_tf", "structures_by_tf",
+    "levels_zone_one_row", "levels_work_zone_not_narrowed", "levels_box_to_base",
+    "levels_volume_outside_base",
     "profile_windows_far", "profile_spans_filled",
     "profile_spans_cached", "profile_spans_failed", "profile_bars_stored",
     "profile_bars_rewritten", "profile_symbols_skipped",
@@ -3045,7 +3350,7 @@ def _check_fields_split() -> None:
 _check_fields_split()
 
 
-def _copy_series(st: SeriesState) -> SeriesState:
+def _copy_series(st: SeriesState, decide_bars: int = 0) -> SeriesState:
     """Копия состояния ряда для снимка: изменяемые списки отвязываются от живых.
 
     Копируются именно списки, не бары: `Bar` заморожен, и делить его между снимком и
@@ -3069,8 +3374,20 @@ def _copy_series(st: SeriesState) -> SeriesState:
     Правило для всякого нового поля: изменяемый контейнер — в `update`, иначе снимок
     перестаёт быть снимком молча, без единого исключения.
     """
+    # ⚠⚠ РЕЗ ГЛУБИНЫ РЕШЕНИЯ — ЗДЕСЬ, а не в опросе. Правка 2026-08-27, и она вторая:
+    # первая редакция посадила ручку на `keep_bars`, который режет ряд ПРИ ПРИХОДЕ бара.
+    # Контроль поймал это до коммита — прогон `--decide-bars 300` дал в кадрах 1637
+    # баров на 15м, потому что за 30 секунд наблюдения новый 15-минутный бар не пришёл
+    # ни разу, и резать было нечего. Снимок же берётся ВСЕГДА, значит и рез обязан быть
+    # здесь: глубина решения не может зависеть от того, повезло ли бару закрыться.
+    #
+    # Правый край сохраняется — режется левый: сравнивать две глубины можно только у
+    # одного и того же правого края (свод, правило о зависимости разметки от глубины).
+    bars = list(st.bars)
+    if decide_bars > 0 and len(bars) > decide_bars:
+        bars = bars[-decide_bars:]
     return st.model_copy(update={
-        "bars": list(st.bars),
+        "bars": bars,
         "gaps": list(st.gaps),
         "rejected_bars": list(st.rejected_bars),
         "rejected_at_ms": list(st.rejected_at_ms),
@@ -3099,6 +3416,7 @@ class Collector:
     """
 
     def __init__(self, uni: Universe, seed_limit: int, *, keep_bars: int = 0,
+                 decide_bars: int = 0,
                  keep_trade_days: int = LIVE_TRADES_KEEP_DAYS,
                  horizon_days: int = 0) -> None:
         self.uni = uni
@@ -3108,6 +3426,13 @@ class Collector:
         выводится глубина каждого ряда (`seed_depth`). Ноль означает «глубину задаёт
         `seed_limit`», то есть прежнее поведение."""
         self.keep_bars = keep_bars
+        self.decide_bars = decide_bars
+        """Предел длины ряда В СНИМКЕ, то есть в том, что идёт в расчёт. Ноль — весь ряд.
+
+        ⚠ ОТЛИЧАЕТСЯ ОТ `keep_bars`, и различие механическое: тот режет живой ряд при
+        приходе бара (память службы 24/7), а этот — снимок, который берётся всегда. Для
+        контроля глубины годится только второй: первый не срезал ничего в прогоне, где
+        за время наблюдения новый бар не закрылся."""
         self.keep_trade_days = keep_trade_days
         self.ex = shared(uni.venue)
         """⚠ ОБЩИЙ НА ПРОЦЕСС, А НЕ СВОЙ. До 2026-08-23 здесь стоял `Exchange(...)`, и
@@ -3370,7 +3695,8 @@ class Collector:
         rep.loop_late_total_ms = 0
         rep.loop_late_events = []
         rep.stage_windows_ns = {}
-        snap.series = {k: _copy_series(st) for k, st in rep.series.items()}
+        snap.series = {k: _copy_series(st, self.decide_bars)
+                       for k, st in rep.series.items()}
         snap.histograms = cycle_hist
         snap.binned = self.binned
         for name in CYCLE_FIELDS:
@@ -3417,6 +3743,7 @@ class Collector:
 async def collect(uni: Universe, seconds: int, seed_limit: int,
                   horizon_days: int = 90,
                   per_side: int = 0,
+                  decide_bars: int = 0,
                   ) -> tuple[RunReport, dict[str, TradeWindows], engine.Detections]:
     """ШАГ 1 из четырёх: ТОЛЬКО добыть данные. Ни карточки, ни леджера.
 
@@ -3429,7 +3756,21 @@ async def collect(uni: Universe, seconds: int, seed_limit: int,
     Оба построены на `Collector`, и различаются ровно тем, сколько раз берётся снимок:
     здесь один, там — по одному на цикл, бесконечно.
     """
-    c = Collector(uni, seed_limit, horizon_days=horizon_days)
+    # ⚠⚠ `decide_bars` — ПРЕДЕЛ ДЛИНЫ РЯДА, КОТОРЫЙ ПОЙДЁТ В РАСЧЁТ. Заведён
+    # 2026-08-27, и заведён по дефекту ПРИБОРА, а не расчёта.
+    #
+    # Свод требует проверять, что «разметка не смеет быть функцией того, СКОЛЬКО баров
+    # скачали»: прогон на ДВУХ глубинах одного правого края. Ручкой для этого считался
+    # `--seed-limit` — и он глубину решения НЕ РЕЖЕТ. Замер 2026-08-27: два прогона,
+    # `--seed-limit 300` и `--seed-limit 200`, дали в кадрах 15м по 1629 и 1630 баров,
+    # 1ч по 1415 и 1415 — то есть одинаково, потому что ключ задаёт размер ПЕРВОГО
+    # запроса к бирже, а решение читает НАКОПЛЕННЫЙ КЭШ целиком. Я провёл на нём ложный
+    # контроль глубины и едва не предъявил его пройденным.
+    #
+    # Механизм под рукой уже был: `keep_bars` режет ряд, идущий в решение, — но наружу
+    # он выведен не был, и правило свода оставалось непроверяемым. Второй сущности не
+    # заводится: ручка садится на существующее поле.
+    c = Collector(uni, seed_limit, horizon_days=horizon_days, decide_bars=decide_bars)
     try:
         await c.start()
         log.info("наблюдение", потоков=len(c.tasks), секунд=seconds)
@@ -3496,6 +3837,7 @@ OUTCOME_LABEL = {
     # правки — KeyError через 79 минут расчёта. Защита сработала как обещает докстрока
     # ниже, но цена ошибки — потерянный круг по всей вселенной.
     "breakeven": "в безубытке",
+
     # ⚠⚠ ЭТОЙ СТРОКИ НЕ БЫЛО, И ПРИЁМКА ПАДАЛА НА КАЖДОМ ПРОГОНЕ (найдено 2026-08-26).
     # `OutcomeKind.UNMEASURABLE` заведён 2026-08-23 (коммит 32869e7), подпись к нему —
     # нет, а раздел 12 обходит ВСЕ члены перечисления независимо от их счёта. То есть
@@ -3507,7 +3849,8 @@ OUTCOME_LABEL = {
     # KeyError через 79 минут расчёта»). Защита «падает по KeyError, а не печатает
     # пустую строку» сработала оба раза как обещано и оба раза ПОЗЖЕ, чем нужно:
     # ценой круга по всей вселенной. Поэтому ниже полнота проверяется ПРИ ИМПОРТЕ.
-    "unmeasurable": "вырожден риск (стоп на цене входа)",
+    "unmeasurable": "риск вырожден — стоп по входу, R не существует",
+
 }
 """Подписи исходов для владельца, который не программист (§7.6).
 
@@ -3840,6 +4183,74 @@ def print_report(r: RunReport) -> int:
         spans = ", ".join(f"{tf}: {n}"
                           for tf, n in sorted(r.profile_spans_by_tf.items()))
         print(f"   добрано по ТФ (перекос виден здесь): {spans}")
+    # ⚠⚠ ДВА КЛАССА ОТКАЗА ПОКРЫТИЯ — ПЕРВОКЛАССНЫМИ СТРОКАМИ (Ф6, 2026-08-26). Прежде
+    # они считались внутри `profile_source.CandleWindows` и наружу не выходили: приёмка
+    # называла только третий класс — «ряда нужного ТФ не собрано», — а уровень теряется
+    # одинаково от всех трёх. Сводятся ПО ТФ: правило сводки отказов требует показывать
+    # измерение, вдоль которого возможен перекос.
+    for cov_label, cov_data, cov_note in (
+        ("окно НЕ ПОКРЫТО свечами вовсе", r.profile_windows_no_bars_by_tf,
+         "период не качали"),
+        ("окно покрыто НЕ ПОЛНОСТЬЮ", r.profile_windows_partial_by_tf,
+         "качали и не докачали — ЭТОТ класс и режет уровни"),
+    ):
+        if cov_data:
+            cov_rows = ", ".join(f"{tf}: {n}" for tf, n in sorted(cov_data.items()))
+            print(f"   {cov_label}: {sum(cov_data.values())} — {cov_rows}  ({cov_note})")
+    # ⚠⚠ МЕРА Ф7 — ДОЛЯ СТРУКТУР, ПОТЕРЯННЫХ НА ПОКРЫТИИ, В РАЗРЕЗЕ ПО ТФ (2026-08-26).
+    # Сама фаза требует НЕДЕЛЮ БОЕВЫХ прогонов и отсюда неисполнима; здесь заведён
+    # ПРИБОР, без которого её нельзя было бы посчитать и в бою: причины непостроения
+    # существовали свободной строкой и не складывались.
+    #
+    # ⚠ Смотреть надо на ДИНАМИКУ доли за неделю, а не на одно число: если добор
+    # покрытия работает, доля падает; если нет — это первый кандидат в следующую фазу,
+    # потому что теряются ровно те ТФ, которым курс обещает лучший винрейт (стр. 48).
+    if r.structures_by_tf:
+        print("   СТРУКТУРЫ → УРОВНИ по ТФ, и потери на ПОКРЫТИИ (мера Ф7):")
+        for tf in sorted(r.structures_by_tf):
+            seen = r.structures_by_tf[tf]
+            lost = r.unbuilt_coverage_by_tf.get(tf, 0)
+            share = f"{lost / seen * 100:.1f}%" if seen else "—"
+            print(f"     {tf:>3}  структур {seen:5}  потеряно покрытием {lost:5}  {share:>7}")
+    if r.unbuilt_by_kind:
+        # Перечислением, а не по словарю: новый класс появится в сводке сам, а не
+        # забудется (тот же приём, что у воронки целей и у исходов).
+        print("   уровень НЕ построен, по классу причины:")
+        for k in levels.UnbuiltKind:
+            n = r.unbuilt_by_kind.get(k.value, 0)
+            if n:
+                mark = "  ⚠ ФИЛЬТР, не отказ" if k in (
+                    levels.UnbuiltKind.FAR, levels.UnbuiltKind.DUPLICATE) else ""
+                print(f"     {k.value:38} {n:5d}{mark}")
+    # ⚠ ДВЕ МЕРЫ, НАЙДЕННЫЕ ГЛАЗАМИ ПО КАРТОЧКЕ 2026-08-27. Печатаются СО
+    # ЗНАМЕНАТЕЛЕМ и БЕЗУСЛОВНО, пока уровни есть: «ноль» здесь — результат, а не
+    # молчание, и отличить его от «не считалось» иначе нельзя.
+    built = sum(r.structures_by_tf.values()) - sum(r.unbuilt_by_kind.values())
+    if built > 0:
+        print(f"   зона в одну-две строки профиля (разрешения нет): "
+              f"{r.levels_zone_one_row} из {built}")
+
+    if r.levels_volume_outside_base:
+        # МЕРА ВЗАМЕН ИСЧЕЗНУВШИХ ОТКАЗОВ. С 2026-08-28 сетка профиля натянута на базу,
+        # поэтому ПОК лежит внутри ПО ПОСТРОЕНИЮ и классы `ZONE_OUT`/`POC_OUT` больше не
+        # срабатывают. Негодность структуры от этого не исчезла — она стала выброшенным
+        # объёмом, и печатается здесь. Печатается ХВОСТОМ, а не одним числом: медиана и
+        # максимум — разные вести.
+        v = sorted(r.levels_volume_outside_base)
+        big = sum(1 for x in v if x > 0.25)
+        print(f"   объём ВНЕ базы (точки не поймали свои свечи): медиана "
+              f"{statistics.median(v) * 100:.1f}%, p90 {v[int(len(v) * 0.9)] * 100:.1f}%, "
+              f"максимум {max(v) * 100:.1f}%; больше четверти теряют {big} из {len(v)}")
+    if r.levels_box_to_base:
+        xs = sorted(r.levels_box_to_base)
+        # ⚠ Референт назван РЯДОМ С ЧИСЛОМ, иначе оно ни о чём не говорит: 1.31 снято
+        # пиксельным проходом по рисунку автора (стр. 30), разбор — в докстроке
+        # `Level.box_to_base`.
+        print(f"   сетка профиля / границы базы: медиана {xs[len(xs)//2]:.2f}, "
+              f"максимум {xs[-1]:.2f}  (у автора на стр. 30 — 1.31)")
+    if not (r.profile_windows_no_bars_by_tf or r.profile_windows_partial_by_tf):
+        print("   отказов покрытия окон нет ни одного класса"
+              + ("" if r.profile_windows else " — но и окон не было, число пусто"))
     print(f"   свечей записано: {r.profile_bars_stored}, "
           f"ПЕРЕЗАПИСАНО: {r.profile_bars_rewritten}")
     if r.profile_windows and not (r.profile_spans_filled + r.profile_spans_cached):
@@ -3864,6 +4275,17 @@ def print_report(r: RunReport) -> int:
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
           f"известно раньше: {r.pp_signals_known}")
+    # ⚠ ОТКАЗЫ НАЗЫВАЮТСЯ РЯДОМ С ЗАПИСЯМИ (§4.3): без них строка «сделок по слому 0»
+    # читается как «сломов не было», хотя причин ровно три и они разные.
+    print(f"   сделок ПО СЛОМУ младшего ТФ (стр. 25/31 → стр. 50): "
+          f"впервые {r.break_signals_recorded}, известно раньше: "
+          f"{r.break_signals_known}; не записано — без цели "
+          f"{r.break_signals_no_target}, цена далеко {r.break_signals_far}")
+    # МОЛЧАНИЕ НАЗЫВАЕТСЯ ЧИСЛОМ: без этой строки «сигналов мало» читалось бы как
+    # свойство рынка, тогда как это наш собственный отказ записывать сделку, к чьей
+    # зоне входа цена ещё не подошла. Знаменатель рядом — сколько записано.
+    print(f"   НЕ записано, цена далеко от зоны входа: {r.signal_far_from_price}"
+          f"   (мера близости — ширина зоны, `geometry.zone_position`)")
     if r.absorption_measured_by_tf or r.absorption_refused_by_tf:
         # Сводка по измерению, вдоль которого возможен перекос: отказ меры уторговки
         # идёт по ТФ (окно от подтверждения слома длиннее собранного ряда минуток).
@@ -3907,6 +4329,35 @@ def print_report(r: RunReport) -> int:
     golden = sum(1 for x in r.emitted_rr if x >= geometry.GOLDEN_RR)
     print(f"     из них ≥ 1к{geometry.GOLDEN_RR:.0f} — «золотым стандартом» стр. 9: "
           f"{golden} из {len(r.emitted_rr)}")
+    # ⚠⚠ ВОРОНКА ЦЕЛЕЙ (Ф1, 2026-08-26) — ЗНАМЕНАТЕЛЬ К СТРОКЕ РР ВЫШЕ. До этой правки
+    # «{golden} из {len(emitted_rr)}» печаталось по подвыборке, которую никто не называл:
+    # у сделки без КРУПНОЙ цели РР не существует (`Setup.rr` → None), и она молча
+    # выпадала из списка. Долю таких сделок дважды считали разовым замером — 96.6% и
+    # 52.5% на разных выборках, — и сравнить их было нечем. Теперь её печатает прогон.
+    no_target = sum(r.no_target_by_sink.values())
+    print(f"   БЕЗ КРУПНОЙ ЦЕЛИ: {no_target} из {emitted}"
+          + (f" ({no_target / emitted * 100:.0f}%)" if emitted else "")
+          + " — у них РР не существует, а не равен нулю")
+    for sink in geometry.TargetSink:
+        if sink is geometry.TargetSink.NONE:
+            continue
+        n = r.no_target_by_sink.get(sink.value, 0)
+        if not n:
+            continue
+        share = f"{n / emitted * 100:.0f}%" if emitted else "—"
+        print(f"     {sink.value:38} {n:5d}  {share:>5}")
+    # КОНТРОЛЬ СХОДИМОСТИ, и он печатается, а не подразумевается: три ветви обязаны
+    # покрыть все эмиссии без остатка. Ненулевой остаток есть потерянная строка —
+    # ровно тот дефект, ради которого воронка и заведена. Остаток законен только один:
+    # крупная цель ЕСТЬ, но риск вырожден (стоп совпал со входом), и тогда РР тоже нет.
+    residual = emitted - no_target - len(r.emitted_rr)
+    print(f"     сходимость: {no_target} без цели + {len(r.emitted_rr)} с РР "
+          f"+ {residual} вырожден риск при цели = {emitted}"
+          + ("" if residual >= 0 else "  ⚠ ОТРИЦАТЕЛЬНЫЙ ОСТАТОК — СЧЁТ РАСХОДИТСЯ"))
+    if no_target:
+        print("     ⚠ сток — НЕ дефект сам по себе: снятый по стр. 25 уровень целью быть "
+              "не может, а несостоявшаяся структура старшего ТФ — отказ прибора. Фильтры "
+              "ради «появления целей» не ослабляются.")
     print(f"   дистанция стопа, % цены: {_spread(r.emitted_stop_pct)}")
     print("   КОМИССИИ, ФАНДИНГ И ПРОСКАЛЬЗЫВАНИЕ НЕ МОДЕЛИРУЮТСЯ НИГДЕ.")
     if r.emitted_stop_pct:
@@ -3918,11 +4369,33 @@ def print_report(r: RunReport) -> int:
     print("\n13. КАРТА УРОВНЕЙ МЕЖДУ ПРОГОНАМИ (стр. 25, 31)")
     print(f"   новых уровней: {r.map_added}, подтверждено прежних: {r.map_updated}")
     print(f"   снято по курсу (отработан/пробит): "
-          f"{r.map_retired - r.map_stale_calc}")
+          f"{r.map_retired - r.map_stale_calc - r.map_unbuilt}")
     print(f"   снято как порождённые ПРЕЖНИМ расчётом: {r.map_stale_calc}"
           + ("  — структуры под ними в свежем разборе НЕТ, хотя её время внутри "
              "собранного ряда; это про НАС, а не про рынок"
              if r.map_stale_calc else "  (ноль: карта построена тем же расчётом)"))
+    # ⚠ ДВЕ ПРИЧИНЫ — ДВЕ СТРОКИ, хотя состояние в леджере одно (`stale_calc`). Строкой
+    # выше структура ПРОПАЛА из разбора; здесь она НА МЕСТЕ, а уровня по ней не строится.
+    # Сложить их в одно число значило бы спрятать перекос между отказом детектора и
+    # отказом профиля — тот самый случай, ради которого у сводки требуют знаменатель.
+    print(f"   снято как БОЛЬШЕ НЕ СТРОЯЩИЕСЯ расчётом: {r.map_unbuilt}"
+          + ("  — структура на месте и в горизонте, а уровня по ней нет (обычно "
+             "профиль); снятие обратимо: построится снова — вернётся в active"
+             if r.map_unbuilt else "  (ноль: всё, что расчёт строил, он строит и сейчас)"))
+    # ⚠⚠ НАСЛОЕНИЕ ВСТРЕЧНЫХ ЗОН (2026-08-26) — величина, которую нашёл ВЛАДЕЛЕЦ
+    # ГЛАЗАМИ 2026-08-18, а проект чинил четырежды, ни разу не назвав числа. Теперь его
+    # называет каждый прогон. Ноль — законное состояние; смотреть надо на РОСТ при
+    # неизменном расчёте. Разбор — в докстроке `store.ZoneOverlaps`.
+    print(f"   наслоение ВСТРЕЧНЫХ зон: {r.zone_overlap_pairs} пар "
+          f"на {r.zone_overlap_levels} активных уровней карты")
+    if r.zone_overlap_by_symbol:
+        top = sorted(r.zone_overlap_by_symbol.items(), key=lambda kv: -kv[1])
+        print("     по символам (перекос виден здесь): "
+              + ", ".join(f"{sym} {n}" for sym, n in top[:8])
+              + (f" … и ещё {len(top) - 8}" if len(top) > 8 else ""))
+        print("     ⚠ пара — НЕ дефект сама по себе: стр. 25 велит «мы этот уровень "
+              "удаляем и ищем новые», и встречный уровень на тех же ценах бывает "
+              "законным. Дефект — РОСТ числа при неизменном расчёте.")
     print(f"   отклонено схемой карты: {len(r.map_rejected)}")
     for why in r.map_rejected[:5]:
         print(f"     ОТКЛОНЕНО {why}")
@@ -3969,9 +4442,16 @@ def print_report(r: RunReport) -> int:
     # Устаревшее сведение часов — тоже нарушение, а не замечание: §6 строит на нём ВСЁ
     # сравнение «сейчас против биржевой метки», и просроченный якорь означает, что
     # свежесть кадров выше измерялась неизвестно чем.
+    # ⚠ РАСХОЖДЕНИЕ ВОРОНКИ ЦЕЛЕЙ — НАРУШЕНИЕ, А НЕ ЗАМЕЧАНИЕ (Ф1, 2026-08-26). Строка
+    # сходимости в разделе 12 печатается, а печать гейтом не является: контроль, который
+    # только печатает, проверяет прибор ровно один раз — в тот день, когда его читали.
+    # Отрицательный остаток означает, что сток и РР посчитаны по РАЗНЫМ множествам
+    # эмиссий, то есть строка потеряна. По построению это невозможно (сток непуст ⇒
+    # крупной цели нет ⇒ РР нет), поэтому здесь растяжка, а не ожидаемый счёт.
     violations = (r.watch_deaths
                   + len(stale) + len(missing) + unexplained + not_ready
-                  + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale))
+                  + len(offgrid_seed) + r.trade_gap_events + int(r.clock_stale)
+                  + int(residual < 0))
     print("\n15. ИТОГ")
     # ⚠ ЗА ЦИКЛ и ВСЕГО — два разных вопроса, и раздел «ИТОГ» задаёт первый. Здесь
     # стоял только процессный счётчик, монотонно растущий у службы за сутки.

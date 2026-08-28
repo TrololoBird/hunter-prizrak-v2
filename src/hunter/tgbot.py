@@ -431,6 +431,32 @@ def _spaced(s: str) -> str:
     return s.replace(",", " ")
 
 
+def tick_price(x: float, tick: Decimal | None = None, *, away: str = "") -> float:
+    """Цена, ОКРУГЛЁННАЯ К ШАГУ ИНСТРУМЕНТА, — то самое число, что печатается.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-27 ПО РАЗБОРУ СООБЩЕНИЙ КАНАЛА. Округление к тику жило ВНУТРИ
+    `_fmt_price` и наружу не выходило: печаталась округлённая цена, а проценты рядом
+    считались по СЫРОЙ. Владелец с калькулятором получал другое число — на живых
+    сообщениях 4 сигнала из 13 не воспроизводились (CHZ: ПОК 0.013845 печатался как
+    0.01385, стоп 0.0131532 как 0.01315; «до лимитки» выходило 1.5% против 1.42% по
+    напечатанному; UNI: ПОК 4.2925 печатался как 4.2930).
+
+    что из чего следует: выставима ТОЛЬКО округлённая цена → и риск читатель несёт по
+    ней же. Считать проценты по сырому ПОКу значит описывать сделку, которую нельзя
+    поставить. Поэтому величина одна, и она эта.
+    """
+    if tick is None or tick <= 0:
+        return x
+    d = Decimal(str(x)) / tick
+    if away == "down":
+        q = d.to_integral_value(rounding=ROUND_FLOOR)
+    elif away == "up":
+        q = d.to_integral_value(rounding=ROUND_CEILING)
+    else:
+        q = d.to_integral_value(rounding=ROUND_HALF_UP)
+    return float(q * tick)
+
+
 def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     """Цена так, как её читает человек: 63 460, 3.691, 0.00385.
 
@@ -457,14 +483,9 @@ def _fmt_price(x: float, tick: Decimal | None = None, *, away: str = "") -> str:
     Вход и текущая цена такого требования не несут и округляются к ближайшему.
     """
     if tick is not None and tick > 0:
-        d = Decimal(str(x)) / tick
-        if away == "down":
-            q = d.to_integral_value(rounding=ROUND_FLOOR)
-        elif away == "up":
-            q = d.to_integral_value(rounding=ROUND_CEILING)
-        else:
-            q = d.to_integral_value(rounding=ROUND_HALF_UP)
-        exact = q * tick
+        # Округление считает `tick_price` — ЕДИНСТВЕННОЕ место этой величины: пока оно
+        # жило здесь, печать знала округлённую цену, а проценты рядом — сырую.
+        exact = Decimal(str(tick_price(x, tick, away=away)))
         if exact >= 10_000:
             return _spaced(f"{float(exact):,.0f}")
         # Знаков ровно столько, сколько их у тика: лишние — обещание точности, которой
@@ -545,12 +566,14 @@ def read_map(symbol: str) -> MapRead | NotReady:
             "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen,"
             " boundary_lo, boundary_hi, from_ms, to_ms, state,"
             " COALESCE(resolved_at, 0), " + dens_col +
-            # Та же отсечка свежести, что у наблюдателя (см. пояснение в `ledger_news`):
-            # на график не идут уровни, которых последний расчёт символа не подтвердил.
-            " FROM levels WHERE symbol=? AND ((state='active' AND last_seen = ("
-            "     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = ?"
-            " )) OR retired_at >= ?)"
-            " ORDER BY price", (symbol, symbol, clock.now_ms() - RETIRED_WINDOW_MS),
+            # ⚠ ОТСЕЧКА СВЕЖЕСТИ — ССЫЛКОЙ, А НЕ КОПИЕЙ (2026-08-28). Здесь стоял
+            # подзапрос, дословно повторённый в `_ledger_news`, и это были ДВЕ записи
+            # одного правила; остальной проект (`hunter check`, наслоение зон) о нём не
+            # знал вовсе и считал по множеству на 20% больше. Определение одно —
+            # `store.LIVE_LEVEL_SQL`.
+            " FROM levels WHERE symbol=? AND ((" + store.LIVE_LEVEL_SQL + ")"
+            " OR retired_at >= ?)"
+            " ORDER BY price", (symbol, clock.now_ms() - RETIRED_WINDOW_MS),
         ).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
@@ -616,6 +639,8 @@ def zones_of(decision: engine.SymbolDecision,
             side=m.current.side.value, timeframe=m.level.timeframe,
             price=float(m.level.price), zone_lo=float(m.level.zone_lo),
             zone_hi=float(m.level.zone_hi), entry_rule=m.status.entry_rule.value,
+            work_lo=float(m.level.zone_work_lo or 0),
+            work_hi=float(m.level.zone_work_hi or 0),
             state=m.status.state.value,
             retired_at_ms=0 if active else resolved,
             boundary_lo=float(m.level.boundary_lo),
@@ -805,7 +830,21 @@ def _beyond_price(z: ZoneSpec, last_price: float) -> bool:
     проходом сквозь не является. То же правило и тем же способом считает
     `levels.status` (`LevelStatus.price_beyond`) — один смысл обязан считаться одинаково
     в тексте и на картинке, иначе они снова разойдутся.
+
+    ⚠⚠ НЕЗАПИСАННАЯ ГРАНИЦА — ЭТО «НЕИЗВЕСТНО», А НЕ «ПРОЙДЕНО» (правка 2026-08-26).
+    Умолчание полей `ZoneSpec.boundary_lo/hi` — `0.0`, и прежняя редакция читала его как
+    цену: у ШОРТА `0.0 < цена` истинно всегда, и уровень молча уходил с графика; у ЛОНГА
+    `0.0 > цена` ложно всегда, и уровень оставался. Асимметрия ПО СТОРОНЕ при одном и том
+    же пробеле в данных — то есть тихая потеря строк, и только с одной стороны (§4.3).
+
+    ⚠ Дефект найден чужой сменой в её незакоммиченной копии; я подтвердил его в
+    ЗАКОММИЧЕННОМ коде и проверил охват сам. Он спящий, но НЕ по той причине, что была
+    названа: единственный производитель зон с нулевыми границами — `pp_zones`, а его зоны
+    идут на график МИМО этого фильтра (`shown + tf_pps`). Зоны карты границы несут всегда.
+    Правка снимает ловушку до того, как появится третий производитель.
     """
+    if z.boundary_lo <= 0 or z.boundary_hi <= 0:
+        return False
     return z.boundary_lo > last_price if z.side == "long" else z.boundary_hi < last_price
 
 
@@ -1463,7 +1502,14 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
         by_seniority = sorted(g, key=lambda z: -order.get(z.timeframe, 0))
         tfs = "+".join(dict.fromkeys(
             TF_LABEL.get(z.timeframe, z.timeframe) for z in by_seniority))
-        g_lo, g_hi = min(z.zone_lo for z in g), max(z.zone_hi for z in g)
+
+        def eb(z: ZoneSpec) -> tuple[float, float]:
+            """Эффективные границы зоны: рабочие вокруг ПОК (решение владельца
+            2026-08-25), иначе VAL…VAH — уровень старого прогона."""
+            return ((z.work_lo, z.work_hi)
+                    if z.work_hi > z.work_lo > 0 else (z.zone_lo, z.zone_hi))
+
+        g_lo, g_hi = min(eb(z)[0] for z in g), max(eb(z)[1] for z in g)
         if len(g) > 1:
             # Края диапазона — по ЗОНАМ, а не по ПОКам (исправлено 2026-08-18).
             # Прежняя редакция печатала min–max ПОКов, а метку «цена уже здесь»
@@ -1476,8 +1522,9 @@ def compose_text(symbol: str, zones: tuple[ZoneSpec, ...], pps: list[ZoneSpec],
                     f" ({tfs})")
         else:
             z = g[0]
+            z_lo, z_hi = eb(z)
             core = (f"— {_fmt_price(z.price)} ({tfs}), зона "
-                    f"{_fmt_price(z.zone_lo)}–{_fmt_price(z.zone_hi)}")
+                    f"{_fmt_price(z_lo)}–{_fmt_price(z_hi)}")
         marks = ""
         # ⚠ Метка "цена уже здесь" НЕ ставится, когда о том же говорит роль зоны
         # (её строка про вход не в приоритет по стр. 44): это ОДИН факт, и печатать его
@@ -1721,6 +1768,26 @@ def _fmt_age(minutes: int) -> str:
 
 
 SENT_DIR = paths.DATA_DIR / "sent"
+WATERMARK_PATH = paths.DATA_DIR / "watcher-watermark.json"
+"""Докуда наблюдатель уже доложил в канал. ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК.
+
+⚠⚠⚠ ЗАВЕДЕНО 2026-08-27 ПО НАБЛЮДЕНИЮ ВЛАДЕЛЬЦА: «пришло уведомление что входы
+состоялись, но при этом не было никаких о них уведомлениях, а просто пришли исходы и
+входы состоялись».
+
+Механизм был такой. Водяной знак жил только в памяти процесса, и на первом такте после
+запуска взводился по текущему максимуму — «иначе перезапуск вылил бы в канал всю
+историю». Довод верен, а следствие не было названо: КАЖДЫЙ сигнал, записанный расчётом
+пока бот лежал, не объявлялся НИКОГДА. Его вход и исход объявлялись — они считаются по
+времени, а не по номеру сигнала.
+
+Замер по журналу отправленного (`data/sent/*.jsonl`, 22-27 августа): входов объявлено
+121, из них БЕЗ предшествующего «⚡ Новые сигналы» — 79, то есть 65%. По ТФ: 4ч 30,
+1ч 30, 1Д 15, 15м 3, 5м 1 — семьдесят пять из семидесяти девяти на СТАРШИХ ТФ, где
+владелец и заметил пропажу.
+
+Прибора, который поймал бы это, в проекте не было: молчание канала не мерилось ничем.
+"""
 """Куда складывается ТЕКСТ каждого отправленного сообщения, по суткам.
 
 ⚠ ЗАВЕДЕНО 2026-08-19 по вопросу владельца: "почему у тебя нигде не сохраняется
@@ -2442,10 +2509,41 @@ ALIVE_EVERY_S = 900.0
 
 async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                      notifier: Notifier) -> None:
-    """Периодическая сводка: бот жив, и вот чем он занимался."""
+    """Периодическая сводка: бот жив, и вот чем он занимался.
+
+    ⚠⚠⚠ ЗДЕСЬ ЖЕ НАЗЫВАЕТСЯ ВОЗРАСТ ЛЕДЖЕРА — правка 2026-08-28 по вопросу владельца
+    «чем серв отличается от бота? я думал это единный механизм».
+
+    Разделение процессов намеренно и обосновано (единственный писатель §10.2, дележ
+    лимита биржи `IpShare`), но СЛЕДСТВИЕ названо не было: бот доставляет из леджера,
+    который пишет `hunter serve`, и если служба не запущена — молчит об этом. Так и
+    вышло: сутки уведомлений «цена у зон» по старой карте при последнем сигнале
+    `#1131` от 2026-08-27 17:24 UTC, и ни строки о том, что расчёт стоит.
+
+    Это молчаливая деградация, которую свод запрещает прямо: «деградации и отсутствие
+    данных недопустимы». Владелец не программист и не обязан помнить, что «бот» — это
+    только доставка.
+
+    ПОРОГ НЕ ВЫДУМАН. Строка `degraded` печатается, когда с СОБСТВЕННОГО СТАРТА бота в
+    леджер не легло ни одной записи: это факт («пока я работаю, никто не пишет»), а не
+    выбранное число часов. Возраст же печатается ВСЕГДА, безусловно.
+    """
+    started_ms = clock.now_ms()
+    seen_max = _read_watermark()[0] or 0
     while True:
         await asyncio.sleep(ALIVE_EVERY_S)
+        fresh = _newest_signal()
+        age_min = ((clock.now_ms() - fresh[1]) // 60_000) if fresh[1] else None
+        if fresh[0] > seen_max:
+            seen_max = fresh[0]
+        elif fresh[1] and fresh[1] < started_ms:
+            log.degraded(
+                "леджер НЕ ПОПОЛНЯЕТСЯ — расчёт не запущен",
+                последний_сигнал=fresh[0],
+                минут_назад=age_min,
+                подсказка="бот только ДОСТАВЛЯЕТ; считает и пишет `hunter serve`")
         log.info("бот жив", запросов=delivery.requests, ответов=delivery.answers,
+                 последний_сигнал_минут_назад=age_min,
                  неопознано=delivery.unknown,
                  отказов_по_паузе=delivery.cooldown.refused,
                  сборок=delivery.on_demand.built, сборок_с_отказом=delivery.on_demand.failed,
@@ -2456,7 +2554,13 @@ async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                  уведомлений_сигналы=notifier.sent_signals,
                  уведомлений_исходы=notifier.sent_outcomes,
                  уведомлений_зоны=notifier.sent_zone_events,
+                 повторов_погашено=notifier.suppressed_repeats,
+                 # МОЛЧАНИЕ НАЗЫВАЕТСЯ ЧИСЛОМ: сигналы, которых читатель не
+                 # увидел, потому что наблюдатель их догонял после простоя.
+                 сигналов_пропущено_после_простоя=notifier.skipped_backlog,
                  уведомлений_отмены=notifier.sent_cancels,
+                 уведомлений_слом=notifier.sent_breaks,
+                 уведомлений_безубыток=notifier.sent_be,
                  тактов_наблюдателя_с_отказом=notifier.ticks_failed)
         watch.note_recovery()
 
@@ -2539,6 +2643,18 @@ class LevelRow:
     boundary_hi: float = 0.0
     """Границы структуры. Ноль — не записаны."""
 
+    zone_work_lo: float = 0.0
+    zone_work_hi: float = 0.0
+    """Рабочая зона вокруг ПОК (HVN-ядро, решение владельца 2026-08-25). Нули —
+    строка записана до схемы 17 либо расчёт ещё не проставил; тогда события зон
+    считаются по VAL…VAH, как раньше."""
+
+    def work_bounds(self) -> tuple[float, float]:
+        """Границы зоны для СОБЫТИЙ: рабочие вокруг ПОК, если есть, иначе VA."""
+        if self.zone_work_hi > self.zone_work_lo > 0:
+            return (self.zone_work_lo, self.zone_work_hi)
+        return (self.zone_lo, self.zone_hi)
+
     priority_tf: str = ""
     priority_depth: int | None = None
     """ЧЕЙ приоритет старшего ТФ и на скольких экстремумах он держится (схема 14).
@@ -2581,7 +2697,13 @@ class LevelRow:
     хэджа и/или на уменьшенный объем риска»; стр. 11 — только под ПРИБЫЛЬНУЮ сделку."""
 
     mtf_break: int | None = None
-    """Подтверждён ли слом структуры на младшем ТФ: 1 да, 0 нет, None неприменимо.
+    """Подтверждён ли слом структуры на младшем ТФ: 1 да, 0 нет, None НЕ СПРАШИВАЛИ.
+
+    ⚠ `None` С 2026-08-28 (правка A-2) значит ТРИ разные вещи, и ни одна из них не
+    «нет»: цена к уровню не приходила; младшего ТФ у курса нет (уровень 5м, стр. 17);
+    ряд младшего ТФ не разобран. Прежде два последних случая писались НУЛЁМ, то есть
+    «искали и не нашли», и бот читал их как «ждём слома» — для 5м это ожидание вечное.
+    Различает их `engine.MtfBreak`; сюда доходят только `CONFIRMED` и `ABSENT`.
 
     Стр. 19: «также можно смотреть слом структуры на мтф, и брать более безопасную
     позицию с хорошим соотношением РР» — у свежего уровня слом это не запрет лимитки,
@@ -2592,20 +2714,99 @@ class LevelRow:
 class LedgerNews:
     """Что появилось в леджере со прошлого такта, плюс новые водяные знаки."""
 
-    signals: tuple[tuple[str, str, str, float, float, float | None], ...]
-    """(symbol, timeframe, direction, entry, stop, target)"""
+    signals: tuple[tuple[str, str, str, float, float, float | None,
+                        int | None, int | None], ...]
+    """(symbol, timeframe, direction, entry, stop, target, level_from_ms, level_to_ms)
+
+    ⚠ Последние два — ССЫЛКА НА СВОЙ УРОВЕНЬ (схема 20, 2026-08-27). Вместе с символом и
+    ТФ это полный ключ таблицы `levels`. `None` — сигнал записан прежней схемой, связь
+    неизвестна; тогда зона рядом с ним НЕ печатается вовсе, а не подбирается на глаз."""
 
     outcomes: tuple[tuple[str, str, str, str, float | None], ...]
     """(symbol, timeframe, direction, kind, r)"""
 
-    states: tuple[tuple[int, str, str, str, str, float], ...]
-    """(signal_id, symbol, timeframe, direction, state, entry) — состояния ВСЕХ
-    незакрытых сигналов. Наблюдатель ловит переход not_filled→open: «вход
-    состоялся» — событие, о котором просил владелец (2026-08-18)."""
+    states: tuple[tuple[int, str, str, str, str, float,
+                   float | None, float | None, float | None], ...]
+    """(signal_id, symbol, timeframe, direction, state, entry,
+    breakeven_at, stop, target) — состояния ВСЕХ незакрытых сигналов. Наблюдатель
+    ловит переход not_filled→open («вход состоялся», приказ владельца 2026-08-18)
+    и достижение цены взведения безубытка (🎯, стр. 14–15)."""
 
     levels: tuple[LevelRow, ...]
+
     max_signal_id: int
     max_closed_ms: int
+
+    break_traded: frozenset[tuple[str, int, int]] = frozenset()
+    """Ключи уровней (symbol, from_ms, to_ms), у которых в леджере ЕСТЬ сделка по слому.
+
+    ⚠⚠ ЗАВЕДЕНО ПРАВКОЙ A-3, 2026-08-28. Объявление «слом младшего ТФ подтверждён —
+    вход активен» срабатывало на переходе `mtf_break` 0→1 и БОЛЬШЕ НИ НА ЧЁМ: сделки
+    при этом могло не существовать вовсе. 28.08 в 13:03 UTC так ушло по BCH шорт 1ч —
+    ни стопа, ни цели, ни РР. Теперь объявление обеспечено записью: пусто здесь —
+    молчим, потому что звать в сделку, не назвав риска, нельзя.
+
+    Пустое множество при отсутствии колонок связи — это ОТКАЗ В ПОЛЬЗУ МОЛЧАНИЯ, и он
+    выбран сознательно: на леджере старой схемы связь неизвестна, а объявлять вход по
+    неизвестной связи — ровно тот дефект, который правка и закрывает.
+    """
+
+
+def _newest_signal() -> tuple[int, int]:
+    """Номер и момент записи САМОГО СВЕЖЕГО сигнала леджера. `(0, 0)` — леджер не читается.
+
+    Отдельный короткий заход вместо расширения `_read_ledger_news`: тот отвечает на
+    вопрос «что нового СО ВРЕМЕНИ такта» и его водяные знаки двигаются, а здесь нужен
+    абсолютный возраст базы независимо от того, докуда доложено.
+    """
+    try:
+        conn = store.open_readonly()
+    except (FileNotFoundError, OSError):
+        return (0, 0)
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0), COALESCE(MAX(recorded_at), 0) FROM signals"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+    except sqlite3.DatabaseError as e:
+        log.degraded("возраст леджера не прочитан", причина=f"{type(e).__name__} {e}")
+        return (0, 0)
+    finally:
+        conn.close()
+
+
+def _read_watermark() -> tuple[int | None, int | None]:
+    """Докуда доложено, с диска. `(None, None)` — знака нет: ПЕРВЫЙ запуск.
+
+    Отсутствие файла и битый файл отвечают ОДИНАКОВО и НАЗЫВАЮТ себя в журнале: тихо
+    подставить ноль значило бы вылить в канал всю историю, тихо подставить максимум —
+    повторить дефект, ради которого файл и заведён.
+    """
+    try:
+        raw = json.loads(WATERMARK_PATH.read_text(encoding="utf-8"))
+        sid = raw.get("last_signal_id")
+        cms = raw.get("last_closed_ms")
+        return (int(sid) if sid is not None else None,
+                int(cms) if cms is not None else None)
+    except FileNotFoundError:
+        return (None, None)
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        log.degraded("наблюдатель: знак не прочитан — считаем первым запуском",
+                     файл=str(WATERMARK_PATH), причина=f"{type(e).__name__} {e}")
+        return (None, None)
+
+
+def _write_watermark(signal_id: int | None, closed_ms: int | None) -> None:
+    """Записать знак. Отказ записи НАЗЫВАЕТСЯ, а не глотается: без него следующий
+    перезапуск снова потеряет объявления, и потеря будет молчаливой."""
+    try:
+        WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WATERMARK_PATH.write_text(json.dumps(
+            {"last_signal_id": signal_id, "last_closed_ms": closed_ms}),
+            encoding="utf-8")
+    except OSError as e:
+        log.degraded("наблюдатель: знак НЕ записан — перезапуск потеряет объявления",
+                     файл=str(WATERMARK_PATH), причина=f"{type(e).__name__} {e}")
 
 
 def _read_ledger_news(after_id: int | None, after_ms: int | None,
@@ -2625,14 +2826,26 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
             "SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()[0])
         max_closed = int(conn.execute(
             "SELECT COALESCE(MAX(closed_at), 0) FROM outcomes").fetchone()[0])
-        sig_rows: list[tuple[str, str, str, float, float, float | None]] = []
+        sig_rows: list[tuple[str, str, str, float, float, float | None,
+                             int | None, int | None]] = []
         out_rows: list[tuple[str, str, str, str, float | None]] = []
+        # ⚠ Колонки ССЫЛКИ НА УРОВЕНЬ спрашиваются у базы, а не предполагаются:
+        # бот открывает леджер `mode=ro` и мигрировать не может, поэтому между
+        # выкладкой кода и первым боевым прогоном схема остаётся прежней. Без
+        # этого запрос отвечает `no such column`, и наблюдатель не читает леджер
+        # ВОВСЕ — поймано живым запуском 2026-08-27. Приём тот же, что у карты.
+        sig_have = store.table_columns(conn, "signals")
+        lfm_col = "level_from_ms" if "level_from_ms" in sig_have else "NULL"
+        ltm_col = "level_to_ms" if "level_to_ms" in sig_have else "NULL"
         if after_id is not None:
             sig_rows = [
                 (r[0], r[1], r[2], float(r[3]), float(r[4]),
-                 None if r[5] is None else float(r[5]))
+                 None if r[5] is None else float(r[5]),
+                 None if r[6] is None else int(r[6]),
+                 None if r[7] is None else int(r[7]))
                 for r in conn.execute(
-                    "SELECT symbol, timeframe, direction, entry, stop, target"
+                    "SELECT symbol, timeframe, direction, entry, stop, target,"
+                    f" {lfm_col}, {ltm_col}"
                     " FROM signals WHERE id > ? ORDER BY id", (after_id,))]
         if after_ms is not None:
             out_rows = [
@@ -2642,11 +2855,27 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                     " FROM outcomes o JOIN signals s ON s.id = o.signal_id"
                     " WHERE o.closed_at > ? ORDER BY o.closed_at", (after_ms,))]
         state_rows = [
-            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]))
+            (int(r[0]), r[1], r[2], r[3], r[4], float(r[5]),
+             None if r[6] is None else float(r[6]),
+             None if r[7] is None else float(r[7]),
+             None if r[8] is None else float(r[8]))
             for r in conn.execute(
                 "SELECT st.signal_id, s.symbol, s.timeframe, s.direction, st.state,"
-                " s.entry FROM signal_states st JOIN signals s ON s.id = st.signal_id"
+                " s.entry, s.breakeven_at, s.stop, s.target"
+                " FROM signal_states st JOIN signals s ON s.id = st.signal_id"
                 " ORDER BY st.signal_id")]
+        # СДЕЛКИ ПО СЛОМУ, УЖЕ ЛЕЖАЩИЕ В ЛЕДЖЕРЕ (правка A-3). Колонки связи
+        # спрашиваются у схемы по тому же правилу, что и всё в этом запросе: наблюдатель
+        # ходит только на чтение и мигрировать не может, а запрос с новой колонкой
+        # уронил бы его целиком (так уже было с `mtf_break`).
+        break_keys: frozenset[tuple[str, int, int]] = frozenset()
+        if "level_from_ms" in sig_have and "level_to_ms" in sig_have:
+            break_keys = frozenset(
+                (str(r[0]), int(r[1]), int(r[2]))
+                for r in conn.execute(
+                    "SELECT symbol, level_from_ms, level_to_ms FROM signals"
+                    " WHERE kind='pp' AND level_from_ms IS NOT NULL"
+                    " AND level_to_ms IS NOT NULL"))
         marks = ",".join("?" * len(symbols))
         # ⚠ КОЛОНКА СПРАШИВАЕТСЯ У СХЕМЫ, А НЕ ПРЕДПОЛАГАЕТСЯ (2026-08-19). Наблюдатель
         # ходит в леджер ТОЛЬКО НА ЧТЕНИЕ и мигрировать не может; схему поднимает
@@ -2661,10 +2890,12 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
         stop_col = "stop_price" if "stop_price" in have else "NULL"
         ptf_col = "priority_tf" if "priority_tf" in have else "NULL"
         pdp_col = "priority_depth" if "priority_depth" in have else "NULL"
+        wlo_col = "zone_work_lo" if "zone_work_lo" in have else "NULL"
+        whi_col = "zone_work_hi" if "zone_work_hi" in have else "NULL"
         lvl_rows = conn.execute(
             f"SELECT symbol, timeframe, side, price, zone_lo, zone_hi, from_ms, to_ms,"
             f" entry_rule, boundary_lo, boundary_hi, {mtf_col}, {agr_col}, state,"
-            f" {stop_col}, {ptf_col}, {pdp_col}"
+            f" {stop_col}, {ptf_col}, {pdp_col}, {wlo_col}, {whi_col}"
             # ⚠⚠ ТОЛЬКО ПОДТВЕРЖДЁННОЕ ПОСЛЕДНИМ РАСЧЁТОМ. `sync_levels` намеренно НЕ
             # снимает уровень, пропавший из расчёта: по автору «зона остаётся актуальна»,
             # и структура, уехавшая за край окна, уровня не теряет. Довод верен, но он
@@ -2681,16 +2912,30 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
             # его последнего расчёта. Уровень, не обновлённый тогда, этим расчётом не
             # порождён. Снятые уровни (`retired_at`) под правило не попадают — они нужны
             # графику как история и заново не синхронизируются.
-            f" FROM levels WHERE ((state='active' AND last_seen = ("
-            f"     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = levels.symbol"
-            f" )) OR retired_at >= ?)"
+            # ⚠ ВТОРАЯ КОПИЯ ЭТОГО ЖЕ ПОДЗАПРОСА СНЯТА 2026-08-28: определение живого
+            # уровня одно на проект — `store.LIVE_LEVEL_SQL`, там же и разбор.
+            f" FROM levels WHERE (({store.LIVE_LEVEL_SQL}) OR retired_at >= ?)"
             f" AND symbol IN ({marks})",
             (clock.now_ms() - RETIRED_WINDOW_MS, *symbols)).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
     finally:
         conn.close()
-    levels = tuple(LevelRow(symbol=r[0], timeframe=r[1], side=r[2], price=float(r[3]),
+    # ⚠⚠ СТОРОНА ПЕРЕВОРАЧИВАЕТСЯ ПО СТР. 43 — правка 2026-08-27. Здесь стояло
+    # `side=r[2]`, сырая колонка леджера, тогда как соседний читатель того же леджера
+    # (`read_map` → `ZoneSpec`) с 2026-08-26 зовёт `flipped_side`. Один файл, одна
+    # таблица, два ответа: у пробитых уровней стороны выходили ПРОТИВОПОЛОЖНЫМИ.
+    #
+    # Цена дефекта: в карте 254 пробитых уровня из 630 (40%). Отбор целей
+    # (`_target_by_course`) работает именно с `LevelRow`, поэтому для 40% карты он брал
+    # чужую сторону — сверка с движком на 13 сделках одних кадров давала 8 расхождений,
+    # у BCH 1ч бот предлагал целью 425.5 ВЫШЕ входа шортовой сделки.
+    #
+    # Правило одно на проект: `levels.flipped_side` (стр. 43 «Уровень лонг/шорт менятся
+    # для нас на противоположный»). Третьей записи здесь не заводится — только вызов.
+    levels = tuple(LevelRow(symbol=r[0], timeframe=r[1],
+                            side=flipped_side(r[2], r[13] or "active"),
+                            price=float(r[3]),
                             zone_lo=float(r[4]), zone_hi=float(r[5]),
                             from_ms=int(r[6]), to_ms=int(r[7]),
                             entry_rule=r[8] or "",
@@ -2700,29 +2945,14 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                             agreement=r[12] or "", state=r[13] or "active",
                             stop_price=None if r[14] is None else float(r[14]),
                             priority_tf=r[15] or "",
-                            priority_depth=None if r[16] is None else int(r[16]))
+                            priority_depth=None if r[16] is None else int(r[16]),
+                            zone_work_lo=0.0 if r[17] is None else float(r[17]),
+                            zone_work_hi=0.0 if r[18] is None else float(r[18]))
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
+                      break_traded=break_keys,
                       max_signal_id=max_id, max_closed_ms=max_closed)
-
-
-def zone_position(price: float, lo: float, hi: float) -> str:
-    """Где цена относительно зоны: `inside` | `near` | `far`.
-
-    «Близко» — ближе ОДНОЙ ШИРИНЫ зоны от её края. Порог не выдуман числом в
-    процентах: курс строит уровень ЗОНОЙ (стр. 23–26), и ширина зоны — единственная
-    мера того, сколько это близко, которая лежит в самой карте. Узкая зона зовёт цену с
-    малого расстояния, широкая — с большого: масштаб задаёт сама структура, а не
-    константа. Зона нулевой ширины (вырожденный профиль) отвечает `far` всюду, кроме
-    точного равенства, — и это честно: у неё нет собственной меры расстояния.
-    """
-    if lo <= price <= hi:
-        return "inside"
-    width = hi - lo
-    if width > 0 and min(abs(price - lo), abs(price - hi)) <= width:
-        return "near"
-    return "far"
 
 
 BOARD_SHOW_MAX = 7
@@ -2831,7 +3061,7 @@ def rank_board(levels: tuple[LevelRow, ...],
                 if risk > 0:
                     rr = abs(target - lv.price) / risk
             out.append(BoardSetup(level=lv, price=price,
-                                  where=zone_position(price, lv.zone_lo, lv.zone_hi),
+                                  where=geometry.zone_position(price, lv.zone_lo, lv.zone_hi),
                                   rr=rr, target=target))
     return tuple(sorted(out, key=_board_key))
 
@@ -3065,9 +3295,19 @@ class Notifier:
     его рождение уже видно в публикации закреплённых, событие здесь — движение цены.
     """
 
+    CATCHUP_LIMIT = 20
+    """Сколько пропущенных сигналов доложить после простоя. Остаток НАЗЫВАЕТСЯ числом.
+
+    Предел нужен ровно по той причине, по какой прежде взводился водяной знак: после
+    долгого простоя весь журнал в канал не выливается. Разница в том, что теперь остаток
+    не исчезает молча, а печатается строкой «ещё N пропущено за время простоя»."""
+
     def __init__(self) -> None:
-        self._last_signal_id: int | None = None
-        self._last_closed_ms: int | None = None
+        mark = _read_watermark()
+        self._last_signal_id: int | None = mark[0]
+        self._last_closed_ms: int | None = mark[1]
+        self.skipped_backlog = 0
+        """Сигналов пропущено как хвост длинного простоя. Печатается сводкой службы."""
         self._zone_state: dict[tuple[str, str, str, int, int], str] = {}
         self._zone_said: dict[tuple[str, str, str, int, int], tuple[int, int]] = {}
         """Что и КОГДА уже сказано про уровень: (ранг, момент). Гасит дребезг у границы.
@@ -3092,7 +3332,31 @@ class Notifier:
         self.sent_zone_events = 0
         self.ticks_failed = 0
         self._alerted: set[tuple[str, str, str, int, int]] = set()
+        self.suppressed_repeats = 0
+        """Сколько дословных повторов «Цена у зон» погашено (2026-08-27).
+
+        Молчание НАЗЫВАЕТСЯ числом: иначе «бот молчал» и «бот погасил повтор»
+        выглядят в сводке одинаково."""
+
+        self._last_zone_text = ""
+        """Текст ПРЕДЫДУЩЕГО сообщения «Цена у зон».
+
+        ⚠ Дословный повтор не несёт читателю ничего: состояние не изменилось. За
+        окно 05:50–09:50 UTC 2026-08-27 из 34 сообщений канала 7 (21%) были
+        дословными повторами — ZEC трижды, THETA трижды, SAND и CHZ по два раза.
+        `_alerted` их не гасил: он держит ключи ради ОТМЕН, а не ради повторов.
+
+        Гасится ТЕКСТ, а не ключ уровня: переход «цена подходит 0.5%» → «цена
+        ВОШЛА в зону» — другое сообщение, и его слать надо."""
         self.sent_cancels = 0
+        # ⚠ СОБЫТИЯ ФАЗЫ «ЖИЗНЬ СИГНАЛА» (план 25.08, Фаза 1). Оба — ПЕРЕХОДЫ:
+        # слом подтверждён (0→1) и цена взвела безубыток (первое касание). Память в
+        # процессе: после рестарта 🎯 может повториться один раз по живому сигналу —
+        # повтор честнее молчания, а постоянная таблица под это — отдельное решение.
+        self._mtf_state: dict[tuple[str, str, str, int, int], int] = {}
+        self._be_said: set[int] = set()
+        self.sent_breaks = 0
+        self.sent_be = 0
 
     def _cap(self, lines: list[str]) -> list[str]:
         if len(lines) <= NOTIFY_LINES_MAX:
@@ -3112,16 +3376,66 @@ class Notifier:
         prev_max_id = self._last_signal_id or 0
         self._last_signal_id = news.max_signal_id
         self._last_closed_ms = news.max_closed_ms
+        # ⚠ ЗНАК СОХРАНЯЕТСЯ НА ДИСК КАЖДЫЙ ТАКТ. Пока он жил в памяти, перезапуск бота
+        # стирал 65% объявлений о сигналах (разбор — в докстроке `WATERMARK_PATH`).
+        _write_watermark(self._last_signal_id, self._last_closed_ms)
 
         out: list[str] = []
         if news.signals:
-            lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
-                     f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}, "
-                     f"стоп {_fmt_price(st)}"
-                     + (f", цель {_fmt_price(tg)}" if tg is not None else "")
-                     for s, tf, d, e, st, tg in news.signals]
-            self.sent_signals += len(news.signals)
-            out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines)]))
+            # ⚠⚠ ХВОСТ ДОЛГОГО ПРОСТОЯ ОБРЕЗАЕТСЯ, НО НАЗЫВАЕТСЯ ЧИСЛОМ (2026-08-27).
+            # Знак теперь переживает перезапуск, и после долгого простоя накопленных
+            # сигналов может быть много. Весь журнал в канал не выливается — это и был
+            # исходный довод, — но остаток больше не исчезает молча: он печатается
+            # отдельной строкой и считается в `skipped_backlog`.
+            backlog = max(0, len(news.signals) - self.CATCHUP_LIMIT)
+            fresh_signals = news.signals[-self.CATCHUP_LIMIT:] if backlog else news.signals
+            self.skipped_backlog += backlog
+            # ФОРМАТ v2 (решение владельца 2026-08-25: рабочая зона вокруг ПОК, R у
+            # цели, одна строка на сигнал).
+            #
+            # ⚠⚠ ЗОНА БЕРЁТСЯ ПО ССЫЛКЕ СИГНАЛА НА СВОЙ УРОВЕНЬ (схема 20, 2026-08-27),
+            # а не подбором ближайшего ПОКа. Здесь стояло
+            # `min(cands, key=lambda lv: abs(lv.price - entry))` — и после пересборки
+            # карты сигналу приписывалась зона ЧУЖОГО уровня. В канал ушло
+            # «ETH шорт 5м: вход 2 488.1, зона 2 489.3–2 496.3»: вход ВНЕ показанной
+            # зоны, что невозможно, если бы они принадлежали одному уровню (сигнал
+            # #1129 имел вход 2488.07, а ближайший ETH 5м шорт — ПОК 2493.685).
+            #
+            # Ссылки нет (строки прежней схемы) — зона НЕ ПЕЧАТАЕТСЯ ВОВСЕ. Подобрать
+            # «похожий» уровень значило бы показать выдуманную принадлежность, а §4.3
+            # требует называть отсутствие, а не подменять его значением.
+            by_link: dict[tuple[str, str, int, int], LevelRow] = {}
+            for lv in news.levels:
+                by_link[(lv.symbol, lv.timeframe, lv.from_ms, lv.to_ms)] = lv
+
+            def work_of(sym: str, tf: str,
+                        lf: int | None, lt: int | None) -> tuple[float, float] | None:
+                if lf is None or lt is None:
+                    return None
+                best = by_link.get((sym, tf, lf, lt))
+                if best is not None and best.zone_work_hi > best.zone_work_lo > 0:
+                    return (best.zone_work_lo, best.zone_work_hi)
+                return None
+
+            lines = []
+            for s, tf, d, e, st, tg, lf, lt in fresh_signals:
+                head = (f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
+                        f"{TF_LABEL.get(tf, tf)}: вход {_fmt_price(e)}")
+                w = work_of(s, tf, lf, lt)
+                if w is not None:
+                    head += f", зона {_fmt_price(w[0])}–{_fmt_price(w[1])}"
+                head += f", стоп {_fmt_price(st)}"
+                if tg is not None:
+                    risk = abs(e - st)
+                    rr = abs(tg - e) / risk if risk > 0 else None
+                    head += (f", цель {_fmt_price(tg)}"
+                             + (f" (R {rr:.1f})" if rr is not None else ""))
+                lines.append(head)
+            self.sent_signals += len(fresh_signals)
+            tail = ([f"⚠ ещё {backlog} пропущено за время простоя наблюдателя — "
+                     f"они есть в леджере, но в канал не выливаются"]
+                    if backlog else [])
+            out.append("\n".join(["⚡ Новые сигналы:", *self._cap(lines), *tail]))
         if news.outcomes:
             lines = [f"• {s.split('/')[0]} {SIDE_WORD.get(d, d)} "
                      f"{TF_LABEL.get(tf, tf)}: {OUTCOME_WORD.get(k, k)}"
@@ -3136,8 +3450,11 @@ class Notifier:
         # перезапуск бота объявил бы «входами» все давно открытые позиции.
         entry_lines: list[str] = []
         alive: set[int] = set()
-        for sid, sym, tf, d, state, entry in news.states:
+        nf: set[tuple[str, str]] = set()
+        for sid, sym, tf, d, state, entry, _be, _st, _tg in news.states:
             alive.add(sid)
+            if state == "not_filled":
+                nf.add((sym, tf))
             was = self._signal_state.get(sid)
             self._signal_state[sid] = state
             if priming or state != "open":
@@ -3157,6 +3474,43 @@ class Notifier:
             self.sent_entries += len(entry_lines)
             out.append("\n".join(["✅ Входы состоялись:", *self._cap(entry_lines)]))
 
+        # 🔓 СЛОМ ПОДТВЕРЖДЁН (стр. 19/31): уровень ждал слома младшего ТФ, и
+        # `mtf_break` перевёлся 0→1 при живом несостоявшемся сигнале этого символа.
+        # Переход, а не состояние: один раз на уровень, первый такт взводит молча.
+        break_lines: list[str] = []
+        seen_mtf: set[tuple[str, str, str, int, int]] = set()
+        for lv in news.levels:
+            if lv.state != "active" or lv.mtf_break is None:
+                continue
+            key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
+            seen_mtf.add(key)
+            prev = self._mtf_state.get(key)
+            self._mtf_state[key] = lv.mtf_break
+            if priming or prev != 0 or lv.mtf_break != 1:
+                continue
+            if (lv.symbol, lv.timeframe) not in nf:
+                continue
+            # ⚠⚠ ОБЪЯВЛЕНИЕ ТОЛЬКО ПРИ СУЩЕСТВУЮЩЕЙ СДЕЛКЕ (правка A-3, 2026-08-28,
+            # решение владельца). Прежде хватало перехода `mtf_break` 0→1, и строка
+            # «вход активен» уходила в канал, когда расчёт сделки НЕ ПОСТРОИЛ: ни стопа,
+            # ни цели, ни РР. Теперь расчёт её строит (стр. 25/31 → стр. 49 → стр. 50),
+            # но строит НЕ ВСЕГДА: замер первого прогона — 61 сделка построена, 0
+            # записано (36 без цели, 25 «цена далеко»). Значит проверять надо не
+            # намерение, а ЗАПИСЬ.
+            if (lv.symbol, lv.from_ms, lv.to_ms) not in news.break_traded:
+                continue
+            base = lv.symbol.split("/")[0]
+            side_word = SIDE_WORD.get(lv.side, lv.side)
+            break_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(lv.timeframe, lv.timeframe)}: "
+                f"слом младшего ТФ подтверждён — вход активен "
+                f"(ПОК {_fmt_price(lv.price)})")
+        for key in [k for k in self._mtf_state if k not in seen_mtf]:
+            del self._mtf_state[key]
+        if break_lines:
+            self.sent_breaks += len(break_lines)
+            out.append("\n".join(["🔓 Подтверждения слома:", *self._cap(break_lines)]))
+
         # ⚠ ЦЕНА ТАКТА ЗАВИСИТ ОТ РАЗМЕРА ВСЕЛЕННОЙ, И ПЕРЕЛОМ ЛЕЖИТ НА СОРОКА. Вес
         # `ticker/24hr` — 1 за символ и 40 за ВСЕ рынки сразу (`fetch_tickers(None)`).
         # На вселенной в 25 поимённый список дешевле (25 против 40); на раскрытой доске
@@ -3169,6 +3523,38 @@ class Notifier:
             log.degraded("наблюдатель: тикеры не получены", причина=tickers.reason)
             self.ticks_failed += 1
             return out
+
+        # 🎯 ЦЕНА ВЗВЕЛА БЕЗУБЫТОК (стр. 14–15): живой сигнал, у которого есть цена
+        # взведения (`breakeven_at`), и цена дошла — стоп переносится в ТВХ. Один раз
+        # на сигнал; после рестарта может повториться один раз (см. память в __init__).
+        be_lines: list[str] = []
+        open_ids: set[int] = set()
+        for sid, sym, tf, d, state, _entry, be, _st, _tg in news.states:
+            if state != "open":
+                continue
+            open_ids.add(sid)
+            if be is None or sid in self._be_said:
+                continue
+            tk = tickers.get(sym)
+            last = float(tk.get("last", 0.0) or 0.0) if isinstance(tk, dict) else 0.0
+            if last <= 0:
+                continue
+            crossed = last >= be if d == "long" else last <= be
+            if not crossed:
+                continue
+            self._be_said.add(sid)
+            base = sym.split("/")[0]
+            side_word = SIDE_WORD.get(d, d)
+            be_lines.append(
+                f"• {base} {side_word} {TF_LABEL.get(tf, tf)}: цель тейка достигнута "
+                f"— стоп переносится в безубыток ({_fmt_price(be)}); сейчас "
+                f"{_fmt_price(last)}")
+        for sid in [s for s in self._be_said if s not in open_ids]:
+            self._be_said.discard(sid)
+        if be_lines:
+            self.sent_be += len(be_lines)
+            out.append("\n".join(["🎯 Безубыток взведён:", *self._cap(be_lines)]))
+
         now_ms = clock.now_ms()
         rank = {"far": 0, "near": 1, "inside": 2}
         hits: list[tuple[LevelRow, float, str]] = []
@@ -3180,7 +3566,10 @@ class Notifier:
                 continue
             key = (lv.symbol, lv.timeframe, lv.side, lv.from_ms, lv.to_ms)
             seen.add(key)
-            pos = zone_position(t.last, lv.zone_lo, lv.zone_hi)
+            # РАБОЧАЯ ЗОНА В СОБЫТИЯХ (решение владельца 2026-08-25): зовём ценой к
+            # входу, а не к контексту старшего ТФ. work_bounds сам падает на VA у
+            # строк без рабочих полей.
+            pos = geometry.zone_position(t.last, *lv.work_bounds())
             was = self._zone_state.get(key)
             self._zone_state[key] = pos
             # Событие — только СБЛИЖЕНИЕ (far→near, near→inside, far→inside).
@@ -3288,8 +3677,13 @@ class Notifier:
             for h in hits:
                 self._alerted.add((h[0].symbol, h[0].timeframe, h[0].side,
                                    h[0].from_ms, h[0].to_ms))
-            self.sent_zone_events += len(zone_lines)
-            out.append("\n".join(["📍 Цена у зон:", *self._cap(zone_lines)]))
+            text = "\n".join(["📍 Цена у зон:", *self._cap(zone_lines)])
+            if text == self._last_zone_text:
+                self.suppressed_repeats += 1
+            else:
+                self._last_zone_text = text
+                self.sent_zone_events += len(zone_lines)
+                out.append(text)
         return out
 
 
@@ -3364,37 +3758,45 @@ def _target_by_course(lv: LevelRow, pool: list[LevelRow]) -> tuple[float, str] |
     ⚠ Цели нет — строки нет. Подставить сюда «ближайший любой уровень» значило бы
     нарушить последнее правило страницы ради непустого поля.
     """
-    order = list(TIMEFRAME_MS)
-    if lv.timeframe not in order:
-        return None
-    own = order.index(lv.timeframe)
     long = lv.side == "long"
+    # ⚠⚠ КОПИЯ ПРАВИЛА СТР. 24 УДАЛЕНА 2026-08-27. Здесь стояла своя реализация ярусов
+    # ТФ, хода сделки и зоны входа, и она сама признавалась копией: «здесь оно повторено,
+    # а не вызвано… при правке править ОБА места». Копии разошлись — сверка на 13 сделках
+    # одних и тех же кадров дала 10 расхождений, у пяти цель была РАЗНАЯ (BCH 1ч: 237.465
+    # против 425.5 — в противоположную сторону), и правила «цель внутри собственной
+    # структуры — не цель» здесь не было вовсе.
+    #
+    # Правило теперь одно: `geometry.page24_tier` и `geometry.page24_reachable`. Что
+    # остаётся РАЗНЫМ законно — МОМЕНТ: движок отбирает цели на момент решения сделки,
+    # бот отвечает про СЕЙЧАС и берёт живую карту.
+    far = lv.boundary_hi if long else lv.boundary_lo
     best_main: tuple[float, float] | None = None
     best_mid: tuple[float, float] | None = None
     for other in pool:
         if other.symbol != lv.symbol or other.side == lv.side:
             continue
-        if other.timeframe not in order:
+        # ⚠⚠ ОТРАБОТАННЫЙ УРОВЕНЬ ЦЕЛЬЮ НЕ СЛУЖИТ — стр. 25: «мы этот уровень удаляем».
+        # Правка 2026-08-27: здесь судьба уровня не проверялась ВООБЩЕ, и бот предлагал
+        # целями уровни, которых на карте уже нет. Движок это делает давно
+        # (`levels.level_as_of` внутри `build_targets_report`), и расхождение двух
+        # поверхностей на одних кадрах было 10 из 13.
+        #
+        # ПРОБИТЫЙ (`flipped`) остаётся: стр. 43 не удаляет уровень, а МЕНЯЕТ ЕГО
+        # СТОРОНУ, и как встречный он целью служит — то же решение, что у движка.
+        if other.state == "worked_off":
             continue
-        rank = order.index(other.timeframe)
-        if rank < own - 1:
-            continue                      # ТФ−2 и ниже: «не берутся в расчет»
-        if rank > own + 1:
-            # ТФ+2 и выше: то же ограничение, что в `geometry.build_targets` (вывод из
-            # стр. 24 и стр. 48 — см. пояснение там). Правится ВМЕСТЕ с ним.
+        slot = geometry.page24_tier(lv.timeframe, other.timeframe)
+        if slot is None:
             continue
         goal = other.price
+        if far and not geometry.page24_reachable(
+                up=long, entry=Decimal(str(lv.price)),
+                zone_lo=Decimal(str(lv.zone_lo)), zone_hi=Decimal(str(lv.zone_hi)),
+                far_edge=Decimal(str(far)), goal=Decimal(str(goal))):
+            continue
         dist = (goal - lv.price) if long else (lv.price - goal)
         if dist <= 0:
-            continue                      # цель обязана лежать ПО ХОДУ сделки
-        if lv.zone_lo <= goal <= lv.zone_hi:
-            # Цель ВНУТРИ ЗОНЫ ВХОДА — не цель. То же правило и по тому же основанию,
-            # что в `geometry.build_targets`: лимитки входа стоят на ПОК и зону (стр. 30),
-            # и одно касание исполняло бы вход и «тейк» разом. Здесь оно повторено, а не
-            # вызвано, потому что у бота на руках строки леджера, а не объекты уровня;
-            # разойтись им нельзя — при правке править ОБА места.
             continue
-        slot = "main" if rank >= own else "mid"
         cur = best_main if slot == "main" else best_mid
         if cur is None or dist < cur[1]:
             if slot == "main":
@@ -3453,9 +3855,22 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     #
     # Порог по-прежнему НЕ ТРОГАЕТСЯ и константы не заводится: печатаются оба расстояния
     # и названы порознь, решает читатель.
-    near_edge = lv.zone_hi if price > lv.zone_hi else lv.zone_lo
-    edge_pct = abs(price - near_edge) / price * 100 if price > 0 else 0.0
-    gap_pct = abs(price - lv.price) / price * 100 if price > 0 else 0.0
+    # ⚠⚠ ВСЕ ПРОЦЕНТЫ СЧИТАЮТСЯ ПО ЦЕНАМ, ОКРУГЛЁННЫМ К ТИКУ, — то есть по ТЕМ ЖЕ
+    # числам, что печатаются строкой ниже. Правка 2026-08-27 по разбору сообщений
+    # канала: округление жило только в печати, а проценты брали сырые значения, и
+    # владелец с калькулятором получал другое число. На живых сообщениях не
+    # воспроизводились 4 сигнала из 13 — разбор в
+    # docs/audit/plan-2026-08-27-telegram-messages.md, дефект Д-1.
+    #
+    # Округлённая цена — не косметика: выставить на бирже можно ТОЛЬКО её, значит и
+    # риск читатель несёт по ней. Сырой ПОК описывает сделку, которую не поставить.
+    p_now = tick_price(price, tick)
+    p_lim = tick_price(lv.price, tick)
+    z_lo = tick_price(lv.zone_lo, tick)
+    z_hi = tick_price(lv.zone_hi, tick)
+    near_edge = z_hi if p_now > z_hi else z_lo
+    edge_pct = abs(p_now - near_edge) / p_now * 100 if p_now > 0 else 0.0
+    gap_pct = abs(p_now - p_lim) / p_now * 100 if p_now > 0 else 0.0
     out = [f"• {base} · {act} · цена подходит {_fmt_price(price, tick)}",
            f"    до зоны {edge_pct:.1f}% (по ней и вердикт), до лимитки {gap_pct:.1f}%",
            f"    лимитка {_fmt_price(lv.price, tick)}, зона "
@@ -3463,22 +3878,36 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
     # СТОП — курсовой: за всю структуру с запасом (стр. 58 «Стоп ВСЕГДА прячем за всю
     # структуру с запасом 1-3%»). Считается тем же числом, что и в карточке.
     edge = lv.boundary_lo if buy else lv.boundary_hi
-    if edge > 0:
-        # СТОП БЕРЁТСЯ ИЗ РАСЧЁТА, а своя формула остаётся только запасным путём для
-        # строк карты старее схемы 13. Своя формула знает лишь курсовой пол (стр. 58) и
-        # не знает ЯКОРЯ (стр. 18) — а якорь решает в половине сделок и уводит стоп
-        # дальше. Пояснение и числа — в докстроке `LevelRow.stop_price`.
-        # ⚠ Формула запаса здесь БОЛЬШЕ НЕ ПИШЕТСЯ (2026-08-24): стояло
-        # `edge * DEFAULT_MARGIN_PCT / 100` — вторая запись той же величины. Теперь
-        # зовётся `geometry.stop_beyond_edge`, одна на проект.
-        stop = lv.stop_price or float(geometry.stop_beyond_edge(
-            Decimal(str(edge)), geometry.DEFAULT_MARGIN_PCT, up=buy))
+    stop = lv.stop_price
+    if edge > 0 and stop is None:
+        # ⚠⚠ ПОДСТАВНОЙ ФОРМУЛЫ СТОПА БОЛЬШЕ НЕТ — ОТСУТСТВИЕ СТАЛО ОТКАЗОМ
+        # (правка A-4, 2026-08-28). Здесь стояло
+        # `stop = lv.stop_price or float(geometry.stop_beyond_edge(...))`, и ветка
+        # `or ...` была ВТОРОЙ КОПИЕЙ величины, которую свод разрешает считать только
+        # в одном месте. Копия знала курсовой пол (стр. 58) и НЕ знала якоря (стр. 18),
+        # а якорь решает примерно в половине сделок и уводит стоп ДАЛЬШЕ. Замер на
+        # разобранном BCH 1ч шорт: расчёт по якорю 300.363 — риск 8.51% от входа
+        # 276.815; подстановка «граница 286.06 + 3%» 294.64 — риск 6.44%. Разница
+        # 2.07 процентного пункта, и читатель получал МЕНЬШИЙ риск, чем настоящий.
+        # Тот же класс, что жалоба владельца «какой микро стоп 0.3%?!», только мельче.
+        #
+        # После правки A-1 подставлять больше нечего: сетап со стопом строится у всех
+        # размеченных уровней. Значит пустой `stop_price` — это уже не «строка карты
+        # старее схемы 13», а НАСТОЯЩЕЕ отсутствие расчёта, и называется оно, а не
+        # затыкается (§4.3). Звать в сделку, не назвав риска, нельзя.
+        out.append("    СТОПА НЕТ: расчёт его не построил — ни риска, ни РР по этой "
+                   "строке не считаем")
+    if edge > 0 and stop is not None:
         # РИСК В ПРОЦЕНТАХ — не новая величина, а то же расстояние вход↔стоп, названное
         # так, как его использует читатель. Стр. 9 определяет Р как «один Риск» и
         # единицу измерения сделки; проценты дают посчитать объём позиции, не зная
         # депозита. Печатается рядом со стопом, чтобы не разводить одну величину по
         # двум строкам.
-        risk_pct = abs(lv.price - stop) / lv.price * 100 if lv.price > 0 else 0.0
+        # Стоп печатается НАРУЖУ от структуры (`away`), поэтому и в счёт риска идёт
+        # округлённый той же стороной: иначе процент описывал бы не тот стоп, что
+        # выставит читатель.
+        p_stop = tick_price(stop, tick, away="down" if buy else "up")
+        risk_pct = abs(p_lim - p_stop) / p_lim * 100 if p_lim > 0 else 0.0
         out.append(f"    стоп {_fmt_price(stop, tick, away='down' if buy else 'up')}"
                    + (f" · риск {risk_pct:.1f}%" if risk_pct > 0 else ""))
         # ЦЕЛЬ И РР — стр. 24 и стр. 9. Без них сообщение не даёт посчитать сделку:
@@ -3490,8 +3919,11 @@ def _zone_alert(lv: LevelRow, price: float, pos: str,
         goal = _target_by_course(lv, pool or [])
         if goal is not None:
             price_t, word = goal
-            risk = abs(lv.price - stop)
-            reward = abs(price_t - lv.price)
+            # РР — тем же округлением, что вход, стоп и цель на печати (Д-1): иначе
+            # читатель, поделив напечатанное, получит не напечатанное отношение.
+            p_goal = tick_price(price_t, tick)
+            risk = abs(p_lim - p_stop)
+            reward = abs(p_goal - p_lim)
             rr = f" · РР 1к{reward / risk:.1f}" if risk > 0 else ""
             out.append(f"    {word} {_fmt_price(price_t, tick)}{rr}")
         # ⚠⚠ СТРОКА Б/У ПО КРАЮ ЗОНЫ УДАЛЕНА 2026-08-24 — ВМЕСТЕ С ПРАВИЛОМ. Здесь бот

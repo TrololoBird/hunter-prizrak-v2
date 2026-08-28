@@ -34,6 +34,7 @@ from . import (
     swings,
 )
 from .bars import continuous_tail
+from .levels import LevelState
 from .models import Bar, NotReady
 from .priority import Agreement
 from .swings import TrendDirection
@@ -212,11 +213,17 @@ FIGURES_SHOWN = 3
 Это ограничение ПЕЧАТИ, а не расчёта: считаются все, и порог здесь не решает ничего."""
 
 
-def _pct(base: Decimal, other: Decimal) -> str:
-    """Расстояние в процентах от цены входа — то, чем курс задаёт запас (стр. 18, 33)."""
+def _pct(base: Decimal, other: Decimal, digits: int = 2) -> str:
+    """Расстояние в процентах от цены входа — то, чем курс задаёт запас (стр. 18, 33).
+
+    ⚠ `digits` заведён 2026-08-26 под ВЫСОТУ СТРОКИ профиля, и это не украшение: она
+    лежит в полосе 0.024…0.240% цены (замер, 42 уровня), и при двух знаках нижняя треть
+    диапазона схлопывается в «0.02%» — прибор перестал бы различать то, ради чего его и
+    показывают. Формула остаётся ОДНА, меняется только печать.
+    """
     if not base:
         return "—"
-    return f"{abs(other - base) / base * 100:.2f}%"
+    return f"{abs(other - base) / base * 100:.{digits}f}%"
 
 
 def trim_zeros(s: str) -> str:
@@ -251,6 +258,65 @@ def _num(x: float | Decimal, digits: int = 8) -> str:
     return trim_zeros(f"{float(x):.{digits}f}")
 
 
+def _what_to_do_now(d: engine.SymbolDecision) -> list[str]:
+    """ГОЛОВА КАРТОЧКИ: что делать сейчас, и ЗНАМЕНАТЕЛЬ к этому ответу.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26, Ф2 плана. Довод — слова владельца, многократные и дословные:
+    «у пользователя нет знаний програмивароиня или торговли и тех анализа». Карточка
+    печатает около 140 строк, и ответ на единственный вопрос оператора — брать или не
+    брать — был рассыпан по ним: сторона в одной строке, стоп в другой, РР в третьей,
+    причина отказа в четвёртой. Это ДАННЫЕ, а не ответ.
+
+    ⚠⚠⚠ НИ ОДНО ЧИСЛО ЗДЕСЬ НЕ СЧИТАЕТСЯ. Все берутся у тех же объектов и теми же
+    помощниками, которыми их печатает подробный разбор ниже: сторона — `dec.current.side`,
+    зона и ПОК — поля уровня, стоп и его процент — `s.stop` и `_pct`, причина отсутствия
+    РР — `_no_rr_reason`, «почему сейчас» — `ENTRY_LABEL[st.entry_rule.value]`. Голова,
+    считающая своё, разошлась бы с телом не «если», а через сколько дней: этот класс в
+    проекте уже ловили ЧЕТЫРЬМЯ копиями коробки структуры (`a971048`).
+
+    ⚠ ЗНАМЕНАТЕЛЬ ПЕЧАТАЕТСЯ ВСЕГДА, в том числе при нулях. «Сделок нет» без него
+    неотличимо от «символ не считался»: первое — вердикт о рынке, второе — отказ прибора.
+    Знаменатель здесь ПОСИМВОЛЬНЫЙ; вселенского («из N рынков карта у K») карточка дать
+    не может и не выдумывает — она чистая функция от кадров ОДНОГО символа
+    (`gates/purity.py`), и это число живёт в приёмке прогона.
+    """
+    out = ["", "ЧТО ДЕЛАТЬ СЕЙЧАС (стр. 30)"]
+    # ⚠ ПРИЗНАК «ТОРГУЕТСЯ» БЕРЁТСЯ У `Decision.emitted`, А НЕ ПИШЕТСЯ ЗАНОВО. Первая
+    # редакция этой строки проверяла `dec.setup is not None` — то есть повторяла ту же
+    # формулу вторым экземпляром рядом со сводкой ТФ, которая уже считает `x.emitted`.
+    # Копия расходится не «если», а через сколько дней; здесь она снята сразу.
+    traded = [(dec, dec.setup) for dec in d.decisions
+              if dec.emitted and dec.setup is not None]
+    for dec, s in traded:
+        lvl, st = dec.level, dec.status
+        rr = s.rr()
+        first = geometry.first_major(s.targets)
+        out.append(
+            f"  {SIDE_LABEL[dec.current.side.value]} "
+            f"{TF_LABEL.get(lvl.timeframe, lvl.timeframe)} — зона "
+            f"{_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}, вход ПОК {_num(s.entry)}"
+        )
+        out.append(
+            f"      стоп {_num(s.stop)} ({_pct(s.entry, s.stop)} от входа) · "
+            + (f"цель {_num(first.price)} ({first.distance_pct:.2f}%), РР {_rr(rr)}"
+               if first is not None and rr is not None
+               else f"РР не считается — {_no_rr_reason(s)}")
+        )
+        out.append(f"      почему сейчас: {ENTRY_LABEL[st.entry_rule.value]}")
+    if not traded:
+        # ⚠ ПУСТО — ТОЖЕ ОТВЕТ, и он называется словами (§4.3). Прежде оператор,
+        # не найдя сделки, не знал, читать ли дальше: причин молчания две — уровней
+        # нет вовсе и уровни есть, но ни один не торгуется, — и лечатся они разным.
+        out.append("  делать нечего: "
+                   + ("уровней в карте нет — почему, сказано в «СВОДКЕ ПО ТФ» ниже"
+                      if not d.mapped
+                      else "ни один уровень не торгуется лимитками; причина у каждого "
+                           "названа ниже строкой «СДЕЛКИ НЕТ»"))
+    out.append(f"  знаменатель: уровней в карте {len(d.mapped)}, "
+               f"торгуется лимитками {len(traded)}")
+    return out
+
+
 def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
     """Карточка символа: ПЕЧАТЬ готового решения. Ничего не считает.
 
@@ -273,6 +339,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
 
     for u in d.unreadable:
         out.append(f"  {TF_LABEL.get(u.timeframe, u.timeframe)}: {u.reason}")
+
+    out.extend(_what_to_do_now(d))
 
     out.append("")
     out.append("ТРЕНД И СТРУКТУРА")
@@ -377,7 +445,19 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             f"  {SIDE_LABEL[dec.current.side.value]} "
             f"{TF_LABEL.get(lvl.timeframe, lvl.timeframe):>3}  "
             f"ПОК {_num(lvl.price)}  зона {_num(lvl.zone_lo)}…{_num(lvl.zone_hi)}  "
-            f"объём {_num(lvl.structure_volume, 2)}  {STATE_LABEL[st.state.value]}"
+            # ⚠⚠ РАБОЧАЯ ЗОНА ПЕЧАТАЕТСЯ С 2026-08-27, И ЭТО ПОЧИНКА ДЕФЕКТА, А НЕ
+            # УКРАШЕНИЕ. С 2026-08-25 вход рисуется по HVN-ядру вокруг ПОК
+            # (`Level.zone_work_*`, решение владельца), и ГРАФИК рисовал именно его —
+            # а карточка печатала только VAL…VAH. То есть владелец читал одну зону, а
+            # видел на картинке другую: ровно «две сущности под одним человеческим
+            # именем», раздел свода «Прибор обязан смотреть на ТУ ЖЕ величину».
+            # Докстрока `Level.zone_work_lo` утверждала «Карточка и график рисуют ЭТУ
+            # зону» — про карточку это было неверно с самого начала.
+            # Пусто — рабочей зоны нет (уровень старого прогона), и тогда вход читается
+            # по VAL…VAH, как раньше; отсутствие НАЗЫВАЕТСЯ пропуском поля, а не нулём.
+            + (f"вход по ядру {_num(lvl.zone_work_lo)}…{_num(lvl.zone_work_hi)}  "
+               if lvl.zone_work_lo is not None and lvl.zone_work_hi is not None else "")
+            + f"объём {_num(lvl.structure_volume, 2)}  {STATE_LABEL[st.state.value]}"
             # Цена по ту сторону всей структуры — печатается РЯДОМ СО СТАТУСОМ, потому
             # что слово «активен» без этой пометки читается как ожидание цены, а цена
             # его уже прошла (стр. 43). Заведено 2026-08-18: владелец увидел на карте
@@ -392,10 +472,34 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             form += f"  база в сужении (стр. 34), шагов {lvl.boundary_narrowed}"
         if lvl.boundary_ladder:
             form += "  граница от прежней структуры (стр. 40)"
+        # ⚠ ПРОКОЛ ПЕЧАТАЕТСЯ ОТДЕЛЬНОЙ ЦЕНОЙ (Ф8, 2026-08-26), и только когда он есть.
+        # Стоп ставится за него (стр. 18), значит владелец обязан видеть, что стоп ушёл
+        # дальше границы, — иначе в карточке снова оказались бы две величины под одним
+        # словом «границы», ровно как до 2026-08-18.
+        punc = ""
+        if lvl.stop_edge_lo < lvl.boundary_lo or lvl.stop_edge_hi > lvl.boundary_hi:
+            punc = (f"  прокол за границу до "
+                    f"{_num(lvl.stop_edge_lo)}…{_num(lvl.stop_edge_hi)} (стр. 18, "
+                    f"стоп прячется за него)")
         out.append(
-            f"        границы {_num(lvl.boundary_lo)}…{_num(lvl.boundary_hi)}  "
-            f"вход: {ENTRY_LABEL[st.entry_rule.value]}  "
-            f"{AGREE_LABEL[ag.value]}"
+            f"        границы {_num(lvl.boundary_lo)}…{_num(lvl.boundary_hi)} "
+            f"(стр. 18: хай и лой по первым 2 точкам){punc}  "
+            # ⚠ РАЗРЕШЕНИЕ ВХОДА (Ф3, 2026-08-26). ПОК есть цена входа, и точнее строки
+            # профиля он не бывает — а высота строки у нас НЕ ПОСТОЯННА: боевой режим
+            # держит постоянным число строк, поэтому точность входа зависит от размаха
+            # СЕТКИ профиля (стр. 26 — все свечи структуры), а не от границ базы.
+            # Разбор — докстрока `Level.row_height`.
+            f"шаг профиля {_num(lvl.row_height)} "
+            f"({_pct(lvl.price, lvl.price + lvl.row_height, 3)} цены)  "
+            # ⚠⚠ ВТОРОЕ СКОПЛЕНИЕ ОБЪЁМА (Ф6, 2026-08-26). Курс велит брать МАКСИМУМ
+            # (стр. 21), и правило не меняется. Но у 6.5% структур второй пик почти равен
+            # первому (замер 2026-08-22), и тогда «максимум» есть подброс монеты: ПОК —
+            # это ЦЕНА ВХОДА, и она могла оказаться другой. Владельцу об этом не
+            # сообщалось никогда. Печатается ВЕЛИЧИНА без порога — вывод делает читающий.
+            + (f"второе скопление {lvl.outside_peak_share:.0%} от ПОК  "
+               if lvl.outside_peak_share else "")
+            + f"вход: {ENTRY_LABEL[st.entry_rule.value]}  "
+            + AGREE_LABEL[ag.value]
             # ⚠ Глубина тренда печатается рядом со стороной (Р-6): `agreement` смотрит
             # только направление, поэтому тренд из двух экстремумов весит как из шести.
             # Число не влияет на решение — оно даёт оператору увидеть, на чём оно стоит.
@@ -414,6 +518,59 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        else "; реакции ещё не было"))
         out.append(f"        заход: {take_txt}")
         out.append(f"        картина отработки: {PLAYOUT_LABEL[st.playout.value]}")
+        # ⚠⚠ СЛОМ НА МЛАДШЕМ ТФ ПЕЧАТАЕТСЯ У КАЖДОГО УРОВНЯ (правка A-2/A-5,
+        # 2026-08-28). Строка стояла ВНУТРИ ветки «СДЕЛКИ НЕТ», и правка A-1 того же дня
+        # эту ветку почти закрыла: сетап теперь строится у всех размеченных уровней, и
+        # `setup is None` остаётся лишь у сделок без цели. Замер по трём карточкам
+        # свежего прогона: слово «слом на младшем ТФ» встретилось НОЛЬ раз при 29
+        # напечатанных уровнях, из которых 10 имели правило входа «только по слому».
+        # То есть карточка писала «вход: только по слому структуры на младшем ТФ
+        # (стр. 31)» и НИ РАЗУ не отвечала, случился он или нет.
+        #
+        # Это тот же класс, что и сама правка A-2: величина, на которой стоит решение о
+        # входе, обязана быть видна владельцу — «прибор смотрит на ТУ ЖЕ величину».
+        # Печатается ровно в одном месте (копия из ветки «СДЕЛКИ НЕТ» удалена).
+        if dec.mtf_break:
+            out.append(f"        слом на младшем ТФ: {dec.mtf_break}")
+        # СДЕЛКА ПО СЛОМУ (правка A-3, 2026-08-28, решение владельца). Курс разрешает
+        # вход от отработанного уровня только по слому (стр. 25, 31), а КАК его брать,
+        # говорит стр. 50: «Торговля ПП – точкой входа является тест ПП, со стопом за
+        # хай/лой или базу в месте слома, если она есть». До этой правки расчёт слом
+        # называл, сделки не строил, а бот объявлял «вход активен» без стопа и цели.
+        #
+        # Печатается ЦЕЛИКОМ — вход, стоп, риск, цель и РР, — потому что это отдельная
+        # сделка на ДРУГОМ ТФ, а не пометка к уровню: её нельзя прочитать по строкам
+        # выше, они описывают лимитную сделку от ПОК.
+        bs = dec.break_setup
+        if bs is not None:
+            tf_lbl = TF_LABEL.get(dec.break_timeframe, dec.break_timeframe)
+            # ⚠ Имя НЕ `rr`: строками ниже так зовётся РР ЛИМИТНОЙ сделки от ПОК, а
+            # область имён у функции одна. Совпадение имён свело бы две РАЗНЫЕ сделки к
+            # одной величине — тот самый класс «две сущности под одним именем».
+            brk_risk = abs(bs.entry - bs.stop)
+            brk_rr = ("" if bs.target is None or brk_risk <= 0
+                      else f"  РР 1к{abs(bs.target - bs.entry) / brk_risk:.1f}")
+            brk_pct = (100 * brk_risk / bs.entry) if bs.entry else 0.0
+            # ⚠⚠ КАРТОЧКА ОБЯЗАНА НАЗЫВАТЬ ОБА ОТКАЗА ЛЕДЖЕРА, А НЕ ОДИН. Без второй
+            # строки владелец читает сделку как доступную, тогда как запись её
+            # отклонила: замер первого же прогона с A-3 — построена 61 сделка, записано
+            # 0, из них 36 без цели и 25 «цена далеко». Печатать 25 строк без пометки
+            # значило бы показывать владельцу не ту величину, которой живёт система.
+            # Близость считается ТОЙ ЖЕ функцией, что в `run` (`geometry.zone_position`)
+            # и по той же зоне теста ПП — второй формулы здесь не заводится.
+            b_bars = series.get(dec.break_timeframe) or []
+            far = bool(
+                b_bars and dec.break_pp is not None
+                and geometry.zone_position(
+                    float(b_bars[-1].close), float(dec.break_pp.zone_lo),
+                    float(dec.break_pp.zone_hi)) == "far")
+            out.append(
+                f"        СДЕЛКА ПО СЛОМУ ({tf_lbl}, стр. 50): вход {_num(bs.entry)} "
+                f"— тест ПП, стоп {_num(bs.stop)} "
+                f"({brk_pct:.2f}% от входа)"
+                + (f", цель {_num(bs.target)}{brk_rr}" if bs.target is not None
+                   else ", ЦЕЛИ НЕТ — сделка неизмерима, в леджер не пишется")
+                + ("  ⚠ ЦЕНА ДАЛЕКО от зоны теста — в леджер не пишется" if far else ""))
         # ⚠ СИЛА ПО ОБЪЁМУ ПЕЧАТАЕТСЯ У КАЖДОГО УРОВНЯ (2026-08-19). До этой правки строка
         # композита стояла ВНУТРИ ветки «СДЕЛКИ НЕТ»: владелец видел силу по объёму ровно
         # у тех уровней, по которым система ничего не делает, и не видел ни у одного
@@ -452,10 +609,6 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"        СДЕЛКИ НЕТ: {dec.hold}")
             if dec.pressed:
                 out.append(f"        накопление у уровня: {dec.pressed}")
-            if dec.mtf_break:
-                # §2.5 подключён к решению 2026-08-07 (А-02): условие входа по стр. 25/31
-                # теперь ПРОВЕРЯЕТСЯ, а не только называется.
-                out.append(f"        слом на младшем ТФ: {dec.mtf_break}")
             if st.event is not None:
                 out.append(f"        событие: {_event(st.event)}")
             continue
@@ -550,9 +703,21 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # РР по ВЫСТАВЛЯЕМОМУ стопу — единственное число, которое можно проверить.
         # Прежде печаталось два РР под два непоставленных стопа.
         rr = s.rr()
-        golden = "" if rr is None or rr >= geometry.GOLDEN_RR else "  НИЖЕ стандарта"
-        out.append(f"        РР {_rr(rr)} до первой цели "
-                   f"(стандарт курса 1к{_num(geometry.GOLDEN_RR, 0)}){golden}")
+        if rr is None:
+            # ⚠⚠ ЗДЕСЬ ПЕЧАТАЛОСЬ «РР нет цели», И ЭТО ВРАЛО В ДВУХ СЛУЧАЯХ ИЗ ДВУХ
+            # (правка 2026-08-26, Ф1). Первый: цели ЕСТЬ, но все промежуточные ТФ-1 —
+            # строками выше владелец читал «промежуточная 12.34 …», а следом «РР нет
+            # цели», то есть карточка спорила сама с собой. Второй: крупная цель есть, а
+            # риск вырожден (стоп совпал со входом) — РР не существует по совсем другой
+            # причине, и та же фраза называла её неверно.
+            # Причина берётся ГОТОВОЙ у стока `Setup.no_target_sink`: он посчитан тем же
+            # обходом, что отбирал цели, и второй копии каскада фильтров здесь нет.
+            out.append(f"        РР не считается — {_no_rr_reason(s)}. "
+                       f"Стандарт курса — 1к{_num(geometry.GOLDEN_RR, 0)}")
+        else:
+            golden = "" if rr >= geometry.GOLDEN_RR else "  НИЖЕ стандарта"
+            out.append(f"        РР {_rr(rr)} до первой цели "
+                       f"(стандарт курса 1к{_num(geometry.GOLDEN_RR, 0)}){golden}")
         # ОТДЕЛЬНЫЙ трейд от уровня стопового объёма — стр. 37 называет нижнее
         # накопление «отдельный трейд», стр. 39 задаёт ТВХ, стоп и цель. В эмиссию не
         # идёт (новый тип сигнала меняет состав леджера), но печатается.
@@ -659,7 +824,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"  {lab}  {FIGURE_KIND_LABEL[ch.kind.value]} "
                        f"{FIGURE_SIDE_LABEL[ch.side.value]}  бары {ch.first_index}…"
                        f"{ch.last_index}  точек {ch.points}  "
-                       f"коридор {_num(ch.lo)}…{_num(ch.hi)}  вход: {_entries(ch.entries)}")
+                       f"коридор {_num(ch.lo)}…{_num(ch.hi)}  "
+                       f"вход: {_entries(ch.entries, ch.side, d.decisions)}")
             out.append(f"        {note}")
         if len(r.channels) > len(shown_ch):
             out.append(f"  {lab}  ещё {len(r.channels) - len(shown_ch)} коридоров раньше "
@@ -667,7 +833,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         shown_pen = r.pennants[-FIGURES_SHOWN:]
         for pen in shown_pen:
             any_fig = True
-            out.append(f"  {lab}  {_pennant(pen)}")
+            out.append(f"  {lab}  {_pennant(pen, d.decisions)}")
         if len(r.pennants) > len(shown_pen):
             out.append(f"  {lab}  ещё {len(r.pennants) - len(shown_pen)} вымпелов раньше "
                        f"по ряду — напечатаны последние {len(shown_pen)}")
@@ -677,7 +843,8 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"а стр. 57 велит «Торгуем по тренду»")
         if r.open_pennant is not None:
             any_fig = True
-            out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: {_pennant(r.open_pennant)}")
+            out.append(f"  {lab}  НЕЗАКРЫТАЯ структура: "
+                       f"{_pennant(r.open_pennant, d.decisions)}")
         elif r.open_pennant_missing:
             out.append(f"  {lab}  вымпела у незакрытой структуры нет: "
                        f"{r.open_pennant_missing}")
@@ -689,7 +856,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
             out.append(f"  {lab}  {name} (стр. 62)  граница выхода {_num(mb.boundary_edge)} "
                        f"внутри зоны ПП {_num(mb.pp_zone_lo)}…{_num(mb.pp_zone_hi)}  "
                        f"второй закуп от {_num(mb.level_side_edge)}  "
-                       f"вход: {_entries(mb.entries)}")
+                       f"вход: {_entries(mb.entries, mb.side, d.decisions)}")
         if len(r.multiple_bases) > len(shown_mb):
             out.append(f"  {lab}  ещё {len(r.multiple_bases) - len(shown_mb)} таких фигур "
                        f"раньше по ряду")
@@ -702,7 +869,7 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
                        f"линия шеи {_num(hs.neckline_lo)}…{_num(hs.neckline_hi)}  "
                        + ("тест был" if hs.tested_at_index is not None
                           else "теста ещё не было")
-                       + f"  вход: {_entries(hs.entries)}")
+                       + f"  вход: {_entries(hs.entries, hs.side, d.decisions)}")
         if len(r.head_shoulders) > len(shown_hs):
             out.append(f"  {lab}  ещё {len(r.head_shoulders) - len(shown_hs)} ГИП раньше "
                        f"по ряду")
@@ -857,8 +1024,13 @@ def render(d: engine.SymbolDecision, series: dict[str, list[Bar]]) -> str:
         # с `bars[-1].close` — то есть отвечал не на тот вопрос. Сделка берётся ПЕРВАЯ
         # эмитируемая на этом ТФ (порядок решений детерминирован); сделок на ТФ нет —
         # это НАЗЫВАЕТСЯ, а не подменяется текущей ценой.
+        # ⚠ `x.emitted` добавлен правкой A-1 (2026-08-28): сетап теперь считается и у
+        # УДЕРЖАННЫХ уровней ради стопа, поэтому один лишь `setup is not None` начал бы
+        # брать сделку, которой нет. Комментарий выше говорит «ПЕРВАЯ эмитируемая» — тут
+        # это условие и стоит.
         ref = next((x.setup for x in d.decisions
-                    if x.setup is not None and x.level.timeframe == tf), None)
+                    if x.emitted and x.setup is not None and x.level.timeframe == tf),
+                   None)
         # ⚠ ЧЕТВЁРТАЯ КОПИЯ ФИЛЬТРА ЦЕЛЕЙ СНЯТА 2026-08-24: здесь стоял свой
         # `role is TargetRole.PRIMARY`, такие же — в `Setup.rr`, `emit.outcome_of` и
         # `run.py`. Правило одно: `geometry.first_major`.
@@ -914,6 +1086,22 @@ def _rr(x: float | None) -> str:
     return "нет цели" if x is None else f"1к{x:.2f}"
 
 
+def _no_rr_reason(s: geometry.Setup) -> str:
+    """Почему РР у сделки от уровня не существует. Ветвей ровно две, и они РАЗНЫЕ.
+
+    что из чего следует: сток непуст → крупной цели нет → РР нет (стр. 9 меряет РР до
+    цели с крупным тейком); сток пуст при отсутствующем РР → цель есть, но риск вырожден
+    (`Setup.rr` отказывает при нулевом расстоянии до стопа), и это дефект геометрии, а не
+    свойство рынка — тот же случай, что `OutcomeKind.UNMEASURABLE` в леджере.
+
+    Третьей ветви быть не может: `Setup._reason_iff_empty` держит сток и наличие крупной
+    цели одним инвариантом, поэтому «сток пуст И цели нет» невозможно по построению.
+    """
+    if s.no_target_sink is geometry.TargetSink.NONE:
+        return "риск вырожден: стоп совпал со входом, единицы R не существует"
+    return f"крупной цели нет: {s.no_target_sink.value}"
+
+
 def _event(ev: breach.Breach) -> str:
     kind = {"puncture": "прокол", "breakout": "пробой",
             "unresolved": "курс вердикта не даёт", "open": "не разрешилось"}
@@ -933,12 +1121,51 @@ def _take_share(share: geometry.TakeShare) -> str:
     return f"крыть {share.min_pct:.0f}-{share.max_pct:.0f}% — {share.note}"
 
 
-def _entries(entries: tuple[figures.FigureEntry, ...]) -> str:
-    """Входы, названные курсом для фигуры, в порядке самого курса."""
-    return ", ".join(FIGURE_ENTRY_LABEL[e.value] for e in entries)
+def _entries(entries: tuple[figures.FigureEntry, ...],
+             side: figures.FigureSide,
+             decisions: tuple[engine.Decision, ...]) -> str:
+    """Входы, названные курсом для фигуры, в порядке самого курса.
+
+    ⚠⚠ «ЕСЛИ ОН ЕСТЬ» — ЭТО ЧАСТЬ ПРАВИЛА, А НЕ ОГОВОРКА (правка 2026-08-26, Ф2). Стр. 56
+    задаёт вход «при коррекции к ближайшему уровню в ЛОНГ/ШОРТ "если он есть"», и то же
+    условие повторяют стр. 57, 60, 61, 62 (докстрока `figures.FigureEntry.NEAREST_LEVEL`).
+    Карточка печатала «от ближайшего уровня» БЕЗУСЛОВНО и ни разу не говорила, есть ли
+    такой уровень: замер по 10 символам свежих данных 2026-08-26 — строка встретилась
+    **225 раз**, медиана 22 на символ, и **ни разу** рядом с ней не стояло ни имени
+    уровня, ни ответа «есть/нет». Половина курсового правила не исполнялась вовсе.
+
+    что из чего следует: сторона фигуры → нужен уровень ТОЙ ЖЕ стороны → если живого
+    такого нет, входа стр. 56 у этой фигуры НЕТ. Обратное неверно: наличие уровня входа не
+    даёт, оно лишь снимает запрет.
+
+    ⚠ Уровень считается СНЯТЫМ по курсу, а не по нашему вкусу: отработанный удалён
+    (стр. 25 «мы этот уровень удаляем»), а пробитый сменил сторону (стр. 43) — и потому
+    берётся `dec.current.side`, сторона СЕЙЧАС, той же формулой `levels.level_now`, что и
+    в разделе «УРОВНИ» выше. Второй копии правила стороны здесь нет.
+
+    ⚠ Какой уровень БЛИЖАЙШИЙ — не решается: у четырёх видов фигур своя геометрия
+    (коридор, границы, линия шеи, край выхода), общей точки отсчёта курс не называет, и
+    выдумывать её ради красивой строки нельзя. Печатается СЧЁТ живых уровней нужной
+    стороны; сами они перечислены разделом «УРОВНИ» тремя экранами выше.
+    """
+    txt = ", ".join(FIGURE_ENTRY_LABEL[e.value] for e in entries)
+    if figures.FigureEntry.NEAREST_LEVEL not in entries:
+        return txt
+    live = sum(1 for dec in decisions
+               if dec.current.side.value == side.value
+               and dec.status.state is not LevelState.WORKED_OFF)
+    # ⚠ «В КАРТЕ НЕТ» БЫЛО НЕВЕРНО И ПРОТИВОРЕЧИЛО СОСЕДНЕМУ РАЗДЕЛУ (правка того же дня,
+    # найдена глазами по карточке ETH/USD). Уровень в карте ЕСТЬ — раздел «УРОВНИ» печатал
+    # его строкой «ШОРТ 15м … отработан», — он снят КУРСОМ, а не отсутствует. Читатель,
+    # сверяющий два раздела, видел прямое противоречие там, где расчёт верен.
+    return txt + (f" (живых уровней в {SIDE_LABEL[side.value]} — {live})" if live
+                  else f" — но ЖИВОГО уровня в {SIDE_LABEL[side.value]} нет "
+                       f"(отработанные сняты стр. 25), а стр. 56 разрешает этот вход "
+                       f"только «если он есть»")
 
 
-def _pennant(pen: figures.Pennant) -> str:
+def _pennant(pen: figures.Pennant,
+             decisions: tuple[engine.Decision, ...]) -> str:
     """Вымпел одной строкой: касания, шестое из них (ТВХ стр. 57) и за что прячем стоп.
 
     Источник стороны печатается ВСЕГДА, а не только когда он необычен: сторона, взятая с
@@ -969,5 +1196,5 @@ def _pennant(pen: figures.Pennant) -> str:
             f"прячем за {_num(pen.stop_anchor)} (стр. 57)"
             + ("  структура уже расширялась (стр. 18)" if pen.is_extended else "")
             + against
-            + f"  вход: {_entries(pen.entries)}")
+            + f"  вход: {_entries(pen.entries, pen.side, decisions)}")
 

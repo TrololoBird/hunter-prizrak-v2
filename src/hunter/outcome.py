@@ -20,6 +20,11 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
+# ⚠ Доля первого тейка берётся ОТТУДА, ГДЕ ОНА ЖИВЁТ, а не повторяется здесь числом:
+# у неё длинная докстрока о том, чего курс НЕ говорит, и вторая копия числа эту оговорку
+# потеряла бы. Цикла импортов нет: `geometry` про `outcome` не знает — знают `emit` и
+# `run`, то есть слои выше обоих.
+from .geometry import PARTIAL_TAKE_PCT
 from .levels import LevelSide
 from .models import Bar
 
@@ -97,6 +102,42 @@ class Outcome(BaseModel):
     closed_at_index: int | None
     exit_price: Decimal | None
     r: float | None
+
+    r_partial: float | None = None
+    """R по модели ЧАСТИЧНОГО выхода — и это ПОЛ, а не точечная оценка (Ф5, 2026-08-26).
+
+    ⚠⚠ ЗАЧЕМ ВТОРОЕ ЧИСЛО. Поле `r` считает сделку по модели ПОЛНОГО выхода: цена дошла
+    до первой крупной цели — позиция закрыта вся. Курс так не торгует. Стр. 15 дословно,
+    и это про сделку ОТ УРОВНЯ («Актив пришел к лонг уровню, вы открыли позицию в
+    лонг»): «Вы сделали тейки по достигнутым целям и передвинули стоп в бу. Далее актив
+    пошел на коррекцию и просто остаток позиции закрылся в безубыток». То есть у цели
+    фиксируется ЧАСТЬ, остаток идёт дальше под защитой безубытка.
+
+    Значит `r` — ВЕРХНЯЯ оценка выигрыша, а не результат сделки курса, и всё, что на ней
+    построено (экспектанси, винрейт в R), эту сделку переоценивает.
+
+    ⚠⚠ ПОЧЕМУ ИМЕННО ПОЛ, А НЕ ТОЧКА. Доли для сделки от уровня курс НЕ НАЗЫВАЕТ ни на
+    одной странице — это записано в докстроке `geometry.PARTIAL_TAKE_PCT` и проверено
+    заново 2026-08-26: стр. 9 даёт 50% ПРИМЕРОМ В СЛОВАРЕ, поясняя единицу R («цена дала
+    реакцию +4Р, делаем тейк 50% и забираем 2Р»), причём тейк там берётся на +4Р, а не у
+    цели; стр. 11 и 16 называют СОБЫТИЕ первого тейка без числа; стр. 19 число даёт, но
+    она — «ТОРГОВЛЯ ВО ФЛЕТЕ», и для сделки от уровня отозвана 2026-08-24.
+
+    Точное R остатка поэтому неизвестно ПО ПОСТРОЕНИЮ. Но НИЖНЯЯ его граница известна и
+    выдумки не требует: после первого тейка стоп стоит в безубытке (стр. 15), значит
+    остаток не может дать МЕНЬШЕ нуля. Отсюда
+
+        r_partial = s·RR₁                       — пока остаток не разрешился,
+        r_partial = s·RR₁ + (1−s)·RR₂           — если остаток дошёл до второй цели,
+
+    где s = `geometry.PARTIAL_TAKE_PCT`. Это ПОЛ: настоящий результат не ниже.
+
+    ⚠ Определено РОВНО ТОГДА, когда определено `r`, — подвыборки не возникает. Незакрытый
+    остаток пола не отменяет: он его лишь не поднимает.
+
+    ⚠ У стопа до первой цели `r_partial` равен `r` = −1: делить там нечего, позиция ещё
+    целая. Это не совпадение моделей, а один и тот же случай.
+    """
     """Результат в R. `None` у неразрешённых.
 
     ⚠ Ноль — НЕ «нет ответа», а ответ: с 2026-08-19 он означает ровно безубыток
@@ -120,6 +161,40 @@ def _filled(bar: Bar, price: Decimal, *, long: bool) -> bool:
     return (bar.low <= float(price)) if long else (bar.high >= float(price))
 
 
+def partial_floor(*, long: bool, entry: Decimal, risk: Decimal, target: Decimal,
+                  target2: Decimal | None, bars: list[Bar], closed_at: int) -> float:
+    """ПОЛ модели частичного выхода: s·RR₁, поднятый до s·RR₁ + (1−s)·RR₂ второй целью.
+
+    Ниже этого сделка дать не может: после первого тейка стоп остатка стоит в безубытке
+    (стр. 15). Почему именно пол, а не точка, — в докстроке `Outcome.r_partial`.
+
+    ⚠ Отдельной функцией, а не замыканием внутри `resolve` (правка того же дня): `resolve`
+    и без того длинна, а эта величина ни одного её состояния не меняет — ей нужны только
+    параметры сделки. Правила входа и стопа остаются в `resolve` в единственном
+    экземпляре: сюда переносится ТОЛЬКО арифметика остатка.
+    """
+    share = PARTIAL_TAKE_PCT / 100.0
+    gain1 = (target - entry) if long else (entry - target)
+    out = share * float(gain1 / risk)
+    if target2 is None:
+        return out
+    # Остаток ведётся СО СЛЕДУЮЩЕГО бара — то же ограничение OHLC, что у переноса стопа:
+    # внутри бара первой цели порядок касаний неизвестен.
+    for b in bars[closed_at + 1:]:
+        back = (b.low <= float(entry)) if long else (b.high >= float(entry))
+        if back:
+            # Возврат к ТВХ закрывает остаток в безубытке (стр. 15) — пол не растёт.
+            # ⚠ И если ТОТ ЖЕ бар накрыл вторую цель, она НЕ засчитывается: порядок
+            # касаний внутри бара неизвестен, а пол обязан оставаться полом. Отдельной
+            # ветки под этот случай нет НАРОЧНО — она возвращала бы ровно то же самое,
+            # то есть была бы дублем, читающимся как отдельное правило.
+            return out
+        if (b.high >= float(target2)) if long else (b.low <= float(target2)):
+            gain2 = (target2 - entry) if long else (entry - target2)
+            return out + (1.0 - share) * float(gain2 / risk)
+    return out
+
+
 def resolve(
     side: LevelSide,
     entry: Decimal,
@@ -128,6 +203,7 @@ def resolve(
     bars: list[Bar],
     from_index: int,
     breakeven_at: Decimal | None = None,
+    target2: Decimal | None = None,
 ) -> Outcome:
     """Исход сделки по барам ПОСЛЕ появления уровня.
 
@@ -144,6 +220,15 @@ def resolve(
     не осторожность, а то же ограничение OHLC, что и у `AMBIGUOUS`: внутри бара порядок
     касаний неизвестен, а бар срабатывания часто и есть бар входа — считать по нему
     возврат к ТВХ значило бы закрывать сделку тем же движением, которым её открыли.
+
+    `target2` — ВТОРАЯ крупная цель, нужна только модели частичного выхода: она поднимает
+    ПОЛ `Outcome.r_partial`, если остаток позиции до неё дошёл. `None` — пол остаётся на
+    первом тейке. Разбор — в докстроке `Outcome.r_partial`.
+
+    ⚠⚠ ЧАСТИЧНЫЙ ВЫХОД СЧИТАЕТСЯ ТЕМ ЖЕ ОБХОДОМ, а не второй функцией рядом. Правила
+    входа (стр. 30), стопа и неоднозначности бара у обеих моделей ОДНИ И ТЕ ЖЕ; вторая
+    их запись разошлась бы с первой не «если», а через сколько дней — этот класс проект
+    ловил четырьмя копиями коробки структуры (`a971048`).
     """
     risk = abs(entry - stop)
     if risk == 0:
@@ -155,6 +240,12 @@ def resolve(
     long = side is LevelSide.LONG
     filled: int | None = None
     be_armed = False
+
+    def floor_r(closed_at: int) -> float:
+        """ПОЛ частичного выхода на момент закрытия по первой цели. Разбор — ниже."""
+        assert target is not None
+        return partial_floor(long=long, entry=entry, risk=risk, target=target,
+                             target2=target2, bars=bars, closed_at=closed_at)
 
     for i in range(from_index, len(bars)):
         bar = bars[i]
@@ -173,14 +264,17 @@ def resolve(
                 return Outcome(kind=OutcomeKind.AMBIGUOUS, filled_at_index=filled,
                                closed_at_index=i, exit_price=None, r=None)
             if hit_be:
+                # Сюда попадают только сделки с порогом б/у (стр. 19); у сделки от уровня
+                # его нет (`geometry.breakeven_watch`). Первая цель не взята, позиция
+                # целая — обе модели дают ноль.
                 return Outcome(kind=OutcomeKind.BREAKEVEN, filled_at_index=filled,
-                               closed_at_index=i, exit_price=entry, r=0.0)
+                               closed_at_index=i, exit_price=entry, r=0.0, r_partial=0.0)
             if hit_tgt_be:
                 assert target is not None
                 gain = (target - entry) if long else (entry - target)
                 return Outcome(kind=OutcomeKind.TARGET, filled_at_index=filled,
                                closed_at_index=i, exit_price=target,
-                               r=float(gain / risk))
+                               r=float(gain / risk), r_partial=floor_r(i))
             continue
 
         if breakeven_at is not None:
@@ -195,13 +289,16 @@ def resolve(
             return Outcome(kind=OutcomeKind.AMBIGUOUS, filled_at_index=filled,
                            closed_at_index=i, exit_price=None, r=None)
         if hit_stop:
+            # ⚠ ОБЕ МОДЕЛИ ДАЮТ −1, и это не совпадение: до первой цели позиция целая,
+            # делить нечего. Расходятся они только на выигрышах.
             return Outcome(kind=OutcomeKind.STOP, filled_at_index=filled,
-                           closed_at_index=i, exit_price=stop, r=-1.0)
+                           closed_at_index=i, exit_price=stop, r=-1.0, r_partial=-1.0)
         if hit_tgt:
             assert target is not None
             gain = (target - entry) if long else (entry - target)
             return Outcome(kind=OutcomeKind.TARGET, filled_at_index=filled,
-                           closed_at_index=i, exit_price=target, r=float(gain / risk))
+                           closed_at_index=i, exit_price=target, r=float(gain / risk),
+                           r_partial=floor_r(i))
 
     if filled is None:
         return Outcome(kind=OutcomeKind.NOT_FILLED, filled_at_index=None,

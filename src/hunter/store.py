@@ -12,9 +12,11 @@ SQLite — состояние и исходы, со схемой и ограни
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sqlite3
+import statistics
 from decimal import Decimal
 from pathlib import Path
 
@@ -56,12 +58,31 @@ CREATE TABLE IF NOT EXISTS signals (
     entry       REAL    NOT NULL,
     stop        REAL    NOT NULL,
     target      REAL,
+    -- ВТОРАЯ крупная цель. Нужна ТОЛЬКО модели частичного выхода: остаток позиции после
+    -- первого тейка идёт к ней (стр. 15 «сделали тейки по достигнутым целям»), и она
+    -- поднимает пол `outcomes.r_partial`. NULL — второй крупной цели у сделки не было
+    -- либо строка записана до схемы 17; ноль подставлять нельзя, это цена.
+    target2     REAL,
+    -- ⚠⚠ ССЫЛКА СИГНАЛА НА СВОЙ УРОВЕНЬ — схема 20, 2026-08-27. Вместе с `symbol` и
+    -- `timeframe` эти две колонки дают ПОЛНЫЙ ключ таблицы `levels`
+    -- (symbol, timeframe, from_ms, to_ms). До них связи не было вовсе, и сообщение
+    -- канала подбирало зону сигналу ПО БЛИЗОСТИ ПОКа: в эфир ушло «вход 2 488.1, зона
+    -- 2 489.3-2 496.3», где вход лежит ВНЕ своей зоны. NULL — сигнал записан прежней
+    -- схемой, связь неизвестна; подставлять ближайший уровень значило бы записать
+    -- выдуманную принадлежность.
+    level_from_ms INTEGER,
+    level_to_ms   INTEGER,
     -- Цена, по достижении которой стоп переносится в ТВХ (стр. 19, 15, 44). NULL —
     -- правила безубытка у сделки нет. ⚠ Это НЕ цель: до 2026-08-19 дорешивание
     -- подавало сюда `target`, и исход «в безубытке» становился недостижим — взведение
     -- срабатывало тем же баром, что и закрытие по цели, а цель проверяется первой.
     breakeven_at REAL,
     frames_ref  TEXT    NOT NULL,
+    -- ⚠ МЕТКА ЭПОХИ КОДА (схема 17, открытый вопрос №10). Леджер копит исходы разных
+    -- редакций расчёта, и накопленный R смеси не приписать методу. Пишется писателем
+    -- сигнала из `CODE_EPOCH`; у строк до ведения отметок — пустая строка, которая
+    -- читается «эпоха неизвестна», а НЕ относится ни к одной эпохе.
+    epoch       TEXT    NOT NULL DEFAULT '',
     CHECK (stop != entry),
     CHECK (entry > 0),
     CHECK (stop > 0),
@@ -76,6 +97,15 @@ CREATE TABLE IF NOT EXISTS outcomes (
     closed_at  INTEGER NOT NULL,
     exit_price REAL,
     r          REAL,
+    -- R по модели ЧАСТИЧНОГО выхода, и это ПОЛ, а не точечная оценка. Разбор — в
+    -- докстроке `outcome.Outcome.r_partial`. Коротко: `r` закрывает всю позицию первой
+    -- целью, а курс так не торгует (стр. 15), поэтому `r` есть ВЕРХНЯЯ оценка выигрыша.
+    -- NULL — строка записана до схемы 17; у свежих строк поле есть всегда, когда есть
+    -- `r`, поэтому подвыборки две модели не создают.
+    -- ⚠ `kind` НЕ дублируется второй моделью нарочно: полный выход всегда закрывается на
+    -- первой цели, поэтому вид исхода у обеих моделей ОДИН И ТОТ ЖЕ, различается только
+    -- число. Вторая колонка вида завела бы две сущности под одним именем.
+    r_partial  REAL,
     CHECK ((kind = 'ambiguous') = (r IS NULL)),
     CHECK ((kind = 'ambiguous') = (exit_price IS NULL))
 );
@@ -179,6 +209,20 @@ CREATE TABLE IF NOT EXISTS levels (
     stop_price   REAL,
     priority_tf  TEXT,
     priority_depth INTEGER,
+
+    -- ⚠ РАБОЧАЯ ЗОНА ВОКРУГ ПОК (схема 17, решение владельца 2026-08-25: «уже вокруг
+    -- ПОК строить небольшую зону?»). NULLABLE: у строк до этой версии рабочей зоны не
+    -- считалось; подставить VAL…VAH значило бы записать фальшивую узость.
+    zone_work_lo REAL,
+    zone_work_hi REAL,
+
+    -- ⚠ РАСШИРЕННЫЙ КРАЙ (прокол стр. 18) — схема 18, 2026-08-26. Заведён вместе с
+    -- возвратом `boundary_*` на линию по первым двум точкам: без него запись уровня
+    -- потеряла бы цену, за которую курс велит ставить стоп. Порядок тот же, в каком
+    -- их дописывает `ALTER TABLE`, — чтобы состав свежей и мигрированной базы совпадал.
+    stop_edge_lo REAL,
+    stop_edge_hi REAL,
+
     CHECK (zone_lo <= price AND price <= zone_hi),
     CHECK (boundary_lo < boundary_hi),
     -- ⚠⚠ ЗОНА ВНУТРИ СТРУКТУРЫ. Ограничение добавлено 2026-08-23 (схема 16), и оно
@@ -189,6 +233,21 @@ CREATE TABLE IF NOT EXISTS levels (
     -- нарушение молча. Проверка в схеме сильнее любого гейта: её исполняет SQLite на
     -- КАЖДОЙ настоящей записи, а не наш код на подобранных примерах.
     CHECK (boundary_lo <= zone_lo AND zone_hi <= boundary_hi),
+
+    -- Рабочая зона обязана лежать внутри области стоимости (NULL проходит проверку:
+    -- у старых строк её нет — это «не считалось», а не нарушение).
+    CHECK (zone_work_lo IS NULL OR
+           (zone_lo <= zone_work_lo AND zone_work_hi <= zone_hi
+            AND zone_work_lo < zone_work_hi)),
+
+    -- ⚠ ПРОКОЛ НЕ БЛИЖЕ ГРАНИЦЫ (стр. 18, схема 18). Прокол записывается только ЗА
+    -- границей, значит расширенный край не может оказаться внутри базы. Колонки
+    -- необязательные: у строк, доживших с прежних схем, их нет, и `NULL` в SQLite
+    -- делает `CHECK` неопределённым, то есть проходимым, — старьё не ломается, а
+    -- всякая новая запись проверяется.
+    CHECK (stop_edge_lo IS NULL OR stop_edge_lo <= boundary_lo),
+    CHECK (stop_edge_hi IS NULL OR boundary_hi <= stop_edge_hi),
+
     CHECK (to_ms > from_ms),
     CHECK (last_seen >= first_seen),
     CHECK ((retired_at IS NULL) = (state = 'active')),
@@ -247,8 +306,80 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 # журнала. Теперь исход считается ТОЛЬКО по барам, закрывшимся ПОЗЖЕ `recorded_at`;
 # следствие честное и неприятное: в первый прогон исходов не бывает вовсе.
 
-SCHEMA_VERSION = "16"
+
+CODE_EPOCH = "2026-08-28-classic"
+"""Метка эпохи расчёта для `signals.epoch` (вопрос №10). Меняется при смене РАСЧЁТА,
+который двигает вход/стоп/цели ЛИБО МЕНЯЕТ СОСТАВ ЗАПИСЫВАЕМЫХ СДЕЛОК, — не при
+каждой правке кода.
+
+⚠⚠⚠ ПОДНЯТА ВТОРОЙ РАЗ 2026-08-28 ПО ПРИКАЗУ ВЛАДЕЛЬЦА «зафиксируй эпоху заново».
+Прежняя метка `2026-08-27-near-zone-only` собрала ОДИН сигнал и уже описывала не тот
+код: за сутки расчёт менялся восемь раз, и каждая правка двигала предъявляемые величины.
+
+Что изменилось между эпохами:
+  1. границы базы вернулись на ХАЙ…ЛОЙ структуры (TradingView: "profile high — the
+     highest reached price level"; кадр автора — свечи не выходят за рамку);
+  2. сетка профиля натянута на базу — ПОК не может выпасть наружу;
+  3. область стоимости переведена на первоисточник (Стайдлмайер через CQG): покрытие
+     72.0% вместо 68.0%, минимум 70.0% вместо 36.7%;
+  4. вход возвращён на VAL…VAH — снят порог ядра HVN, у которого нет референта;
+  5. приоритет ТФ — ближайший старший вместо самого старшего (тройной экран Элдера);
+  6. заслон близости на сигналах от УРОВНЯ (было 76% записей дальше 10% от цены);
+  7. тот же заслон на сигналах от ПЕРЕПРИОРА (было 28% дальше 10%, максимум 728%);
+  8. вторая ветвь стопа ПП — "база в месте слома" (стр. 50): РР упал с 1.62 до 0.67.
+
+⚠ Отсчёт по этой метке начнётся только когда заработает РАСЧЁТ. `hunter bot`
+доставляет из леджера, а пишет в него `hunter run`/`serve`; на 2026-08-28 последний
+сигнал в базе — #1131 от 08-27 17:24 UTC.
+
+⚠⚠ ПОДНЯТА 2026-08-27 ПРАВКОЙ Ф1. До неё сделка писалась для уровня на любом расстоянии
+от цены: замер по 300 последним сигналам дал медиану 25.1%, дальше 10% — 76% записей,
+максимум 2961%. Накопленные исходы предыдущей эпохи описывают эту популяцию, а не метод:
+`hunter check` того же дня печатал «средний R -0.394 при 320 закрытых сделках», и все 320
+считались по строкам с ПУСТОЙ меткой эпохи. Смешивать их с новыми нельзя — ровно ради
+этого метка и заведена. Состав даты и сути:
+с 2026-08-25 боевой профиль считается Ticks Per Row 0.07% цены строки. Статистика
+`/stats` обязана разделять «по этой эпохе» и «за всё время» — прежние строки леджера
+несут пустую метку («эпоха неизвестна») и к новой статистике не прибавляются."""
+
+SCHEMA_VERSION = "20"
 """Версия схемы леджера. Растёт, когда прежние строки перестают означать то же самое.
+
+⚠ СТУПЕНИ 17 И 18 ПЕРЕНУМЕРОВАНЫ ПРИ СЛИЯНИИ 2026-08-26. Две ветки независимо друг от друга
+объявили себя семнадцатой схемой: `main` — рабочей зоной вокруг ПОК (25 августа), ветка
+Ф5/Ф8 — моделью частичного выхода (26 августа). Номер один, содержимое разное, и лестница
+`_schema_version` различает ступени ПО КОЛОНКАМ, а не по записанному числу, — значит база,
+поднятая одной веткой, у другой прошла бы мимо своей ступени молча. Ступени разведены по
+ДАТАМ: рабочая зона осталась семнадцатой, частичный выход стал восемнадцатой, границы
+стр. 18 — девятнадцатой.
+
+19 → 20 (2026-08-27): у сигнала появилась ССЫЛКА НА УРОВЕНЬ (`level_from_ms`,
+`level_to_ms`) — вместе с `symbol` и `timeframe` это полный ключ таблицы `levels`. До неё
+связи не существовало, и сообщение канала подбирало зону сигналу ближайшим ПОКом, отчего
+вход мог оказаться вне показанной рядом зоны. Прежние строки получают NULL — «связь
+неизвестна», а не ближайший уровень.
+
+18 → 19 (2026-08-26): `boundary_lo/hi` СМЕНИЛИ СМЫСЛ — с коробки ХАЙ…ЛОЙ всех баров на
+линию по первым двум точкам (стр. 18); рядом заведён расширенный край `stop_edge_lo/hi`
+(прокол стр. 18), за который курс велит ставить стоп. Прежние строки УДАЛЯЮТСЯ и их
+число НАЗЫВАЕТСЯ в журнале — по той же причине, что на ступени 15→16: колонка с двумя
+смыслами есть дефект по построению. Обоснование прежней конвенции опровергнуто по
+источнику, разбор — в докстроке `levels.Level.boundary_lo`.
+
+17 → 18 (2026-08-26): модель ЧАСТИЧНОГО ВЫХОДА — `signals.target2` и `outcomes.r_partial`
+(ПОЛ рядом с полным выходом). Обе колонки NULLABLE: у прежних строк второй цели не
+записывали, и досчитать пол задним числом нечем. Значит две модели сравниваются только на
+строках схемы 18 и выше, и это НАЗЫВАЕТСЯ в отчёте (`store.expectancy`), а не замазывается
+нулём. ⚠ Ступень записана здесь при слиянии: в своей ветке она была реализована кодом, но
+в этой лестнице описана не была.
+
+16 → 17 (2026-08-25): рабочая зона вокруг ПОК в `levels` (`zone_work_lo/hi`, NULLABLE,
+CHECK «внутри VAL…VAH») — решение владельца: «уже вокруг ПОК строить небольшую зону?»;
+и метка эпохи кода в `signals` (`epoch`) — открытый вопрос №10: леджер копил исходы
+разных редакций расчёта, и накопленный R смеси нельзя было приписать методу. Пустая
+строка у прежних строк читается «эпоха неизвестна», подставлять им что-то другое —
+записать фальшивую принадлежность.
+
 
 15 → 16 (2026-08-23): у `levels` появилось ограничение «ЗОНА ВНУТРИ СТРУКТУРЫ»
 (`boundary_lo <= zone_lo AND zone_hi <= boundary_hi`) — то самое, что владелец
@@ -604,6 +735,22 @@ def saved_runs() -> tuple[str, ...]:
     return tuple(d.name for d in sorted(runs, key=lambda p: p.stat().st_mtime))
 
 
+def dir_name(symbol: str) -> str:
+    """Имя каталога кадров для символа. Одно место: по нему сверяются чистка и чтение."""
+    return _safe(symbol)
+
+
+def clear_run_dir(run_id: str, dir_name_: str) -> None:
+    """Стереть каталог кадров ПО ИМЕНИ КАТАЛОГА, а не по символу.
+
+    Нужен там, где символа уже нет: кадры чужого прогона под тем же `--run-id`. Символ по
+    имени каталога не восстанавливается однозначно (`_safe` необратим), поэтому чистка
+    берёт имя как есть."""
+    d = FRAMES_DIR / run_id / dir_name_
+    if d.is_dir():
+        shutil.rmtree(d)
+
+
 def saved_symbols(run_id: str) -> tuple[str, ...]:
     """Символы, у которых в прогоне есть кадры. Порядок — алфавитный, для дет-повтора."""
     root = FRAMES_DIR / run_id
@@ -715,6 +862,27 @@ def _schema_version(conn: sqlite3.Connection) -> str:
     # появилось бы НИ РАЗУ, а `schema_meta` всё равно проштамповалась бы новым числом.
     if lvl_sql is not None and "zone_hi <= boundary_hi" not in lvl_text:
         return "15"
+    # 16 → 17 видно по колонкам: `zone_work_lo` добавляется дешёвым ALTER, текст
+    # CREATE при этом не меняет ограничений, которые не видны колонками.
+    if lvl_cols and "zone_work_lo" not in lvl_cols:
+        return "16"
+    # 17 → 18: две колонки модели частичного выхода. Ступень стоит ЗДЕСЬ по той же
+    # причине, что и все выше, — ловушка описана абзацем ниже: без неё база версии 17
+    # назвала бы себя восемнадцатой, колонки не появились бы НИ РАЗУ, а `schema_meta`
+    # всё равно проштамповалась бы новым числом.
+    if "target2" not in cols:
+        return "17"
+    # 18 → 19: у `levels` появляется расширенный край (прокол стр. 18). Ступень стоит
+    # ЗДЕСЬ по той же причине, что и все выше, — иначе база версии 18 назвала бы себя
+    # девятнадцатой, колонки не появились бы НИ РАЗУ.
+    if lvl_cols and "stop_edge_lo" not in lvl_cols:
+        return "18"
+    # 19 → 20: ссылка сигнала на уровень. Ступень стоит ЗДЕСЬ по той же причине, что и
+    # все выше: без неё база версии 19 назвала бы себя двадцатой, колонки не появились
+    # бы ни разу, а `schema_meta` всё равно проштамповалась бы новым числом.
+    if "level_from_ms" not in cols:
+        return "19"
+
     return SCHEMA_VERSION
 
 
@@ -743,7 +911,22 @@ def level_columns(conn: sqlite3.Connection) -> set[str]:
     Дефект был бы виден не сразу и не мне: у меня боевой леджер только для чтения.
     Поэтому читатели спрашивают схему, а не предполагают её.
     """
-    return {r[1] for r in conn.execute("PRAGMA table_info(levels)")}
+    return table_columns(conn, "levels")
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Колонки ЛЮБОЙ таблицы в этой базе. Одно место на всех читателей.
+
+    ⚠⚠ ОБОБЩЕНО 2026-08-27, И ПОВОД БОЕВОЙ — ТОТ ЖЕ, ЧТО У `level_columns`. Ссылка
+    сигнала на уровень (`signals.level_from_ms`, схема 20) была добавлена в запрос
+    бота БЕЗ этой защиты, хотя соседняя докстрока описывает ровно такой случай. Живой
+    запуск лёг сразу: база на схеме 19, бот открывает её `mode=ro` и мигрировать не
+    может, запрос ответил `no such column: level_from_ms`, и наблюдатель повторял
+    «леджер не прочитан» — то есть уведомлений не было ВООБЩЕ.
+
+    Защита нужна не только `levels`: любая новая колонка любой таблицы даёт тот же
+    отказ. Поэтому спрашивается таблица, а не предполагается схема."""
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
@@ -1124,6 +1307,80 @@ def open_production_ledger(path: Path = LEDGER_PATH) -> sqlite3.Connection:
         else:
             log.info("миграция 15→16: ограничение «зона внутри структуры» добавлено",
                      нарушающих_строк=0, строк=moved)
+    if _schema_version(conn) == "16":
+
+        # 16 → 17: две дешёвые правки НА МЕСТЕ (обе колонки NULLABLE — перестройка
+        # таблиц не нужна).
+        #
+        # Рабочая зона: у прежних строк её НЕ СЧИТАЛИ; подставить VAL…VAH значило бы
+        # записать фальшивую узость там, где расчёт ничего не говорил. NULL = «не
+        # считалось» (§4.3), читатель обязан обрабатывать отсутствие сам.
+        conn.execute("ALTER TABLE levels ADD COLUMN zone_work_lo REAL")
+        conn.execute("ALTER TABLE levels ADD COLUMN zone_work_hi REAL")
+        # Метка эпохи: у прежних сигналов эпоха НЕИЗВЕСТНА. Пустая строка — честный
+        # ответ «до ведения отметок», а не выдуманная принадлежность.
+        conn.execute("ALTER TABLE signals ADD COLUMN epoch TEXT"
+                     " NOT NULL DEFAULT ''")
+        conn.commit()
+        log.info("миграция 16→17: рабочая зона уровня и метка эпохи сигнала добавлены")
+    if _schema_version(conn) == "17":
+        # 17 → 18: две колонки МОДЕЛИ ЧАСТИЧНОГО ВЫХОДА, обе на месте и NULLABLE.
+        # Перестройка не нужна: ни `UNIQUE`, ни `CHECK` не трогаются, а
+        # `ALTER TABLE ADD COLUMN` в SQLite строк не переписывает.
+        #
+        # NULL у прежних строк ОСОЗНАНЕН и означает «не считалось». Досчитать их задним
+        # числом нельзя: для пола нужна ВТОРАЯ цель, а её не записывали, — и подставить
+        # вместо неё `target` значило бы удвоить первый тейк. Значит две модели
+        # сравниваются только на строках схемы 18 и выше, и это НАЗЫВАЕТСЯ в отчёте
+        # (`store.expectancy`), а не замазывается нулём.
+        conn.execute("ALTER TABLE signals ADD COLUMN target2 REAL")
+        conn.execute("ALTER TABLE outcomes ADD COLUMN r_partial REAL")
+        conn.commit()
+    if _schema_version(conn) == "18":
+        # 18 → 19: расширенный край (прокол стр. 18) двумя NULLABLE-колонками.
+        #
+        # ⚠⚠ И ВМЕСТЕ С НИМИ МЕНЯЕТСЯ СМЫСЛ `boundary_lo/hi`. С 2026-08-18 по 2026-08-26
+        # там лежала КОРОБКА ХАЙ…ЛОЙ всех баров структуры; теперь — линия по первым двум
+        # точкам (стр. 18, разбор в докстроке `levels.Level.boundary_lo`). Одна колонка
+        # с двумя смыслами — тот самый дефект «две сущности под одним именем», от
+        # которого проект уже пострадал, поэтому прежние строки УДАЛЯЮТСЯ, а их число
+        # НАЗЫВАЕТСЯ в журнале. Тот же выбор, что на ступени 15→16, и по той же причине:
+        # они построены расчётом, который признан неверным, а показывать их боту дальше
+        # значило бы выдавать коробку за границы. Уровни выводятся из баров заново на
+        # первом же прогоне символа; теряется только `first_seen`.
+        # ⚠⚠ ТАБЛИЦА СНОСИТСЯ ЦЕЛИКОМ, а не дополняется `ALTER TABLE`. Причина —
+        # ловушка SQLite, пойманная ПРОБНИКОМ на копии 2026-08-26, а не вычитанная:
+        # `ALTER TABLE ADD COLUMN` колонки добавляет, но ОГРАНИЧЕНИЯ из текста
+        # `CREATE TABLE IF NOT EXISTS` к уже существующей таблице не применяет — а
+        # `executescript(SCHEMA)` ниже для неё пустышка. Первый прогон миграции так и
+        # вышел: колонки появились, `CHECK` про прокол НЕ появился, и подсадка строки с
+        # проколом ВНУТРИ границы прошла. Тот же класс, что у ступени 15→16, где таблицу
+        # ради нового `CHECK` пришлось перестраивать.
+        #
+        # Здесь снос дешевле перестройки: строки всё равно удаляются целиком (см. абзац
+        # выше про смену смысла `boundary_*`), а `executescript(SCHEMA)` создаёт таблицу
+        # заново — со всеми ограничениями и индексами.
+        dropped = conn.execute("SELECT COUNT(*) FROM levels").fetchone()[0]
+        conn.execute("DROP TABLE levels")
+        conn.commit()
+        if dropped:
+            log.degraded(
+                "миграция 18→19: карта уровней ОЧИЩЕНА — `boundary_*` сменили смысл",
+                удалено=dropped,
+                причина="границы вернулись на линию по первым двум точкам (стр. 18); "
+                        "прежние строки хранят коробку ХАЙ…ЛОЙ и означали бы другое")
+        else:
+            log.info("миграция 18→19: расширенный край добавлен, карта была пуста",
+                     удалено=0)
+
+    if _schema_version(conn) == "19":
+        # 19 → 20: две дешёвые колонки НА МЕСТЕ, обе NULLABLE. NULL у прежних сигналов
+        # означает «уровень неизвестен»: досчитать его задним числом нельзя, карта с
+        # тех пор пересобиралась.
+        conn.execute("ALTER TABLE signals ADD COLUMN level_from_ms INTEGER")
+        conn.execute("ALTER TABLE signals ADD COLUMN level_to_ms INTEGER")
+        conn.commit()
+        log.info("миграция 19→20: у сигнала появилась ссылка на свой уровень")
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -1174,7 +1431,11 @@ def record_signal(
     conn: sqlite3.Connection, symbol: str, timeframe: str, direction: str,
     opened_at: int, entry: Decimal, stop: Decimal, frames_ref: str, recorded_at: int,
     kind: str = "level", target: Decimal | None = None,
+    target2: Decimal | None = None,
     breakeven_at: Decimal | None = None,
+    epoch: str = CODE_EPOCH,
+    level_from_ms: int | None = None,
+    level_to_ms: int | None = None,
 ) -> SignalRow | NotReady:
     """Записать сигнал ИЛИ вернуть уже записанный. ЕДИНСТВЕННЫЙ писатель сигналов (§10.2, §6).
 
@@ -1197,12 +1458,15 @@ def record_signal(
     try:
         cur = conn.execute(
             "INSERT INTO signals (kind, symbol, timeframe, direction, opened_at,"
-            " recorded_at, entry, stop, target, breakeven_at, frames_ref)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " recorded_at, entry, stop, target, target2, breakeven_at, frames_ref,"
+            " epoch, level_from_ms, level_to_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (kind, symbol, timeframe, direction, opened_at, recorded_at,
              float(entry), float(stop),
              None if target is None else float(target),
-             None if breakeven_at is None else float(breakeven_at), frames_ref),
+             None if target2 is None else float(target2),
+             None if breakeven_at is None else float(breakeven_at), frames_ref,
+             epoch, level_from_ms, level_to_ms),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -1214,7 +1478,7 @@ def record_signal(
 
 def record_outcome(
     conn: sqlite3.Connection, signal_id: int, kind: str, closed_at: int,
-    exit_price: Decimal | None, r: float | None,
+    exit_price: Decimal | None, r: float | None, r_partial: float | None = None,
 ) -> NotReady | None:
     """Записать исход. Открытые и несостоявшиеся сделки сюда НЕ пишутся (§4.3).
 
@@ -1238,9 +1502,9 @@ def record_outcome(
             f"запрещена, расхождение требует разбора"))
     try:
         conn.execute(
-            "INSERT INTO outcomes (signal_id, kind, closed_at, exit_price, r)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (signal_id, kind, closed_at, px, r),
+            "INSERT INTO outcomes (signal_id, kind, closed_at, exit_price, r,"
+            " r_partial) VALUES (?, ?, ?, ?, ?, ?)",
+            (signal_id, kind, closed_at, px, r, r_partial),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -1264,6 +1528,12 @@ class PendingSignal(BaseModel):
     direction: str
     entry: Decimal
     stop: Decimal
+
+    target2: Decimal | None = None
+    """ВТОРАЯ крупная цель — только модели частичного выхода (Ф5). `None` у строк схем
+    до 17-й: тогда её не записывали, и досчитать задним числом нечем. Значит у таких
+    сигналов пол `r_partial` останется на первом тейке — это НЕ ошибка расчёта, а
+    названное ограничение старых строк."""
     target: Decimal | None
     breakeven_at: Decimal | None = None
     """Цена взведения безубытка (стр. 19, 15, 44). None — правила у сделки нет либо
@@ -1284,7 +1554,7 @@ def pending_signals(
     следующих барах может смениться исходом. Отменяет только сам исход.
     """
     sql = ("SELECT s.id, s.symbol, s.timeframe, s.direction, s.entry, s.stop,"
-           " s.target, s.recorded_at, s.breakeven_at FROM signals s"
+           " s.target, s.recorded_at, s.breakeven_at, s.target2 FROM signals s"
            " LEFT JOIN outcomes o ON o.signal_id = s.id"
            " WHERE o.signal_id IS NULL")
     args: tuple[str, ...] = ()
@@ -1299,6 +1569,7 @@ def pending_signals(
             target=None if r[6] is None else Decimal(str(r[6])),
             recorded_at=int(r[7]),
             breakeven_at=None if r[8] is None else Decimal(str(r[8])),
+            target2=None if r[9] is None else Decimal(str(r[9])),
         )
         for r in rows
     )
@@ -1362,8 +1633,19 @@ def sync_levels(
     Замер `map-drift` (зонд удалён 19.08): при сдвиге окна на 200 баров 2% карты
     BTC и 3% ETH
     исчезали не потому, что уровень отработан (стр. 25 — единственная причина, которую
-    знает курс), а потому что структура уехала за край окна в 1000 баров. Уровень при
-    этом оставался активным. Автор говорит ровно обратное: «зона остаётся актуальна».
+    знает курс), а потому что структура уехала за край окна в 1000 баров.
+
+    ⚠⚠ ЗДЕСЬ СТОЯЛА ССЫЛКА НА АВТОРА, И ОНА ВЫДУМАНА. Снято 2026-08-28: «Автор говорит
+    ровно обратное: „зона остаётся актуальна"». Греп по текстовому слою всех 69 страниц:
+    слов «остаётся актуальна» НЕТ НИ НА ОДНОЙ. Единственное «актуальн» в курсе — стр. 25,
+    и оно говорит ПРОТИВОПОЛОЖНОЕ: «этот уровень становиться больше не актуальным, т.е.
+    мы этот уровень удаляем и ищем новые». Выдуманной цитатой обосновывалось то, что
+    уровень, которого расчёт больше не производит, остаётся `active`.
+
+    ⚠ Сам ЗАМЕР при этом в силе, и вывод из него уже: пропажа из расчёта не есть
+    рыночное событие, поэтому писать таким строкам `worked_off` или `flipped` нельзя.
+    Но и `active` им не принадлежит — для этого в схеме есть четвёртое состояние
+    `stale_calc` (см. комментарий у столбца: оставлять `active` — «враньём про нас»).
 
     Что делает функция:
       * НОВЫЙ уровень (окна структуры ещё нет в таблице) — вставляется;
@@ -1400,14 +1682,18 @@ def sync_levels(
                     " boundary_lo, boundary_hi, volume, from_ms, to_ms, first_seen,"
                     " last_seen, state, retired_at, entry_rule, resolved_at,"
                     " vrvp_density, mtf_break, agreement, stop_price, priority_tf,"
-                    " priority_depth)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " priority_depth, stop_edge_lo, stop_edge_hi, zone_work_lo, zone_work_hi)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    " ?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (symbol, lvl.timeframe, lvl.side.value, float(lvl.price),
                      float(lvl.zone_lo), float(lvl.zone_hi), float(lvl.boundary_lo),
                      float(lvl.boundary_hi), lvl.structure_volume, lvl.structure_from_ms,
                      lvl.structure_to_ms, now_ms, now_ms, state.value,
                      None if active else now_ms, rule.value, resolved,
-                     lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth),
+                     lvl.vrvp_density, mtf, agree, stop_px, pr_tf, pr_depth,
+                     float(lvl.stop_edge_lo), float(lvl.stop_edge_hi),
+                     None if lvl.zone_work_lo is None else float(lvl.zone_work_lo),
+                     None if lvl.zone_work_hi is None else float(lvl.zone_work_hi)),
                 )
                 added += 1
                 retired += not active
@@ -1436,13 +1722,15 @@ def sync_levels(
             # нарушений, пока леджер держал 50%. Две геометрии под одним уровнем.
             conn.execute(
                 "UPDATE levels SET last_seen=?, side=?, price=?, zone_lo=?, zone_hi=?,"
-                " boundary_lo=?, boundary_hi=?, volume=?, vrvp_density=?, state=?,"
+                " boundary_lo=?, boundary_hi=?, stop_edge_lo=?, stop_edge_hi=?,"
+                " volume=?, vrvp_density=?, state=?,"
                 " retired_at=?, entry_rule=?, resolved_at=?, mtf_break=?,"
                 " agreement=?, stop_price=?, priority_tf=?, priority_depth=?"
                 " WHERE symbol=? AND timeframe=? AND from_ms=? AND to_ms=?",
                 (now_ms, lvl.side.value, float(lvl.price),
                  float(lvl.zone_lo), float(lvl.zone_hi),
-                 float(lvl.boundary_lo), float(lvl.boundary_hi), lvl.structure_volume,
+                 float(lvl.boundary_lo), float(lvl.boundary_hi),
+                 float(lvl.stop_edge_lo), float(lvl.stop_edge_hi), lvl.structure_volume,
                  lvl.vrvp_density,
                  state.value, retired_at, rule.value, resolved, mtf, agree,
                  stop_px, pr_tf, pr_depth, *key),
@@ -1919,6 +2207,235 @@ def format_win_rate(w: WinRate) -> list[str]:
     return out
 
 
+SAMPLE_FLOORS: tuple[tuple[int, str], ...] = (
+    (500, "статистически сильная выборка"),
+    (200, "убедительно; сильной значимость становится от 500 сделок"),
+    (100, "минимум набран, число можно читать; убедительным оно станет от 200"),
+    (30, "ПРЕДВАРИТЕЛЬНОЕ ЧТЕНИЕ, а не вывод; минимум для чтения — 100 сделок"),
+    (1, "ПЕРВЫЕ НАБЛЮДЕНИЯ, выводов из них не делают: внешний порог даже "
+        "предварительного чтения — 30 сделок"),
+)
+"""Черта, ниже которой число не читается как вывод. Пороги ВНЕШНИЕ, не наши.
+
+Ни курс, ни корпус размера выборки не называют — здесь работает роль «ВЕРНО ЛИ
+посчитано», то есть статистика. Внешний консенсус сходится на четырёх ступенях: 30 —
+предварительное чтение, 100 — минимум, при котором число вообще что-то значит, 200 —
+убедительно, 500 — сильная значимость (edgeflo, Traders Second Brain, разбор
+статистической значимости в бэктесте; ссылки — в плане
+`docs/audit/plan-2026-08-26-product-and-edge.md`, раздел 7).
+
+⚠ Это НЕ ОТСЕЧКА и не фильтр: ни одна строка из-за малой выборки не прячется. Порог
+только НАЗЫВАЕТ словами, чем является напечатанное число, — ровно то, чего не хватало
+проекту, когда решения принимались по срезу на 300 барах.
+"""
+
+
+def sample_verdict(trades: int) -> str:
+    """Что такое напечатанное число при такой выборке — словами, а не молчанием.
+
+    ⚠ Хвост цикла НЕ возвращает пустую строку: нижняя ступень `SAMPLE_FLOORS` — единица,
+    а ноль и меньше отсечены выше, поэтому досюда дойти нельзя. Пустая строка на этом
+    месте была бы тихой деградацией — вердикт исчез бы, а число осталось; невозможный
+    случай обязан ПАДАТЬ с объяснением (тот же приём, что у `Breach.worked_off`).
+    """
+    if trades <= 0:
+        return "ЗАКРЫТЫХ СДЕЛОК НЕТ — считать нечего, и это данные, а не ноль"
+    for floor, words in SAMPLE_FLOORS:
+        if trades >= floor:
+            return words
+    raise AssertionError(
+        f"вердикт о выборке не назначен при {trades} сделках: нижняя ступень "
+        f"SAMPLE_FLOORS перестала быть единицей")
+
+
+class ExpectancyCell(BaseModel):
+    """Экспектанси одного разреза — средний результат сделки в единицах R.
+
+    Метрика взята у литературы и совпадает с нашей: «(Win Rate × Average Win in R) −
+    (Loss Rate × Average Loss in R)», что тождественно среднему R по завершённым
+    сделкам. Считается ВТОРЫМ способом — прямым средним, — и это не копия формулы, а
+    та же величина в один шаг: перемножать доли и средние, уже посчитанные из тех же
+    строк, значило бы завести вторую запись одного числа.
+
+    ⚠ ЗНАМЕНАТЕЛЬ ТОТ ЖЕ, ЧТО У ВИНРЕЙТА (`WinRateCell`): завершённые сделки — цель,
+    стоп, безубыток. Неоднозначные не входят: у них `r IS NULL` по схеме, и назначить
+    им число значило бы придумать исход. Их счёт печатается рядом.
+
+    ⚠ ИНТЕРВАЛ — НЕ УКРАШЕНИЕ. Среднее по 12 сделкам и по 500 читаются одинаково, а
+    значат разное; без интервала владелец не может отличить преимущество от шума.
+    Полуширина 95%: `1.96 · σ / √n` для среднего R и `1.96 · √(p(1−p)/n)` для доли.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: str
+    trades: int
+    r_sum: float
+    r_mean: float | None
+    """`None` при нуле сделок. Ноль означал бы «в среднем сделка не даёт ничего» —
+    другое утверждение (§4.3)."""
+
+    r_ci_half: float | None
+    """Полуширина 95% интервала среднего. `None` при `trades < 2`: по одной сделке
+    разброс не определён вовсе."""
+
+    ambiguous: int
+    """Вне знаменателя: исход не назначен, `r` не существует."""
+
+
+class Expectancy(BaseModel):
+    """Экспектанси целиком и в разрезе по ТФ, с вердиктом о выборке."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total: ExpectancyCell
+    by_timeframe: tuple[ExpectancyCell, ...]
+    win_ci_half: float | None
+    """Полуширина 95% интервала ВИНРЕЙТА по всем ТФ. `None` при нуле сделок."""
+
+    partial: ExpectancyCell
+    """То же среднее, но по модели ЧАСТИЧНОГО выхода — и это ПОЛ (Ф5, 2026-08-26).
+
+    ⚠⚠ ЗАЧЕМ ВТОРАЯ СТРОКА. `total` считает сделку так, будто на первой крупной цели
+    закрывается ВСЯ позиция. Курс так не торгует: стр. 15 о сделке от уровня говорит
+    «Вы сделали тейки по достигнутым целям и передвинули стоп в бу. Далее актив пошел на
+    коррекцию и просто остаток позиции закрылся в безубыток». Значит `total` есть ВЕРХНЯЯ
+    оценка, а не результат метода, и вся статистика на ней завышена.
+
+    ⚠ Числа ДВУХ строк НЕСРАВНИМЫ С ПРЕЖНИМИ отчётами: до схемы 17 второй модели не было
+    вовсе. Знаменатели у строк тоже могут расходиться — у строк схем до 17-й `r_partial`
+    пуст, — поэтому `trades` печатается у каждой свой.
+
+    Разбор, почему пол, а не точка: докстрока `outcome.Outcome.r_partial`. Коротко —
+    доли для сделки от уровня курс не называет ни на одной странице, а нижняя граница
+    выдумки не требует: после первого тейка стоп в безубытке, остаток не проигрывает.
+    """
+
+    fingerprint: str
+    verdict: str
+
+
+def expectancy(conn: sqlite3.Connection) -> Expectancy:
+    """Средний результат сделки в R по НАКОПЛЕННОМУ леджеру. Только на чтение.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26 ПО ПРИКАЗУ ВЛАДЕЛЬЦА «начинай с Ф0». До этого дня о качестве
+    сигналов проект знал только из СРЕЗОВ на 300 барах, и сам же назвал такой срез ложью
+    окна: медленное движение в окно не попадает, быстрое попадает, и средний R по срезу
+    систематически хуже правды. Леджер копит ВПЕРЁД и этой ошибки не имеет — не хватало
+    ровно отчёта.
+
+    ТФ берутся из `signals`, как и у винрейта: ТФ без единой завершённой сделки обязан
+    попасть в разрез со своим нулём, иначе перекос будет съеден соединением.
+    """
+    rows = conn.execute(
+        "SELECT s.timeframe,"
+        " SUM(CASE WHEN o.r IS NOT NULL THEN 1 ELSE 0 END) AS trades,"
+        " SUM(CASE WHEN o.kind='ambiguous' THEN 1 ELSE 0 END) AS amb"
+        " FROM signals s LEFT JOIN outcomes o ON o.signal_id = s.id"
+        " GROUP BY s.timeframe ORDER BY s.timeframe"
+    ).fetchall()
+    per_tf: dict[str, list[float]] = {str(r[0]): [] for r in rows}
+    amb_by_tf = {str(r[0]): int(r[2]) for r in rows}
+    for tf, r in conn.execute(
+        "SELECT s.timeframe, o.r FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+        " WHERE o.r IS NOT NULL"
+    ).fetchall():
+        per_tf.setdefault(str(tf), []).append(float(r))
+
+    def cell(tf: str, rs: list[float], amb: int) -> ExpectancyCell:
+        n = len(rs)
+        half = None
+        if n >= 2:
+            half = 1.96 * statistics.stdev(rs) / math.sqrt(n)
+        return ExpectancyCell(
+            timeframe=tf, trades=n, r_sum=sum(rs),
+            r_mean=None if n == 0 else sum(rs) / n,
+            r_ci_half=half, ambiguous=amb,
+        )
+
+    cells = tuple(cell(tf, rs, amb_by_tf.get(tf, 0)) for tf, rs in sorted(per_tf.items()))
+    # ⚠ ТОТ ЖЕ `cell`, а не вторая формула рядом: среднее и полуширина у обеих моделей
+    # считаются одинаково, и вторая их запись разошлась бы с первой (Ф5).
+    # ⚠ ТОЛЬКО СДЕЛКИ ОТ УРОВНЯ (`kind='level'`), и это НАЗВАНО, а не выпало само.
+    # Модель частичного выхода стоит на стр. 15, а та говорит о сделке от уровня («Актив
+    # пришел к лонг уровню»). Сделке от ПП (стр. 50) это правило не адресовано, и
+    # распространять его на неё значило бы повторить перенос чужой страницы, которым
+    # проект уже дважды ошибался. Без явного фильтра ПП-строки молча выпали бы из
+    # знаменателя пола (у них `r_partial` пуст), и расхождение строк объяснялось бы
+    # неверно — «старые строки», хотя причина другая.
+    partial_rs = [float(r[0]) for r in conn.execute(
+        "SELECT o.r_partial FROM outcomes o JOIN signals s ON s.id = o.signal_id"
+        " WHERE o.r_partial IS NOT NULL AND s.kind = 'level'")]
+    all_r = [x for rs in per_tf.values() for x in rs]
+    total = cell("ВСЕ", all_r, sum(amb_by_tf.values()))
+    wins = conn.execute(
+        "SELECT COUNT(*) FROM outcomes WHERE kind='target'").fetchone()[0]
+    win_half = None
+    if total.trades:
+        p = wins / total.trades
+        win_half = 1.96 * math.sqrt(p * (1 - p) / total.trades) * 100
+    n_signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    return Expectancy(
+        total=total, by_timeframe=cells, win_ci_half=win_half,
+        partial=cell("частичный", partial_rs, sum(amb_by_tf.values())),
+        fingerprint=f"сигналов {n_signals}, завершённых сделок {total.trades}",
+        verdict=sample_verdict(total.trades),
+    )
+
+
+def format_expectancy(e: Expectancy) -> list[str]:
+    """Экспектанси словами для владельца (§7.5). Вердикт о выборке — ПЕРВОЙ строкой."""
+    out = [f"ЭКСПЕКТАНСИ — средний результат сделки в R. ОТПЕЧАТОК: {e.fingerprint}",
+           f"   ВЫБОРКА: {e.verdict}"]
+    if e.total.trades == 0:
+        out.append("   леджер копит вперёд: у свежего сигнала исхода нет и быть не может")
+        return out
+    out.append("   ТФ     сделок   сумма R   средний R    95% интервал среднего   неодн.")
+    for c in (e.total, *e.by_timeframe):
+        mean = "     —" if c.r_mean is None else f"{c.r_mean:+.3f}"
+        if c.r_ci_half is None or c.r_mean is None:
+            span = "по одной сделке не определён"
+        else:
+            span = f"от {c.r_mean - c.r_ci_half:+.3f} до {c.r_mean + c.r_ci_half:+.3f}"
+        out.append(f"   {c.timeframe:6} {c.trades:6} {c.r_sum:+9.2f} {mean:>10}   "
+                   f"{span:26} {c.ambiguous:5}")
+    # ⚠⚠ ВТОРАЯ МОДЕЛЬ ПЕЧАТАЕТСЯ РЯДОМ, А НЕ ВМЕСТО (Ф5, 2026-08-26). Строка выше
+    # закрывает всю позицию первой целью — курс так не торгует (стр. 15), значит она
+    # ВЕРХНЯЯ оценка. Строка ниже — ПОЛ модели частичного выхода. Настоящий результат
+    # лежит между ними, и это честнее одного числа с выдуманной долей.
+    pc = e.partial
+    if pc.trades:
+        pmean = "     —" if pc.r_mean is None else f"{pc.r_mean:+.3f}"
+        pspan = ("по одной сделке не определён"
+                 if pc.r_ci_half is None or pc.r_mean is None else
+                 f"от {pc.r_mean - pc.r_ci_half:+.3f} до {pc.r_mean + pc.r_ci_half:+.3f}")
+        out.append(f"   {'ПОЛ':6} {pc.trades:6} {pc.r_sum:+9.2f} {pmean:>10}   "
+                   f"{pspan:26}")
+        out.append("   строка ПОЛ — модель ЧАСТИЧНОГО выхода (стр. 15): у первой цели "
+                   "фиксируется часть, остаток идёт под стопом в безубытке. Настоящий "
+                   "результат НЕ НИЖЕ этой строки и НЕ ВЫШЕ строки «ВСЕ»")
+        if pc.trades != e.total.trades:
+            out.append(f"   ⚠ знаменатели РАЗНЫЕ: {e.total.trades} против {pc.trades}, и "
+                       f"причин ДВЕ: сделки от ПП (стр. 50) в пол не входят вовсе — стр. "
+                       f"15 говорит о сделке от УРОВНЯ; и у строк, записанных до схемы "
+                       f"17, второй цели нет. Сравнивать средние этих строк нельзя")
+    else:
+        out.append("   ПОЛ модели частичного выхода не считался ни у одной сделки: все "
+                   "строки записаны до схемы 17 (стр. 15, Ф5)")
+    if e.win_ci_half is not None:
+        out.append(f"   интервал ВИНРЕЙТА по всем ТФ: ±{e.win_ci_half:.1f} п.п. — "
+                   f"столько же значит и сама доля")
+    crosses = (e.total.r_mean is not None and e.total.r_ci_half is not None
+               and abs(e.total.r_mean) <= e.total.r_ci_half)
+    out.append("   ⚠ ИНТЕРВАЛ ПЕРЕСЁК НОЛЬ — преимущество НЕ ПОКАЗАНО этой выборкой"
+               if crosses else
+               "   интервал среднего ноль НЕ пересекает — знак результата выборкой "
+               "подтверждён")
+    out.append("   правило проекта: правка МЕТОДА не обосновывается выборкой ниже "
+               "названной черты")
+    return out
+
+
 class SymbolFreshness(BaseModel):
     """Свежесть карты ОДНОГО символа: сколько активных уровней и когда их видели.
 
@@ -2009,6 +2526,117 @@ def level_freshness(conn: sqlite3.Connection, symbols: tuple[str, ...],
     rows.sort(key=lambda r: (r.in_universe, -r.active, r.symbol))
     return LevelFreshness(rows=tuple(rows), as_of_ms=as_of_ms,
                           universe_size=len(symbols))
+
+
+class ZoneOverlaps(BaseModel):
+    """Наслоение ВСТРЕЧНЫХ зон в накопленной карте — число, а не глаза владельца.
+
+    ⚠⚠ ЗАВЕДЕНО 2026-08-26 по приказу «разбери наслоение зон». Класс нашёл ВЛАДЕЛЕЦ
+    ГЛАЗАМИ 2026-08-18 («допускаешь НАСЛОЕНИЕ противоположных зон!»), замер того дня —
+    4413 активных уровней по 5 символам, **385–418 пар у одного символа**. За неделю
+    класс чинили ЧЕТЫРЕЖДЫ (`price_beyond`, склейка уровней между ТФ, `first_verdict`
+    вместо `first_breach`, `resolve_carried`), и НИ РАЗУ не перемерили: прибора, который
+    считает эти пары, в проекте не было вовсе. Следующий возврат класса опять нашли бы
+    глаза, а не число.
+
+    ⚠ Считается по НАКОПЛЕННОЙ карте, а не по свежему прогону, и это существенно: число
+    владельца пришло именно оттуда. Свежий прогон видит только то, что построил сам;
+    карта копит уровни между прогонами, и копила она их как раз потому, что
+    перенесённые не пересуживались.
+
+    ⚠ Отбор `state='active'` — тот же, которым отбирал владелец, и тот же, по которому
+    доска рисует бокс зоны (`render`: «бокс — только ЖИВОМУ входу»). Значит сторона в
+    карте и есть сторона СЕЙЧАС: `flipped` — отдельное состояние и сюда не попадает,
+    поэтому переворот стр. 43 здесь не считается второй раз.
+
+    ⚠ Это НЕ ГЕЙТ и гейтом не станет: число печатается приёмкой прогона, кода возврата
+    не меняет и ничего не отсекает. Ненулевое значение — повод посмотреть, а не отказ:
+    встречный уровень на тех же ценах бывает и законно (стр. 25 «мы этот уровень удаляем
+    и ищем новые»), а вот РОСТ числа от прогона к прогону при неизменном расчёте
+    означает, что карта снова копит непересуженное.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pairs: int
+    """Пар активных уровней ПРОТИВОПОЛОЖНЫХ сторон с пересечением зон."""
+
+    by_symbol: dict[str, int]
+    """Разрез по символам — измерение, вдоль которого возможен перекос (правило сводки
+    отказов): двести пар у одного символа и по нулю у прочих есть дефект символа, а не
+    свойство рынка."""
+
+    levels: int
+    """Активных уровней в карте — ЗНАМЕНАТЕЛЬ. Без него «пар 0» у пустой карты
+    неотличимо от «пар 0» у карты в тысячу уровней."""
+
+
+LIVE_LEVEL_SQL = (
+    "state='active' AND last_seen = ("
+    " SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = levels.symbol)")
+"""УСЛОВИЕ ЖИВОГО УРОВНЯ — того, который ПОДТВЕРДИЛ последний расчёт символа.
+
+⚠⚠ ЗАВЕДЕНО 2026-08-28, И ЭТО СВЕДЕНИЕ КОПИЙ, А НЕ НОВОЕ ПРАВИЛО. `state='active'`
+отвечает лишь на вопрос "сняли ли уровень по вердикту курса" (стр. 25 — отработан,
+стр. 43 — пробит). На вопрос "производит ли его расчёт СЕЙЧАС" он не отвечает: строка,
+которую прогон не пересчитал, остаётся `active` намеренно — это накопление карты, и
+основание у него замеренное (см. `sync_levels`: при сдвиге окна 2% карты BTC и 3% ETH
+исчезали не по вердикту курса, а от края окна).
+
+Бот про это знал и фильтровал сам — ДВУМЯ одинаковыми подзапросами, в `read_map` и в
+`_ledger_news`. Больше не знал НИКТО. Замер 2026-08-28: активных строк 108, бот
+показывает 90, скрыто 18 (на 5м — 30 против 19). То есть `hunter check`, вердикт
+которого владелец читает командой, считал по множеству на 20% больше того, что владелец
+видит, а на 5м — на 58%. Ровно «прибор смотрит НЕ на ту величину, которую видит
+владелец», и порождено это второй копией правила.
+
+⚠ Подзапрос КОРРЕЛИРОВАННЫЙ (`l2.symbol = levels.symbol`), поэтому годится только там,
+где внешняя таблица зовётся `levels` без псевдонима. Отсечка без константы: `sync_levels`
+проставляет всем уровням символа один и тот же `last_seen`, значит максимум по символу
+И ЕСТЬ момент его последнего расчёта.
+
+⚠ НЕ применять в `level_freshness`: та функция СПЕЦИАЛЬНО меряет отставание, и фильтр
+свежести обнулил бы её измерение.
+"""
+
+
+def zone_overlaps(conn: sqlite3.Connection) -> ZoneOverlaps:
+    """Посчитать наслоение встречных зон по активной карте. Разбор — в `ZoneOverlaps`.
+
+    что из чего следует: две активные строки одного символа с РАЗНЫМИ сторонами и
+    пересекающимися зонами → одна пара. Обратное не проверяется: пара ничего не говорит
+    о том, какая из двух строк лишняя, — это решает человек с референтом.
+
+    ⚠ ПЕРЕСЕЧЕНИЕ НЕСТРОГОЕ, и это взято у проекта, а не выбрано здесь: `tgbot.spans` и
+    `render.merge_spans` клеят зоны тем же нестрогим сравнением. Значит зоны, смежные
+    кромка-в-кромку (низ одной равен верху другой), считаются парой. Второй предикат
+    «перекрытия» рядом с существующим был бы ровно той второй сущностью под одним
+    именем, которую свод запрещает. На живых данных случай редкий: в замере 2026-08-26
+    (10 символов, 42 уровня, 7 встречных пар) ширина перекрытия шла от 0.54% до 2.93%
+    цены, кромка-в-кромку не встретилась ни разу.
+    """
+    by_sym: dict[str, list[tuple[str, float, float]]] = {}
+    # ⚠ ПО ЖИВЫМ, А НЕ ПО ВСЕМ `active` (2026-08-28). Прибор заведён по жалобе
+    # владельца, нашедшего наслоение ГЛАЗАМИ в своей карте, — значит и считать он обязан
+    # по ЕГО карте. Замер в день правки: 108 строк против 90 живых, пар 1 и 1 —
+    # сегодня число не меняется, но множество было чужим, и совпадение случайно.
+    for sym, side, lo, hi in conn.execute(
+            "SELECT symbol, side, zone_lo, zone_hi FROM levels WHERE "
+            + LIVE_LEVEL_SQL):
+        by_sym.setdefault(str(sym), []).append((str(side), float(lo), float(hi)))
+    pairs: dict[str, int] = {}
+    total = n_lv = 0
+    for sym, rows in by_sym.items():
+        n_lv += len(rows)
+        n = 0
+        for i, (s_a, lo_a, hi_a) in enumerate(rows):
+            for s_b, lo_b, hi_b in rows[i + 1:]:
+                if s_a != s_b and lo_a <= hi_b and lo_b <= hi_a:
+                    n += 1
+        if n:
+            pairs[sym] = n
+        total += n
+    return ZoneOverlaps(pairs=total, by_symbol=pairs, levels=n_lv)
 
 
 def format_level_freshness(f: LevelFreshness) -> list[str]:

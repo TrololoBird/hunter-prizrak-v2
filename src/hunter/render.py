@@ -63,6 +63,23 @@ _TEXT, _TICK = "#d1d4dc", "#787b86"
 _UP, _DN = "#26a69a", "#ef5350"
 _LONG_FILL, _LONG_EDGE = "#1b5e20", "#4caf50"
 _SHORT_FILL, _SHORT_EDGE = "#7f1d1d", "#ef5350"
+
+
+def _price_label(y: float) -> str:
+    """Цена для ценника на шкале. `%g` здесь врал на микропенных монетах:
+    0.0000091 печатался как «9.1e-06» — научная нотация на графике для читателя,
+    который не программист. Формат по порядку величины: тысячи без хвоста,
+    единицы — 4 знака, дро-цены — до 8 без нулей."""
+    a = abs(y)
+    if a >= 1000:
+        s = f"{y:.1f}"
+    elif a >= 1:
+        s = f"{y:.4f}"
+    else:
+        s = f"{y:.8f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 _CONF_FILL, _CONF_EDGE = "#6b5d1c", "#f2c94c"
 """Жёлтый = режим входа «по факту/наблюдение» — семантика цвета у автора
 (корпус tg-prizrak-2026-08.md, разделы 4 и 8: 🟡/жёлтая полоса, id 7654)."""
@@ -87,6 +104,11 @@ class ZoneSpec:
     price: float
     zone_lo: float
     zone_hi: float
+    work_lo: float = 0.0
+    work_hi: float = 0.0
+    """Рабочая зона вокруг ПОК (HVN-ядро, решение владельца 2026-08-25). Ненулевая —
+    боксы входа/наблюдения рисуются по ней; VAL…VAH остаётся контекстом записи.
+    Ноль — уровень старого прогона без рабочей зоны, рисуем как раньше."""
     kind: str = "level"
     entry_rule: str = ""
     """Чем уровень торгуется: limit | confirmation | retest_flipped. Пусто — не записано
@@ -222,15 +244,27 @@ def chart_png(
     вход отсюда не приоритет по стр. 44. Два правила для одной величины: картинка брала
     только `entry_rule` из леджера и о стр. 44 не знала вовсе."""
 
+    # ⚠ ВРЕМЯ → ИНДЕКС ТОЛЬКО ПОИСКОМ ПО ФАКТИЧЕСКИМ МЕТКАМ. Прежняя редакция делила
+    # `(ms - bars[0].open_ms) // step`: на ряду БЕЗ пропусков это верно, но ряды с
+    # дырами (а они есть — «засев: дыры внутри окна» в каждом прогоне) сдвигают все
+    # индексы правее первой дыры, и бокс структуры рисовался на ЧУЖИХ свечах —
+    # «выходные» бары попадали в его диапазон, свечи торчали из коробки. Поймано
+    # геометрическим аудитом 2026-08-25 (5 боксов из 25 на живом BTC). Тот же класс,
+    # что убран из `structure_window_ms` (докстрока: «индексная арифметика убрана
+    # совсем») — в рендере она осталась.
+    from bisect import bisect_right
+    _xs = [b.open_ms for b in bars]
+
     def bar_index(ms: int) -> int | None:
-        """Номер бара по метке времени. None — метка вне окна графика."""
-        if ms <= 0 or not bars:
+        """Номер бара по метке времени. None — метка вне окна графика.
+
+        Метка ОТКРЫТИЯ существующего бара даёт его номер; правая граница окна
+        (`последний.open + ТФ`, эксклюзивная) даёт последний бар — боксы и значки
+        рисуются до конца своего последнего бара, как и раньше."""
+        if ms <= 0 or not _xs:
             return None
-        step = bars[1].open_ms - bars[0].open_ms if len(bars) > 1 else 0
-        if step <= 0:
-            return None
-        idx = (ms - bars[0].open_ms) // step
-        return int(idx) if 0 <= idx < len(bars) else None
+        idx = bisect_right(_xs, ms) - 1
+        return idx if 0 <= idx < len(bars) else None
 
     for z in sorted(zones, key=lambda z: z.zone_hi - z.zone_lo, reverse=True):
         if z.zone_lo > hi or z.zone_hi < lo:
@@ -249,6 +283,11 @@ def chart_png(
         i0 = bar_index(z.from_ms) if z.timeframe == timeframe else None
         i1 = bar_index(z.to_ms) if z.timeframe == timeframe else None
         drawn_box = False
+        # РАЗВЕДКА ЗНАЧКОВ СУДЬБЫ по вертикали: несколько уровней, решившихся на
+        # одном баре, ложились стрелка-на-стрелку и крест-на-крест (кластер июня
+        # на BTC 4h, разбор глазами 2026-08-25). Счётчик на бар: каждый следующий
+        # значок поднимается на 2% высоты кадра.
+        fate_at: dict[int, int] = {}
         if i0 is not None and z.boundary_lo > 0 and z.boundary_hi > z.boundary_lo:
             i1 = i1 if i1 is not None else len(bars) - 1
             b_lo, b_hi = max(z.boundary_lo, lo), min(z.boundary_hi, hi)
@@ -288,7 +327,7 @@ def chart_png(
             if i_ev is None:
                 # Плашка кладётся ОТЛОЖЕННО: сначала собираются все, потом раздвигаются
                 # по вертикали, чтобы не наезжать друг на друга (см. ниже).
-                tags.append((z.price, f"{z.price:g}", edge))
+                tags.append((z.price, _price_label(z.price), edge))
 
         # 3. ЗОНА ВХОДА — бокс кандидатом в `entry_boxes`, рисование ПОСЛЕ цикла со
         # склейкой пересекающихся (см. ниже). Прежняя редакция рисовала бокс каждому
@@ -304,15 +343,20 @@ def chart_png(
         if z.kind == "level" and z.state == "active" and tradable_side:
             # НАСТОЯЩИЕ границы, не обрезанные кадром: обрезка — при рисовании.
             # Иначе ценник границы печатал бы край кадра вместо цены зоны.
-            if z.zone_lo <= ref_price <= z.zone_hi:
+            # РАБОЧАЯ ЗОНА предпочтительнее VAL…VAH (решение владельца 2026-08-25):
+            # у старших ТФ область стоимости шире торгуемого диапазона, вход читают
+            # вокруг ПОК. Нулевые рабочие — уровень старого прогона, рисуем VA.
+            e_lo, e_hi = ((z.work_lo, z.work_hi)
+                          if z.work_hi > z.work_lo > 0 else (z.zone_lo, z.zone_hi))
+            if e_lo <= ref_price <= e_hi:
                 # Стр. 44 — то же правило и той же проверкой, что в тексте карточки.
-                inside_boxes.append((z.zone_lo, z.zone_hi))
+                inside_boxes.append((e_lo, e_hi))
             elif z.entry_rule in ("limit", "retest_flipped"):
-                entry_boxes.append((z.side, z.zone_lo, z.zone_hi))
+                entry_boxes.append((z.side, e_lo, e_hi))
             else:
                 # «По факту»-зона: не готовый вход (стр. 25 — лимитки сняты), но у
                 # автора она на карте ЖЁЛТАЯ, а не отсутствует (корпус, раздел 4).
-                conf_boxes.append((z.zone_lo, z.zone_hi))
+                conf_boxes.append((e_lo, e_hi))
         # 3б. ЗНАЧКИ СУДЬБЫ — как на разметке автора: красная стрелка там, где уровень
         # отработан (стр. 25 «мы этот уровень удаляем»), синий крестик там, где пробит
         # и сменил сторону (стр. 43). Ставятся НА БАРЕ СОБЫТИЯ, а не в конце графика:
@@ -327,9 +371,12 @@ def chart_png(
                     # Прежняя редакция красила обе красным — это была моя выдумка.
                     up = z.side == "long"
                     dy = (hi - lo) * 0.055
+                    k = fate_at.get(i_ev, 0)
+                    fate_at[i_ev] = k + 1
+                    off = k * (hi - lo) * 0.02
                     ax.annotate(
-                        "", xy=(i_ev, z.price + (dy if up else -dy)),
-                        xytext=(i_ev, z.price + (-dy if up else dy) * 0.35),
+                        "", xy=(i_ev, z.price + off + (dy if up else -dy)),
+                        xytext=(i_ev, z.price + off + (-dy if up else dy) * 0.35),
                         arrowprops={"arrowstyle": "-|>",
                                     "color": "#2f9e4f" if up else "#d0342c",
                                     "linewidth": 2.4, "mutation_scale": 16},
@@ -342,7 +389,10 @@ def chart_png(
                     # Крестик взят с РАЗМЕТКИ КАНАЛА автора (скриншот владельца
                     # 2026-08-17) — источник второго ряда, и здесь это названо, а не
                     # выдано за курс.
-                    ax.plot([i_ev], [z.price], marker="x", color="#2f6fd0",
+                    k = fate_at.get(i_ev, 0)
+                    fate_at[i_ev] = k + 1
+                    off = k * (hi - lo) * 0.02
+                    ax.plot([i_ev], [z.price + off], marker="x", color="#2f6fd0",
                             markersize=11, markeredgewidth=2.4, zorder=8)
 
         if z.kind == "pp":
@@ -425,7 +475,7 @@ def chart_png(
             # прибора. Плашки идут в общую раздвижку с дедупликацией.
             for y in (b_lo, b_hi):
                 if lo <= y <= hi:
-                    tags.append((y, f"{y:g}", edge))
+                    tags.append((y, _price_label(y), edge))
             if ref_price > 0 and (ref_price < b_lo or ref_price > b_hi):
                 ruler_edges.append(b_lo if ref_price < b_lo else b_hi)
 
@@ -446,9 +496,19 @@ def chart_png(
         ax.plot([x_r], [y1c if edge_y > ref_price else y0c],
                 marker="^" if edge_y > ref_price else "v",
                 color=_TICK, markersize=4, zorder=6)
-        ax.annotate(f"{move:+.2f}%", xy=(x_r, (y0c + y1c) / 2),
-                    xytext=(3, 0), textcoords="offset points",
-                    va="center", ha="left", fontsize=7.5, color=_TEXT, zorder=6)
+        # ⚠⚠ ПОДПИСЬ УХОДИТ ВЛЕВО И НЕСЁТ ТОЛЬКО ПРОЦЕНТ — правка 2026-08-27 по разбору
+        # ГЛАЗАМИ отправленного графика. Здесь стояло `ha="left"` с полным текстом
+        # «78801.2 → 77207.6 (-1.4%)»: линейка стоит на 0.78 поля будущего, а ценовые
+        # плашки — ЗА краем оси, и текст въезжал прямо под них. На живой картинке BTC 4ч
+        # читалось «78801.» слева от плашки и «2 (-1.4%)» справа — цена как число
+        # пропадала. Обе цены линейки И ТАК подписаны плашками на шкале, поэтому
+        # повторять их незачем: уникальное содержание линейки — РАССТОЯНИЕ.
+        ax.annotate(f"{move:+.1f}%",
+                    xy=(x_r, (y0c + y1c) / 2),
+                    xytext=(-4, 0), textcoords="offset points",
+                    va="center", ha="right", fontsize=7.5, color=_TEXT, zorder=7,
+                    bbox={"boxstyle": "square,pad=0.15", "facecolor": _BG,
+                          "edgecolor": "none", "alpha": 0.75})
 
     w = 0.62
     for i, b in enumerate(bars):
@@ -481,10 +541,19 @@ def chart_png(
         # съедала кадр и зоны входа ложились ПОВЕРХ профиля — разбор ответа
         # 2026-08-17, замечание владельца о «ужасных графиках».
         width_px = future * 0.32
+        # Порог HVN-ядра видимого профиля — половина пикового ряда: тот же критерий,
+        # что у рабочей зоны уровня (решение владельца 2026-08-25), чтобы картинка и
+        # числа говорили одним языком о «где объём».
+        hvn_cut = max(buckets) / 2
         for k, v in enumerate(buckets):
             if v <= 0:
                 continue
-            colr = "#c8b93a" if k == poc_k else "#2a3a55"
+            if k == poc_k:
+                colr = "#f2f2f2"   # ПОК — белый: жёлтый на карте занят «по факту»
+            elif v >= hvn_cut:
+                colr = "#5a6f96"   # HVN-ядро — светлее фона, темнее полных
+            else:
+                colr = "#2a3a55"
             ax.add_patch(patches.Rectangle(
                 (right - v / vmax * width_px, lo + k * step_px),
                 v / vmax * width_px, step_px * 0.92,
@@ -498,7 +567,7 @@ def chart_png(
         ax.plot([-1, right], [last_close, last_close], color=_TEXT,
                 linewidth=0.9, linestyle=(0, (4, 3)), zorder=7)
         # Плашка текущей цены — цветом последней свечи, как в терминале автора.
-        tags.append((last_close, f"{last_close:g}",
+        tags.append((last_close, _price_label(last_close),
                      _UP if bars[-1].close >= bars[-1].open else _DN))
 
     # ПЛАШКИ ЦЕН — с раздвижкой: близкие сдвигаются по вертикали, чтобы каждая
@@ -570,6 +639,34 @@ def chart_png(
         title += f" · {caption}"
     ax.set_title(title, loc="left", fontsize=10.5, color=_TEXT)
     fig.tight_layout()
+    # Место под вынесенную легенду освобождается ПОСЛЕ `tight_layout`: он о
+    # фигурных легендах не знает и вернул бы поле обратно.
+    fig.subplots_adjust(bottom=0.11)
+
+    # ЛЕГЕНДА — нижний левый угол, мелко, полупрозрачно. Без неё жёлтый/зелёный/
+    # крестик читаются догадкой (разбор глазами 2026-08-25: «жёлтая полоса — это
+    # зона или ПОК?»).
+    from matplotlib.lines import Line2D
+    handles = [
+        patches.Patch(facecolor=_LONG_FILL, edgecolor=_LONG_EDGE, label="лонг"),
+        patches.Patch(facecolor=_SHORT_FILL, edgecolor=_SHORT_EDGE, label="шорт"),
+        patches.Patch(facecolor=_CONF_FILL, edgecolor=_CONF_EDGE, label="по факту"),
+        Line2D([0], [0], color="#f2f2f2", linewidth=3,
+               label="ПОК профиля (белый)"),
+        Line2D([0], [0], color="#2f6fd0", marker="x", linewidth=0,
+               markersize=7, markeredgewidth=2, label="пробит (сторона сменилась)"),
+    ]
+    # ⚠⚠ ЛЕГЕНДА ВЫНЕСЕНА ЗА ПОЛЕ ГРАФИКА — правка 2026-08-27 по разбору ГЛАЗАМИ.
+    # Стояло `loc="lower left"` ВНУТРИ осей, и на живой картинке BTC 4ч коробка легенды
+    # легла прямо на свечи накопления, а нижняя граница структуры прошла сквозь строку
+    # «по факту». То есть подпись закрывала ровно ту базу, ради которой уровень и
+    # построен, — а свод требует, чтобы предъявляемое проверялось глазами.
+    # Строкой ПОД осью времени легенда не может пересечься с данными ни при какой
+    # раскладке свечей, тогда как любой угол внутри осей рано или поздно занят.
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=7,
+               frameon=False, labelcolor=_TEXT, bbox_to_anchor=(0.5, 0.0),
+               columnspacing=1.6, handlelength=1.6)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)

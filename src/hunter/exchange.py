@@ -448,15 +448,21 @@ def desync_s(key: str, base_s: float) -> float:
 
 
 USED_CCXT_METHODS: tuple[str, ...] = (
-    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchCurrencies", "fetchTicker",
-    "fetchTickers", "fetchTrades", "fetchOrderBook", "fetchBidsAsks",
-    "fetchLastPrices", "fetchMarkPrice", "fetchMarkPrices", "fetchFundingRate",
-    "fetchFundingRates", "fetchFundingRateHistory", "fetchFundingIntervals",
-    "fetchOpenInterest", "fetchOpenInterests", "fetchOpenInterestHistory",
-    "fetchLiquidations", "fetchLongShortRatioHistory", "loadMarkets",
-    "watchTrades", "watchOHLCV",
+    "fetchOHLCV", "fetchTime", "fetchStatus", "fetchTicker", "fetchTickers",
+    "fetchTrades", "fetchOrderBook", "loadMarkets", "watchTrades", "watchOHLCV",
 )
-"""Методы ccxt, которые проект ДЕЙСТВИТЕЛЬНО вызывает. Знаменатель к «спрошено N».
+"""Методы ccxt, ДОСТИЖИМЫЕ ИЗ ЖИВОГО ПУТИ. Знаменатель к «спрошено N».
+
+⚠⚠ СПИСОК СОКРАЩЁН С 24 ДО 10 — 2026-08-27, ПО ЗАМЕРУ ДОСТИЖИМОСТИ. Здесь стояли ещё
+четырнадцать имён, и строка отчёта говорила владельцу «проект ВЫЗЫВАЕТ 24». Замер
+обходом дерева вызовов: у каждого из тех четырнадцати ЕДИНСТВЕННЫЙ вызывающий — обёртка
+`exchange.py`, которую не зовёт никто (`fetch_currencies`, `fetch_quotes`,
+`fetch_last_prices`, `fetch_mark_price(s)`, `fetch_funding*`, `fetch_open_interest*`,
+`fetch_liquidations`, `fetch_long_short_ratio`). Они перечислены ниже в
+`WRAPPED_ONLY_CCXT_METHODS`: поверхность у нас написана, но бой её не проходит, и
+называть это «вызываем» значило бы завысить охват в 2.4 раза. Тот же класс, что
+разобран в комментарии к `capabilities_missing`: печатать надо ЗАМЕР, а не вывод из
+рассуждения.
 
 ⚠⚠ ЗАВЕДЕНО 2026-08-23. `REQUIRED_CAPABILITIES` ниже покрывает ТРИ метода, и приёмка
 печатала «возможности проверены: 3» — без знаменателя это читается как «проверено всё»,
@@ -467,6 +473,20 @@ USED_CCXT_METHODS: tuple[str, ...] = (
 `-5000 «Method is invalid»`, а существующий метод объявлен `None`). Жёсткая проверка по
 ней остановила бы прогон на работающем методе. Правило проекта — «проверка возможности
 только вызов»; пока вызова нет, честно назвать разрыв, а не закрыть его объявлением.
+"""
+
+WRAPPED_ONLY_CCXT_METHODS: tuple[str, ...] = (
+    "fetchCurrencies", "fetchBidsAsks", "fetchLastPrices", "fetchMarkPrice",
+    "fetchMarkPrices", "fetchFundingRate", "fetchFundingRates",
+    "fetchFundingRateHistory", "fetchFundingIntervals", "fetchOpenInterest",
+    "fetchOpenInterests", "fetchOpenInterestHistory", "fetchLiquidations",
+    "fetchLongShortRatioHistory",
+)
+"""Методы, у которых обёртка НАПИСАНА, но живой путь её не зовёт (замер 2026-08-27).
+
+Держатся отдельным списком, а не удаляются: обёртки — готовая поверхность под будущие
+признаки, и стереть их значило бы писать заново. Но и в «вызываем» им не место —
+владелец читает это число как охват боя.
 """
 
 REQUIRED_CAPABILITIES: dict[str, str] = {
@@ -1014,6 +1034,9 @@ class Exchange:
         """
 
         self.tickers_unparsed = 0
+        self.tickers_retried = 0
+        """Повторов суточной статистики. Молчание НАЗЫВАЕТСЯ числом: без счётчика
+        «сеть подлатали» и «сеть здорова» выглядели бы одинаково."""
         """Тикеров, отброшенных как неполные. Знаменатель — принятые: биржа отдаёт
         суточную статистику и по рынкам, где суток ещё не набралось."""
 
@@ -1134,7 +1157,11 @@ class Exchange:
         log.info("возможности, которые проект ВЫЗЫВАЕТ, но у карты не спрашивает",
                  вызываем=len(USED_CCXT_METHODS),
                  спрошено=len(REQUIRED_CAPABILITIES),
-                 не_спрошено=len(unchecked), методы=", ".join(unchecked))
+                 не_спрошено=len(unchecked), методы=", ".join(unchecked),
+                 # ⚠ Второе число заведено 2026-08-27: до него «вызываем» включало и
+                 # методы, достижимые ТОЛЬКО через обёртки, которых не зовёт никто, —
+                 # охват был завышен с 10 до 24. Разрыв называется, а не прячется.
+                 обёрнуто_но_не_зовём=len(WRAPPED_ONLY_CCXT_METHODS))
         # ⚠ «проверено N» здесь означает «спрошено у карты N раз», а НЕ «работает N».
         # Формулировка правится вместе с находкой о лживости `has`: прежняя читалась как
         # утверждение об исправности.
@@ -1226,7 +1253,31 @@ class Exchange:
         from .archive import check_venue
         if why := check_venue(self.venue.ccxt_class):
             raise CapabilityMissing(why)
-        await self._ex.load_markets()
+        # ⚠⚠ КАРТА РЫНКОВ БЕРЁТСЯ С ПОВТОРОМ — правка 2026-08-27. Здесь стоял ОДИН
+        # вызов, и первый же `RequestTimeout` на `exchangeInfo` убивал процесс целиком:
+        # 2026-08-27 это случилось дважды, бот выходил и канал замолкал бы навсегда.
+        # Отказ транзиентный — та же сеть отвечает через секунду, — а цена его была
+        # полная остановка доставки.
+        #
+        # Политика та же, что у потерянной страницы (`PAGE_RETRIES`, удвоение паузы) и
+        # заведена тем же приказом владельца: «дегдрадации, остутсвие данных НЕ
+        # ДОПУСТИМЫ!» Второй константы не вводится — здесь ровно та же величина и тот
+        # же довод. Исчерпав попытки, поднимаем ПОСЛЕДНЮЮ ошибку: молчаливой работы без
+        # карты рынков быть не может.
+        for attempt in range(PAGE_RETRIES):
+            try:
+                await self._ex.load_markets()
+                if attempt:
+                    log.info("карта рынков взята повтором", площадка=self._ex.id,
+                             попытка=attempt + 1)
+                break
+            except ccxt.NetworkError as e:
+                if attempt == PAGE_RETRIES - 1:
+                    raise
+                log.degraded("карта рынков не пришла — повтор", площадка=self._ex.id,
+                             попытка=attempt + 1, из=PAGE_RETRIES,
+                             причина=f"{type(e).__name__}: {str(e)[:120]}")
+                await asyncio.sleep(2.0 ** attempt)
         # Проверка ПОСЛЕ load_markets: у ccxt часть `has` уточняется по ответу биржи.
         # И ДО всего остального: отказ обязан случиться в начале прогона, а не из
         # середины стека спустя минуты сбора.
@@ -2828,8 +2879,30 @@ class Exchange:
         корпуса), а число оборота снято руками 2026-08-03 и с тех пор ничем не проверялось.
         Здесь появляется прибор, которым его можно пересчитать, не открывая браузер.
         """
-        got = await self._rest("суточная статистика", self.venue.ccxt_class,
-                               lambda: self._ex.fetch_tickers(symbols))
+        # ⚠⚠⚠ ПОВТОР С УДВОЕНИЕМ ПАУЗЫ. Заведён 2026-08-27 ПО ЖИВОМУ ЗАПУСКУ, а не по
+        # гейту. Вызов тяжёлый — вес 40 за все рынки сразу, у нас их 877, — и на боевой
+        # площадке он падал по `RequestTimeout` ЧАЩЕ, ЧЕМ ПРОХОДИЛ: за первый час работы
+        # 7 отказов против 3 успешных тактов наблюдателя.
+        #
+        # Цена отказа была не «нет суточной статистики», а куда больше: такт наблюдателя
+        # обрывался целиком (`return out`), и вместе с ним пропадали уведомления «цена у
+        # зон» и взведение безубытка — то есть САМОЕ ЧАСТОЕ, что бот говорит читателю,
+        # терялось в 70% тактов. Владелец видел бы редкие сообщения и считал бы, что
+        # рынок тихий.
+        #
+        # Политика та же и та же константа, что у потерянной страницы и у карты рынков
+        # (`PAGE_RETRIES`): второй копии не заводится, довод один — приказ владельца
+        # «дегдрадации, остутсвие данных НЕ ДОПУСТИМЫ!». Исчерпав попытки, отдаём
+        # `NotReady` как раньше: врать пустой статистикой нельзя.
+        got: dict[str, Any] | NotReady = NotReady(reason="не запрашивалось")
+        for attempt in range(PAGE_RETRIES):
+            got = await self._rest("суточная статистика", self.venue.ccxt_class,
+                                   lambda: self._ex.fetch_tickers(symbols))
+            if not isinstance(got, NotReady):
+                break
+            if attempt < PAGE_RETRIES - 1:
+                self.tickers_retried += 1
+                await asyncio.sleep(2.0 ** attempt)
         if isinstance(got, NotReady):
             return got
         out: dict[str, Ticker24h] = {}
