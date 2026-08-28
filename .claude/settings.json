@@ -61,6 +61,17 @@
     ]
   },
   "hooks": {
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project python ${CLAUDE_PROJECT_DIR}/.claude/hooks/instructions_loaded.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",

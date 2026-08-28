@@ -237,7 +237,7 @@
 
 **5.3. Что делать дальше — ждать следующий выпуск.** Границы верхняя и нижняя объявлены
 темой следующего ролика. Это буквально узкое место правок 17–23 августа
-(`docs/audit/author-markup-2026-08-21.md`, `.claude/rules/open-method-questions.md`).
+(`docs/audit/author-markup-2026-08-21.md`, `.claude/skills/open-method-questions/SKILL.md`).
 Разбирать его надо первым, как только владелец его передаст.
 
 ---

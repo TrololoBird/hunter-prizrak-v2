@@ -1,17 +1,10 @@
----
-paths:
-  - "src/hunter/**/*.py"
-  - "gates/binning_agrees.py"
-  - "gates/indicator_oracle.py"
-  - "gates/formula_reference.py"
----
 
 # Открытые расхождения расчёта с первоисточниками
 
 Вынесено из `CLAUDE.md` 2026-08-23. **Повестка осталась в `CLAUDE.md` — здесь числа и
 способ их получения.** Числа пунктов 1–5 получены 2026-08-22, способ воспроизведения
 назван в разделе 9 плана
-[plan-2026-08-21-geometry-transport.md](../../docs/audit/plan-2026-08-21-geometry-transport.md).
+[plan-2026-08-21-geometry-transport.md](../../../../docs/audit/plan-2026-08-21-geometry-transport.md).
 
 ⚠ Ни один пункт НЕ означает «менять расчёт немедленно». Каждый означает: назвать
 расхождение, замерить цену, предъявить владельцу и решать с ним, а не за него.

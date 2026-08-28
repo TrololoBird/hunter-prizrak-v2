@@ -324,7 +324,7 @@ class TVProfile(BaseModel):
     ⚠ Зачем её вообще показывать. ПОК ЕСТЬ ЦЕНА ВХОДА, и он не может быть точнее строки,
     в которой найден. При режиме `RowSize.ROWS` постоянно ЧИСЛО строк, а высота гуляет от
     окна к окну — то есть точность входа меняется, и владелец об этом не знал. Открытый
-    вопрос №2 в .claude/rules/open-method-questions.md.
+    вопрос №2 в .claude/skills/open-method-questions/SKILL.md.
     """
 
     rows_built: int = Field(gt=0)
