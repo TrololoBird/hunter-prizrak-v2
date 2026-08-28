@@ -2731,8 +2731,23 @@ class LedgerNews:
     и достижение цены взведения безубытка (🎯, стр. 14–15)."""
 
     levels: tuple[LevelRow, ...]
+
     max_signal_id: int
     max_closed_ms: int
+
+    break_traded: frozenset[tuple[str, int, int]] = frozenset()
+    """Ключи уровней (symbol, from_ms, to_ms), у которых в леджере ЕСТЬ сделка по слому.
+
+    ⚠⚠ ЗАВЕДЕНО ПРАВКОЙ A-3, 2026-08-28. Объявление «слом младшего ТФ подтверждён —
+    вход активен» срабатывало на переходе `mtf_break` 0→1 и БОЛЬШЕ НИ НА ЧЁМ: сделки
+    при этом могло не существовать вовсе. 28.08 в 13:03 UTC так ушло по BCH шорт 1ч —
+    ни стопа, ни цели, ни РР. Теперь объявление обеспечено записью: пусто здесь —
+    молчим, потому что звать в сделку, не назвав риска, нельзя.
+
+    Пустое множество при отсутствии колонок связи — это ОТКАЗ В ПОЛЬЗУ МОЛЧАНИЯ, и он
+    выбран сознательно: на леджере старой схемы связь неизвестна, а объявлять вход по
+    неизвестной связи — ровно тот дефект, который правка и закрывает.
+    """
 
 
 def _newest_signal() -> tuple[int, int]:
@@ -2847,6 +2862,18 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                 " s.entry, s.breakeven_at, s.stop, s.target"
                 " FROM signal_states st JOIN signals s ON s.id = st.signal_id"
                 " ORDER BY st.signal_id")]
+        # СДЕЛКИ ПО СЛОМУ, УЖЕ ЛЕЖАЩИЕ В ЛЕДЖЕРЕ (правка A-3). Колонки связи
+        # спрашиваются у схемы по тому же правилу, что и всё в этом запросе: наблюдатель
+        # ходит только на чтение и мигрировать не может, а запрос с новой колонкой
+        # уронил бы его целиком (так уже было с `mtf_break`).
+        break_keys: frozenset[tuple[str, int, int]] = frozenset()
+        if "level_from_ms" in sig_have and "level_to_ms" in sig_have:
+            break_keys = frozenset(
+                (str(r[0]), int(r[1]), int(r[2]))
+                for r in conn.execute(
+                    "SELECT symbol, level_from_ms, level_to_ms FROM signals"
+                    " WHERE kind='pp' AND level_from_ms IS NOT NULL"
+                    " AND level_to_ms IS NOT NULL"))
         marks = ",".join("?" * len(symbols))
         # ⚠ КОЛОНКА СПРАШИВАЕТСЯ У СХЕМЫ, А НЕ ПРЕДПОЛАГАЕТСЯ (2026-08-19). Наблюдатель
         # ходит в леджер ТОЛЬКО НА ЧТЕНИЕ и мигрировать не может; схему поднимает
@@ -2922,6 +2949,7 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
                    for r in lvl_rows)
     return LedgerNews(signals=tuple(sig_rows), outcomes=tuple(out_rows),
                       states=tuple(state_rows), levels=levels,
+                      break_traded=break_keys,
                       max_signal_id=max_id, max_closed_ms=max_closed)
 
 
@@ -3459,6 +3487,15 @@ class Notifier:
             if priming or prev != 0 or lv.mtf_break != 1:
                 continue
             if (lv.symbol, lv.timeframe) not in nf:
+                continue
+            # ⚠⚠ ОБЪЯВЛЕНИЕ ТОЛЬКО ПРИ СУЩЕСТВУЮЩЕЙ СДЕЛКЕ (правка A-3, 2026-08-28,
+            # решение владельца). Прежде хватало перехода `mtf_break` 0→1, и строка
+            # «вход активен» уходила в канал, когда расчёт сделки НЕ ПОСТРОИЛ: ни стопа,
+            # ни цели, ни РР. Теперь расчёт её строит (стр. 25/31 → стр. 49 → стр. 50),
+            # но строит НЕ ВСЕГДА: замер первого прогона — 61 сделка построена, 0
+            # записано (36 без цели, 25 «цена далеко»). Значит проверять надо не
+            # намерение, а ЗАПИСЬ.
+            if (lv.symbol, lv.from_ms, lv.to_ms) not in news.break_traded:
                 continue
             base = lv.symbol.split("/")[0]
             side_word = SIDE_WORD.get(lv.side, lv.side)

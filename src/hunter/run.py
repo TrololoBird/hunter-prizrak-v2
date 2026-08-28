@@ -3126,6 +3126,80 @@ def record(run_id: str, report: RunReport, uni: Universe,
                                      причина=serr.reason)
                     else:
                         report.states_recorded += 1
+            # СДЕЛКА ПО СЛОМУ МЛАДШЕГО ТФ (правка A-3, 2026-08-28, решение
+            # владельца). Стр. 25 и 31 разрешают вход от отработанного уровня «только по
+            # факту слома структуры на младшем ТФ»; стр. 49 называет слом переприором;
+            # стр. 50 описывает торговлю переприора целиком. Значит это НЕ новый тип
+            # сделки, а тот же род `pp` — просто найденный от уровня, а не сам по себе,
+            # и потому связанный с ним ключом `level_from_ms/level_to_ms`.
+            #
+            # До этой правки расчёт слом проверял и НАЗЫВАЛ, а сделку не строил: бот
+            # объявлял «вход активен», не имея ни стопа, ни цели, ни РР. Теперь
+            # объявление обеспечено записью, а не обещанием.
+            for one in d.decisions:
+                bs = one.break_setup
+                if bs is None or one.break_pp is None:
+                    continue
+                if bs.target is None:
+                    # Та же причина, что у сделок от уровня и от ПП: сделка без цели
+                    # НЕИЗМЕРИМА, у неё нет исхода, по которому считается R.
+                    report.break_signals_no_target += 1
+                    continue
+                bbars = series.get(one.break_timeframe)
+                if not bbars:
+                    continue
+                # Тот же заслон по расстоянию, что у сделок от уровня и от ПП: вход есть
+                # ТЕСТ сломанного экстремума, его зоной и меряется приход цены.
+                if live_px > 0 and geometry.zone_position(
+                        live_px, float(one.break_pp.zone_lo),
+                        float(one.break_pp.zone_hi)) == "far":
+                    report.break_signals_far += 1
+                    continue
+                b_open = bbars[one.break_pp.confirmed_at_index].open_ms
+                brow = store.record_signal(
+                    conn, sym, one.break_timeframe, bs.side, b_open,
+                    Decimal(str(bs.entry)), Decimal(str(bs.stop)), run_id, stamp_ms,
+                    kind="pp", target=Decimal(str(bs.target)),
+                    level_from_ms=one.level.structure_from_ms,
+                    level_to_ms=one.level.structure_to_ms,
+                )
+                if isinstance(brow, NotReady):
+                    log.degraded("сделка по слому не записана", причина=brow.reason)
+                    continue
+                if brow.fresh:
+                    report.break_signals_recorded += 1
+                else:
+                    report.break_signals_known += 1
+                bres = outcome_resolve(
+                    side=(levels.LevelSide.LONG if bs.side == "long"
+                          else levels.LevelSide.SHORT),
+                    entry=Decimal(str(bs.entry)), stop=Decimal(str(bs.stop)),
+                    target=Decimal(str(bs.target)), bars=bbars,
+                    from_index=emit.first_bar_after(
+                        bbars, one.break_timeframe, brow.recorded_at,
+                        one.break_pp.confirmed_at_index + 1),
+                )
+                if bres.kind is OutcomeKind.UNMEASURABLE:
+                    report.pp_degenerate_risk += 1
+                elif bres.kind in CLOSED_KINDS:
+                    assert bres.closed_at_index is not None
+                    berr = store.record_outcome(
+                        conn, brow.id, bres.kind.value,
+                        bbars[bres.closed_at_index].open_ms, bres.exit_price, bres.r,
+                    )
+                    if isinstance(berr, NotReady):
+                        log.degraded("исход сделки по слому не записан",
+                                     причина=berr.reason)
+                    else:
+                        report.outcomes_recorded += 1
+                else:
+                    bserr = store.record_signal_state(
+                        conn, brow.id, bres.kind.value, bbars[-1].open_ms)
+                    if isinstance(bserr, NotReady):
+                        log.degraded("состояние сделки по слому не записано",
+                                     причина=bserr.reason)
+                    else:
+                        report.states_recorded += 1
         # ⚠ НАСЛОЕНИЕ ВСТРЕЧНЫХ ЗОН — по НАКОПЛЕННОЙ карте и ПОСЛЕ всех символов
         # (2026-08-26). Класс нашёл владелец глазами 2026-08-18, чинили четырежды, и ни
         # один прогон не назвал числа. Считается здесь, а не по свежим уровням символа:
@@ -3156,6 +3230,8 @@ CYCLE_FIELDS = (
     "frames_written", "cards_written", "archive_slices_written",
     "profile_series_written",
     "signals_recorded", "signals_known", "pp_signals_recorded", "pp_signals_known",
+    "break_signals_recorded", "break_signals_known", "break_signals_no_target",
+    "break_signals_far",
     "absorption_measured_by_tf", "absorption_refused_by_tf",
     "outcomes_recorded", "outcomes_resolved_late", "states_recorded",
     "pending_no_target", "pending_no_bars", "pending_degenerate_risk",
@@ -4170,6 +4246,12 @@ def print_report(r: RunReport) -> int:
           f"было известно раньше: {r.signals_known}")
     print(f"   сигналов от ПП (kind=pp): впервые {r.pp_signals_recorded}, "
           f"известно раньше: {r.pp_signals_known}")
+    # ⚠ ОТКАЗЫ НАЗЫВАЮТСЯ РЯДОМ С ЗАПИСЯМИ (§4.3): без них строка «сделок по слому 0»
+    # читается как «сломов не было», хотя причин ровно три и они разные.
+    print(f"   сделок ПО СЛОМУ младшего ТФ (стр. 25/31 → стр. 50): "
+          f"впервые {r.break_signals_recorded}, известно раньше: "
+          f"{r.break_signals_known}; не записано — без цели "
+          f"{r.break_signals_no_target}, цена далеко {r.break_signals_far}")
     # МОЛЧАНИЕ НАЗЫВАЕТСЯ ЧИСЛОМ: без этой строки «сигналов мало» читалось бы как
     # свойство рынка, тогда как это наш собственный отказ записывать сделку, к чьей
     # зоне входа цена ещё не подошла. Знаменатель рядом — сколько записано.
