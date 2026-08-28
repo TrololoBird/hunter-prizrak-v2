@@ -324,6 +324,56 @@ Handoff числит Ф3 заблокированной. На `main` она бы
 [Wyckoff Analytics — Wyckoff Method](https://www.wyckoffanalytics.com/wyckoff-method/),
 [TrendSpider — Wyckoff Accumulation Pattern](https://trendspider.com/learning-center/chart-patterns-wyckoff-accumulation/).
 
+## 8. РАСХОЖДЕНИЕ ПОСТАВЩИКА С ПЕРВОИСТОЧНИКОМ: ОБЛАСТЬ СТОИМОСТИ
+
+Найдено 2026-08-28 по вопросу владельца «а если изучить данные и информацию кроме
+tradingview». Изнутри TradingView это расхождение не видно по построению: пока мерка та
+же, что и реализация, сверять нечего.
+
+**Что делаем мы.** Строка, переваливающая порог 70%, в зону НЕ добавляется. Справка
+TradingView подтверждает дословно: "If it would exceed the target, stop — the value area
+is complete".
+
+**Что говорит первоисточник.** CQG, документирующая метод Стайдлмайера: "The value area
+begins calculating at the POC. The system expands the value area one price at a time in
+either direction **until the value area represents 70% of the TPOs**" — то есть
+переваливающая строка входит.
+
+что из чего следует: у TradingView зона покрывает НЕ БОЛЕЕ 70%, у Стайдлмайера — НЕ МЕНЕЕ.
+
+**Цена расхождения, замер на 3869 профилях кадров `zonesplit`:**
+
+    доля объёма в нашей «зоне 70%»
+        медиана     68.0%
+        p10         63.1%
+        МИНИМУМ     36.7%
+        зон с покрытием < 65%    703  (18.2%)
+        зон с покрытием < 60%    152  (3.9%)
+        зон с покрытием < 50%     16  (0.4%)
+        строк в зоне: медиана 10, МИНИМУМ 1
+
+Оракул, написанный по описанию CQG независимо от нашего кода, даёт медиану 71.98% и не
+опускается ниже 70.00% ни разу. Расхождение с нашей реализацией — ровно ОДНА строка
+(медиана 1, максимум 1), и оно систематическое: VAL совпадает всегда, VAH ниже на строку.
+
+**Почему это не правится молча.** Свод разделяет роли: «что рисовать» отвечает инструмент
+автора, «верно ли посчитано» — классика и первоисточники. Здесь они расходятся, и правило
+требует расхождение НАЗВАТЬ числом и предъявить владельцу, а не закрыть выбором одной
+стороны.
+
+**Цена перехода на классику, если он будет решён:** зона расширяется на одну строку,
+покрытие поднимается с 68.0% до 71.98%, верхний край зоны входа сдвигается на 0.07% цены
+(высота строки). Уровней это не добавляет и не убавляет.
+
+⚠ Попутно найдено и НЕ является дефектом: тай-брейк ПОКа. Классика его определяет — "If
+several prices have the same max TPO, then the price that is closest to the middle price
+range is the POC price", — а мы при равенстве ОТКАЗЫВАЕМ (`NO_POC`, «ПОК неоднозначен»).
+На кадрах `zonesplit` это не сработало ни разу из 3869, то есть расхождение спящее.
+
+**Источники:** [CQG — Market Profile Value Areas](https://help.cqg.com/cqgic/25/Documents/marketprofilevalueareasmpva.htm),
+[TradingView — Volume profile indicators: basic concepts](https://www.tradingview.com/support/solutions/43000502040-volume-profile-indicators-basic-concepts/),
+[LuxAlgo — TPO Profile](https://www.luxalgo.com/library/concept/tpo-profile/).
+
 ## 4. КОМАНДЫ ВОСПРОИЗВЕДЕНИЯ
 
 ```bash
