@@ -858,8 +858,23 @@ def build_level(
         price=profile.poc_price,
         zone_lo=profile.val_price,
         zone_hi=profile.vah_price,
-        zone_work_lo=profile.work_lo_price,
-        zone_work_hi=profile.work_hi_price,
+        # ⚠⚠⚠ РАБОЧАЯ ЗОНА БОЛЬШЕ НЕ ПОДАЁТСЯ В УРОВЕНЬ — приказ владельца 2026-08-28
+        # «верни вход на VAL…VAH». `None` означает «не считается», и все пять
+        # потребителей (карточка, график, события зоны, сводка монеты, сообщение о
+        # сигнале) по своим же условиям падают на VAL…VAH.
+        #
+        # ПОЧЕМУ. Ширина рабочей зоны задавалась порогом «объём строки не ниже половины
+        # пикового», у которого НЕТ РЕФЕРЕНТА: HVN во внешних источниках определяется
+        # качественно («a peak of volume around a price level»), а где число называют —
+        # оно другое и объявлено конвенцией ("seventy percent is a common, configurable
+        # convention — not a natural law"). Замер 2026-08-28 на 3869 профилях показал,
+        # что вход к этому числу очень чувствителен: медиана ширины 100% области
+        # стоимости при пороге 30%, 75% при наших 50%, 37.5% при 70% — в 2.7 раза.
+        #
+        # Область стоимости 70% референт ИМЕЕТ (Стайдлмайер, Market Profile) и уже
+        # посчитана здесь же. Возврат снимает выдуманное число, ничего не добавляя.
+        zone_work_lo=None,
+        zone_work_hi=None,
         created_at_index=acc.exit.confirmed_at_index,
         created_at_ms=born_ms,
         structure_first_index=acc.first_index,

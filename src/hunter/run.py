@@ -2483,9 +2483,12 @@ def decide_once(report: RunReport, uni: Universe,
             report.levels_volume_outside_base.append(lv.volume_outside_base)
             if lv.row_height and (lv.zone_hi - lv.zone_lo) <= 2 * lv.row_height:
                 report.levels_zone_one_row += 1
-            if (lv.zone_work_lo is not None and lv.zone_work_hi is not None
-                    and lv.zone_work_lo <= lv.zone_lo and lv.zone_work_hi >= lv.zone_hi):
-                report.levels_work_zone_not_narrowed += 1
+            # ⚠ МЕРА РАБОЧЕЙ ЗОНЫ СНЯТА 2026-08-28 вместе с самой зоной (приказ
+            # владельца «верни вход на VAL…VAH»). Условие ниже осталось бы истинным
+            # НИКОГДА — `zone_work_*` теперь всегда `None`, — и печать «0 из N»
+            # читалась бы как «ядро всегда у́же зоны», хотя ядра нет вовсе. Ноль,
+            # который значит «не считается», и ноль, который значит «нарушений нет», —
+            # разные вести, и путать их запрещено (§4.3).
         for tf, n in dec.levels_by_tf().items():
             report.structures_by_tf[tf] = report.structures_by_tf.get(tf, 0) + n
         for ub in dec.unbuilt:
@@ -4091,8 +4094,7 @@ def print_report(r: RunReport) -> int:
     if built > 0:
         print(f"   зона в одну-две строки профиля (разрешения нет): "
               f"{r.levels_zone_one_row} из {built}")
-        print(f"   рабочая зона НЕ сузила VAL…VAH (ядро = вся зона): "
-              f"{r.levels_work_zone_not_narrowed} из {built}")
+
     if r.levels_volume_outside_base:
         # МЕРА ВЗАМЕН ИСЧЕЗНУВШИХ ОТКАЗОВ. С 2026-08-28 сетка профиля натянута на базу,
         # поэтому ПОК лежит внутри ПО ПОСТРОЕНИЮ и классы `ZONE_OUT`/`POC_OUT` больше не
