@@ -566,12 +566,14 @@ def read_map(symbol: str) -> MapRead | NotReady:
             "SELECT timeframe, side, price, zone_lo, zone_hi, entry_rule, last_seen,"
             " boundary_lo, boundary_hi, from_ms, to_ms, state,"
             " COALESCE(resolved_at, 0), " + dens_col +
-            # Та же отсечка свежести, что у наблюдателя (см. пояснение в `ledger_news`):
-            # на график не идут уровни, которых последний расчёт символа не подтвердил.
-            " FROM levels WHERE symbol=? AND ((state='active' AND last_seen = ("
-            "     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = ?"
-            " )) OR retired_at >= ?)"
-            " ORDER BY price", (symbol, symbol, clock.now_ms() - RETIRED_WINDOW_MS),
+            # ⚠ ОТСЕЧКА СВЕЖЕСТИ — ССЫЛКОЙ, А НЕ КОПИЕЙ (2026-08-28). Здесь стоял
+            # подзапрос, дословно повторённый в `_ledger_news`, и это были ДВЕ записи
+            # одного правила; остальной проект (`hunter check`, наслоение зон) о нём не
+            # знал вовсе и считал по множеству на 20% больше. Определение одно —
+            # `store.LIVE_LEVEL_SQL`.
+            " FROM levels WHERE symbol=? AND ((" + store.LIVE_LEVEL_SQL + ")"
+            " OR retired_at >= ?)"
+            " ORDER BY price", (symbol, clock.now_ms() - RETIRED_WINDOW_MS),
         ).fetchall()
     except sqlite3.DatabaseError as e:
         return NotReady(reason=f"леджер не прочитан: {type(e).__name__} {e}")
@@ -2910,9 +2912,9 @@ def _read_ledger_news(after_id: int | None, after_ms: int | None,
             # его последнего расчёта. Уровень, не обновлённый тогда, этим расчётом не
             # порождён. Снятые уровни (`retired_at`) под правило не попадают — они нужны
             # графику как история и заново не синхронизируются.
-            f" FROM levels WHERE ((state='active' AND last_seen = ("
-            f"     SELECT MAX(l2.last_seen) FROM levels l2 WHERE l2.symbol = levels.symbol"
-            f" )) OR retired_at >= ?)"
+            # ⚠ ВТОРАЯ КОПИЯ ЭТОГО ЖЕ ПОДЗАПРОСА СНЯТА 2026-08-28: определение живого
+            # уровня одно на проект — `store.LIVE_LEVEL_SQL`, там же и разбор.
+            f" FROM levels WHERE (({store.LIVE_LEVEL_SQL}) OR retired_at >= ?)"
             f" AND symbol IN ({marks})",
             (clock.now_ms() - RETIRED_WINDOW_MS, *symbols)).fetchall()
     except sqlite3.DatabaseError as e:

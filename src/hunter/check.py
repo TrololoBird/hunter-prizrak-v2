@@ -328,14 +328,19 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
         wide = conn.execute(
             "SELECT symbol, timeframe,"
             " (zone_hi-zone_lo)/((zone_hi+zone_lo)/2)*100 AS w FROM levels"
-            " WHERE state='active' AND zone_hi+zone_lo > 0"
+            # ⚠ ЖИВЫЕ, А НЕ ВСЕ `active` (2026-08-28, `store.LIVE_LEVEL_SQL`). Вердикт
+            # читает ВЛАДЕЛЕЦ, и считаться он обязан по той же карте, которую владелец
+            # видит: бот фильтрует непересчитанные, а этот отчёт их считал. Замер в день
+            # правки: 108 строк против 90 живых, на 5м 30 против 19.
+            " WHERE " + store.LIVE_LEVEL_SQL + " AND zone_hi+zone_lo > 0"
             " AND (zone_hi-zone_lo)/((zone_hi+zone_lo)/2) > 0.39 ORDER BY w DESC"
         ).fetchall()
         # Знаменатели по ТФ: одна худшая зона без «из скольких» скрыла бы измерение
         # перекоса (урок backfill-window-2026-08-04 — сводка вдоль измерения).
         tf_totals: dict[str, int] = dict(conn.execute(
             "SELECT timeframe, COUNT(*) FROM levels"
-            " WHERE state='active' AND zone_hi+zone_lo > 0 GROUP BY timeframe"
+            " WHERE " + store.LIVE_LEVEL_SQL + " AND zone_hi+zone_lo > 0"
+            " GROUP BY timeframe"
         ).fetchall())
         lines.append(("Леджер читается", True, f"записей о сигналах: {n}"))
         print(f"   записей: {n}")
@@ -373,7 +378,7 @@ def run_check(uni: Universe, seconds: int, seed_limit: int) -> int:
                     if "vrvp_density" in store.level_columns(conn) else "0")
         for tf, total, have in conn.execute(
             f"SELECT timeframe, COUNT(*), {have_col} FROM levels"
-            " WHERE state='active' GROUP BY timeframe"
+            " WHERE " + store.LIVE_LEVEL_SQL + " GROUP BY timeframe"
         ).fetchall():
             vol_rows[tf] = (int(total), int(have))
         v_total = sum(t for t, _ in vol_rows.values())
