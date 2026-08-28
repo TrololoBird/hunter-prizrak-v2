@@ -2507,10 +2507,41 @@ ALIVE_EVERY_S = 900.0
 
 async def alive_loop(delivery: Delivery, watch: NetworkWatch,
                      notifier: Notifier) -> None:
-    """Периодическая сводка: бот жив, и вот чем он занимался."""
+    """Периодическая сводка: бот жив, и вот чем он занимался.
+
+    ⚠⚠⚠ ЗДЕСЬ ЖЕ НАЗЫВАЕТСЯ ВОЗРАСТ ЛЕДЖЕРА — правка 2026-08-28 по вопросу владельца
+    «чем серв отличается от бота? я думал это единный механизм».
+
+    Разделение процессов намеренно и обосновано (единственный писатель §10.2, дележ
+    лимита биржи `IpShare`), но СЛЕДСТВИЕ названо не было: бот доставляет из леджера,
+    который пишет `hunter serve`, и если служба не запущена — молчит об этом. Так и
+    вышло: сутки уведомлений «цена у зон» по старой карте при последнем сигнале
+    `#1131` от 2026-08-27 17:24 UTC, и ни строки о том, что расчёт стоит.
+
+    Это молчаливая деградация, которую свод запрещает прямо: «деградации и отсутствие
+    данных недопустимы». Владелец не программист и не обязан помнить, что «бот» — это
+    только доставка.
+
+    ПОРОГ НЕ ВЫДУМАН. Строка `degraded` печатается, когда с СОБСТВЕННОГО СТАРТА бота в
+    леджер не легло ни одной записи: это факт («пока я работаю, никто не пишет»), а не
+    выбранное число часов. Возраст же печатается ВСЕГДА, безусловно.
+    """
+    started_ms = clock.now_ms()
+    seen_max = _read_watermark()[0] or 0
     while True:
         await asyncio.sleep(ALIVE_EVERY_S)
+        fresh = _newest_signal()
+        age_min = ((clock.now_ms() - fresh[1]) // 60_000) if fresh[1] else None
+        if fresh[0] > seen_max:
+            seen_max = fresh[0]
+        elif fresh[1] and fresh[1] < started_ms:
+            log.degraded(
+                "леджер НЕ ПОПОЛНЯЕТСЯ — расчёт не запущен",
+                последний_сигнал=fresh[0],
+                минут_назад=age_min,
+                подсказка="бот только ДОСТАВЛЯЕТ; считает и пишет `hunter serve`")
         log.info("бот жив", запросов=delivery.requests, ответов=delivery.answers,
+                 последний_сигнал_минут_назад=age_min,
                  неопознано=delivery.unknown,
                  отказов_по_паузе=delivery.cooldown.refused,
                  сборок=delivery.on_demand.built, сборок_с_отказом=delivery.on_demand.failed,
@@ -2696,6 +2727,29 @@ class LedgerNews:
     levels: tuple[LevelRow, ...]
     max_signal_id: int
     max_closed_ms: int
+
+
+def _newest_signal() -> tuple[int, int]:
+    """Номер и момент записи САМОГО СВЕЖЕГО сигнала леджера. `(0, 0)` — леджер не читается.
+
+    Отдельный короткий заход вместо расширения `_read_ledger_news`: тот отвечает на
+    вопрос «что нового СО ВРЕМЕНИ такта» и его водяные знаки двигаются, а здесь нужен
+    абсолютный возраст базы независимо от того, докуда доложено.
+    """
+    try:
+        conn = store.open_readonly()
+    except (FileNotFoundError, OSError):
+        return (0, 0)
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0), COALESCE(MAX(recorded_at), 0) FROM signals"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+    except sqlite3.DatabaseError as e:
+        log.degraded("возраст леджера не прочитан", причина=f"{type(e).__name__} {e}")
+        return (0, 0)
+    finally:
+        conn.close()
 
 
 def _read_watermark() -> tuple[int | None, int | None]:
