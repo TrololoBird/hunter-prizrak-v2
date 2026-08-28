@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
+from typing import Protocol
 
 import ccxt
 from aiogram import Bot, Dispatcher
@@ -823,7 +824,24 @@ class OnDemand:
 # --- графики и текст --------------------------------------------------------------
 
 
-def _beyond_price(z: ZoneSpec, last_price: float) -> bool:
+class _Bounded(Protocol):
+    """Что нужно `_beyond_price`: сторона и границы структуры — и ничего больше.
+
+    ⚠ Из заначки 2026-08-26, применено 2026-08-29. Правило «цена прошла сквозь
+    структуру» считается в ОДНОМ месте, а спрашивают его ДВА носителя: `ZoneSpec`
+    (картинка) и `LevelRow` (доска). Вторая реализация той же формулы разошлась бы с
+    первой не «если», а «через сколько дней» — свод запрещает копию величины.
+    """
+
+    @property
+    def side(self) -> str: ...
+    @property
+    def boundary_lo(self) -> float: ...
+    @property
+    def boundary_hi(self) -> float: ...
+
+
+def _beyond_price(z: _Bounded, last_price: float) -> bool:
     """Цена прошла СКВОЗЬ структуру зоны: лонговая целиком выше цены, шортовая ниже.
 
     Границы, а не зона: коробка ХАЙ…ЛОЙ и есть структура (стр. 30), а заход внутрь неё
@@ -1179,7 +1197,7 @@ def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
     он увидел бы списком, а не длину внутреннего массива.
     """
     order = TF_RANK
-    best: dict[tuple[str, str], ZoneSpec] = {}
+    best: dict[tuple[str, str, str], ZoneSpec] = {}
     # ⚠ СИЛА ПО ОБЪЁМУ РЕШАЕТ ПРИ РАВНОМ ТФ (2026-08-19, приказ владельца: "примени
     # силу по объёму в отборе уровней"). Стр. 22: «Сила уровня определяется ТФ и объемом» —
     # два измерения, и второе в отборе не участвовало вовсе. При равном ТФ прежняя
@@ -1190,7 +1208,14 @@ def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
     # (стр. 48), и объём его не перебивает. Курс единой шкалы «ТФ + объём» не даёт, а
     # выдуманный вес одного против другого был бы придумкой из головы.
     for z in rows:
-        key = (z.side, _fmt_price(z.price))
+        # ⚠ СОСТОЯНИЕ — ЧАСТЬ КЛЮЧА (из заначки 2026-08-26, применено 2026-08-29).
+        # `active` и `worked_off`/`flipped` — разные судьбы уровня и, как правило,
+        # разные структуры. Склеив их, показ оставил бы одну строку и СПРЯТАЛ бы, что
+        # второй уровень уже отработан (стр. 25) или флипнут (стр. 43).
+        # Замер на нынешней карте: ключей (символ, сторона, цена) с РАЗНЫМИ состояниями
+        # 1 из 783, и та пара `flipped`+`worked_off` — столкновения активного с
+        # неактивным сегодня нет. Дыра структурная, цена её сегодня нулевая.
+        key = (z.side, z.state, _fmt_price(z.price))
         kept = best.get(key)
         if kept is None or _strength(z, order) > _strength(kept, order):
             best[key] = z
@@ -1214,7 +1239,8 @@ def _dedupe(rows: list[ZoneSpec], price: float) -> list[ZoneSpec]:
     for z in sorted(best.values(),
                     key=lambda z: (*(-v for v in _strength(z, order)),
                                    -(z.zone_hi - z.zone_lo))):
-        if any(k.side == z.side and k.zone_lo <= z.price <= k.zone_hi
+        if any(k.side == z.side and k.state == z.state
+               and k.zone_lo <= z.price <= k.zone_hi
                and z.zone_lo <= k.price <= z.zone_hi
                for k in kept_zones):
             continue
@@ -3044,7 +3070,18 @@ def rank_board(levels: tuple[LevelRow, ...],
     """
     by_symbol: dict[str, list[LevelRow]] = {}
     for lv in levels:
-        if lv.state == "active":
+        # ⚠⚠ `state='active'` НЕ ОЗНАЧАЕТ «уровень работает СВОЕЙ стороной». Цена может
+        # стоять по ту сторону всей структуры: лонговый уровень выше цены — уже не
+        # поддержка, а сопротивление, и «покупать от него» некуда. Расчёт это знает и
+        # такой уровень НЕ эмитирует (`emit.hold_reason` → `price_beyond`, стр. 43), а
+        # доска бота о правиле не знала и ранжировала его наравне со свежим — два рта
+        # проекта отвечали по-разному об одном уровне.
+        #
+        # Из заначки 2026-08-26, применено 2026-08-29. Замер на нынешней карте: таких
+        # уровней 0 из 22 живых с известной ценой — вреда СЕГОДНЯ нет, дыра
+        # структурная. Контроль прибора: та же формула с обращённой стороной даёт
+        # 17 из 22, то есть ответить «да» она способна, и ноль настоящий.
+        if lv.state == "active" and not _beyond_price(lv, prices.get(lv.symbol, 0.0)):
             by_symbol.setdefault(lv.symbol, []).append(lv)
     out: list[BoardSetup] = []
     for sym, pool in by_symbol.items():
