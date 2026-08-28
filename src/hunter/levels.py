@@ -2396,6 +2396,36 @@ def status(
     pressed = pressed_structures(level, scan, bars) if scan is not None else ()
     play = playout(level, bars, event=ev, take=take, pressed=pressed)
     if ev is None or ev.kind in (BreachKind.OPEN, BreachKind.UNRESOLVED):
+        if took and TF_RANK.get(level.timeframe) == 0:
+            # ⚠⚠ УРОВЕНЬ МЛАДШЕГО ТФ, ЗАБРАННЫЙ С РЕАКЦИЕЙ, СНИМАЕТСЯ, А НЕ ЖДЁТ ВЕЧНО
+            # (правка A-2, 2026-08-28). Ветка ниже оставляла его `active` с правилом
+            # входа `confirmation`, то есть «войдём по слому структуры на младшем ТФ».
+            # У 5м младшего ТФ не существует: стр. 17 называет 5м/15м/час/4ч/1Д/1Н и
+            # 2ч/6ч/12ч/10мин/30мин — ничего младше пяти минут. Условие входа стр. 25 и
+            # 31 для такого уровня НЕВЫПОЛНИМО в принципе, и ожидание длится вечно.
+            #
+            # Замер по активной карте: так ждали 28 уровней 5м, из них 10 входили ТОЛЬКО
+            # по слому — эти десять не активировались бы НИКОГДА, оставаясь в карте
+            # активными и годными ко входу. Владелец видел строки, которые не сработают.
+            #
+            # Курс на этот случай отвечает прямо, и своей логики здесь не добавляется:
+            # стр. 25 «уровень был отработан на 1 касание (как на графике - увидели
+            # хорошую реакцию)» → «мы этот уровень удаляем». Оговорка стр. 31 (моими
+            # словами: лимитки сняты, но вход по слому остаётся) спасает уровень старших
+            # ТФ и не спасает этот: спасать нечем.
+            #
+            # ⚠ МОМЕНТ СНЯТИЯ — БАР РЕАКЦИИ, а не время прогона. `state_at` читает
+            # `resolved_at_ms` и при `None` возвращает `active`, поэтому снятие без
+            # момента было бы снятием только на словах.
+            assert take.reaction_index is not None, (
+                "реакция засчитана без бара реакции: `took` выведен из `take.reacted`, "
+                "а `take_depth` ставит оба поля одним присваиванием")
+            return LevelStatus(
+                state=LevelState.WORKED_OFF, event=ev, limit_orders_allowed=False,
+                price_in_zone=in_zone, price_beyond=beyond, take=take, playout=play,
+                entry_rule=EntryRule.CONFIRMATION,
+                resolved_at_ms=(bars[take.reaction_index].open_ms
+                                + tf_ms(level.timeframe)))
         if beyond or took:
             return LevelStatus(state=LevelState.ACTIVE, event=ev,
                                limit_orders_allowed=False, price_in_zone=in_zone,

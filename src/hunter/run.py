@@ -2765,12 +2765,23 @@ def record(run_id: str, report: RunReport, uni: Universe,
             # наблюдателю недоступны.
             broke: dict[tuple[str, int, int], int] = {}
             for one in d.decisions:
-                note = one.mtf_break or ""
-                if not note:
+                # ⚠⚠ РЕШАЕТ СОСТОЯНИЕ, А НЕ ПОДСТРОКА (правка A-5, 2026-08-28). Здесь
+                # стояло `1 if "подтверждён" in note else 0`: русская фраза, которую в
+                # этом проекте переписывают постоянно, управляла целым числом леджера, а
+                # оно — объявлением бота «вход активен». Ложного срабатывания на тот день
+                # не было; защиты от него не было тоже.
+                #
+                # ⚠⚠ И В НОЛЬ ПАДАЛИ ТРИ РАЗНЫЕ ВЕЩИ (правка A-2). «Слома не было»,
+                # «ряд не разобран» и «младшего ТФ у курса нет» получали один ответ на
+                # троих. Бот читает ноль как «слома ещё нет, ЖДЁМ» — для двух последних
+                # это ложь, и ждать там нечего. В леджер идут только два НАСТОЯЩИХ
+                # ответа; остальное остаётся NULL — «неизвестно», а не «нет» (§4.3).
+                st = one.mtf_break_state
+                if st not in (engine.MtfBreak.CONFIRMED, engine.MtfBreak.ABSENT):
                     continue
                 k = (one.level.timeframe, one.level.structure_from_ms,
                      one.level.structure_to_ms)
-                broke[k] = 1 if "подтверждён" in note else 0
+                broke[k] = 1 if st is engine.MtfBreak.CONFIRMED else 0
             # Шестым — СОГЛАСИЕ СО СТАРШИМ ТФ (схема 12): доставке нужно сказать, что
             # сделка встречная (стр. 47), а тренды наблюдателю недоступны.
             agree: dict[tuple[str, int, int], str] = {}
