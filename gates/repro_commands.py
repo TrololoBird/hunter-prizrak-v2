@@ -48,6 +48,7 @@ EXEMPT = {
     # книг с URL, собственных замеров нет, документ сам это заявляет.
     "docs/audit/ta-terms-research-2-2026-09-01.md",
     "docs/audit/ta-terms-research-3-2026-09-01.md",  # та же серия, та же природа чисел
+    "docs/audit/ta-terms-research-4-2026-09-01.md",  # та же серия, та же природа чисел
 }
 
 
