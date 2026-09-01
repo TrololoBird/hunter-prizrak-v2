@@ -373,7 +373,7 @@ def _admission(args: argparse.Namespace) -> int:
     # ⚠ Указатель уточнён 2026-08-17: wilder-reference покрывает только ATR/RSI (и сам
     # говорит об этом строкой 79); точки каноничности ВСЕХ величин держит гейт
     # gates/formula_reference.py на каждом прогоне CI.
-    print(f"Требования замерены: {REQUIRED_BARS} (ATR/RSI — "
+    print(f"Требования замерены: {REQUIRED_BARS} (RSI — "
           f"docs/audit/wilder-reference-2026-08-03.md; все — gates/formula_reference.py)")
     print()
     print(f"(счёт с отсечкой на {required}: большее значение означает «не меньше»)")
