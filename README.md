@@ -53,8 +53,7 @@ uv run python -m hunter check
 Что система умеет и чего не умеет — на языке оператора: [`docs/OPERATOR.md`](docs/OPERATOR.md).
 
 ⚠ **В дереве лежит ЧУЖОЙ материал:** мини-курс PrizrakTrade целиком (`docs/course/`),
-расшифровки разборов автора (`research/prizrak_corpus/`), кадры и транскрипт его видео
-(`docs/audit/evidence/E-080-author-video/`). Он нужен гейтам `course_citations` и
+расшифровки разборов автора (`research/prizrak_corpus/`). Он нужен гейтам `course_citations` и
 `course_rules`, которые сверяют цитаты дословно с источником, а не с пересказом.
 
 Репозиторий был приватным именно поэтому и **открыт 2026-08-10 решением владельца** —

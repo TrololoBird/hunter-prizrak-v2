@@ -7,8 +7,8 @@
 указанного источника. Сверяется с тем, что выдаёт проектный код (polars_talib).
 
 ИСТОЧНИКИ ФОРМУЛ (вторичные изложения первоисточников; книг в проекте нет):
-  ATR, RSI  — J.W. Wilder, New Concepts in Technical Trading Systems (1978),
-              https://en.wikipedia.org/wiki/Average_true_range
+  RSI (и TR/сглаживание для ADX) — J.W. Wilder, New Concepts in Technical Trading
+              Systems (1978), https://en.wikipedia.org/wiki/Average_true_range
   EMA       — s_t = a*x_t + (1-a)*s_{t-1}; a = 2/(k+1),
               https://en.wikipedia.org/wiki/Exponential_smoothing
   MACD      — MACD = EMA12 - EMA26; сигнал = EMA9(MACD),
@@ -83,9 +83,9 @@ def wilder_smooth(x: list[float], n: int, start: int) -> list[float | None]:
     return out
 
 
-def atr(high: list[float], low: list[float], close: list[float],
-        n: int = 14) -> list[float | None]:
-    return wilder_smooth(true_range(high, low, close), n, start=1)
+# ⚠ Функция `atr` удалена 2026-09-01 по приказу владельца «МЫ УДАЛЯЛИ ATR ОТОВСЮДУ»:
+# из сверки она выпала ещё 2026-08-21 (см. примечание в main) и лежала мёртвым кодом.
+# `true_range` и `wilder_smooth` остаются — их использует adx.
 
 
 def rsi(close: list[float], n: int = 14) -> list[float | None]:
